@@ -6,8 +6,6 @@ import hashlib
 from pathlib import Path
 import uuid
 
-import psutil
-
 from ._io import LINE_LIMIT, encode, file_hash, private_dir, read_message, write_json
 
 
@@ -33,6 +31,8 @@ class ClickResult:
 class BrowserSession:
     @classmethod
     async def start(cls, spec, workspace, persona, allowed_origins, initial_mode="PAUSED"):
+        import psutil
+
         binary = Path(spec["binary"]).resolve(strict=True)
         if file_hash(binary) != spec["sha256"]:
             raise BrowserError("BROWSER_BINARY_MISMATCH")
