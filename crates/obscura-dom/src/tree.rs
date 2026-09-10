@@ -244,6 +244,119 @@ impl Node {
     }
 }
 
+/// Live input facts shared by DOM selectors and the browser owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputState {
+    pub hovered: Option<NodeId>,
+    pub pressed: Option<NodeId>,
+    pub focused: Option<NodeId>,
+    pub focus_visible: bool,
+    pub focus_generation: u64,
+    pub keyboard_input: bool,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            hovered: None,
+            pressed: None,
+            focused: None,
+            focus_visible: false,
+            focus_generation: 0,
+            keyboard_input: true,
+        }
+    }
+}
+
+impl InputState {
+    fn disconnect(&mut self, node: NodeId) {
+        if self.hovered == Some(node) {
+            self.hovered = None;
+        }
+        if self.pressed == Some(node) {
+            self.pressed = None;
+        }
+        if self.focused == Some(node) {
+            self.focused = None;
+            self.focus_visible = false;
+            self.focus_generation = self.focus_generation.wrapping_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextControlKind {
+    Text,
+    Url,
+    Email { multiple: bool },
+    Password,
+    TextArea,
+}
+
+impl TextControlKind {
+    pub fn supports_selection(self) -> bool {
+        !matches!(self, Self::Email { .. })
+    }
+
+    pub fn normalize(self, value: &str) -> String {
+        if self == Self::TextArea {
+            return value.replace("\r\n", "\n").replace('\r', "\n");
+        }
+        let value = value.replace(['\r', '\n'], "");
+        let trim = |text: &str| {
+            text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+                .to_string()
+        };
+        match self {
+            Self::Url | Self::Email { multiple: false } => trim(&value),
+            Self::Email { multiple: true } => {
+                value.split(',').map(trim).collect::<Vec<_>>().join(",")
+            }
+            _ => value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextControlState {
+    pub kind: TextControlKind,
+    pub value: String,
+    pub default_value: String,
+    pub dirty: bool,
+    pub last_user_edit: bool,
+    pub start: u32,
+    pub end: u32,
+    pub direction: String,
+    pub generation: u64,
+    input_type: Option<String>,
+    before_user_edit: Option<String>,
+}
+
+impl TextControlState {
+    fn clamp_selection(&mut self) {
+        let length = self.value.encode_utf16().count() as u32;
+        self.end = self.end.min(length);
+        self.start = self.start.min(self.end);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RadioGroup {
+    root: NodeId,
+    form: Option<NodeId>,
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedState {
+    pub checked: bool,
+    pub default_checked: bool,
+    pub dirty: bool,
+    pub indeterminate: bool,
+    group: Option<RadioGroup>,
+    connected: bool,
+}
+
 pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
@@ -251,7 +364,22 @@ pub struct DomTree {
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
+    node_generations: Vec<u64>,
     pub(crate) document: NodeId,
+    document_url: Option<String>,
+    target_element: Option<NodeId>,
+    // First HTML base[href], its raw href, and the fallback URL when frozen.
+    frozen_base: Option<(NodeId, String, String)>,
+    base_generation: u64,
+    input: InputState,
+    text_controls: HashMap<NodeId, TextControlState>,
+    text_generation: u64,
+    checked_controls: HashMap<NodeId, CheckedState>,
+    forwarding_labels: HashSet<NodeId>,
+    resetting_forms: HashSet<NodeId>,
+    submitting_forms: HashSet<NodeId>,
+    constructing_forms: HashSet<NodeId>,
+    custom_validity: HashMap<NodeId, String>,
     pub(crate) id_index: HashMap<String, NodeId>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
@@ -282,7 +410,21 @@ impl DomTree {
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
+                node_generations: vec![0],
                 document: NodeId(0),
+                document_url: None,
+                target_element: None,
+                frozen_base: None,
+                base_generation: 0,
+                input: InputState::default(),
+                text_controls: HashMap::new(),
+                text_generation: 0,
+                checked_controls: HashMap::new(),
+                forwarding_labels: HashSet::new(),
+                resetting_forms: HashSet::new(),
+                submitting_forms: HashSet::new(),
+                constructing_forms: HashSet::new(),
+                custom_validity: HashMap::new(),
                 id_index: HashMap::new(),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
@@ -294,6 +436,917 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    /// Distinguish a live node from a later allocation reusing its arena slot.
+    pub fn node_generation(&self, node: NodeId) -> Option<u64> {
+        let inner = self.inner.borrow();
+        inner.nodes.get(node.index())?.as_ref()?;
+        inner.node_generations.get(node.index()).copied()
+    }
+
+    /// Fragment targets belong to the light document tree. Scan tree order:
+    /// the ID index need not retain the first duplicate after DOM mutations.
+    pub fn potential_fragment_target(&self, fragment: &str) -> Option<NodeId> {
+        let nodes = self.descendants(self.document());
+        let attribute_matches = |id, attribute| {
+            self.with_node(id, |node| {
+                node.as_element().is_some() && node.get_attribute(attribute) == Some(fragment)
+            })
+            .unwrap_or(false)
+        };
+        nodes
+            .iter()
+            .copied()
+            .find(|id| attribute_matches(*id, "id"))
+            .or_else(|| {
+                nodes
+                    .into_iter()
+                    .find(|id| self.is_html_element(*id, "a") && attribute_matches(*id, "name"))
+            })
+    }
+
+    pub fn target_element(&self) -> Option<NodeId> {
+        self.inner.borrow().target_element
+    }
+
+    pub fn set_target_element(&self, target: Option<NodeId>) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.target_element == target {
+            return false;
+        }
+        inner.target_element = target;
+        true
+    }
+
+    pub fn input_state(&self) -> InputState {
+        self.inner.borrow().input
+    }
+
+    pub fn text_control_kind(&self, id: NodeId) -> Option<TextControlKind> {
+        let node = self.get_node(id)?;
+        let name = node.as_element()?;
+        if name.ns.as_ref() != "http://www.w3.org/1999/xhtml" {
+            return None;
+        }
+        match name.local.as_ref() {
+            "textarea" => Some(TextControlKind::TextArea),
+            "input" => match node
+                .get_attribute("type")
+                .unwrap_or("text")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "text" | "search" | "tel" => Some(TextControlKind::Text),
+                "url" => Some(TextControlKind::Url),
+                "email" => Some(TextControlKind::Email {
+                    multiple: node.get_attribute("multiple").is_some(),
+                }),
+                "password" => Some(TextControlKind::Password),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn text_default_value(&self, id: NodeId, kind: TextControlKind) -> String {
+        if kind == TextControlKind::TextArea {
+            return self.text_content(id);
+        }
+        self.get_node(id)
+            .and_then(|node| node.get_attribute("value").map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    fn store_text_state(&self, id: NodeId, mut value: TextControlState) -> TextControlState {
+        let mut inner = self.inner.borrow_mut();
+        inner.text_generation = inner.text_generation.wrapping_add(1);
+        value.generation = inner.text_generation;
+        inner.text_controls.insert(id, value.clone());
+        value
+    }
+
+    /// Default changes never overwrite a dirty current value. Run after DOM
+    /// mutation so a change away and back cannot be missed by a later getter.
+    fn sync_text_controls(&self) {
+        let ids: Vec<_> = self.inner.borrow().text_controls.keys().copied().collect();
+        for id in ids {
+            let Some(kind) = self.text_control_kind(id) else {
+                self.inner.borrow_mut().text_controls.remove(&id);
+                continue;
+            };
+            let default = self.text_default_value(id, kind);
+            let input_type = self.input_type(id);
+            let mut state = self.inner.borrow().text_controls[&id].clone();
+            if state.kind == kind
+                && state.default_value == default
+                && state.input_type == input_type
+            {
+                continue;
+            }
+            if state.input_type != input_type {
+                state.before_user_edit = None;
+            }
+            if !state.dirty {
+                state.value = kind.normalize(&default);
+            } else if state.kind != kind {
+                state.value = kind.normalize(&state.value);
+            }
+            state.kind = kind;
+            state.input_type = input_type;
+            state.default_value = default;
+            state.clamp_selection();
+            self.store_text_state(id, state);
+        }
+    }
+
+    pub fn text_control(&self, id: NodeId) -> Option<TextControlState> {
+        let kind = self.text_control_kind(id)?;
+        self.sync_text_controls();
+        if let Some(state) = self.inner.borrow().text_controls.get(&id).cloned() {
+            return Some(state);
+        }
+        let default_value = self.text_default_value(id, kind);
+        Some(self.store_text_state(
+            id,
+            TextControlState {
+                kind,
+                value: kind.normalize(&default_value),
+                default_value,
+                dirty: false,
+                last_user_edit: false,
+                start: 0,
+                end: 0,
+                direction: "none".into(),
+                generation: 0,
+                input_type: self.input_type(id),
+                before_user_edit: None,
+            },
+        ))
+    }
+
+    pub fn set_text_value(&self, id: NodeId, value: &str) -> Option<TextControlState> {
+        self.write_text_value(id, value, false)
+    }
+
+    pub fn set_user_text_value(&self, id: NodeId, value: &str) -> Option<TextControlState> {
+        self.write_text_value(id, value, true)
+    }
+
+    fn write_text_value(&self, id: NodeId, value: &str, user_edit: bool) -> Option<TextControlState> {
+        let mut state = self.text_control(id)?;
+        let value = state.kind.normalize(value);
+        if user_edit {
+            if state.before_user_edit.is_none() {
+                state.before_user_edit = Some(state.value.clone());
+            }
+            if state.before_user_edit.as_ref() == Some(&value) {
+                state.before_user_edit = None;
+            }
+        }
+        if state.value != value {
+            state.start = value.encode_utf16().count() as u32;
+            state.end = state.start;
+            state.direction = "none".into();
+        }
+        state.value = value;
+        state.dirty = true;
+        state.last_user_edit = user_edit;
+        Some(self.store_text_state(id, state))
+    }
+
+    /// Consume before dispatch so a reentrant focus change cannot commit twice.
+    pub fn take_text_change(&self, id: NodeId) -> bool {
+        let Some(mut state) = self.text_control(id) else {
+            return false;
+        };
+        let Some(before) = state.before_user_edit.take() else {
+            return false;
+        };
+        let changed = before != state.value;
+        self.store_text_state(id, state);
+        changed
+    }
+
+    pub fn set_text_selection(
+        &self,
+        id: NodeId,
+        start: u32,
+        end: u32,
+        direction: &str,
+    ) -> Option<TextControlState> {
+        let mut state = self.text_control(id)?;
+        state.start = start;
+        state.end = end;
+        state.direction = if matches!(direction, "forward" | "backward") {
+            direction
+        } else {
+            "none"
+        }
+        .into();
+        state.clamp_selection();
+        Some(self.store_text_state(id, state))
+    }
+
+    pub fn reset_text_control(&self, id: NodeId) -> Option<TextControlState> {
+        let mut state = self.text_control(id)?;
+        let value = state.kind.normalize(&state.default_value);
+        if state.value != value {
+            state.start = value.encode_utf16().count() as u32;
+            state.end = state.start;
+            state.direction = "none".into();
+        }
+        state.value = value;
+        state.dirty = false;
+        state.last_user_edit = false;
+        Some(self.store_text_state(id, state))
+    }
+
+    fn copy_text_control(&self, source: &DomTree, from: NodeId, to: NodeId) {
+        if let Some(mut state) = source.text_control(from) {
+            state.before_user_edit = None;
+            state.default_value = self.text_default_value(to, state.kind);
+            state.start = 0;
+            state.end = 0;
+            state.direction = "none".into();
+            self.store_text_state(to, state);
+        }
+    }
+
+    pub fn is_html_element(&self, id: NodeId, tag: &str) -> bool {
+        self.get_node(id).is_some_and(|node| {
+            node.as_element().is_some_and(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml" && name.local.as_ref() == tag
+            })
+        })
+    }
+
+    pub fn input_type(&self, id: NodeId) -> Option<String> {
+        self.is_html_element(id, "input").then(|| {
+            self.get_node(id)
+                .map(|node| {
+                    node.get_attribute("type")
+                        .unwrap_or("text")
+                        .to_ascii_lowercase()
+                })
+                .unwrap()
+        })
+    }
+
+    pub fn form_owner(&self, id: NodeId) -> Option<NodeId> {
+        let node = self.get_node(id)?;
+        if let Some(form_id) = node.get_attribute("form").filter(|_| self.is_connected(id)) {
+            let first = self
+                .descendants(self.document())
+                .into_iter()
+                .find(|candidate| {
+                    self.get_node(*candidate)
+                        .is_some_and(|node| node.get_attribute("id") == Some(form_id))
+                })?;
+            return self.is_html_element(first, "form").then_some(first);
+        }
+        self.ancestors(id)
+            .into_iter()
+            .find(|ancestor| self.is_html_element(*ancestor, "form"))
+    }
+
+    /// These controls reflect value in an attribute, without a dirty current value.
+    pub fn attribute_value(&self, id: NodeId) -> Option<String> {
+        let kind = self.input_type(id);
+        let check = matches!(kind.as_deref(), Some("checkbox" | "radio"));
+        if !self.is_html_element(id, "button")
+            && !check
+            && !matches!(
+                kind.as_deref(),
+                Some("hidden" | "button" | "submit" | "reset" | "image")
+            )
+        {
+            return None;
+        }
+        Some(
+            self.get_node(id)?
+                .get_attribute("value")
+                .unwrap_or(if check { "on" } else { "" })
+                .to_string(),
+        )
+    }
+
+    pub fn begin_form_reset(&self, form: NodeId) -> Option<bool> {
+        self.is_html_element(form, "form")
+            .then(|| self.inner.borrow_mut().resetting_forms.insert(form))
+    }
+
+    pub fn end_form_reset(&self, form: NodeId) {
+        self.inner.borrow_mut().resetting_forms.remove(&form);
+    }
+
+    pub fn can_reset_form(&self, form: NodeId) -> bool {
+        self.is_html_element(form, "form")
+            && self.form_controls(form).into_iter().all(|id| {
+                self.text_control_kind(id).is_some()
+                    || self.attribute_value(id).is_some()
+                    || ["fieldset", "object"]
+                        .iter()
+                        .any(|tag| self.is_html_element(id, tag))
+            })
+    }
+
+    /// Validate the current collection before any value writes. Event handlers
+    /// may have reassociated controls since the reset action was requested.
+    pub fn reset_form_controls(&self, form: NodeId) -> bool {
+        if !self.inner.borrow().resetting_forms.contains(&form) || !self.can_reset_form(form) {
+            return false;
+        }
+        for id in self.form_controls(form) {
+            self.reset_text_control(id);
+            if self.is_html_element(id, "input") {
+                self.reset_checked(id);
+            }
+        }
+        true
+    }
+
+    pub fn label_forwarding(&self, id: NodeId) -> bool {
+        self.inner.borrow().forwarding_labels.contains(&id)
+    }
+
+    pub fn begin_label_forwarding(&self, id: NodeId) -> bool {
+        self.inner.borrow_mut().forwarding_labels.insert(id)
+    }
+
+    pub fn end_label_forwarding(&self, id: NodeId) {
+        self.inner.borrow_mut().forwarding_labels.remove(&id);
+    }
+
+    pub fn is_labelable(&self, id: NodeId) -> bool {
+        [
+            "button", "meter", "output", "progress", "select", "textarea",
+        ]
+        .iter()
+        .any(|tag| self.is_html_element(id, tag))
+            || self.input_type(id).is_some_and(|kind| kind != "hidden")
+    }
+
+    pub fn labeled_control(&self, label: NodeId) -> Option<NodeId> {
+        if !self.is_html_element(label, "label") {
+            return None;
+        }
+        let node = self.get_node(label)?;
+        if let Some(id) = node.get_attribute("for") {
+            let root = self.ancestors(label).last().copied().unwrap_or(label);
+            let first = std::iter::once(root)
+                .chain(self.descendants(root))
+                .find(|candidate| {
+                    self.get_node(*candidate)
+                        .is_some_and(|node| node.get_attribute("id") == Some(id))
+                })?;
+            return self.is_labelable(first).then_some(first);
+        }
+        self.descendants(label)
+            .into_iter()
+            .find(|id| self.is_labelable(*id))
+    }
+
+    fn radio_group(&self, id: NodeId) -> Option<RadioGroup> {
+        if self.input_type(id)?.as_str() != "radio" {
+            return None;
+        }
+        let node = self.get_node(id)?;
+        let name = node
+            .get_attribute("name")
+            .filter(|name| !name.is_empty())?
+            .to_string();
+        Some(RadioGroup {
+            root: self.ancestors(id).last().copied().unwrap_or(id),
+            form: self.form_owner(id),
+            name,
+        })
+    }
+
+    pub fn form_controls(&self, form: NodeId) -> Vec<NodeId> {
+        if !self.is_html_element(form, "form") {
+            return Vec::new();
+        }
+        let root = self.ancestors(form).last().copied().unwrap_or(form);
+        std::iter::once(root)
+            .chain(self.descendants(root))
+            .filter(|id| {
+                [
+                    "input", "select", "textarea", "button", "fieldset", "output", "object",
+                ]
+                .iter()
+                .any(|tag| self.is_html_element(*id, tag))
+                    && self.form_owner(*id) == Some(form)
+            })
+            .collect()
+    }
+
+    pub fn is_submit_button(&self, id: NodeId) -> bool {
+        if self.is_html_element(id, "button") {
+            return !self
+                .get_node(id)
+                .unwrap()
+                .get_attribute("type")
+                .is_some_and(|kind| {
+                    kind.eq_ignore_ascii_case("button") || kind.eq_ignore_ascii_case("reset")
+                });
+        }
+        matches!(self.input_type(id).as_deref(), Some("submit" | "image"))
+    }
+
+    pub fn custom_validity(&self, id: NodeId) -> String {
+        self.inner
+            .borrow()
+            .custom_validity
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_custom_validity(&self, id: NodeId, message: &str) {
+        if message.is_empty() {
+            self.inner.borrow_mut().custom_validity.remove(&id);
+        } else {
+            self.inner
+                .borrow_mut()
+                .custom_validity
+                .insert(id, message.into());
+        }
+    }
+
+    pub fn radio_value_missing(&self, id: NodeId) -> bool {
+        let ids: Vec<_> = self
+            .inner
+            .borrow()
+            .nodes
+            .iter()
+            .flatten()
+            .map(|node| node.id)
+            .collect();
+        let mut required = false;
+        let mut checked = false;
+        for peer in ids {
+            if peer == id || self.same_radio_group(id, peer) {
+                required |= self
+                    .get_node(peer)
+                    .is_some_and(|node| node.get_attribute("required").is_some());
+                checked |= self.checked_state(peer).is_some_and(|state| state.checked);
+            }
+        }
+        required && !checked
+    }
+
+    pub fn begin_form_submission(
+        &self,
+        form: NodeId,
+        submitter: Option<NodeId>,
+    ) -> Result<bool, &'static str> {
+        if !self.is_html_element(form, "form") {
+            return Err("FORM_INVALID");
+        }
+        if let Some(id) = submitter {
+            if !self.is_submit_button(id) {
+                return Err("FORM_SUBMITTER_TYPE");
+            }
+            if self.form_owner(id) != Some(form) {
+                return Err("FORM_SUBMITTER_OWNER");
+            }
+        }
+        Ok(self.is_connected(form)
+            && !self.constructing_form_entries(form)
+            && self.inner.borrow_mut().submitting_forms.insert(form))
+    }
+
+    pub fn end_form_submission(&self, form: NodeId) {
+        self.inner.borrow_mut().submitting_forms.remove(&form);
+    }
+
+    pub fn constructing_form_entries(&self, form: NodeId) -> bool {
+        self.inner.borrow().constructing_forms.contains(&form)
+    }
+
+    pub fn begin_form_entries(
+        &self,
+        form: NodeId,
+        submitter: Option<NodeId>,
+    ) -> Result<Option<Vec<(String, String)>>, &'static str> {
+        if !self.is_html_element(form, "form") {
+            return Err("FORM_INVALID");
+        }
+        if let Some(id) = submitter {
+            if !self.is_submit_button(id) {
+                return Err("FORM_SUBMITTER_TYPE");
+            }
+            if self.form_owner(id) != Some(form) {
+                return Err("FORM_SUBMITTER_OWNER");
+            }
+        }
+        if !self.inner.borrow_mut().constructing_forms.insert(form) {
+            return Ok(None);
+        }
+        match self.form_text_entries(form, submitter) {
+            Ok(entries) => Ok(Some(entries)),
+            Err(error) => {
+                self.end_form_entries(form);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn end_form_entries(&self, form: NodeId) {
+        self.inner.borrow_mut().constructing_forms.remove(&form);
+    }
+
+    /// Text-only submission data. Event dispatch and file/selection state belong
+    /// to the submission caller; unsupported successful controls are never lost.
+    pub fn form_text_entries(
+        &self,
+        form: NodeId,
+        submitter: Option<NodeId>,
+    ) -> Result<Vec<(String, String)>, &'static str> {
+        if !self.is_html_element(form, "form") {
+            return Err("FORM_INVALID");
+        }
+        if let Some(id) = submitter {
+            if !self.is_submit_button(id) || self.form_owner(id) != Some(form) {
+                return Err("FORM_SUBMITTER_INVALID");
+            }
+        }
+        let mut entries = Vec::new();
+        for id in self.form_controls(form) {
+            if self.is_disabled(id)
+                || self
+                    .ancestors(id)
+                    .into_iter()
+                    .any(|a| self.is_html_element(a, "datalist"))
+                || self.is_html_element(id, "fieldset")
+                || self.is_html_element(id, "output")
+            {
+                continue;
+            }
+            let node = self.get_node(id).ok_or("FORM_INVALID")?;
+            let kind = self.input_type(id);
+            let button = self.is_html_element(id, "button")
+                || matches!(
+                    kind.as_deref(),
+                    Some("submit" | "image" | "button" | "reset")
+                );
+            if button && Some(id) != submitter {
+                continue;
+            }
+            if kind.as_deref() == Some("image") {
+                return Err("INPUT_ELEMENT_UNSUPPORTED");
+            }
+            let checked = matches!(kind.as_deref(), Some("checkbox" | "radio"));
+            if checked && !self.checked_state(id).is_some_and(|state| state.checked) {
+                continue;
+            }
+            let Some(name) = node.get_attribute("name").filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let value = if let Some(state) = self.text_control(id) {
+                let direction_field = self.is_html_element(id, "textarea")
+                    || matches!(
+                        kind.as_deref(),
+                        Some("text" | "search" | "tel" | "url" | "email")
+                    );
+                if (direction_field
+                    && node
+                        .get_attribute("dirname")
+                        .is_some_and(|value| !value.is_empty()))
+                    || (self.is_html_element(id, "textarea")
+                        && node
+                            .get_attribute("wrap")
+                            .is_some_and(|value| value.eq_ignore_ascii_case("hard")))
+                {
+                    return Err("INPUT_ELEMENT_UNSUPPORTED");
+                }
+                state.value
+            } else if kind.as_deref() == Some("hidden") && name.eq_ignore_ascii_case("_charset_") {
+                "UTF-8".into()
+            } else if let Some(value) = self.attribute_value(id) {
+                value
+            } else {
+                return Err("INPUT_ELEMENT_UNSUPPORTED");
+            };
+            entries.push((name.to_owned(), value));
+        }
+        Ok(entries)
+    }
+
+    fn input_nodes_in_tree_order(&self) -> Vec<NodeId> {
+        let roots: Vec<_> = self
+            .inner
+            .borrow()
+            .nodes
+            .iter()
+            .flatten()
+            .filter(|node| node.parent.is_none())
+            .map(|node| node.id)
+            .collect();
+        roots
+            .into_iter()
+            .flat_map(|root| std::iter::once(root).chain(self.descendants(root)))
+            .filter(|id| self.is_html_element(*id, "input"))
+            .collect()
+    }
+
+    fn enforce_radio_group(inner: &mut DomTreeInner, winner: NodeId) {
+        let Some(group) = inner
+            .checked_controls
+            .get(&winner)
+            .filter(|state| state.checked)
+            .and_then(|state| state.group.clone())
+        else {
+            return;
+        };
+        for (id, state) in &mut inner.checked_controls {
+            if *id != winner && state.group.as_ref() == Some(&group) {
+                state.checked = false;
+            }
+        }
+    }
+
+    /// Once native checkedness is observed, DOM mutations keep defaults and
+    /// radio membership current. Ordinary getters never reselect a default.
+    fn sync_checked_controls(&self, initialize: bool, preferred: Option<NodeId>) {
+        if !initialize && self.inner.borrow().checked_controls.is_empty() {
+            return;
+        }
+        let snapshots: Vec<_> = self
+            .input_nodes_in_tree_order()
+            .into_iter()
+            .map(|id| {
+                let node = self.get_node(id).unwrap();
+                let preferred =
+                    preferred.is_some_and(|root| id == root || self.ancestors(id).contains(&root));
+                (
+                    id,
+                    node.get_attribute("checked").is_some(),
+                    self.radio_group(id),
+                    node.connected,
+                    preferred,
+                )
+            })
+            .collect();
+        let mut inner = self.inner.borrow_mut();
+        let mut winners = Vec::new();
+        inner
+            .checked_controls
+            .retain(|id, _| snapshots.iter().any(|entry| entry.0 == *id));
+        for (id, default_checked, group, connected, preferred) in snapshots {
+            let existed = inner.checked_controls.contains_key(&id);
+            let state = inner
+                .checked_controls
+                .entry(id)
+                .or_insert_with(|| CheckedState {
+                    checked: default_checked,
+                    default_checked,
+                    dirty: false,
+                    indeterminate: false,
+                    group: group.clone(),
+                    connected,
+                });
+            let default_changed = state.default_checked != default_checked;
+            let membership_changed = state.group != group || (!state.connected && connected);
+            if default_changed && !state.dirty {
+                state.checked = default_checked;
+            }
+            state.default_checked = default_checked;
+            state.group = group;
+            state.connected = connected;
+            if state.checked && (!existed || default_changed || membership_changed || preferred) {
+                winners.push((preferred, id));
+            }
+        }
+        // A moved/changed checked radio wins over pre-existing checked defaults.
+        winners.sort_by_key(|entry| entry.0);
+        for (_, id) in winners {
+            if let Some(state) = inner.checked_controls.get_mut(&id) {
+                state.checked = true;
+            }
+            Self::enforce_radio_group(&mut inner, id);
+        }
+    }
+
+    pub fn checked_state(&self, id: NodeId) -> Option<CheckedState> {
+        if !self.is_html_element(id, "input") {
+            return None;
+        }
+        if !self.inner.borrow().checked_controls.contains_key(&id) {
+            self.sync_checked_controls(true, None);
+        }
+        self.inner.borrow().checked_controls.get(&id).cloned()
+    }
+
+    pub fn set_checked(&self, id: NodeId, checked: bool) -> Option<CheckedState> {
+        self.checked_state(id)?;
+        let mut inner = self.inner.borrow_mut();
+        let state = inner.checked_controls.get_mut(&id)?;
+        state.checked = checked;
+        state.dirty = true;
+        Self::enforce_radio_group(&mut inner, id);
+        inner.checked_controls.get(&id).cloned()
+    }
+
+    pub fn set_indeterminate(&self, id: NodeId, value: bool) -> Option<CheckedState> {
+        self.checked_state(id)?;
+        let mut inner = self.inner.borrow_mut();
+        let state = inner.checked_controls.get_mut(&id)?;
+        state.indeterminate = value;
+        Some(state.clone())
+    }
+
+    pub fn reset_checked(&self, id: NodeId) -> Option<CheckedState> {
+        self.checked_state(id)?;
+        let mut inner = self.inner.borrow_mut();
+        let state = inner.checked_controls.get_mut(&id)?;
+        state.checked = state.default_checked;
+        state.dirty = false;
+        Self::enforce_radio_group(&mut inner, id);
+        inner.checked_controls.get(&id).cloned()
+    }
+
+    pub fn checked_radio_peer(&self, id: NodeId) -> Option<NodeId> {
+        let group = self.checked_state(id)?.group?;
+        self.inner
+            .borrow()
+            .checked_controls
+            .iter()
+            .find_map(|(peer, state)| {
+                (*peer != id && state.checked && state.group.as_ref() == Some(&group))
+                    .then_some(*peer)
+            })
+    }
+
+    pub fn same_radio_group(&self, a: NodeId, b: NodeId) -> bool {
+        self.checked_state(a)
+            .and_then(|state| state.group)
+            .is_some_and(|group| {
+                self.checked_state(b)
+                    .is_some_and(|state| state.group.as_ref() == Some(&group))
+            })
+    }
+
+    fn copy_checked_state(&self, source: &DomTree, from: NodeId, to: NodeId) {
+        if let Some(mut state) = source.checked_state(from) {
+            state.group = self.radio_group(to);
+            state.connected = self.is_connected(to);
+            self.inner.borrow_mut().checked_controls.insert(to, state);
+        }
+    }
+
+    pub fn is_inert(&self, node: NodeId) -> bool {
+        std::iter::once(node).chain(self.ancestors(node)).any(|id| {
+            self.get_node(id)
+                .is_some_and(|node| node.get_attribute("inert").is_some())
+        })
+    }
+
+    /// HTML disabledness, including the first-legend exception of each fieldset.
+    pub fn is_disabled(&self, id: NodeId) -> bool {
+        let Some(node) = self.get_node(id) else {
+            return false;
+        };
+        let Some(name) = node.as_element() else {
+            return false;
+        };
+        if name.ns.as_ref() != "http://www.w3.org/1999/xhtml" {
+            return false;
+        }
+        let tag = name.local.as_ref();
+        if !matches!(
+            tag,
+            "input" | "button" | "select" | "textarea" | "option" | "optgroup" | "fieldset"
+        ) {
+            return false;
+        }
+        if node.get_attribute("disabled").is_some() {
+            return true;
+        }
+        let ancestors = self.ancestors(id);
+        for ancestor in &ancestors {
+            let Some(parent) = self.get_node(*ancestor) else {
+                continue;
+            };
+            let Some(name) = parent.as_element() else {
+                continue;
+            };
+            if name.ns.as_ref() != "http://www.w3.org/1999/xhtml" {
+                continue;
+            }
+            if tag == "option"
+                && name.local.as_ref() == "optgroup"
+                && parent.get_attribute("disabled").is_some()
+            {
+                return true;
+            }
+            if matches!(tag, "input" | "button" | "select" | "textarea" | "fieldset")
+                && name.local.as_ref() == "fieldset"
+                && parent.get_attribute("disabled").is_some()
+            {
+                let first_legend = self.children(*ancestor).into_iter().find(|child| {
+                    self.get_node(*child).is_some_and(|node| {
+                        node.as_element().is_some_and(|name| {
+                            name.local.as_ref() == "legend"
+                                && name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                        })
+                    })
+                });
+                if !first_legend.is_some_and(|legend| ancestors.contains(&legend)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn is_text_input(&self, id: NodeId) -> bool {
+        self.get_node(id).is_some_and(|node| {
+            node.as_element().is_some_and(|name| {
+                name.local.as_ref() == "textarea"
+                    || (name.local.as_ref() == "input"
+                        && matches!(
+                            node.get_attribute("type")
+                                .unwrap_or("text")
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+                        ))
+            })
+        })
+    }
+
+    pub fn is_light_document_element(&self, id: NodeId) -> bool {
+        self.is_connected(id)
+            && self.ancestors(id).contains(&self.document())
+            && self.get_node(id).is_some_and(|node| {
+                node.as_element()
+                    .is_some_and(|name| name.ns.as_ref() == "http://www.w3.org/1999/xhtml")
+            })
+    }
+
+    /// Structural focusability; the runtime additionally verifies computed layout.
+    pub fn can_focus(&self, id: NodeId) -> bool {
+        if !self.is_light_document_element(id) || self.is_disabled(id) || self.is_inert(id) {
+            return false;
+        }
+        let node = self.get_node(id).unwrap();
+        let name = node.as_element().unwrap();
+        let tag = name.local.as_ref();
+        if tag == "iframe"
+            || (tag == "input"
+                && node
+                    .get_attribute("type")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("hidden")))
+        {
+            return false;
+        }
+        matches!(tag, "input" | "button" | "select" | "textarea")
+            || (tag == "a" && node.get_attribute("href").is_some())
+            || node
+                .get_attribute("tabindex")
+                .is_some_and(|value| value.trim().parse::<i32>().is_ok())
+            || node.get_attribute("contenteditable").is_some_and(|value| {
+                value.is_empty()
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("plaintext-only")
+            })
+    }
+
+    pub fn set_pointer_state(&self, hovered: Option<NodeId>, pressed: Option<NodeId>) -> bool {
+        let hovered =
+            hovered.filter(|id| self.is_light_document_element(*id) && !self.is_inert(*id));
+        let pressed =
+            pressed.filter(|id| self.is_light_document_element(*id) && !self.is_inert(*id));
+        let mut inner = self.inner.borrow_mut();
+        let previous = inner.input;
+        if pressed.is_some() {
+            inner.input.keyboard_input = false;
+        }
+        inner.input.hovered = hovered;
+        inner.input.pressed = pressed;
+        inner.input != previous
+    }
+
+    /// Compare-and-set prevents an old focus operation from winning after a callback.
+    pub fn set_focused(&self, node: Option<NodeId>, generation: u64) -> Option<InputState> {
+        if node.is_some_and(|id| !self.can_focus(id)) {
+            return None;
+        }
+        let text = node.is_some_and(|id| self.is_text_input(id));
+        let mut inner = self.inner.borrow_mut();
+        let input = &mut inner.input;
+        if input.focus_generation != generation {
+            return None;
+        }
+        let visible = node.is_some() && (input.keyboard_input || text);
+        if input.focused != node || input.focus_visible != visible {
+            input.focused = node;
+            input.focus_visible = visible;
+            input.focus_generation = input.focus_generation.wrapping_add(1);
+        }
+        Some(*input)
     }
 
     /// Record whether the document was parsed in (full) quirks mode.
@@ -481,6 +1534,12 @@ impl DomTree {
             .is_some_and(|node| node.first_child.is_none())
             && !inner.shadow_roots_by_host.contains_key(&root);
         if is_leaf {
+            if !connected {
+                inner.input.disconnect(root);
+                if let Some(state) = inner.text_controls.get_mut(&root) {
+                    state.before_user_edit = None;
+                }
+            }
             if let Some(Some(node)) = inner.nodes.get_mut(root.index()) {
                 node.connected = connected;
             }
@@ -492,6 +1551,12 @@ impl DomTree {
         while let Some(node_id) = stack.pop() {
             if !seen.insert(node_id) {
                 continue;
+            }
+            if !connected {
+                inner.input.disconnect(node_id);
+                if let Some(state) = inner.text_controls.get_mut(&node_id) {
+                    state.before_user_edit = None;
+                }
             }
             let (mut child, shadow_root) = match inner
                 .nodes
@@ -568,10 +1633,12 @@ impl DomTree {
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
+            inner.node_generations[slot as usize] = inner.node_generations[slot as usize].wrapping_add(1);
             NodeId(slot)
         } else {
             let idx = inner.nodes.len() as u32;
             inner.nodes.push(None);
+            inner.node_generations.push(0);
             NodeId(idx)
         };
 
@@ -597,6 +1664,90 @@ impl DomTree {
         id
     }
 
+    /// Start tracking document base changes when the parsed tree is installed.
+    /// Later History URL changes only affect the next base activation.
+    pub fn set_document_url(&self, url: &str) {
+        let mut inner = self.inner.borrow_mut();
+        let initialize = inner.document_url.is_none();
+        if inner.document_url.as_deref() == Some(url) {
+            return;
+        }
+        inner.document_url = Some(url.to_string());
+        inner.base_generation = inner.base_generation.wrapping_add(1);
+        drop(inner);
+        if initialize {
+            self.sync_document_base();
+        }
+    }
+
+    pub fn document_url(&self) -> Option<String> {
+        self.inner.borrow().document_url.clone()
+    }
+
+    pub fn frozen_base(&self) -> Option<(String, String)> {
+        self.inner.borrow().frozen_base.as_ref()
+            .map(|(_, href, fallback)| (href.clone(), fallback.clone()))
+    }
+
+    /// Host document installation may supply the URL after installing its DOM.
+    /// This is distinct from a History URL change in an already active page.
+    pub fn reset_document_base(&self) {
+        self.inner.borrow_mut().frozen_base = None;
+        self.sync_document_base();
+    }
+
+    pub fn base_generation(&self) -> u64 {
+        self.inner.borrow().base_generation
+    }
+
+    /// setAttribute runs href change steps even when its value is unchanged.
+    /// A changed value already passed through with_node_mut's synchronization.
+    pub fn refresh_base_href(&self, id: NodeId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let Some(fallback) = inner.document_url.clone() else { return false; };
+        let Some((first, _, frozen_at)) = inner.frozen_base.as_mut() else { return false; };
+        if *first != id || *frozen_at == fallback {
+            return false;
+        }
+        *frozen_at = fallback;
+        inner.base_generation = inner.base_generation.wrapping_add(1);
+        true
+    }
+
+    fn base_href(&self, id: NodeId) -> Option<String> {
+        if !self.is_html_element(id, "base") {
+            return None;
+        }
+        self.with_node(id, |node| node.get_attribute_ns("", "href").map(str::to_string))?
+    }
+
+    fn sync_document_base(&self) {
+        if self.inner.borrow().document_url.is_none() {
+            return;
+        }
+        let first = self.descendants(self.document()).into_iter()
+            .find_map(|id| self.base_href(id).map(|href| (id, href)));
+        let mut inner = self.inner.borrow_mut();
+        if inner.frozen_base.as_ref().map(|(id, href, _)| (*id, href))
+            == first.as_ref().map(|(id, href)| (*id, href))
+        {
+            return;
+        }
+        inner.frozen_base = first.map(|(id, href)| {
+            (id, href, inner.document_url.as_ref().unwrap().clone())
+        });
+        inner.base_generation = inner.base_generation.wrapping_add(1);
+    }
+
+    fn sync_base_subtree(&self, root: NodeId) {
+        if self.inner.borrow().document_url.is_some()
+            && std::iter::once(root).chain(self.descendants(root))
+                .any(|id| self.is_html_element(id, "base"))
+        {
+            self.sync_document_base();
+        }
+    }
+
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
         self.inner.borrow().nodes.get(id.index())?.clone()
     }
@@ -613,8 +1764,16 @@ impl DomTree {
     where
         F: FnOnce(&mut Node) -> R,
     {
+        let old_base = self.base_href(id);
         let mut inner = self.inner.borrow_mut();
-        inner.nodes.get_mut(id.index())?.as_mut().map(f)
+        let result = inner.nodes.get_mut(id.index())?.as_mut().map(f);
+        drop(inner);
+        self.sync_text_controls();
+        self.sync_checked_controls(false,Some(id));
+        if old_base != self.base_href(id) {
+            self.sync_document_base();
+        }
+        result
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
@@ -700,6 +1859,12 @@ impl DomTree {
         if parent_connected && !child_connected {
             Self::set_subtree_connected(&mut inner, child_id, true);
         }
+        drop(inner);
+        self.sync_text_controls();
+        self.sync_checked_controls(false,Some(child_id));
+        if parent_connected || child_connected {
+            self.sync_base_subtree(child_id);
+        }
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
@@ -783,6 +1948,12 @@ impl DomTree {
         if parent_connected && !child_connected {
             Self::set_subtree_connected(&mut inner, new_sibling_id, true);
         }
+        drop(inner);
+        self.sync_text_controls();
+        self.sync_checked_controls(false,Some(new_sibling_id));
+        if parent_connected || child_connected {
+            self.sync_base_subtree(new_sibling_id);
+        }
     }
 
     pub fn detach(&self, node_id: NodeId) {
@@ -835,6 +2006,12 @@ impl DomTree {
             node.parent = None;
             node.prev_sibling = None;
             node.next_sibling = None;
+        }
+        drop(inner);
+        self.sync_text_controls();
+        self.sync_checked_controls(false,Some(node_id));
+        if parent_id.is_some() {
+            self.sync_base_subtree(node_id);
         }
     }
 
@@ -912,6 +2089,15 @@ impl DomTree {
         // same NodeId to two live nodes (aliasing).
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
+                inner.input.disconnect(id);
+                inner.text_controls.remove(&id);
+                inner.checked_controls.remove(&id);
+                inner.forwarding_labels.remove(&id);
+                inner.resetting_forms.remove(&id);
+                inner.submitting_forms.remove(&id);
+                inner.constructing_forms.remove(&id);
+                inner.custom_validity.remove(&id);
+                if inner.target_element == Some(id) { inner.target_element = None; }
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -1431,6 +2617,8 @@ impl DomTree {
         }
         let source_data = self.get_node(source_node_id)?.data;
         let cloned_root = self.new_node(source_data);
+        self.copy_text_control(self, source_node_id, cloned_root);
+        self.copy_checked_state(self, source_node_id, cloned_root);
         let mut stack = Vec::new();
         self.prepare_cloned_children(source_node_id, cloned_root, deep, &mut stack);
 
@@ -1440,6 +2628,8 @@ impl DomTree {
                 None => continue,
             };
             let cloned_node = self.new_node(source_data);
+            self.copy_text_control(self, source_node, cloned_node);
+            self.copy_checked_state(self, source_node, cloned_node);
             self.append_child(dest_parent, cloned_node);
             self.prepare_cloned_children(source_node, cloned_node, true, &mut stack);
         }
@@ -1508,6 +2698,8 @@ impl DomTree {
             };
 
             let new_id = self.new_node(node_data);
+            self.copy_text_control(source, src_id, new_id);
+            self.copy_checked_state(source, src_id, new_id);
             self.append_child(dest_parent, new_id);
             // The first node off the stack is source_node_id itself.
             if imported_root.is_none() {

@@ -85,6 +85,8 @@ pub struct Response {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub redirected_from: Vec<Url>,
+    /// Computed referrer of the final request, independent of response headers.
+    pub request_referrer: Option<Url>,
 }
 
 impl Response {
@@ -165,6 +167,84 @@ impl RequestMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ReferrerPolicy {
+    NoReferrer,
+    NoReferrerWhenDowngrade,
+    SameOrigin,
+    Origin,
+    StrictOrigin,
+    OriginWhenCrossOrigin,
+    #[default]
+    StrictOriginWhenCrossOrigin,
+    UnsafeUrl,
+}
+
+impl ReferrerPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "no-referrer" => Self::NoReferrer,
+            "no-referrer-when-downgrade" => Self::NoReferrerWhenDowngrade,
+            "same-origin" => Self::SameOrigin,
+            "origin" => Self::Origin,
+            "strict-origin" => Self::StrictOrigin,
+            "origin-when-cross-origin" => Self::OriginWhenCrossOrigin,
+            "strict-origin-when-cross-origin" => Self::StrictOriginWhenCrossOrigin,
+            "unsafe-url" => Self::UnsafeUrl,
+            _ => return None,
+        })
+    }
+
+    pub fn from_header(value: &str) -> Option<Self> {
+        value.split(',').filter_map(|token| Self::parse(token.trim())).last()
+    }
+
+    /// The returned URL becomes the request's source for its next redirect hop.
+    pub fn referrer(self, source: Option<&Url>, target: &Url) -> Option<Url> {
+        let source = source?;
+        if self == Self::NoReferrer
+            || !matches!(source.scheme(), "http" | "https")
+            || !matches!(target.scheme(), "http" | "https")
+        {
+            return None;
+        }
+        let mut full = source.clone();
+        let _ = full.set_username("");
+        let _ = full.set_password(None);
+        full.set_fragment(None);
+        let origin = Url::parse(&format!("{}/", full.origin().ascii_serialization())).ok()?;
+        if full.as_str().len() > 4096 {
+            full = origin.clone();
+        }
+        let same_origin = source.origin() == target.origin();
+        let downgrade = potentially_trustworthy(source) && !potentially_trustworthy(target);
+        match self {
+            Self::NoReferrer => None,
+            Self::NoReferrerWhenDowngrade => (!downgrade).then_some(full),
+            Self::SameOrigin => same_origin.then_some(full),
+            Self::Origin => Some(origin),
+            Self::StrictOrigin => (!downgrade).then_some(origin),
+            Self::OriginWhenCrossOrigin => Some(if same_origin { full } else { origin }),
+            Self::StrictOriginWhenCrossOrigin => {
+                if same_origin { Some(full) } else { (!downgrade).then_some(origin) }
+            }
+            Self::UnsafeUrl => Some(full),
+        }
+    }
+}
+
+fn potentially_trustworthy(url: &Url) -> bool {
+    url.scheme() == "https" || match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => {
+            let host = host.trim_end_matches('.');
+            host == "localhost" || host.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequest {
     pub resource_type: ResourceType,
@@ -176,6 +256,7 @@ pub struct ResourceRequest {
     /// but a module dependency is referred by its importing module while its
     /// credentials mode is still relative to the owning document.
     pub referrer: Option<Url>,
+    pub referrer_policy: ReferrerPolicy,
     pub mode: RequestMode,
     pub credentials: RequestCredentials,
     /// Hard limit for the decoded response body retained by this request.
@@ -189,6 +270,7 @@ impl ResourceRequest {
             resource_type: ResourceType::Document,
             initiator: None,
             referrer: None,
+            referrer_policy: ReferrerPolicy::default(),
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
@@ -218,6 +300,7 @@ impl ResourceRequest {
             resource_type,
             initiator: Some(initiator.clone()),
             referrer: Some(initiator.clone()),
+            referrer_policy: ReferrerPolicy::default(),
             mode,
             credentials,
             max_response_bytes: match resource_type {
@@ -240,6 +323,7 @@ impl ResourceRequest {
             resource_type: ResourceType::Script,
             initiator: Some(initiator.clone()),
             referrer: Some(referrer.clone()),
+            referrer_policy: ReferrerPolicy::default(),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
             // OBSCURA_FETCH_MAX_BODY_BYTES (the fetch()/XHR override from #581)
@@ -255,6 +339,15 @@ impl ResourceRequest {
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.max_response_bytes = max_response_bytes;
         self
+    }
+
+    /// Browser-owned Fetch Metadata for this resource and current redirect hop.
+    pub fn fetch_metadata_headers(&self, target: &Url) -> [(&'static str, &'static str); 3] {
+        [
+            ("sec-fetch-mode", self.mode.header_value()),
+            ("sec-fetch-site", request_fetch_site(self, target)),
+            ("sec-fetch-dest", self.destination()),
+        ]
     }
 
     pub(crate) fn destination(&self) -> &'static str {
@@ -428,25 +521,8 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
 }
 
 pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
-    let source = request
-        .referrer
-        .as_ref()
-        .or(request.initiator.as_ref())?;
-    if !matches!(source.scheme(), "http" | "https")
-        || !matches!(target.scheme(), "http" | "https")
-        || (source.scheme() == "https" && target.scheme() == "http")
-    {
-        return None;
-    }
-    if source.origin() == target.origin() {
-        let mut value = source.clone();
-        let _ = value.set_username("");
-        let _ = value.set_password(None);
-        value.set_fragment(None);
-        Some(value.to_string())
-    } else {
-        Some(format!("{}/", source.origin().ascii_serialization()))
-    }
+    request.referrer_policy.referrer(request.referrer.as_ref(), target)
+        .map(|url| url.to_string())
 }
 
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
@@ -803,6 +879,7 @@ pub(crate) async fn fetch_file_url(
         headers,
         body,
         redirected_from: Vec::new(),
+        request_referrer: None,
     })
 }
 
@@ -927,6 +1004,7 @@ struct ResourceCacheKey {
     credentials: RequestCredentials,
     initiator: Option<String>,
     referrer: Option<String>,
+    referrer_policy: ReferrerPolicy,
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
@@ -1220,6 +1298,13 @@ impl ObscuraHttpClient {
         .await
     }
 
+    pub async fn post_form_resource_with_callbacks(
+        &self, url: &Url, body: &str, request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(Method::POST, url, Some(body.as_bytes().to_vec()), callbacks, request).await
+    }
+
     /// Fetch a non-navigation resource through the same validated client,
     /// cookie jar, proxy, connection pool, interception and callback path as
     /// the owning page. The renderer can seed its byte cache from this result
@@ -1276,6 +1361,7 @@ impl ObscuraHttpClient {
             credentials: request.credentials,
             initiator: request.initiator.as_ref().map(ToString::to_string),
             referrer: request.referrer.as_ref().map(ToString::to_string),
+            referrer_policy: request.referrer_policy,
             user_agent: self.user_agent.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
@@ -1432,7 +1518,7 @@ impl ObscuraHttpClient {
         url: &Url,
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
-        request: ResourceRequest,
+        mut request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -1453,6 +1539,7 @@ impl ObscuraHttpClient {
                         headers: HashMap::new(),
                         body: Vec::new(),
                         redirected_from: Vec::new(),
+                        request_referrer: None,
                     });
                 }
             }
@@ -1484,7 +1571,8 @@ impl ObscuraHttpClient {
                     InterceptAction::Block => {
                         return Err(ObscuraNetError::Blocked(current_url.to_string()));
                     }
-                    InterceptAction::Fulfill(response) => {
+                    InterceptAction::Fulfill(mut response) => {
+                        response.request_referrer = request.referrer_policy.referrer(request.referrer.as_ref(), &current_url);
                         return Ok(response);
                     }
                     InterceptAction::ModifyHeaders(headers) => {
@@ -1543,7 +1631,9 @@ impl ObscuraHttpClient {
                 HeaderName::from_static("sec-fetch-dest"),
                 HeaderValue::from_static(request.destination()),
             );
-            if let Some(referer) = request_referrer(&request, &current_url) {
+            let referer = request_referrer(&request, &current_url);
+            request.referrer = referer.as_deref().and_then(|value| Url::parse(value).ok());
+            if let Some(referer) = referer {
                 if let Ok(value) = HeaderValue::from_str(&referer) {
                     headers.insert(reqwest::header::REFERER, value);
                 }
@@ -1592,6 +1682,9 @@ impl ObscuraHttpClient {
             }
 
             for (k, v) in self.extra_headers.read().await.iter() {
+                if k.eq_ignore_ascii_case("referer") {
+                    continue;
+                }
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -1643,25 +1736,35 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let response_headers: HashMap<String, String> = resp
+            let mut response_headers: HashMap<String, String> = resp
                 .headers()
                 .iter()
                 .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
                 .collect();
+            let policies = resp.headers().get_all("referrer-policy").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",");
+            if !policies.is_empty() { response_headers.insert("referrer-policy".into(), policies); }
 
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
                     let location_str = location.to_str().map_err(|_| {
                         ObscuraNetError::Network("Invalid redirect Location header".into())
                     })?;
-                    let next_url = current_url.join(location_str).map_err(|e| {
+                    let mut next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
+                    if next_url.fragment().is_none() {
+                        next_url.set_fragment(current_url.fragment());
+                    }
                     validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
+                    if let Some(policy) = resp.headers().get_all("referrer-policy").iter()
+                        .filter_map(|value| value.to_str().ok().and_then(ReferrerPolicy::from_header)).last()
+                    {
+                        request.referrer_policy = policy;
+                    }
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY
                         || status == reqwest::StatusCode::FOUND
@@ -1688,6 +1791,7 @@ impl ObscuraHttpClient {
                 headers: response_headers,
                 body: body_bytes,
                 redirected_from: redirects,
+                request_referrer: request.referrer,
             };
 
             if let Some(cbs) = callbacks {

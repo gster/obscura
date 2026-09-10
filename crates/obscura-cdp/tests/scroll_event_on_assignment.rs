@@ -58,8 +58,8 @@ async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session
     resp.result.unwrap_or_else(|| json!({}))
 }
 
-/// `awaitPromise` matters here: the scroll event is dispatched from a
-/// `setTimeout(..., 0)`, so the probe has to yield before reading the counter.
+/// `awaitPromise` matters here: the scroll event is dispatched during a
+/// rendering opportunity, so the probe waits for an animation frame before reading the counter.
 async fn eval(ctx: &mut CdpContext, id: u64, expr: &str, session_id: &str) -> Value {
     cdp(
         ctx,
@@ -89,9 +89,9 @@ async fn probe(ctx: &mut CdpContext, sid: &str, body: &str) -> Value {
             let fired = 0;
             el.addEventListener('scroll', () => {{ fired++; }});
             {body}
-            return new Promise(r => setTimeout(() => r(JSON.stringify({{
+            return new Promise(r => requestAnimationFrame(() => r(JSON.stringify({{
                 fired, top: el.scrollTop, left: el.scrollLeft,
-            }})), 0));
+            }}))));
         }})()"#
     );
     let v = eval(ctx, 2, &expr, sid).await;
@@ -152,12 +152,12 @@ async fn scroll_driven_lazy_loader_advances() {
                 for (let i = 0; i < 5; i++) el.appendChild(document.createElement('p'));
             });
             el.scrollTop = 500;
-            return new Promise(r => setTimeout(() => {
+            return new Promise(r => requestAnimationFrame(() => {
                 el.scrollTop = 1000;
-                setTimeout(() => r(JSON.stringify({
+                requestAnimationFrame(() => r(JSON.stringify({
                     batches, rows: el.querySelectorAll('p').length,
-                })), 0);
-            }, 0));
+                })));
+            }));
         })()"#,
         &sid,
     )

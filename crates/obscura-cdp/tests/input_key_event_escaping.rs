@@ -209,7 +209,7 @@ async fn insert_text_types_into_the_focused_field() {
     .await;
     assert_eq!(
         v["result"]["value"].as_str().unwrap_or_default(),
-        r#""he'll\\o\nbye""#,
-        "insertText must type the full text with quotes, backslashes, and newlines intact"
+        r#""he'll\\obye""#,
+        "text inputs preserve quotes and backslashes but strip newlines"
     );
 }

@@ -27,6 +27,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
+percent-encoding = "2"
 # document.domain must reject public suffixes (including private suffixes such
 # as github.io), not just compare dotted strings.  `psl` embeds the Mozilla
 # Public Suffix List and adds no runtime I/O.

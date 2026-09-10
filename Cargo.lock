@@ -1960,6 +1960,7 @@ dependencies = [
  "obscura-net",
  "obscura-render",
  "pbkdf2",
+ "percent-encoding",
  "psl",
  "reqwest",
  "serde",

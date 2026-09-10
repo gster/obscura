@@ -825,6 +825,173 @@ impl ResolvedScrollState {
     }
 }
 
+fn point_in_rect((x, y): (f32, f32), rect: crate::Rect) -> bool {
+    rect.width > 0.0
+        && rect.height > 0.0
+        && x >= rect.x
+        && y >= rect.y
+        && x < rect.x + rect.width
+        && y < rect.y + rect.height
+}
+
+fn point_in_rounded_rect(
+    point: (f32, f32),
+    rect: crate::Rect,
+    radii: crate::ResolvedBorderRadii,
+) -> bool {
+    if !point_in_rect(point, rect) {
+        return false;
+    }
+    let (x, y) = point;
+    for (rx, ry, cx, cy, in_corner) in [
+        (
+            radii.top_left.0,
+            radii.top_left.1,
+            rect.x + radii.top_left.0,
+            rect.y + radii.top_left.1,
+            x < rect.x + radii.top_left.0 && y < rect.y + radii.top_left.1,
+        ),
+        (
+            radii.top_right.0,
+            radii.top_right.1,
+            rect.x + rect.width - radii.top_right.0,
+            rect.y + radii.top_right.1,
+            x > rect.x + rect.width - radii.top_right.0 && y < rect.y + radii.top_right.1,
+        ),
+        (
+            radii.bottom_right.0,
+            radii.bottom_right.1,
+            rect.x + rect.width - radii.bottom_right.0,
+            rect.y + rect.height - radii.bottom_right.1,
+            x > rect.x + rect.width - radii.bottom_right.0
+                && y > rect.y + rect.height - radii.bottom_right.1,
+        ),
+        (
+            radii.bottom_left.0,
+            radii.bottom_left.1,
+            rect.x + radii.bottom_left.0,
+            rect.y + rect.height - radii.bottom_left.1,
+            x < rect.x + radii.bottom_left.0 && y > rect.y + rect.height - radii.bottom_left.1,
+        ),
+    ] {
+        if in_corner
+            && rx > 0.0
+            && ry > 0.0
+            && ((x - cx) / rx).powi(2) + ((y - cy) / ry).powi(2) > 1.0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Shared paint/hit-test stacking order; an atomic root is expanded by its caller.
+fn ordered_paint_nodes(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    paint_root: Option<obscura_dom::tree::NodeId>,
+    suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
+    suppress_transform_for: Option<obscura_dom::tree::NodeId>,
+    suppress_stacking_for: Option<obscura_dom::tree::NodeId>,
+) -> (
+    Vec<obscura_dom::tree::NodeId>,
+    Vec<obscura_dom::tree::NodeId>,
+) {
+    let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
+    let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
+    let mut float_layers: Vec<obscura_dom::tree::NodeId> = Vec::new();
+    let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
+    let mut root_background = Vec::new();
+    // Auto positioned boxes are in the zero band, but are not atomic contexts.
+    // Only their non-positioned, non-context descendants follow their group.
+    let mut auto_group: HashMap<obscura_dom::tree::NodeId, usize> = HashMap::new();
+    let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> =
+        std::collections::HashSet::new();
+    let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
+    paint_nodes.extend(crate::dom::rendered_descendants(
+        tree,
+        paint_root.unwrap_or_else(|| tree.document()),
+    ));
+    for nid in paint_nodes.iter().copied() {
+        if consumed.contains(&nid) {
+            continue;
+        }
+        let is_opacity_root = suppress_opacity_for != Some(nid)
+            && laid
+                .styles
+                .get(&nid)
+                .and_then(|style| style.opacity)
+                .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
+        let is_transform_root = suppress_transform_for != Some(nid)
+            && laid.styles.get(&nid).is_some_and(has_authored_transform);
+        let z = (suppress_stacking_for != Some(nid))
+            .then(|| stacking_z_index(tree, laid, nid))
+            .flatten();
+        let is_float_root = paint_root != Some(nid) && is_effective_float(tree, laid, nid);
+        if is_opacity_root || is_transform_root {
+            let mut sub = vec![nid];
+            sub.extend(crate::dom::rendered_descendants(tree, nid));
+            for &member in &sub {
+                consumed.insert(member);
+            }
+            // An opacity effect is one atomic paint-order unit. Its internal
+            // z-order is resolved while painting its isolated surface.
+            match z {
+                Some(z) if z < 0 => neg_layers.push((z, vec![nid])),
+                Some(z) => pos_layers.push((z, vec![nid])),
+                None => pos_layers.push((0, vec![nid])),
+            }
+        } else if let Some(z) = z {
+            let mut sub = vec![nid];
+            sub.extend(crate::dom::rendered_descendants(tree, nid));
+            for &m in &sub {
+                consumed.insert(m);
+            }
+            if z < 0 {
+                neg_layers.push((z, vec![nid]));
+            } else {
+                pos_layers.push((z, vec![nid]));
+            }
+        } else if paint_root == Some(nid) {
+            root_background.push(nid);
+        } else if laid
+            .styles
+            .get(&nid)
+            .is_some_and(|style| style.position.is_some())
+        {
+            auto_group.insert(nid, pos_layers.len());
+            pos_layers.push((0, vec![nid]));
+        } else {
+            let parent_group = crate::dom::rendered_parent(tree, nid)
+                .and_then(|parent| auto_group.get(&parent).copied());
+            if is_float_root {
+                consumed.insert(nid);
+                consumed.extend(crate::dom::rendered_descendants(tree, nid));
+                if let Some(index) = parent_group {
+                    pos_layers[index].1.push(nid);
+                } else {
+                    float_layers.push(nid);
+                }
+            } else if let Some(index) = parent_group {
+                pos_layers[index].1.push(nid);
+                auto_group.insert(nid, index);
+            } else {
+                normal.push(nid);
+            }
+        }
+    }
+    neg_layers.sort_by_key(|(z, _)| *z);
+    pos_layers.sort_by_key(|(z, _)| *z);
+    let paint_order: Vec<obscura_dom::tree::NodeId> = root_background
+        .into_iter()
+        .chain(neg_layers.into_iter().flat_map(|(_, sub)| sub))
+        .chain(normal)
+        .chain(float_layers)
+        .chain(pos_layers.into_iter().flat_map(|(_, sub)| sub))
+        .collect();
+
+    (paint_nodes, paint_order)
+}
 /// A final image/font-aware document layout retained across viewport paints.
 /// The DOM must not be mutated while this value is reused.
 pub struct PreparedRender {
@@ -845,6 +1012,230 @@ pub struct PreparedRender {
 }
 
 impl PreparedRender {
+    /// The visible bounding region from the same scroll and clipping snapshot as paint.
+    pub fn visible_rect(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState,
+    ) -> Option<crate::Rect> {
+        let viewport = crate::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: self.viewport.0,
+            height: self.viewport.1,
+        };
+        let mut rect = self
+            .viewport_rect_with_scroll(id, scroll)?
+            .intersect(&viewport)?;
+        if let Some(clip) = scroll.inherited_clip_for(id) {
+            rect = clip.intersect_rect(&rect)?;
+        }
+        Some(rect)
+    }
+
+    /// Topmost HTML box at CSS viewport coordinates. Unsupported candidate
+    /// geometry is an error, never permission to click the next box underneath.
+    pub fn hit_test(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        point: (f32, f32),
+    ) -> Result<Option<obscura_dom::tree::NodeId>, &'static str> {
+        use obscura_dom::tree::NodeId;
+        let (x, y) = point;
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x >= self.viewport.0
+            || y >= self.viewport.1
+        {
+            return Err("INPUT_POINT_OUTSIDE_VIEWPORT");
+        }
+        fn collect(
+            tree: &DomTree,
+            layout: &crate::DomLayout,
+            root: Option<NodeId>,
+            out: &mut Vec<NodeId>,
+        ) {
+            let (_, nodes) = ordered_paint_nodes(tree, layout, root, root, root, root);
+            for node in nodes {
+                let atomic = root != Some(node)
+                    && layout.styles.get(&node).is_some_and(|style| {
+                        style.opacity.is_some_and(|opacity| opacity < 1.0)
+                            || has_authored_transform(style)
+                            || stacking_z_index(tree, layout, node).is_some()
+                            || is_effective_float(tree, layout, node)
+                    });
+                if atomic {
+                    collect(tree, layout, Some(node), out);
+                } else {
+                    out.push(node);
+                }
+            }
+        }
+        // Pseudo boxes have their own paint placement. Until that placement is
+        // represented in the hit list, refuse a point they might cover.
+        for generated in &self.layout.generated_boxes {
+            if tree.is_inert(generated.host) { continue; }
+            let movement = scroll.movement_for(generated.host);
+            let translation = self
+                .layout
+                .translates
+                .get(&generated.host)
+                .copied()
+                .unwrap_or_default();
+            let rect = crate::Rect {
+                x: generated.rect.x + movement.0 + translation.0,
+                y: generated.rect.y + movement.1 + translation.1,
+                ..generated.rect
+            };
+            if point_in_rect(point, rect) {
+                return Err("INPUT_GEOMETRY_UNSUPPORTED");
+            }
+        }
+        for (&host, style) in &self.layout.styles {
+            if tree.is_inert(host) { continue; }
+            for pseudo in [
+                style.before_pseudo.as_deref(),
+                style.after_pseudo.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|pseudo| pseudo.position == Some(taffy::Position::Absolute))
+            {
+                // A non-rendered host cannot create an anonymous paint box.
+                // Opacity zero alone is deliberately not an exclusion.
+                if style.display == crate::Display::None
+                    || pseudo.display == crate::Display::None
+                    || style.visibility_hidden == Some(true)
+                {
+                    continue;
+                }
+                let rect = self
+                    .viewport_rect_with_scroll(host, scroll)
+                    .ok_or("INPUT_GEOMETRY_UNSUPPORTED")?;
+                let mut ancestor = Some(host);
+                let mut containing_block = rect;
+                while let Some(candidate) = ancestor {
+                    let establishes = self.layout.styles.get(&candidate).is_some_and(|style| {
+                        style.position.is_some() || style.establishes_positioning_containing_block()
+                    });
+                    if establishes {
+                        if let Some(candidate_rect) =
+                            self.viewport_rect_with_scroll(candidate, scroll)
+                        {
+                            containing_block = candidate_rect;
+                            break;
+                        }
+                    }
+                    ancestor = crate::dom::rendered_parent(tree, candidate);
+                }
+                let bounds = positioned_pseudo_rect(
+                    pseudo,
+                    &containing_block,
+                    &rect,
+                    self.viewport,
+                    self.root_font_size,
+                    None,
+                )
+                .ok_or("INPUT_GEOMETRY_UNSUPPORTED")?;
+                if point_in_rect(point, bounds) {
+                    return Err("INPUT_GEOMETRY_UNSUPPORTED");
+                }
+            }
+        }
+        let mut nodes = Vec::new();
+        collect(tree, &self.layout, None, &mut nodes);
+        for id in nodes.into_iter().rev() {
+            let Some(node) = tree.get_node(id) else {
+                continue;
+            };
+            if node.as_element().is_none() || tree.is_inert(id) {
+                continue;
+            }
+            let Some(style) = self.layout.styles.get(&id) else {
+                continue;
+            };
+            let Some(rect) = self.viewport_rect_with_scroll(id, scroll) else {
+                continue;
+            };
+            if !point_in_rect(point, rect) {
+                continue;
+            }
+            let mut ancestor = Some(id);
+            let mut hidden = None;
+            let mut pointer_none = None;
+            let mut unsupported = node
+                .as_element()
+                .is_some_and(|name| name.ns.as_ref() != "http://www.w3.org/1999/xhtml");
+            while let Some(current) = ancestor {
+                if let Some(style) = self.layout.styles.get(&current) {
+                    if hidden.is_none() {
+                        hidden = style.visibility_hidden;
+                    }
+                    if pointer_none.is_none() {
+                        pointer_none = style.pointer_events_none;
+                    }
+                    unsupported |= style.clip_path.is_some();
+                }
+                unsupported |= self
+                    .layout
+                    .transforms
+                    .get(&current)
+                    .is_some_and(|transform| !transform.is_translation());
+                ancestor = crate::dom::rendered_parent(tree, current);
+            }
+            // opacity:0 still intercepts pointer events. It is deliberately not
+            // read from effectively_invisible, the renderer's paint-culling bit.
+            if hidden.unwrap_or(false) || pointer_none.unwrap_or(false) {
+                continue;
+            }
+            if unsupported {
+                return Err("INPUT_GEOMETRY_UNSUPPORTED");
+            }
+            if let Some(clip) = scroll.inherited_clip_for(id) {
+                if !point_in_rect(point, clip.viewport_rect(self.viewport)) {
+                    continue;
+                }
+                let offset = clip.rounded_offset();
+                let mut chain = clip.rounded_chain().map(AsRef::as_ref);
+                let mut clipped = false;
+                while let Some(node) = chain {
+                    let rect = crate::Rect {
+                        x: node.clip.rect.x + offset.0,
+                        y: node.clip.rect.y + offset.1,
+                        ..node.clip.rect
+                    };
+                    if !point_in_rounded_rect(point, rect, node.clip.radii) {
+                        clipped = true;
+                        break;
+                    }
+                    chain = node.parent.as_deref();
+                }
+                if clipped {
+                    continue;
+                }
+            }
+            // Inline fragments must not hit the whitespace between wrapped lines.
+            let fragments = self
+                .viewport_client_rects_with_scroll(id, scroll)
+                .unwrap_or_default();
+            if !fragments.iter().any(|rect| point_in_rect(point, *rect)) {
+                continue;
+            }
+            if !point_in_rounded_rect(
+                point,
+                rect,
+                style.border_model.radii.resolve(rect.width, rect.height),
+            ) {
+                continue;
+            }
+            return Ok(Some(id));
+        }
+        Ok(None)
+    }
+
     pub fn viewport(&self) -> (f32, f32) {
         self.viewport
     }
@@ -3490,75 +3881,10 @@ fn paint_laid_dom_scrolled(
     // tree order). The unit is recursively painted at its sorted position,
     // preventing its backgrounds, replaced content, and shaped text from
     // leaking into different global paint phases.
-    let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
-    let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
-    let mut float_layers: Vec<obscura_dom::tree::NodeId> = Vec::new();
-    let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
-    let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> =
-        std::collections::HashSet::new();
-    let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
-    paint_nodes.extend(crate::dom::rendered_descendants(
-        tree,
-        paint_root.unwrap_or_else(|| tree.document()),
-    ));
-    for nid in paint_nodes.iter().copied() {
-        if consumed.contains(&nid) {
-            continue;
-        }
-        let is_opacity_root = suppress_opacity_for != Some(nid)
-            && laid
-                .styles
-                .get(&nid)
-                .and_then(|style| style.opacity)
-                .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
-        let is_transform_root = suppress_transform_for != Some(nid)
-            && laid.styles.get(&nid).is_some_and(has_authored_transform);
-        let z = (suppress_stacking_for != Some(nid))
-            .then(|| stacking_z_index(tree, laid, nid))
-            .flatten();
-        let is_float_root = paint_root != Some(nid) && is_effective_float(tree, laid, nid);
-        if is_opacity_root || is_transform_root {
-            let mut sub = vec![nid];
-            sub.extend(crate::dom::rendered_descendants(tree, nid));
-            for &member in &sub {
-                consumed.insert(member);
-            }
-            // An opacity effect is one atomic paint-order unit. Its internal
-            // z-order is resolved while painting its isolated surface.
-            match z {
-                Some(z) if z < 0 => neg_layers.push((z, vec![nid])),
-                Some(z) => pos_layers.push((z, vec![nid])),
-                None if is_float_root => float_layers.push(nid),
-                None => normal.push(nid),
-            }
-        } else if let Some(z) = z {
-            let mut sub = vec![nid];
-            sub.extend(crate::dom::rendered_descendants(tree, nid));
-            for &m in &sub {
-                consumed.insert(m);
-            }
-            if z < 0 {
-                neg_layers.push((z, vec![nid]));
-            } else {
-                pos_layers.push((z, vec![nid]));
-            }
-        } else if is_float_root {
-            consumed.insert(nid);
-            consumed.extend(crate::dom::rendered_descendants(tree, nid));
-            float_layers.push(nid);
-        } else {
-            normal.push(nid);
-        }
-    }
-    neg_layers.sort_by_key(|(z, _)| *z);
-    pos_layers.sort_by_key(|(z, _)| *z);
-    let paint_order: Vec<obscura_dom::tree::NodeId> = neg_layers
-        .into_iter()
-        .flat_map(|(_, sub)| sub)
-        .chain(normal)
-        .chain(float_layers)
-        .chain(pos_layers.into_iter().flat_map(|(_, sub)| sub))
-        .collect();
+    let (paint_nodes, paint_order) = ordered_paint_nodes(
+        tree, laid, paint_root, suppress_opacity_for,
+        suppress_transform_for, suppress_stacking_for,
+    );
 
     // Generated boxes are anonymous layout children. ::before paints directly
     // after its host's own box; ::after paints after the host's last DOM
@@ -4650,94 +4976,83 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        // An empty text `<input>`/`<textarea>` shows its `placeholder`
-        // attribute as muted text; there is no DOM text node for it (it is
-        // not real content), so paint it directly from the attribute instead
-        // of going through `paint_text_node`.
-        if name.local.as_ref() == "input" || name.local.as_ref() == "textarea" {
-            let has_value = node
-                .get_attribute("value")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-                || (name.local.as_ref() == "textarea"
-                    && !tree.text_content(nid).is_empty());
-            // A text `<input>`'s value is not a DOM text node either, so it
-            // needs painting from the attribute the same way. Without this the
-            // control renders empty however it was filled in — from markup,
-            // from script, or by typing — while its `value` reads back
-            // correctly, so only a screenshot or PDF shows anything wrong.
-            // `<textarea>` is unaffected: its value *is* a text node.
-            if has_value && name.local.as_ref() == "input" {
-                if let Some(value) = node.get_attribute("value") {
-                    if !value.is_empty() {
-                        let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
-                        let color = style.color.unwrap_or([0, 0, 0, 255]);
-                        let masked;
-                        let shown = if node
-                            .get_attribute("type")
-                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
-                        {
-                            masked = "\u{2022}".repeat(value.chars().count());
-                            masked.as_str()
-                        } else {
-                            value
-                        };
-                        if color[3] != 0 {
-                            draw_text(
-                                &mut pixmap,
-                                shown,
-                                text_x,
-                                text_y,
-                                color,
-                                fsize,
-                                false,
-                                style.font_family.as_deref(),
-                                style.letter_spacing.unwrap_or(0.0),
-                                clip,
-                                element_clip_mask,
-                                raster_scale,
-                            );
-                        }
-                    }
-                }
-            }
-            if !has_value {
-                if let Some(placeholder) = node.get_attribute("placeholder") {
-                    if !placeholder.is_empty() {
-                        let fsize = style.font_size.unwrap_or(16.0);
-                        let text_x = rect.x + style.padding.left + style.border.left;
-                        let text_y = rect.y + style.padding.top + style.border.top;
-                        let placeholder_style = style.placeholder_pseudo.as_deref();
-                        let mut color = placeholder_style
-                            .and_then(|pseudo| pseudo.color)
-                            .unwrap_or([117, 117, 117, 255]);
-                        let opacity = placeholder_style
-                            .and_then(|pseudo| pseudo.opacity)
-                            .unwrap_or(1.0)
-                            .clamp(0.0, 1.0);
-                        color[3] = ((color[3] as f32) * opacity).round() as u8;
-                        if color[3] != 0 {
-                            draw_text(
-                                &mut pixmap,
-                                placeholder,
-                                text_x,
-                                text_y,
-                                color,
-                                fsize,
-                                false,
-                                style.font_family.as_deref(),
-                                style.letter_spacing.unwrap_or(0.0),
-                                clip,
-                                element_clip_mask,
-                                raster_scale,
-                            );
-                        }
-                    }
-                }
+        if matches!(tree.input_type(nid).as_deref(), Some("checkbox" | "radio"))
+            && !control_appearance_none(tree, laid, nid)
+        {
+            if let Some(control) = tree.checked_state(nid) {
+                paint_checked_control(
+                    &mut pixmap,
+                    &rect,
+                    &visible_rect,
+                    element_clip_mask,
+                    raster_scale,
+                    tree.input_type(nid).as_deref() == Some("radio"),
+                    control.checked,
+                    control.indeterminate,
+                    tree.is_disabled(nid),
+                );
             }
         }
+
+        if let Some(control) = tree.text_control(nid) {
+            use obscura_dom::tree::TextControlKind;
+            let mut text_style = style.clone();
+            let text = if control.value.is_empty() {
+                let placeholder = node.get_attribute("placeholder").unwrap_or("").to_string();
+                let pseudo = style.placeholder_pseudo.as_deref();
+                let mut color = pseudo
+                    .and_then(|value| value.color)
+                    .unwrap_or([117, 117, 117, 255]);
+                let opacity = pseudo
+                    .and_then(|value| value.opacity)
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                color[3] = ((color[3] as f32) * opacity).round() as u8;
+                text_style.color = Some(color);
+                placeholder
+            } else if control.kind == TextControlKind::Password {
+                "•".repeat(control.value.chars().count())
+            } else {
+                control.value
+            };
+            text_style.white_space = Some(
+                if control.kind == TextControlKind::TextArea
+                    && node.get_attribute("wrap") != Some("off")
+                {
+                    crate::WhiteSpace::PreWrap
+                } else {
+                    crate::WhiteSpace::Pre
+                },
+            );
+            let content = crate::Rect {
+                x: rect.x + style.border.left + style.padding.left,
+                y: rect.y + style.border.top + style.padding.top,
+                width: (rect.width
+                    - style.border.left
+                    - style.border.right
+                    - style.padding.left
+                    - style.padding.right)
+                    .max(0.0),
+                height: (rect.height
+                    - style.border.top
+                    - style.border.bottom
+                    - style.padding.top
+                    - style.padding.bottom)
+                    .max(0.0),
+            };
+            if let Some(control_clip) = content.intersect(&visible_rect) {
+                laid.text_engine.paint_control_value(
+                    &text,
+                    &text_style,
+                    content,
+                    control_clip,
+                    &mut pixmap,
+                    element_clip_mask,
+                    raster_scale,
+                );
+            }
+        }
+
         for generated in &generated_after_at[paint_index] {
             paint_in_flow_generated_box(
                 &mut pixmap,
@@ -4820,6 +5135,137 @@ fn paint_laid_dom_scrolled(
     }
 
     Some(pixmap)
+}
+
+fn control_appearance_none(
+    tree: &DomTree,
+    layout: &crate::DomLayout,
+    id: obscura_dom::tree::NodeId,
+) -> bool {
+    let mut current = Some(id);
+    while let Some(node) = current {
+        let Some(style) = layout.styles.get(&node) else {
+            break;
+        };
+        if !style.appearance_inherit {
+            return style.appearance_none;
+        }
+        current = crate::dom::rendered_parent(tree, node);
+    }
+    false
+}
+
+fn paint_checked_control(
+    pixmap: &mut Pixmap,
+    rect: &crate::Rect,
+    visible: &crate::Rect,
+    ancestor_mask: Option<&tiny_skia::Mask>,
+    scale: f32,
+    radio: bool,
+    checked: bool,
+    indeterminate: bool,
+    disabled: bool,
+) {
+    let size = rect.width.min(rect.height);
+    if size <= 1.0 {
+        return;
+    }
+    let x = rect.x + (rect.width - size) / 2.0;
+    let y = rect.y + (rect.height - size) / 2.0;
+    let clipped = crate::Rect {
+        x: visible.x * scale,
+        y: visible.y * scale,
+        width: visible.width * scale,
+        height: visible.height * scale,
+    };
+    let mask = intersect_clip_masks(
+        box_clip_mask(pixmap.width(), pixmap.height(), &clipped),
+        ancestor_mask,
+    );
+    let mut outline = PathBuilder::new();
+    if radio {
+        outline.push_circle(x + size / 2.0, y + size / 2.0, (size - 1.0) / 2.0);
+    } else if let Some(rect) = Rect::from_xywh(x + 0.5, y + 0.5, size - 1.0, size - 1.0) {
+        outline.push_rect(rect);
+    }
+    let Some(outline) = outline.finish() else {
+        return;
+    };
+    let selected = checked || (!radio && indeterminate);
+    let accent = if disabled {
+        Color::from_rgba8(150, 150, 150, 255)
+    } else {
+        Color::from_rgba8(25, 103, 210, 255)
+    };
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    paint.set_color(if selected && !radio {
+        accent
+    } else {
+        Color::from_rgba8(255, 255, 255, 255)
+    });
+    pixmap.fill_path(
+        &outline,
+        &paint,
+        FillRule::Winding,
+        raster_transform(scale),
+        mask.as_ref(),
+    );
+    paint.set_color(if selected {
+        accent
+    } else {
+        Color::from_rgba8(100, 100, 100, 255)
+    });
+    pixmap.stroke_path(
+        &outline,
+        &paint,
+        &tiny_skia::Stroke {
+            width: 1.0,
+            ..Default::default()
+        },
+        raster_transform(scale),
+        mask.as_ref(),
+    );
+    if !selected {
+        return;
+    }
+    let mut mark = PathBuilder::new();
+    if radio {
+        mark.push_circle(x + size / 2.0, y + size / 2.0, size * 0.25);
+        if let Some(mark) = mark.finish() {
+            pixmap.fill_path(
+                &mark,
+                &paint,
+                FillRule::Winding,
+                raster_transform(scale),
+                mask.as_ref(),
+            );
+        }
+    } else {
+        if indeterminate {
+            mark.move_to(x + size * 0.25, y + size * 0.5);
+            mark.line_to(x + size * 0.75, y + size * 0.5);
+        } else {
+            mark.move_to(x + size * 0.22, y + size * 0.5);
+            mark.line_to(x + size * 0.43, y + size * 0.7);
+            mark.line_to(x + size * 0.79, y + size * 0.28);
+        }
+        paint.set_color(Color::from_rgba8(255, 255, 255, 255));
+        if let Some(mark) = mark.finish() {
+            pixmap.stroke_path(
+                &mark,
+                &paint,
+                &tiny_skia::Stroke {
+                    width: (size * 0.12).max(1.5),
+                    line_cap: tiny_skia::LineCap::Round,
+                    line_join: tiny_skia::LineJoin::Round,
+                    ..Default::default()
+                },
+                raster_transform(scale),
+                mask.as_ref(),
+            );
+        }
+    }
 }
 
 fn raster_transform(scale: f32) -> Transform {
@@ -8772,6 +9218,56 @@ fn paint_in_flow_generated_box(
     );
 }
 
+fn positioned_pseudo_rect(
+    style: &crate::LayoutStyle,
+    containing_block: &crate::Rect,
+    static_position_rect: &crate::Rect,
+    viewport: (f32, f32),
+    root_font_size: f32,
+    generated_intrinsic: Option<(f32, f32)>,
+) -> Option<crate::Rect> {
+    let em = style.font_size.unwrap_or(16.0);
+    let resolve = |dimension: crate::Dimension, basis: f32| match dimension.resolve(
+        em,
+        root_font_size,
+        viewport.0 / 100.0,
+        viewport.1 / 100.0,
+    ) {
+        crate::Dimension::Px(value) => Some(value),
+        crate::Dimension::Percent(value) => Some(value * basis),
+        _ => None,
+    };
+    let top = style.inset[0].and_then(|value| resolve(value, containing_block.height));
+    let right = style.inset[1].and_then(|value| resolve(value, containing_block.width));
+    let bottom = style.inset[2].and_then(|value| resolve(value, containing_block.height));
+    let left = style.inset[3].and_then(|value| resolve(value, containing_block.width));
+    let width = resolve(style.width, containing_block.width)
+        .or_else(|| Some(containing_block.width - left? - right?))
+        .or_else(|| generated_intrinsic.map(|size| size.0));
+    let height = resolve(style.height, containing_block.height)
+        .or_else(|| Some(containing_block.height - top? - bottom?))
+        .or_else(|| generated_intrinsic.map(|size| size.1));
+    let (width, height) = (width?, height?);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let x = left
+        .map(|value| containing_block.x + value)
+        .or_else(|| right.map(|value| containing_block.x + containing_block.width - value - width))
+        .unwrap_or(static_position_rect.x);
+    let y = top
+        .map(|value| containing_block.y + value)
+        .or_else(|| {
+            bottom.map(|value| containing_block.y + containing_block.height - value - height)
+        })
+        .unwrap_or(static_position_rect.y);
+    Some(crate::Rect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
 fn paint_positioned_pseudo(
     text_engine: &mut crate::inline::TextEngine,
     pixmap: &mut Pixmap,
@@ -8790,20 +9286,6 @@ fn paint_positioned_pseudo(
         return;
     }
     let em = style.font_size.unwrap_or(16.0);
-    let resolve = |dimension: crate::Dimension, basis: f32| match dimension.resolve(
-        em,
-        root_font_size,
-        viewport.0 / 100.0,
-        viewport.1 / 100.0,
-    ) {
-        crate::Dimension::Px(value) => Some(value),
-        crate::Dimension::Percent(value) => Some(value * basis),
-        _ => None,
-    };
-    let top = style.inset[0].and_then(|value| resolve(value, containing_block.height));
-    let right = style.inset[1].and_then(|value| resolve(value, containing_block.width));
-    let bottom = style.inset[2].and_then(|value| resolve(value, containing_block.height));
-    let left = style.inset[3].and_then(|value| resolve(value, containing_block.width));
     // Generated text supplies the shrink-to-fit dimensions of an absolutely
     // positioned pseudo whose width and/or height is auto. Tailwind's code
     // gutters use exactly this shape (`width` plus auto height); requiring two
@@ -8814,34 +9296,10 @@ fn paint_positioned_pseudo(
         .filter(|content| !content.is_empty())
         .and_then(|content| text_engine.push_generated_text(content, style));
     let generated_intrinsic = generated_item.map(|item| text_engine.measure(item, None));
-    let width = resolve(style.width, containing_block.width)
-        .or_else(|| Some(containing_block.width - left? - right?))
-        .or_else(|| generated_intrinsic.map(|size| size.0));
-    let height = resolve(style.height, containing_block.height)
-        .or_else(|| Some(containing_block.height - top? - bottom?))
-        .or_else(|| generated_intrinsic.map(|size| size.1));
-    let (Some(width), Some(height)) = (width, height) else {
-        return;
-    };
-    if width <= 0.0 || height <= 0.0 {
-        return;
-    }
-    let x = left
-        .map(|value| containing_block.x + value)
-        .or_else(|| right.map(|value| containing_block.x + containing_block.width - value - width))
-        .unwrap_or(static_position_rect.x);
-    let y = top
-        .map(|value| containing_block.y + value)
-        .or_else(|| {
-            bottom.map(|value| containing_block.y + containing_block.height - value - height)
-        })
-        .unwrap_or(static_position_rect.y);
-    let rect = crate::Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+    let Some(rect) = positioned_pseudo_rect(
+        style, containing_block, static_position_rect, viewport,
+        root_font_size, generated_intrinsic,
+    ) else { return };
     let ancestor_clip = ancestor_overflow_clip
         .map(|clip| clip.viewport_rect(clip_extent));
     let visible = match ancestor_clip {
@@ -11692,6 +12150,14 @@ mod tests {
             })),
             "the painted glyphs must be the value's color, not the grey placeholder"
         );
+        tree.with_node_mut(node("#filled"), |node| node.remove_attribute_ns("", "placeholder"));
+        let without_placeholder = paint_dom(&tree, (200.0, 130.0), None).unwrap();
+        for y in 90..120 {
+            for x in 0..180 {
+                assert_eq!(pixmap.pixel(x, y), without_placeholder.pixel(x, y),
+                    "a non-empty control value must suppress placeholder glyphs");
+            }
+        }
     }
 
     #[test]
@@ -14290,9 +14756,9 @@ mod tests {
         assert!(
             (20..100).any(|x| (20..60).any(|y| {
                 let pixel = pixmap.pixel(x, y).expect("scaled text region");
-                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() < 80
+                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() > 180
             })),
-            "text must be rasterized inside the scaled atomic subtree"
+            "authored blue text must be rasterized inside the scaled atomic subtree"
         );
 
         let rotated_box = pixmap.pixel(165, 25).expect("rotated box");

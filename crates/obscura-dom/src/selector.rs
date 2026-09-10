@@ -104,9 +104,11 @@ pub enum PseudoClass {
     Focus,
     FocusVisible,
     FocusWithin,
+    Target,
     Enabled,
     Disabled,
     Checked,
+    Indeterminate,
     /// `:link` / `:any-link`: an `<a>`/`<area>` with an `href`. Extremely
     /// common (`a:link { color: ... }` is the standard way sites set their
     /// base link color), so treating it as unsupported silently drops the
@@ -152,9 +154,11 @@ impl ToCss for PseudoClass {
             PseudoClass::Focus => dest.write_str(":focus"),
             PseudoClass::FocusVisible => dest.write_str(":focus-visible"),
             PseudoClass::FocusWithin => dest.write_str(":focus-within"),
+            PseudoClass::Target => dest.write_str(":target"),
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
+            PseudoClass::Indeterminate => dest.write_str(":indeterminate"),
             PseudoClass::Link => dest.write_str(":link"),
             PseudoClass::Visited => dest.write_str(":visited"),
         }
@@ -231,9 +235,11 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "focus" => Ok(PseudoClass::Focus),
             "focus-visible" => Ok(PseudoClass::FocusVisible),
             "focus-within" => Ok(PseudoClass::FocusWithin),
+            "target" => Ok(PseudoClass::Target),
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
+            "indeterminate" => Ok(PseudoClass::Indeterminate),
             "link" | "any-link" => Ok(PseudoClass::Link),
             "visited" => Ok(PseudoClass::Visited),
             _ => Err(cssparser::ParseError {
@@ -263,16 +269,17 @@ impl<'a> DomElement<'a> {
             .with_node(self.node_id, |n| {
                 n.as_element()
                     .map(|name| {
-                        matches!(
-                            name.local.as_ref(),
-                            "input"
-                                | "button"
-                                | "select"
-                                | "textarea"
-                                | "optgroup"
-                                | "option"
-                                | "fieldset"
-                        )
+                        name.ns == html5ever::ns!(html)
+                            && matches!(
+                                name.local.as_ref(),
+                                "input"
+                                    | "button"
+                                    | "select"
+                                    | "textarea"
+                                    | "optgroup"
+                                    | "option"
+                                    | "fieldset"
+                            )
                     })
                     .unwrap_or(false)
             })
@@ -489,26 +496,39 @@ impl<'a> Element for DomElement<'a> {
         match pc {
             PseudoClass::Link => self.is_link(),
             PseudoClass::Visited => false,
-            // :enabled/:disabled/:checked reflect real, static DOM state (the
-            // disabled/checked attributes), not live user interaction, so
-            // they resolve the same way against a static snapshot as they
-            // would in a browser that never received an input event. Modern
-            // component systems (Codex, Material, Bootstrap, ...) lean on
-            // :enabled constantly for their default/base styling, so
-            // treating it as unconditionally false (as :hover/:active
-            // correctly are) made every such base rule silently inert.
-            PseudoClass::Enabled => self.is_form_control() && !self.has_boolean_attr("disabled"),
-            PseudoClass::Disabled => self.is_form_control() && self.has_boolean_attr("disabled"),
+            // Disabledness is shared with native focus and input validation.
+            PseudoClass::Enabled => self.is_form_control() && !self.tree.is_disabled(self.node_id),
+            PseudoClass::Disabled => self.is_form_control() && self.tree.is_disabled(self.node_id),
             PseudoClass::Checked => {
-                self.has_boolean_attr("checked") || self.has_boolean_attr("selected")
+                if matches!(self.tree.input_type(self.node_id).as_deref(),Some("checkbox"|"radio")) {
+                    self.tree.checked_state(self.node_id).is_some_and(|state| state.checked)
+                } else { self.tree.is_html_element(self.node_id,"option") && self.has_boolean_attr("selected") }
             }
-            // Dynamic user-interaction pseudo-classes have no meaning against
-            // a static DOM snapshot with no live user input.
-            PseudoClass::Hover
-            | PseudoClass::Active
-            | PseudoClass::Focus
-            | PseudoClass::FocusVisible
-            | PseudoClass::FocusWithin => false,
+            PseudoClass::Indeterminate => {
+                match self.tree.input_type(self.node_id).as_deref() {
+                    Some("checkbox") => self.tree.checked_state(self.node_id).is_some_and(|state| state.indeterminate),
+                    Some("radio") => self.tree.checked_state(self.node_id).is_some_and(|state| !state.checked)
+                        && self.tree.checked_radio_peer(self.node_id).is_none(),
+                    _ => self.tree.is_html_element(self.node_id,"progress") && !self.has_boolean_attr("value"),
+                }
+            }
+            PseudoClass::Hover | PseudoClass::Active | PseudoClass::FocusWithin => {
+                let input = self.tree.input_state();
+                let target = match pc {
+                    PseudoClass::Hover => input.hovered,
+                    PseudoClass::Active => input.pressed,
+                    _ => input.focused,
+                };
+                target.is_some_and(|id| {
+                    id == self.node_id || self.tree.ancestors(id).contains(&self.node_id)
+                })
+            }
+            PseudoClass::Target => self.tree.target_element() == Some(self.node_id),
+            PseudoClass::Focus => self.tree.input_state().focused == Some(self.node_id),
+            PseudoClass::FocusVisible => {
+                let input = self.tree.input_state();
+                input.focused == Some(self.node_id) && input.focus_visible
+            }
         }
     }
 

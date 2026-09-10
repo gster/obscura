@@ -1484,14 +1484,6 @@ pub async fn handle(
                 url
             };
             if let Some(url) = target_url {
-                // Stash + restore history so push_history doesn't clobber
-                // the cursor we just moved.
-                let stash = {
-                    let page = ctx
-                        .get_session_page_mut(session_id)
-                        .ok_or("No page for session")?;
-                    (page.history.clone(), page.history_index)
-                };
                 let (frame_id, page_id, network_events, page_url, reached_idle) = {
                     let page = ctx
                         .get_session_page_mut(session_id)
@@ -1499,8 +1491,6 @@ pub async fn handle(
                     page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
                         .await
                         .map_err(|e| e.to_string())?;
-                    page.history = stash.0;
-                    page.history_index = stash.1;
                     (
                         page.frame_id.clone(),
                         page.id.clone(),
@@ -1526,8 +1516,7 @@ pub async fn handle(
         }
         "resetNavigationHistory" => {
             if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.history.clear();
-                page.history_index = 0;
+                page.reset_history();
             }
             Ok(json!({}))
         }

@@ -1411,6 +1411,11 @@ pub struct LayoutStyle {
     /// a real inherited CSS property). Resolved into `effectively_invisible`
     /// during `dom::layout_dom`'s inheritance pass.
     pub visibility_hidden: Option<bool>,
+    /// HTML pointer-events; None inherits, true is none, false is auto.
+    pub pointer_events_none: Option<bool>,
+    /// Native control decoration; appearance is not inherited unless requested.
+    pub appearance_none: bool,
+    pub appearance_inherit: bool,
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,

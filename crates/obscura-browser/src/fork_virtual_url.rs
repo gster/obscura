@@ -2,8 +2,8 @@
 //!
 //! A single page app answers a click by calling `history.pushState` and
 //! rendering the next view in place. `bootstrap.js` tracks that in
-//! `__virtualUrl` so `location.href` reads correctly, but nothing on the Rust
-//! side ever looked at it, so the page had moved on while `page.url()` still
+//! a native document URL alongside `__virtualUrl`. Adopt that native URL so
+//! a page cannot forge navigation by replacing a public global. Previously `page.url()` still
 //! reported the old document. To a CDP client that is a click that did nothing,
 //! and `tools/ab/clicklocal.mjs` reports it as `spa route: FAILED`.
 //!
@@ -21,21 +21,15 @@ impl Page {
     ///
     /// Returns whether the URL changed.
     pub fn sync_virtual_url(&mut self) -> bool {
-        let Some(js) = self.js.as_mut() else {
+        let Some(js) = self.js.as_ref() else {
             return false;
         };
-        let Ok(virtual_url) = js.evaluate("globalThis.__virtualUrl || ''") else {
+        let Some(url) = js.take_same_document_navigation() else {
             return false;
         };
-        let Some(virtual_url) = virtual_url.as_str().filter(|url| !url.is_empty()) else {
+        let Ok(parsed) = Url::parse(&url) else {
             return false;
         };
-        let Ok(parsed) = Url::parse(virtual_url) else {
-            return false;
-        };
-        if self.url.as_ref() == Some(&parsed) {
-            return false;
-        }
         self.url = Some(parsed);
         self.push_history(self.url_string());
         true

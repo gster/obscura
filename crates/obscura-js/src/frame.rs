@@ -33,6 +33,8 @@ use crate::runtime::ObscuraJsRuntime;
 /// the page's isolate.
 pub struct FrameRealm {
     context: deno_core::v8::Global<deno_core::v8::Context>,
+    lifecycle: deno_core::v8::Global<deno_core::v8::Function>,
+    state: crate::ops::SharedState,
     /// Held so the frame's entry can be taken out again when the frame dies.
     realms: Rc<std::cell::RefCell<RealmStates>>,
     frame_id: u32,
@@ -61,6 +63,7 @@ impl FrameRealm {
         html: &str,
     ) -> Option<Self> {
         let context = parent.create_realm_context()?;
+        let lifecycle = parent.take_realm_native_input(&context, "__obscura_native_lifecycle_handoff")?;
         if !parent.share_ops_with_realm(&context) {
             return None;
         }
@@ -83,18 +86,22 @@ impl FrameRealm {
         let mut state = ObscuraState::new();
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
+        state.dom.as_ref().unwrap().set_document_url(url);
         state.frame_id = frame_id;
         parent.share_resources_with(&mut state);
 
+        let state = Rc::new(std::cell::RefCell::new(state));
         let realms = parent.realm_states();
         realms.borrow_mut().register(
             context.clone(),
             frame_id,
-            Rc::new(std::cell::RefCell::new(state)),
+            state.clone(),
         );
 
         let realm = FrameRealm {
             context,
+            lifecycle,
+            state,
             realms,
             frame_id,
             parent_frame_id,
@@ -130,20 +137,16 @@ impl FrameRealm {
     /// can talk to its parent perfectly and still never build its interface,
     /// which looks like a rendering problem and is a lifecycle one.
     pub fn dispatch_load_events(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
-        self.execute_script(
-            parent,
-            "globalThis.__documentReadyState__ = 'interactive';\
-             try { document.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
-             try { window.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
-             globalThis.__documentReadyState__ = 'complete';\
-             try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
-             try { const loadEvent = new Event('load', \
-                 { bubbles: false, cancelable: false }); \
-                 if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
-                 try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
-        )
+        for phase in 1..=4 {
+            {
+                let mut state = self.state.borrow_mut();
+                if phase <= state.document_lifecycle { continue; }
+                state.document_lifecycle = phase;
+            }
+            parent.dispatch_document_lifecycle(&self.context, &self.lifecycle, phase)
+                .map_err(str::to_string)?;
+        }
+        Ok(())
     }
 
     /// Delivers a `postMessage` that another realm sent to this one.

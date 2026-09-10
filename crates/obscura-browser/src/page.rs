@@ -6,7 +6,7 @@ use obscura_js::frame::FrameRealm;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
-    ResourceType, Response, ResponseCallback,
+    ResourceType, Response, ResponseCallback, ReferrerPolicy,
 };
 use url::Url;
 
@@ -139,29 +139,10 @@ fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
     }
 }
 
-/// Compute the default `strict-origin-when-cross-origin` referrer value used
-/// for a document-initiated navigation. Direct navigations bypass this helper
-/// and use an empty referrer. Referrer-Policy overrides are not yet plumbed
-/// through the navigation request.
+#[cfg(test)]
 fn navigation_referrer(source: &Url, target: &Url) -> String {
-    if !matches!(source.scheme(), "http" | "https")
-        || !matches!(target.scheme(), "http" | "https")
-        || (source.scheme() == "https" && target.scheme() == "http")
-    {
-        return String::new();
-    }
-
-    if source.origin() == target.origin() {
-        let mut sanitized = source.clone();
-        sanitized.set_fragment(None);
-        let _ = sanitized.set_username("");
-        let _ = sanitized.set_password(None);
-        return sanitized.to_string();
-    }
-
-    let mut origin = source.origin().ascii_serialization();
-    origin.push('/');
-    origin
+    obscura_net::ReferrerPolicy::default().referrer(Some(source), target)
+        .map(|url| url.to_string()).unwrap_or_default()
 }
 
 /// Escape a value for safe inclusion inside a JavaScript template
@@ -260,6 +241,7 @@ pub struct Page {
     /// separate from `url`: direct automation navigations have no referrer,
     /// while a navigation requested by page script uses the previous document.
     pub referrer: String,
+    referrer_policy: ReferrerPolicy,
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
@@ -299,6 +281,8 @@ pub struct Page {
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
     pub history: Vec<String>,
     pub history_index: usize,
+    session_history: obscura_js::ops::SharedSessionHistory,
+    requested_history: Option<obscura_js::ops::HistoryNavigation>,
     pub network_events: Vec<NetworkEvent>,
     response_bodies: std::collections::HashMap<String, StoredResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
@@ -1124,10 +1108,10 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            Some(Arc::new(StealthHttpClient::with_policy(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
-                context.allow_private_network,
+                context.http_client.clone(),
             )))
         } else {
             None
@@ -1145,6 +1129,7 @@ impl Page {
             context,
             title: String::new(),
             referrer: String::new(),
+            referrer_policy: ReferrerPolicy::default(),
             viewport: (1280.0, 720.0),
             screen_size_override: None,
             screen_metrics_emulated: false,
@@ -1157,6 +1142,8 @@ impl Page {
             navigation_chain_limit: None,
             history: Vec::new(),
             history_index: 0,
+            session_history: std::rc::Rc::new(std::cell::RefCell::new(Default::default())),
+            requested_history: None,
             network_events: Vec::new(),
             response_bodies: std::collections::HashMap::new(),
             response_body_order: std::collections::VecDeque::new(),
@@ -1329,7 +1316,7 @@ impl Page {
             let source = if self.should_block_url(&url) {
                 None
             } else if let Ok(parsed) = Url::parse(&url) {
-                match self.do_fetch(&parsed).await {
+                match self.do_fetch(&parsed, ResourceRequest::navigation()).await {
                     Ok(response) => Some(String::from_utf8_lossy(&response.body).into_owned()),
                     Err(error) => {
                         tracing::warn!("frame script {} failed: {}", url, error);
@@ -1759,18 +1746,18 @@ impl Page {
             .unwrap_or([255, 255, 255, 255])
     }
 
-    async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+    async fn do_fetch(&self, url: &Url, request: ResourceRequest) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
             // Pass the page callbacks so CDP Network events and
             // page.on('request'/'response') observers fire for stealth-mode
             // navigations too, matching the non-stealth path below.
             return stealth
-                .fetch_with_callbacks(url, Some(&self.callbacks))
+                .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
                 .await;
         }
         self.http_client
-            .fetch_with_callbacks(url, Some(&self.callbacks))
+            .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
             .await
     }
     fn init_js(&mut self) {
@@ -1804,9 +1791,12 @@ impl Page {
             self.context.proxy_url.clone(),
         );
         rt.set_url(&self.url_string());
+        rt.set_session_history(self.session_history.clone());
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
+        rt.set_referrer_policy(self.referrer_policy);
+        rt.set_device_identity(self.context.device_identity.clone());
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
@@ -1985,6 +1975,7 @@ impl Page {
             let stealth_client = self.stealth_client.clone();
             let callbacks = self.callbacks.clone();
             let initiator = document_url.clone();
+            let referrer_policy = self.js.as_ref().map(|js| js.referrer_policy()).unwrap_or(self.referrer_policy);
             use futures::StreamExt as _;
             let results: Vec<_> =
                 futures::stream::iter(batch.into_iter().map(|(key, requested_url, depth)| {
@@ -1994,8 +1985,9 @@ impl Page {
                     let callbacks = callbacks.clone();
                     let initiator = initiator.clone();
                     async move {
-                        let request =
+                        let mut request =
                             ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        request.referrer_policy = referrer_policy;
                         #[cfg(feature = "stealth")]
                         let result = if let Some(stealth_client) = stealth_client {
                             stealth_client
@@ -2121,8 +2113,8 @@ impl Page {
             .collect()
     }
 
-    async fn execute_scripts(&mut self) {
-        self.execute_scripts_with_module_budget(None).await;
+    async fn execute_scripts(&mut self) -> Result<(), PageError> {
+        self.execute_scripts_with_module_budget(None).await
     }
 
     /// Drive only dynamic script elements which participate in the current
@@ -2176,7 +2168,9 @@ impl Page {
         true
     }
 
-    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) -> Result<(), PageError> {
+        #[cfg(feature = "render")]
+        let mut fragment = self.js.as_ref().and_then(ObscuraJsRuntime::begin_document_fragment);
         let scripts_started = std::time::Instant::now();
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -2316,7 +2310,7 @@ impl Page {
                 })
                 .unwrap_or_default()
             }
-            None => return,
+            None => return Ok(()),
         };
 
         // HTML scripts have an "already started" flag. Mark every
@@ -2377,6 +2371,7 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
+        let referrer_policy = self.js.as_ref().map(|js| js.referrer_policy()).unwrap_or(self.referrer_policy);
         let script_initiator = self
             .url
             .clone()
@@ -2413,10 +2408,12 @@ impl Page {
                             headers,
                             body,
                             redirected_from: Vec::new(),
+                            request_referrer: None,
                         };
                         return Some((idx, url, resp));
                     }
-                    let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    request.referrer_policy = referrer_policy;
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
                         .await
@@ -2479,16 +2476,6 @@ impl Page {
                 let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                 fetched.insert(idx, (url, code, resp));
             }
-        }
-
-        // Spec: readyState is "loading" while parser-discovered scripts execute.
-        // Scripts that check readyState === 'loading' will register DOMContentLoaded
-        // listeners instead of calling their callback immediately.
-        if let Some(js) = &mut self.js {
-            let _ = js.execute_script(
-                "<ready-state>",
-                "globalThis.__documentReadyState__ = 'loading';",
-            );
         }
 
         // CDP `Page.addScriptToEvaluateOnNewDocument` contract: preload
@@ -2823,12 +2810,7 @@ impl Page {
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
-        if let Some(js) = &mut self.js {
-            let _ = js.execute_script(
-                "<ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';",
-            );
-        }
+        let lifecycle_error = self.js.as_mut().and_then(|js| js.document_lifecycle(1).err());
 
         for scheduled in post_parse {
             if tokio::time::Instant::now() >= script_deadline {
@@ -2895,40 +2877,38 @@ impl Page {
             }
         }
 
-        if let Some(js) = &mut self.js {
-            // DOMContentLoaded follows parser/defer/module work, but async
-            // dynamic script elements do not gate it. They do remain in the
-            // document's load-event delay set, including scripts inserted by
-            // a DOMContentLoaded listener.
-            let _ = js.execute_script(
-                "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
-            );
+        let completion = async {
+            if let Some(error) = lifecycle_error { return Err(PageError::LifecycleError(error.into())); }
+            if let Some(js) = &mut self.js {
+                #[cfg(feature = "render")]
+                js.try_document_fragment(&mut fragment)
+                    .map_err(|error| PageError::FragmentError(error.into()))?;
+                // DOMContentLoaded follows parser/defer/module work, but async
+                // dynamic script elements do not gate it. They do remain in the
+                // document's load-event delay set, including scripts inserted by
+                // a DOMContentLoaded listener.
+                js.document_lifecycle(2).map_err(|error| PageError::LifecycleError(error.into()))?;
 
-            let load_blockers_finished =
-                Self::drive_load_delaying_scripts(js, script_deadline).await;
-            if !load_blockers_finished {
-                tracing::warn!(
-                    "script deadline reached with load-delaying dynamic scripts still pending"
-                );
+                let load_blockers_finished =
+                    Self::drive_load_delaying_scripts(js, script_deadline).await;
+                if !load_blockers_finished {
+                    tracing::warn!(
+                        "script deadline reached with load-delaying dynamic scripts still pending"
+                    );
+                }
+
+                #[cfg(feature = "render")]
+                js.try_document_fragment(&mut fragment)
+                    .map_err(|error| PageError::FragmentError(error.into()))?;
+
+                // readyState becomes complete before the load event. A script
+                // inserted by an onload handler is therefore post-load work and
+                // remains pending until an explicit caller settle/wait.
+                js.document_lifecycle(3).map_err(|error| PageError::LifecycleError(error.into()))?;
+                js.document_lifecycle(4).map_err(|error| PageError::LifecycleError(error.into()))?;
             }
-
-            // readyState becomes complete before the load event. A script
-            // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
-                "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 try {\n\
-                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
-                   if (typeof window.onload === 'function') {\n\
-                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
-                   }\n\
-                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
-                 } catch(e) {}",
-            );
-        }
+            Ok(())
+        }.await;
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
                 js.disarm_watchdog(token);
@@ -2940,6 +2920,7 @@ impl Page {
             budget_ms = script_deadline_ms,
             "script execution phase complete",
         );
+        completion
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -2975,9 +2956,10 @@ impl Page {
         let nav_timeout = self.navigation_timeout();
         let nav_timeout_ms = duration_millis_u64(nav_timeout);
 
+        let history = self.requested_history.take().unwrap_or_default();
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ResourceRequest::navigation(), history),
         )
         .await
         {
@@ -2990,6 +2972,7 @@ impl Page {
             }
         };
         if result.is_ok() {
+            self.sync_virtual_url();
             self.push_history(self.url_string());
         }
         result
@@ -3100,30 +3083,35 @@ impl Page {
         }
     }
 
-    /// Append the current URL to the history stack, truncating any forward
-    /// entries past the cursor (matches real Chrome: navigating after a
-    /// goBack clobbers the forward history).
-    pub fn push_history(&mut self, url: String) {
-        if url.is_empty() {
-            return;
-        }
-        // Don't dupe consecutive entries (Page.reload would otherwise pile up).
-        if self.history.get(self.history_index) == Some(&url) {
-            return;
-        }
-        if !self.history.is_empty() && self.history_index < self.history.len() - 1 {
-            self.history.truncate(self.history_index + 1);
-        }
-        self.history.push(url);
-        self.history_index = self.history.len() - 1;
+    /// Refresh the legacy CDP projection from native session history.
+    pub fn push_history(&mut self, _url: String) {
+        let history = self.session_history.borrow();
+        self.history = history
+            .entries
+            .iter()
+            .map(|entry| entry.url.clone())
+            .collect();
+        self.history_index = history.index;
     }
 
-    /// Move the history cursor without re-navigating; used by
-    /// Page.navigateToHistoryEntry which then drives the actual fetch.
+    /// Select a stable entry for the next CDP navigation, without committing it.
     pub fn set_history_index(&mut self, idx: usize) {
-        if idx < self.history.len() {
-            self.history_index = idx;
+        self.requested_history = self
+            .session_history
+            .borrow()
+            .entries
+            .get(idx)
+            .map(|entry| obscura_js::ops::HistoryNavigation::Traverse(entry.id));
+    }
+
+    pub fn reset_history(&mut self) {
+        {
+            let mut history = self.session_history.borrow_mut();
+            let entry = history.current().clone();
+            history.entries = vec![entry];
+            history.index = 0;
         }
+        self.push_history(self.url_string());
     }
 
     async fn navigate_with_wait_post_inner(
@@ -3132,12 +3120,14 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
-        initial_referrer: &str,
+        initial_request: ResourceRequest,
+        history: obscura_js::ops::HistoryNavigation,
     ) -> Result<(), PageError> {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
-        let mut document_referrer = initial_referrer.to_string();
+        let mut request = initial_request;
+        let mut current_history = history;
         let chain_limit = self.navigation_chain_limit();
         for chain in 0..chain_limit {
             self.navigate_single(
@@ -3145,10 +3135,22 @@ impl Page {
                 wait_until,
                 &current_method,
                 &current_body,
-                &document_referrer,
+                request.clone(),
+                current_history.clone(),
             )
             .await?;
-            if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
+            if let Some(navigation) = self
+                .js
+                .as_ref()
+                .and_then(|js| js.take_pending_navigation_request())
+            {
+                let obscura_js::ops::PendingNavigation {
+                    url: next_url,
+                    method: next_method,
+                    body: next_body,
+                    request: next_request,
+                    history: next_history,
+                } = navigation;
                 if cross_scheme_to_file(&current_url, &next_url) {
                     // SOP gate. A web page must not be able to drive
                     // a navigation to file:// and then read the loaded
@@ -3169,15 +3171,8 @@ impl Page {
                     current_url,
                     next_url
                 );
-                document_referrer = self
-                    .url
-                    .as_ref()
-                    .and_then(|source| {
-                        Url::parse(&next_url)
-                            .ok()
-                            .map(|target| navigation_referrer(source, &target))
-                    })
-                    .unwrap_or_default();
+                request = next_request;
+                current_history = next_history;
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
@@ -3201,14 +3196,33 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
-        referrer: &str,
+        mut request: ResourceRequest,
+        history_kind: obscura_js::ops::HistoryNavigation,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
+        // Revisit the original entry with its request policy. Never turn a
+        // POST-derived page into an implicit GET or an unapproved resubmission.
+        {
+            use obscura_js::ops::HistoryNavigation;
+            let history = self.session_history.borrow();
+            let entry = match &history_kind {
+                HistoryNavigation::Traverse(id) => Some(history.entries.iter().find(|e|e.id == *id)
+                    .ok_or_else(||PageError::NetworkError("HISTORY_ENTRY_GONE".into()))?),
+                HistoryNavigation::Reload => Some(history.current()),
+                _ => None,
+            };
+            if let Some(entry) = entry {
+                if entry.post {return Err(PageError::NetworkError("HISTORY_POST_REQUIRES_AUTHORIZATION".into()));}
+                request = entry.request.clone();
+            }
+        }
+        #[cfg(feature = "render")]
+        if let Some(js) = &self.js {js.save_session_scroll();}
+        let previous_lifecycle = self.lifecycle;
         self.lifecycle = LifecycleState::Loading;
-        self.referrer = referrer.to_string();
-        self.url = Some(url.clone());
         self.network_events.clear();
+        let history_request = request.clone();
 
         if self.context.obey_robots {
             if url.scheme() == "http" || url.scheme() == "https" {
@@ -3246,6 +3260,12 @@ impl Page {
         }
 
         if url.scheme() == "about" {
+            self.session_history.borrow_mut()
+                .commit_document(url.as_str(), &history_kind, history_request, false, false)
+                .map_err(|e| PageError::NetworkError(e.into()))?;
+            self.url = Some(url.clone());
+            self.referrer.clear();
+            self.referrer_policy = ReferrerPolicy::default();
             self.navigate_blank();
             self.init_js();
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
@@ -3281,13 +3301,14 @@ impl Page {
                 headers,
                 body: body_bytes,
                 redirected_from: Vec::new(),
+                request_referrer: None,
             })
         } else if method == "POST" {
             self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
+                .post_form_resource_with_callbacks(&url, body, request, Some(&self.callbacks))
                 .await
         } else {
-            self.do_fetch(&url).await
+            self.do_fetch(&url, request).await
         }
         .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
@@ -3308,9 +3329,17 @@ impl Page {
             main_is_binary,
         );
 
-        if !response.redirected_from.is_empty() {
-            self.url = Some(response.url.clone());
+        if matches!(response.status, 204 | 205) {
+            self.lifecycle = previous_lifecycle;
+            return Ok(());
         }
+        self.url = Some(if response.redirected_from.is_empty() {url.clone()} else {response.url.clone()});
+        self.session_history.borrow_mut().commit_document(
+            &self.url_string(), &history_kind, history_request,
+            method == "POST", !response.redirected_from.is_empty(),
+        ).map_err(|e| PageError::NetworkError(e.into()))?;
+        self.referrer = response.request_referrer.as_ref().map(Url::to_string).unwrap_or_default();
+        self.referrer_policy = response.header("referrer-policy").and_then(ReferrerPolicy::from_header).unwrap_or_default();
 
         // Honor the response charset: HTTP Content-Type → <meta charset> sniff
         // in the first 1KB → UTF-8 fallback. Without this, every non-UTF-8
@@ -3391,13 +3420,18 @@ impl Page {
             let _ = self.prepare_screenshot_resources(warmup_ms).await;
         }
 
+        #[cfg(feature = "render")]
+        if let Some(js) = &self.js {
+            js.restore_session_scroll().map_err(|e|PageError::NetworkError(e.into()))?;
+        }
+
         // Spec: DOMContentLoaded fires AFTER parser-blocking scripts run,
         // not before. Skipping execute_scripts() on the DCL path meant
         // every inline <script> in the page was silently dropped: form
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await;
+        self.execute_scripts().await?;
 
         #[cfg(feature = "render")]
         {
@@ -3661,6 +3695,7 @@ impl Page {
         let stealth_client = self.stealth_client.clone();
         let callbacks = self.callbacks.clone();
         let initiator = document_url.clone();
+            let referrer_policy = self.js.as_ref().map(|js| js.referrer_policy()).unwrap_or(self.referrer_policy);
         use futures::StreamExt as _;
         let requests = futures::stream::iter(requested.into_iter().map(|(raw, profile, kind)| {
             let client = client.clone();
@@ -3671,6 +3706,7 @@ impl Page {
             async move {
                 let parsed = url::Url::parse(&raw).expect("validated render resource URL");
                 let mut request = ResourceRequest::subresource(kind, &initiator);
+                request.referrer_policy = referrer_policy;
                 match profile {
                     Some(obscura_js::ImageRequestProfile::CorsSameOrigin) => {
                         request.mode = obscura_net::RequestMode::Cors;
@@ -4503,16 +4539,8 @@ impl Page {
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
-        if let Some((url, method, body)) = self.take_pending_navigation() {
-            let source_url = self
-                .url
-                .as_ref()
-                .and_then(|source| {
-                    Url::parse(&url)
-                        .ok()
-                        .map(|target| navigation_referrer(source, &target))
-                })
-                .unwrap_or_default();
+        if let Some(navigation) = self.js.as_ref().and_then(|js| js.take_pending_navigation_request()) {
+            let obscura_js::ops::PendingNavigation { url, method, body, request, history } = navigation;
             let nav_timeout = self.navigation_timeout();
             let nav_timeout_ms = duration_millis_u64(nav_timeout);
             let result = tokio::time::timeout(
@@ -4522,7 +4550,8 @@ impl Page {
                     crate::lifecycle::WaitUntil::Load,
                     &method,
                     &body,
-                    &source_url,
+                    request,
+                    history,
                 ),
             )
             .await
@@ -4531,6 +4560,7 @@ impl Page {
                 PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
             })?;
             result?;
+            self.sync_virtual_url();
             self.push_history(self.url_string());
             Ok(true)
         } else {
@@ -6123,7 +6153,7 @@ mod tests {
             </body></html>"#,
         ));
         page.init_js();
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
 
         let before = page
             .js
@@ -6317,7 +6347,7 @@ mod tests {
                 globalThis.__shared_deadline_completed = true;
             </script></head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(Some(350)).await;
+        page.execute_scripts_with_module_budget(Some(350)).await.unwrap();
 
         assert_eq!(
             request_rx
@@ -6383,7 +6413,7 @@ mod tests {
                 </script>
             </head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(Some(300)).await;
+        page.execute_scripts_with_module_budget(Some(300)).await.unwrap();
 
         assert_eq!(
             page.js
@@ -6411,7 +6441,7 @@ mod tests {
             <script type="importmap">{"imports":{"ordered":"./after.js"}}</script>
         </head><body></body></html>"#,
         );
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
 
         assert_eq!(
             page.js
@@ -6449,7 +6479,7 @@ mod tests {
             </script>
         </head><body></body></html>"#,
         );
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
 
         let js = page.js.as_mut().unwrap();
         assert_eq!(
@@ -6487,7 +6517,7 @@ mod tests {
             <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
         </head><body></body></html>"#,
         );
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
         page.settle_for_duration(500).await;
         assert_eq!(
             page.js
@@ -6510,7 +6540,7 @@ mod tests {
             <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
         </head><body></body></html>"#,
         );
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
         page.settle_for_duration(500).await;
         assert_eq!(
             page.js
@@ -6547,7 +6577,7 @@ mod tests {
             </script>
         </body></html>"#,
         );
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
         page.settle_for_duration(500).await;
         assert_eq!(
             page.js
@@ -6662,7 +6692,7 @@ mod tests {
             &html,
         );
 
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
 
         assert_eq!(
             requests
@@ -6680,8 +6710,8 @@ mod tests {
                 "dom-content-loaded",
                 "dynamic-exec",
                 "script-load",
-                "window-onload",
-                "window-load"
+                "window-load",
+                "window-onload"
             ]),
             "dynamic async scripts gate load, not DOMContentLoaded",
         );
@@ -6721,7 +6751,7 @@ mod tests {
         );
         let started = std::time::Instant::now();
 
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
 
         let elapsed = started.elapsed();
         assert!(
@@ -6891,7 +6921,7 @@ mod tests {
         let mut page = import_map_test_page("post-load-dynamic-lifecycle", &base, &html);
         let started = std::time::Instant::now();
 
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
 
         let navigation_elapsed = started.elapsed();
         assert!(
@@ -6946,7 +6976,7 @@ mod tests {
             </script></body></html>"#,
         );
 
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
         assert_eq!(
             page.js
                 .as_mut()
@@ -7024,7 +7054,7 @@ mod tests {
             </script></body></html>"#,
         );
         let started = std::time::Instant::now();
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
 
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
@@ -7090,7 +7120,7 @@ mod tests {
             &html,
         );
         let started = std::time::Instant::now();
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
         let elapsed = started.elapsed();
 
         assert!(
@@ -7132,7 +7162,7 @@ mod tests {
             </script>
         </body></html>"#,
         );
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
         page.settle_for_duration(500).await;
         assert_eq!(
             page.js
@@ -7165,7 +7195,7 @@ mod tests {
             </script>
         </head><body></body></html>"#,
         );
-        page.execute_scripts().await;
+        page.execute_scripts().await.unwrap();
         assert_eq!(
             page.js
                 .as_mut()
@@ -7974,6 +8004,12 @@ pub enum PageError {
 
     #[error("Parse error: {0}")]
     ParseError(String),
+
+    #[error("Fragment landing failed: {0}")]
+    FragmentError(String),
+
+    #[error("Document lifecycle failed: {0}")]
+    LifecycleError(String),
 
     /// A page kept triggering its own navigations until the chain's limit
     /// was exhausted. HTTP 3xx redirects are followed one layer down, in
