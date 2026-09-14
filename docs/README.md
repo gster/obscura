@@ -33,6 +33,7 @@ the wreq/BoringSSL transport and browser-identity protections.
 - [Use with Playwright](Use-with-Playwright.md)
 - [Use the MCP server](Use-the-MCP-server.md)
 - [Use as a Rust library](Use-as-a-Rust-library.md)
+- [Use the isolated runtime](Use-the-isolated-runtime.md)
 - [Persist cookies and storage](Persist-cookies-and-storage.md)
 - [Intercept and modify requests](Intercept-and-modify-requests.md)
 - [Run in production at scale](Run-in-production-at-scale.md)
@@ -50,7 +51,8 @@ the wreq/BoringSSL transport and browser-identity protections.
 
 ## Links
 
-- Source: https://github.com/h4ckf0r0day/obscura
+- Fork source: https://github.com/gster/obscura
+- Upstream source: https://github.com/h4ckf0r0day/obscura
 - Releases: https://github.com/h4ckf0r0day/obscura/releases
 - Issues: https://github.com/h4ckf0r0day/obscura/issues
 

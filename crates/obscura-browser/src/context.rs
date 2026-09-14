@@ -11,6 +11,7 @@ pub struct BrowserContext {
     pub platform: String,
     pub ua_platform: String,
     pub ua_platform_version: String,
+    pub device_identity: Option<obscura_js::ops::DeviceIdentity>,
     pub proxy_url: Option<String>,
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
@@ -126,6 +127,7 @@ impl BrowserContext {
             platform,
             ua_platform,
             ua_platform_version,
+            device_identity: None,
             proxy_url,
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
@@ -183,6 +185,7 @@ impl BrowserContext {
             platform: self.platform.clone(),
             ua_platform: self.ua_platform.clone(),
             ua_platform_version: self.ua_platform_version.clone(),
+            device_identity: self.device_identity.clone(),
             proxy_url: self.proxy_url.clone(),
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: self.obey_robots,
@@ -247,17 +250,23 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn isolated_copy_does_not_share_mutable_network_state() {
-        let source = BrowserContext::with_full_options(
+        let mut source = BrowserContext::with_full_options(
             "source".to_string(),
             None,
             false,
             Some("Template-UA/1.0".to_string()),
         );
+        source.device_identity = Some(obscura_js::ops::DeviceIdentity {
+            seed: 123, hardware_concurrency: 8, device_memory: 8.0,
+            screen_width: 1920, screen_height: 1080,
+        });
         source.cookie_jar.set_cookie("sid=source", &url::Url::parse("https://example.com").unwrap());
 
         let persistent = source.isolated_copy("persistent".to_string(), true);
         let incognito = source.isolated_copy("incognito".to_string(), false);
 
+        assert_eq!(serde_json::to_value(&persistent.device_identity).unwrap(), serde_json::to_value(&source.device_identity).unwrap());
+        assert_eq!(serde_json::to_value(&incognito.device_identity).unwrap(), serde_json::to_value(&source.device_identity).unwrap());
         assert_eq!(persistent.cookie_jar.get_all_cookies().len(), 1);
         assert!(incognito.cookie_jar.get_all_cookies().is_empty());
         persistent.cookie_jar.clear();

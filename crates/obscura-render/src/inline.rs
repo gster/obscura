@@ -54,6 +54,7 @@ static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.tt
 static SYSTEM_R: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SYSTEM_B: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
 static EMOJI_R: &[u8] = include_bytes!("../assets/noto-color-emoji.ttf");
+static CJK_R: &[u8] = include_bytes!("../../../fonts/NotoSansCJKsc-Regular.otf");
 #[cfg(test)]
 static FALLBACK: &[u8] = SYSTEM_R;
 
@@ -341,7 +342,7 @@ fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
         let mut declarations = Vec::new();
         for bytes in [
             SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
-            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
+            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B, CJK_R,
         ] {
             for id in database
                 .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)))
@@ -1492,6 +1493,34 @@ impl TextEngine {
             collector.owner_boxes,
             collector.boundary_events,
         )
+    }
+
+    /// Control values use the document's font selection and glyph cache. The
+    /// temporary shaped item must not accumulate across screenshots/Relay frames.
+    #[cfg(feature = "paint")]
+    pub(crate) fn paint_control_value(
+        &mut self,
+        text: &str,
+        style: &LayoutStyle,
+        rect: Rect,
+        clip: Rect,
+        pixmap: &mut tiny_skia::Pixmap,
+        mask: Option<&tiny_skia::Mask>,
+        scale: f32,
+    ) {
+        let length = self.items.len();
+        if let Some(item) = self.push_generated_text(text, style) {
+            self.finalize(item, (rect.x, rect.y), rect.width, Some(clip));
+            self.paint_item_with_clip_mask_scaled(
+                item,
+                pixmap,
+                (0.0, 0.0),
+                Some(clip),
+                mask,
+                scale,
+            );
+            self.items.truncate(length);
+        }
     }
 
     /// Shared tail of [`try_build`] / [`try_build_run`]: shape the collected
@@ -3067,7 +3096,7 @@ pub(crate) fn default_replaced_intrinsic_size(
 /// genuinely cannot fold are rejected: replaced/atomic elements, block-level
 /// children, floats, out-of-flow positioned boxes, and elements with generated
 /// content (which would be lost).
-fn inline_child_ok(
+pub(crate) fn inline_child_ok(
     tree: &DomTree,
     cid: NodeId,
     styles: &std::collections::HashMap<NodeId, LayoutStyle>,

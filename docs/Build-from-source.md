@@ -1,6 +1,6 @@
 ## Requirements
 
-- Rust 1.75+ ([rustup.rs](https://rustup.rs))
+- Rust 1.98.1 (validated toolchain; [rustup.rs](https://rustup.rs))
 - C compiler (gcc or clang)
 - ~5 GB free disk space (V8 compiles from source on first build)
 
@@ -9,12 +9,14 @@ First build takes about 5 minutes. Incremental builds are seconds.
 ## Build
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
+git clone git@github.com:gster/obscura.git
 cd obscura
 cargo build --release -p obscura-cli --bins --features render
 ```
 
-Binary is at `./target/release/obscura`.
+Binary is at `./target/release/obscura` unless `CARGO_TARGET_DIR` overrides it.
+This builds the CLI. The [isolated runtime](Use-the-isolated-runtime.md) has its
+own workspace, lockfile, and pinned toolchain in `runtime/`.
 
 This produces the release binary with geometry, screenshots, screencasting,
 and PDF export.

@@ -234,7 +234,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let stealth = state.stealth_client.clone();
                 #[cfg(not(feature = "stealth"))]
                 let stealth: Option<std::sync::Arc<()>> = None;
-                Ok((client, stealth, state.callbacks.clone()))
+                Ok((client, stealth, state.callbacks.clone(), state.referrer_policy))
             })(),
             None => self
                 .standalone_client
@@ -244,7 +244,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None)
+                    (client, stealth, None, obscura_net::ReferrerPolicy::default())
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
@@ -261,11 +261,12 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, stealth, callbacks)) => {
+                Ok((client, stealth, callbacks, referrer_policy)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-                    let request =
+                    let mut request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    request.referrer_policy = referrer_policy;
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
                         Some(stealth) => stealth

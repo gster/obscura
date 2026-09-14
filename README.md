@@ -144,6 +144,13 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
   </tr>
 </table>
 
+## Fork integration
+
+This fork is maintained at [gster/obscura](https://github.com/gster/obscura).
+The [isolated runtime guide](docs/Use-the-isolated-runtime.md) describes its Rust
+RPC executable, Python SDK, and Autopilot integration. Upstream releases and
+Docker images below are separate from this fork's pinned runtime artifacts.
+
 ## Install
 
 ### Download
@@ -200,7 +207,7 @@ Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage
 ### Build from source
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
+git clone git@github.com:gster/obscura.git
 cd obscura
 
 # Rendering
@@ -216,7 +223,7 @@ cargo build --release -p obscura-cli --bins --no-default-features
 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
-Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
+Validated with Rust 1.98.1 ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
 The stealth build also compiles BoringSSL and generates bindings, so it needs
 CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
 
@@ -265,6 +272,7 @@ obscura fetch https://example.com --screenshot page.png
 
 # The screenshot flag also has a short form
 obscura fetch https://example.com -s page.png
+```
 
 ### Testing against localhost / LAN dev servers
 
@@ -281,7 +289,6 @@ obscura serve --port 9222 --allow-private-network
 
 See [docs/Environment-variables.md](docs/Environment-variables.md) for the
 full allow/deny rules (DNS-resolution-time checks included).
-```
 
 ## Rendering
 
@@ -580,3 +587,9 @@ streaming `Page.startScreencast` protocol.
 Apache 2.0
 
 ---
+
+## Isolated runtime and Python client
+
+The [isolated runtime guide](docs/Use-the-isolated-runtime.md) covers the Rust RPC
+executable, standalone Python client, pinned builds, and the Autopilot consumer
+boundary. These components are maintained in this repository.

@@ -1473,19 +1473,16 @@ pub async fn handle(
         }
         "navigateToHistoryEntry" => {
             let entry_id = params.get("entryId").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            // Snapshot history and the current cursor BEFORE moving it, so a
-            // navigation that fails can roll back to where the page actually is
-            // instead of leaving currentIndex on an entry it never reached (#920).
-            let (target_url, saved_history, prev_index) = {
+            // Select an entry without moving the native session-history cursor.
+            let target_url = {
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
                 let url = page.history.get(entry_id).cloned();
-                let snapshot = (page.history.clone(), page.history_index);
                 if url.is_some() {
                     page.set_history_index(entry_id);
                 }
-                (url, snapshot.0, snapshot.1)
+                url
             };
             if let Some(url) = target_url {
                 let nav_result = {
@@ -1495,22 +1492,16 @@ pub async fn handle(
                     page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
                         .await
                 };
-                // navigate_with_wait's push_history rewrote history during the
-                // load, so restore the snapshot either way. On failure the page
-                // never moved — put the cursor back where it was (#920).
-                if let Err(e) = nav_result {
-                    if let Some(page) = ctx.get_session_page_mut(session_id) {
-                        page.history = saved_history;
-                        page.history_index = prev_index;
-                    }
-                    return Err(e.to_string());
+                // The native history owns commit/rollback, including redirects.
+                // Refresh the CDP view from it on both success and failure.
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    page.push_history(page.url_string());
                 }
+                nav_result.map_err(|e| e.to_string())?;
                 let (frame_id, page_id, network_events, page_url, reached_idle) = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
-                    page.history = saved_history;
-                    page.history_index = entry_id;
                     // Flush script-initiated network events before draining,
                     // matching do_navigate — otherwise fetch/XHR requests the
                     // navigated page starts are dropped from CDP events (#920).
@@ -1540,8 +1531,7 @@ pub async fn handle(
         }
         "resetNavigationHistory" => {
             if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.history.clear();
-                page.history_index = 0;
+                page.reset_history();
             }
             Ok(json!({}))
         }
@@ -1810,11 +1800,11 @@ mod tests {
 
         {
             let page = ctx.get_session_page_mut(&session).unwrap();
-            page.history = vec![
-                "data:text/html,<title>a</title>".to_string(),
-                "data:text/html,<title>b</title>".to_string(),
-            ];
-            page.history_index = 1;
+            page.navigate_with_wait("data:text/html,<title>a</title>", WaitUntil::DomContentLoaded)
+                .await.unwrap();
+            page.reset_history();
+            page.navigate_with_wait("data:text/html,<title>b</title>", WaitUntil::DomContentLoaded)
+                .await.unwrap();
         }
 
         handle(
@@ -1829,6 +1819,8 @@ mod tests {
         let page = ctx.get_session_page(&session).unwrap();
         assert_eq!(page.history_index, 0, "currentIndex must move to the target entry");
         assert_eq!(page.history.len(), 2, "history must be preserved across the navigation");
+        assert_eq!(page.url_string(), "data:text/html,<title>a</title>");
+
     }
 
     // #833: chromiumoxide's new_page waits for the initial target's "load"

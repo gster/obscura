@@ -1,2 +1,6 @@
 target/
 .DS_Store
+__pycache__/
+*.py[cod]
+/bindings/python/dist/
+/bindings/python/.venv/

@@ -1,4 +1,4 @@
-Obscura is a workspace of nine crates.
+Obscura has a root workspace of nine crates and a separate isolated runtime workspace.
 
 ```
 obscura-cli       CLI entry point. fetch, serve, scrape, mcp.
@@ -23,7 +23,7 @@ CDP client (Puppeteer)
 obscura-cdp/server.rs           accept, route by sessionId
         │
         ▼
-obscura-cdp/dispatch.rs         method router, acquires v8_lock
+obscura-cdp/dispatch.rs         method router on the owning connection thread
         │
         ▼
 obscura-cdp/domains/page.rs     Page.navigate handler
@@ -56,24 +56,24 @@ viewport, scroll, animation, font, and resource changes. The same geometry
 therefore drives browser APIs and paint instead of maintaining separate
 measurement and screenshot models.
 
-## Single V8 isolate
+## V8 ownership
 
-All pages in a process share one V8 isolate. The isolate is single-threaded by design.
+Each page runtime owns a V8 isolate. The CDP server warms V8 on its main thread,
+then gives each connection an OS thread with a current-thread Tokio runtime and
+LocalSet. A connection owns its pages, cookie jar, and HTTP client. Isolate
+construction is serialized by `ISOLATE_CREATE_LOCK`; execution is confined to
+the owner thread and uses scoped isolate entry/exit, not a process-wide async lock.
+Long operations are serviced through `process_with_interception` in `server.rs`.
 
-`obscura_js::v8_lock::global()` is a `tokio::sync::Mutex` that serializes V8 work. A handler that wants to run JS must acquire the lock first:
-
-```rust
-let _guard = obscura_js::v8_lock::global().lock().await;
-page.evaluate(expr).await
-```
-
-The dispatcher routes long-running operations (navigation, eval) through `process_with_interception` in `server.rs`, which spawns the work onto the tokio `LocalSet` and releases the dispatcher to keep handling other CDP messages.
-
-This is why `Target.createTarget` from many concurrent clients works: each `newPage` returns immediately while the actual navigation runs in a spawned task.
+The separate [isolated runtime](Use-the-isolated-runtime.md) embeds the same
+engine and exposes bounded NDJSON to `obscura_runtime.BrowserSession`. Its
+browser loop owns the pages on one thread; it does not run the CDP server.
+Application scheduling, business workflows, and Attempt cleanup remain with the
+consumer. Use release-mode `cargo nextest` for process-isolated test execution.
 
 ## Robustness
 
-One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. The complete script phase is bounded by `OBSCURA_SCRIPT_DEADLINE_MS`; enhancement modules have a shorter per-module graph-loading/evaluation budget controlled by `OBSCURA_MODULE_BUDGET_MS`, while modules mounting an empty SPA shell receive the full script deadline. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot hold the V8 lock and wedge other sessions (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module network requests are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
+One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. The complete script phase is bounded by `OBSCURA_SCRIPT_DEADLINE_MS`; enhancement modules have a shorter per-module graph-loading/evaluation budget controlled by `OBSCURA_MODULE_BUDGET_MS`, while modules mounting an empty SPA shell receive the full script deadline. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot indefinitely block the owning connection (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module network requests are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
 
 ## JS bridge
 

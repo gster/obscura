@@ -12,11 +12,11 @@ use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 #[cfg(feature = "render")]
-use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
+use obscura_net::RequestCredentials;
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
-    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    RequestMode, CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response, ResourceRequest, ReferrerPolicy,
 };
 use tokio::sync::Mutex;
 
@@ -104,6 +104,147 @@ pub(crate) struct CanvasBackingSurface {
     pub pixels: JsBuffer,
 }
 
+#[derive(Clone, Debug, Default)]
+pub enum HistoryNavigation {
+    #[default]
+    Push,
+    Replace,
+    Reload,
+    Traverse(u64),
+}
+
+#[derive(Clone)]
+pub struct SessionHistoryEntry {
+    pub id: u64,
+    pub document: u64,
+    pub url: String,
+    pub data: Option<Vec<u8>>,
+    pub scroll: String,
+    pub position: Option<String>,
+    pub request: ResourceRequest,
+    pub post: bool,
+}
+
+pub type SharedSessionHistory = Rc<RefCell<SessionHistory>>;
+
+pub struct SessionHistory {
+    pub entries: Vec<SessionHistoryEntry>,
+    pub index: usize,
+    pub epoch: u64,
+    next_id: u64,
+    initial: bool,
+}
+
+impl Default for SessionHistory {
+    fn default() -> Self {
+        Self {
+            entries: vec![SessionHistoryEntry {
+                id: 0,
+                document: 0,
+                url: "about:blank".into(),
+                data: None,
+                scroll: "auto".into(),
+                position: None,
+                request: ResourceRequest::navigation(),
+                post: false,
+            }],
+            index: 0,
+            epoch: 0,
+            next_id: 1,
+            initial: true,
+        }
+    }
+}
+
+impl SessionHistory {
+    pub fn current(&self) -> &SessionHistoryEntry {
+        &self.entries[self.index]
+    }
+    pub fn save_position(&mut self, position: Option<String>) {
+        self.entries[self.index].position = position;
+    }
+    fn allocate_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("session history id exhausted");
+        id
+    }
+    fn describe(&self) -> serde_json::Value {
+        let e = self.current();
+        serde_json::json!({"id":e.id.to_string(),"url":e.url,"data":e.data,
+            "scroll":e.scroll,"position":e.position,"length":self.entries.len()})
+    }
+    pub fn commit_document(
+        &mut self,
+        url: &str,
+        kind: &HistoryNavigation,
+        request: ResourceRequest,
+        post: bool,
+        redirected: bool,
+    ) -> Result<(), &'static str> {
+        let target = match kind {
+            HistoryNavigation::Traverse(id) => Some(
+                self.entries
+                    .iter()
+                    .position(|e| e.id == *id)
+                    .ok_or("HISTORY_ENTRY_GONE")?,
+            ),
+            HistoryNavigation::Reload => Some(self.index),
+            _ => None,
+        };
+        self.epoch = self.epoch.checked_add(1).ok_or("HISTORY_EPOCH_EXHAUSTED")?;
+        if let Some(index) = target {
+            self.index = index;
+            self.entries[index].url = url.into();
+            if redirected {
+                // Redirects create a new document state, even at the same URL.
+                self.entries[index].document = self.epoch;
+                self.entries[index].data = None;
+            }
+        } else {
+            let entry = SessionHistoryEntry {
+                id: self.allocate_id(),
+                document: self.epoch,
+                url: url.into(),
+                data: None,
+                scroll: self.current().scroll.clone(),
+                position: None,
+                request,
+                post,
+            };
+            if self.initial || matches!(kind, HistoryNavigation::Replace) {
+                self.entries[self.index] = entry;
+            } else {
+                self.entries.truncate(self.index + 1);
+                self.entries.push(entry);
+                self.index += 1;
+            }
+        }
+        self.initial = false;
+        Ok(())
+    }
+}
+
+pub struct PendingNavigation {
+    pub history: HistoryNavigation,
+    pub url: String,
+    pub method: String,
+    pub body: String,
+    pub request: ResourceRequest,
+}
+
+/// Immutable embedding-owned device description, shared by every page realm.
+#[derive(Clone, serde::Serialize)]
+pub struct DeviceIdentity {
+    pub seed: u32,
+    pub hardware_concurrency: u32,
+    pub device_memory: f64,
+    pub screen_width: u32,
+    pub screen_height: u32,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -116,6 +257,8 @@ pub struct ObscuraState {
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
     pub referrer: String,
+    pub referrer_policy: ReferrerPolicy,
+    pub device_identity: Option<DeviceIdentity>,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
@@ -128,7 +271,11 @@ pub struct ObscuraState {
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
-    pub pending_navigation: Option<(String, String, String)>,
+    pub session_history: SharedSessionHistory,
+    pub history_epoch: u64,
+    pub restoring_history_scroll: bool,
+    pub pending_navigation: Option<PendingNavigation>,
+    pub same_document_navigation: bool,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
@@ -185,6 +332,7 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    pub document_lifecycle: u8,
     /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
     /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
     /// Interior mutability so the read path keeps its shared borrow.
@@ -289,6 +437,9 @@ pub struct ObscuraState {
     pub element_scroll_offsets: HashMap<NodeId, (f32, f32)>,
     #[cfg(feature = "render")]
     pub scroll_generation: u64,
+    /// Explicit CSSOM scroll changes; DOM cleanup and layout clamping do not count.
+    #[cfg(feature = "render")]
+    pub script_scroll_generation: u64,
     #[cfg(feature = "render")]
     pub resolved_scroll: Option<(u64, obscura_render::ResolvedScrollState)>,
     /// Window-global import-map state shared by parser-discovered scripts,
@@ -345,13 +496,19 @@ impl ObscuraState {
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
+            referrer_policy: ReferrerPolicy::default(),
+            device_identity: None,
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
             stealth_client: None,
+            session_history: Rc::new(RefCell::new(SessionHistory::default())),
+            history_epoch: 0,
+            restoring_history_scroll: false,
             pending_navigation: None,
+            same_document_navigation: false,
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
@@ -375,6 +532,7 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            document_lifecycle: 0,
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
             prepared_render: None,
@@ -430,6 +588,8 @@ impl ObscuraState {
             element_scroll_offsets: HashMap::new(),
             #[cfg(feature = "render")]
             scroll_generation: 0,
+            #[cfg(feature = "render")]
+            script_scroll_generation: 0,
             #[cfg(feature = "render")]
             resolved_scroll: None,
             import_map: Rc::new(RefCell::new(ImportMap::default())),
@@ -1351,7 +1511,823 @@ fn op_dom(
     })
 }
 
+/// User input changes selector matching without changing content attributes.
+pub(crate) fn invalidate_input_render(state: &mut ObscuraState) {
+    state.activity_generation = state.activity_generation.wrapping_add(1);
+    #[cfg(feature = "render")]
+    {
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+        state.resolved_scroll = None;
+    }
+}
+
+pub(crate) fn input_focusable(state: &mut ObscuraState, id: NodeId) -> bool {
+    if !state.dom.as_ref().is_some_and(|dom| dom.can_focus(id)) {
+        return false;
+    }
+    #[cfg(feature = "render")]
+    {
+        let loading = state.render_resources.set_sync_loading_enabled(false);
+        let ready = ensure_resolved_scroll(state).is_some();
+        state.render_resources.set_sync_loading_enabled(loading);
+        if !ready {
+            return false;
+        }
+        let dom = state.dom.as_ref().unwrap();
+        let layout = state.prepared_render.as_ref().unwrap().layout();
+        if !layout.rects.contains_key(&id) {
+            return false;
+        }
+        for node in std::iter::once(id).chain(dom.ancestors(id)) {
+            if let Some(hidden) = layout
+                .styles
+                .get(&node)
+                .and_then(|style| style.visibility_hidden)
+            {
+                return !hidden;
+            }
+        }
+    }
+    true
+}
+
+fn focus_dom_op(shared: &SharedState, cmd: &str, arg1: &str, arg2: &str) -> String {
+    let mut state = shared.borrow_mut();
+    let Some(dom) = state.dom.as_ref() else {
+        return "null".into();
+    };
+    let previous = dom.input_state();
+    if cmd == "focus_state" {
+        return serde_json::json!([
+            previous.focused.map(|id| id.raw() as i64).unwrap_or(-1),
+            previous.focus_generation
+        ])
+        .to_string();
+    }
+    let node = arg1.parse::<u32>().ok().map(NodeId::new);
+    if cmd == "focusable" {
+        return node
+            .is_some_and(|id| input_focusable(&mut state, id))
+            .to_string();
+    }
+    let valid_target = arg1 == "-1" || node.is_some_and(|id| input_focusable(&mut state, id));
+    let next = if valid_target {
+        arg2.parse::<u64>()
+            .ok()
+            .and_then(|generation| state.dom.as_ref().unwrap().set_focused(node, generation))
+    } else {
+        None
+    };
+    let applied = next.is_some();
+    let current = next.unwrap_or_else(|| state.dom.as_ref().unwrap().input_state());
+    if previous != current {
+        invalidate_input_render(&mut state);
+    }
+    serde_json::json!([
+        applied,
+        current.focused.map(|id| id.raw() as i64).unwrap_or(-1),
+        current.focus_generation
+    ])
+    .to_string()
+}
+
+fn text_dom_op(shared: &SharedState, cmd: &str, arg1: &str, arg2: &str) -> String {
+    let mut state = shared.borrow_mut();
+    let Some(dom) = state.dom.as_ref() else {
+        return "null".into();
+    };
+    let Ok(id) = arg1.parse::<u32>().map(NodeId::new) else {
+        return "null".into();
+    };
+    if cmd == "text_take_change" {
+        return dom.take_text_change(id).to_string();
+    }
+    let value = match cmd {
+        "text_state" => dom.text_control(id),
+        "text_value_set" => dom.set_text_value(id, arg2),
+        "text_reset" => dom.reset_text_control(id),
+        "text_selection_set" => serde_json::from_str::<(u32, u32, String)>(arg2)
+            .ok()
+            .and_then(|(start, end, direction)| {
+                if !dom.text_control_kind(id)?.supports_selection() {
+                    return None;
+                }
+                dom.set_text_selection(id, start, end, &direction)
+            }),
+        _ => None,
+    };
+    let connected = dom.is_connected(id);
+    let Some(value) = value else {
+        return "null".into();
+    };
+    if cmd != "text_state" && connected {
+        invalidate_input_render(&mut state);
+    }
+    serde_json::json!({"value":value.value,"default_value":value.default_value,"selection":[value.start,value.end,value.direction],
+        "selection_supported":value.kind.supports_selection(),"generation":value.generation}).to_string()
+}
+
+fn checked_dom_op(shared: &SharedState, cmd: &str, arg1: &str, arg2: &str) -> String {
+    let mut state = shared.borrow_mut();
+    let Some(dom) = state.dom.as_ref() else {
+        return "null".into();
+    };
+    let Ok(id) = arg1.parse::<u32>().map(NodeId::new) else {
+        return "null".into();
+    };
+    if cmd == "label_forwarding" {
+        return dom.label_forwarding(id).to_string();
+    }
+    if cmd == "form_owner" {
+        return serde_json::json!(dom.form_owner(id).map(NodeId::raw)).to_string();
+    }
+    if cmd == "form_controls" {
+        return serde_json::json!(dom
+            .form_controls(id)
+            .into_iter()
+            .map(NodeId::raw)
+            .collect::<Vec<_>>())
+        .to_string();
+    }
+    let value = match cmd {
+        "checked_state" => dom.checked_state(id),
+        "checked_set" => arg2
+            .parse::<bool>()
+            .ok()
+            .and_then(|value| dom.set_checked(id, value)),
+        "indeterminate_set" => arg2
+            .parse::<bool>()
+            .ok()
+            .and_then(|value| dom.set_indeterminate(id, value)),
+        "checked_reset" => dom.reset_checked(id),
+        _ => None,
+    };
+    let Some(value) = value else {
+        return "null".into();
+    };
+    let kind = dom.input_type(id);
+    let connected = dom.is_connected(id);
+    if cmd != "checked_state" && connected {
+        invalidate_input_render(&mut state);
+    }
+    serde_json::json!({"checked":value.checked,"default_checked":value.default_checked,"dirty":value.dirty,
+        "indeterminate":value.indeterminate,"type":kind}).to_string()
+}
+
+/// HTML form serialization normalizes lone CR/LF before percent encoding.
+pub fn encode_form_text(entries: &[(String, String)]) -> String {
+    fn crlf(value: &str) -> String {
+        value.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n")
+    }
+    let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in entries {
+        encoded.append_pair(&crlf(name), &crlf(value));
+    }
+    encoded.finish()
+}
+
+/// Plan from current native DOM facts; callers commit only a complete request.
+fn form_navigation(
+    state: &ObscuraState,
+    form: NodeId,
+    submitter: Option<NodeId>,
+    entries: &[(String, String)],
+) -> Result<Option<PendingNavigation>, &'static str> {
+    let dom = state.dom.as_ref().ok_or("FORM_INVALID")?;
+    if !dom.is_html_element(form, "form") {
+        return Err("FORM_INVALID");
+    }
+    if !dom.is_connected(form) {
+        return Ok(None);
+    }
+    let form_node = dom.get_node(form).ok_or("FORM_INVALID")?;
+    let button = submitter.and_then(|id| dom.get_node(id));
+    let attr = |name, override_name| {
+        button
+            .as_ref()
+            .and_then(|node| node.get_attribute(override_name))
+            .or_else(|| form_node.get_attribute(name))
+            .unwrap_or("")
+    };
+    let method = attr("method", "formmethod");
+    if method.eq_ignore_ascii_case("dialog") {
+        return Err("INPUT_ELEMENT_UNSUPPORTED");
+    }
+    let post = method.eq_ignore_ascii_case("post");
+    let enctype = attr("enctype", "formenctype");
+    if post
+        && ["multipart/form-data", "text/plain"]
+            .iter()
+            .any(|value| enctype.eq_ignore_ascii_case(value))
+    {
+        return Err("INPUT_ELEMENT_UNSUPPORTED");
+    }
+    if form_node
+        .get_attribute("accept-charset")
+        .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("utf-8"))
+    {
+        return Err("INPUT_ELEMENT_UNSUPPORTED");
+    }
+    let base_target = dom
+        .query_selector("base[target]")
+        .ok()
+        .flatten()
+        .and_then(|id| dom.get_node(id))
+        .and_then(|node| node.get_attribute("target").map(str::to_string));
+    let target = button
+        .as_ref()
+        .and_then(|node| node.get_attribute("formtarget"))
+        .or_else(|| form_node.get_attribute("target"))
+        .or(base_target.as_deref())
+        .unwrap_or("");
+    if !(target.is_empty()
+        || target.eq_ignore_ascii_case("_self")
+        || (state.frame_id == 0
+            && (target.eq_ignore_ascii_case("_top") || target.eq_ignore_ascii_case("_parent"))))
+    {
+        return Err("INPUT_ELEMENT_UNSUPPORTED");
+    }
+    let source = dom
+        .document_url()
+        .and_then(|value| url::Url::parse(&value).ok())
+        .ok_or("INPUT_ELEMENT_UNSUPPORTED")?;
+    let action = attr("action", "formaction");
+    let mut url = if action.is_empty() {
+        source.clone()
+    } else {
+        let base = document_base_url(state).ok_or("INPUT_ELEMENT_UNSUPPORTED")?;
+        url::Url::parse(&base)
+            .and_then(|base| base.join(action))
+            .map_err(|_| "INPUT_ELEMENT_UNSUPPORTED")?
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.fragment().is_some() {
+        return Err("INPUT_ELEMENT_UNSUPPORTED");
+    }
+    let encoded = encode_form_text(entries);
+    let mut request = ResourceRequest::navigation();
+    request.referrer_policy = state.referrer_policy;
+    if form_node.get_attribute("rel").is_some_and(|value| {
+        value
+            .split_ascii_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("noreferrer"))
+    }) {
+        request.referrer_policy = ReferrerPolicy::NoReferrer;
+    }
+    request.referrer = Some(source.clone());
+    request.initiator = Some(source);
+    if !post {
+        url.set_query(Some(&encoded));
+    }
+    Ok(Some(PendingNavigation {
+        history: HistoryNavigation::Push,
+        url: url.to_string(),
+        method: if post { "POST" } else { "GET" }.into(),
+        body: if post { encoded } else { String::new() },
+        request,
+    }))
+}
+
+/// Check supported native submission without dispatching events or planning navigation.
+pub(crate) fn preflight_form_submission(
+    state: &ObscuraState,
+    form: NodeId,
+    button: NodeId,
+) -> Result<(), &'static str> {
+    let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+    let form_node = dom.get_node(form).ok_or("INPUT_TARGET_CHANGED")?;
+    let submitter = dom.get_node(button).ok_or("INPUT_TARGET_CHANGED")?;
+    if form_node.get_attribute("novalidate").is_none()
+        && submitter.get_attribute("formnovalidate").is_none()
+    {
+        for control in dom.form_controls(form) {
+            control_validity(state, control)?;
+        }
+    }
+    let entries = dom.form_text_entries(form, Some(button))?;
+    form_navigation(state, form, Some(button), &entries)?;
+    Ok(())
+}
+
+/// Return native facts; ECMAScript pattern matching stays in the protected V8 closure.
+fn control_validity(state: &ObscuraState, id: NodeId) -> Result<serde_json::Value, &'static str> {
+    let dom = state.dom.as_ref().ok_or("FORM_INVALID")?;
+    let node = dom.get_node(id).ok_or("FORM_INVALID")?;
+    let input = dom.is_html_element(id, "input");
+    let text = dom.text_control(id);
+    let kind = dom.input_type(id).unwrap_or_default();
+    let button = dom.is_html_element(id, "button");
+    let readonly = text.is_some() && node.get_attribute("readonly").is_some();
+    let candidate = (input || text.is_some() || button || dom.is_html_element(id, "select"))
+        && !dom.is_disabled(id)
+        && !readonly
+        && !dom
+            .ancestors(id)
+            .iter()
+            .any(|id| dom.is_html_element(*id, "datalist"))
+        && !(input && matches!(kind.as_str(), "hidden" | "reset" | "button"))
+        && !(button && !dom.is_submit_button(id));
+    let supported = text.is_some()
+        || button
+        || !input && !dom.is_html_element(id, "select")
+        || matches!(
+            kind.as_str(),
+            "checkbox" | "radio" | "hidden" | "reset" | "button" | "submit" | "image"
+        );
+    if candidate && !supported {
+        return Err("INPUT_ELEMENT_UNSUPPORTED");
+    }
+    let custom = dom.custom_validity(id);
+    let required = node.get_attribute("required").is_some();
+    let mut missing = false;
+    let mut too_long = false;
+    let mut too_short = false;
+    let mut value = String::new();
+    let mut pattern = None;
+    let mut multiple = false;
+    if let Some(text) = text {
+        value = text.value;
+        missing = required && value.is_empty() && !readonly;
+        let length = value.encode_utf16().count();
+        let bound = |attribute| node.get_attribute(attribute).and_then(|value| {
+            let value = value.trim_start_matches([' ', '\t', '\n', '\r', '\u{000c}']);
+            let value = value.strip_prefix('+').unwrap_or(value);
+            let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<usize>().ok()
+        });
+        if text.dirty && text.last_user_edit {
+            too_long = bound("maxlength").is_some_and(|max| length > max);
+            too_short = !value.is_empty() && bound("minlength").is_some_and(|min| length < min);
+        }
+        if input {
+            pattern = node.get_attribute("pattern").map(str::to_string);
+        }
+        multiple = node.get_attribute("multiple").is_some();
+    } else if kind == "checkbox" {
+        missing = required && !dom.checked_state(id).is_some_and(|state| state.checked);
+    } else if kind == "radio" {
+        missing = dom.radio_value_missing(id);
+    }
+    Ok(
+        serde_json::json!({"candidate":candidate,"valueMissing":missing,"tooLong":too_long,
+        "tooShort":too_short,"customError":!custom.is_empty(),"customMessage":custom,
+        "value":value,"kind":kind,"multiple":multiple,"pattern":pattern,
+        "urlValid":kind != "url" || value.is_empty() || url::Url::parse(&value).is_ok()}),
+    )
+}
+
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if matches!(
+        cmd.as_str(),
+        "control_validity" | "custom_validity_set" | "validation_controls" | "form_no_validate"
+    ) {
+        let state = shared.borrow();
+        let result = (|| {
+            let dom = state.dom.as_ref().ok_or("FORM_INVALID")?;
+            let id = arg1
+                .parse::<u32>()
+                .map(NodeId::new)
+                .map_err(|_| "FORM_INVALID")?;
+            let node = dom.get_node(id).ok_or("FORM_INVALID")?;
+            if cmd == "custom_validity_set" {
+                dom.set_custom_validity(id, &arg2);
+                return Ok(serde_json::Value::Null);
+            }
+            if cmd == "validation_controls" {
+                return Ok(serde_json::json!(if dom.is_html_element(id, "form") {
+                    dom.form_controls(id)
+                        .into_iter()
+                        .map(NodeId::raw)
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![id.raw()]
+                }));
+            }
+            if cmd == "form_no_validate" {
+                let button = arg2
+                    .parse::<u32>()
+                    .ok()
+                    .map(NodeId::new)
+                    .and_then(|id| dom.get_node(id));
+                return Ok(serde_json::json!(
+                    node.get_attribute("novalidate").is_some()
+                        || button
+                            .is_some_and(|node| node.get_attribute("formnovalidate").is_some())
+                ));
+            }
+            control_validity(&state, id)
+        })();
+        return result
+            .unwrap_or_else(|error| serde_json::json!({"error":error}))
+            .to_string();
+    }
+
+    if cmd == "form_submit_begin" || cmd == "form_submit_end" {
+        let state = shared.borrow();
+        let result = (|| {
+            let dom = state.dom.as_ref().ok_or("FORM_INVALID")?;
+            let form = arg1
+                .parse::<u32>()
+                .map(NodeId::new)
+                .map_err(|_| "FORM_INVALID")?;
+            if cmd == "form_submit_end" {
+                dom.end_form_submission(form);
+                return Ok(false);
+            }
+            let submitter = if arg2.is_empty() {
+                None
+            } else {
+                Some(
+                    arg2.parse::<u32>()
+                        .map(NodeId::new)
+                        .map_err(|_| "FORM_SUBMITTER_TYPE")?,
+                )
+            };
+            dom.begin_form_submission(form, submitter)
+        })();
+        return match result {
+            Ok(started) => serde_json::json!({"started": started}).to_string(),
+            Err(error) => serde_json::json!({"error": error}).to_string(),
+        };
+    }
+
+    if matches!(
+        cmd.as_str(),
+        "form_entries_begin" | "form_entries_end" | "form_entries_active"
+    ) {
+        let state = shared.borrow();
+        let result = (|| {
+            let dom = state.dom.as_ref().ok_or("FORM_INVALID")?;
+            let form = arg1
+                .parse::<u32>()
+                .map(NodeId::new)
+                .map_err(|_| "FORM_INVALID")?;
+            if cmd == "form_entries_active" {
+                return Ok(serde_json::json!(dom.constructing_form_entries(form)));
+            }
+            if cmd == "form_entries_end" {
+                dom.end_form_entries(form);
+                return Ok(serde_json::Value::Null);
+            }
+            let submitter = if arg2.is_empty() {
+                None
+            } else {
+                Some(
+                    arg2.parse::<u32>()
+                        .map(NodeId::new)
+                        .map_err(|_| "FORM_SUBMITTER_TYPE")?,
+                )
+            };
+            dom.begin_form_entries(form, submitter)
+                .map(|entries| serde_json::json!(entries))
+        })();
+        return result
+            .unwrap_or_else(|error| serde_json::json!({"error":error}))
+            .to_string();
+    }
+
+    if cmd == "form_navigate" {
+        let mut state = shared.borrow_mut();
+        let result = (|| {
+            let form = arg1
+                .parse::<u32>()
+                .map(NodeId::new)
+                .map_err(|_| "FORM_INVALID")?;
+            let (submitter, entries): (Option<u32>, Vec<(String, String)>) =
+                serde_json::from_str(&arg2).map_err(|_| "FORM_ENTRIES_INVALID")?;
+            form_navigation(&state, form, submitter.map(NodeId::new), &entries)
+        })();
+        return match result {
+            Ok(navigation) => {
+                if let Some(navigation) = navigation {
+                    state.url = navigation.url.clone();
+                    state.pending_navigation = Some(navigation);
+                    state.same_document_navigation = false;
+                }
+                "{}".into()
+            }
+            Err(error) => serde_json::json!({"error": error}).to_string(),
+        };
+    }
+
+    if cmd == "device_identity" {
+        return serde_json::to_string(&shared.borrow().device_identity).unwrap();
+    }
+    if matches!(cmd.as_str(), "location_url_get" | "location_url_resolve") {
+        let state = shared.borrow();
+        let current = state
+            .dom
+            .as_ref()
+            .and_then(DomTree::document_url)
+            .unwrap_or_else(|| "about:blank".into());
+        let Ok(mut url) = url::Url::parse(&current) else {
+            return serde_json::json!({"error":"SyntaxError"}).to_string();
+        };
+        if cmd == "location_url_get" {
+            return url_components(&url).to_string();
+        }
+        let before = url.clone();
+        match arg1.as_str() {
+            "href" => {
+                let parsed = document_base_url(&state)
+                    .and_then(|base| url::Url::parse(&base).ok())
+                    .and_then(|base| base.join(&arg2).ok());
+                let Some(next) = parsed else {
+                    return serde_json::json!({"error":"SyntaxError"}).to_string();
+                };
+                url = next;
+            }
+            "hash" => {
+                url.set_fragment(Some(arg2.strip_prefix('#').unwrap_or(&arg2)));
+                if url.fragment().unwrap_or("") == before.fragment().unwrap_or("") {
+                    return serde_json::json!({"noop":true}).to_string();
+                }
+            }
+            "protocol" => {
+                // The URL crate reports ignored scheme transitions as Err too.
+                // Location throws only for invalid syntax, then navigates the
+                // URL that the setter actually produced.
+                let scheme: String = arg2
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|ch| !matches!(ch, '\t' | '\n' | '\r'))
+                    .collect();
+                let mut bytes = scheme.bytes();
+                if !bytes.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+                    || !bytes
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'+' | b'-' | b'.'))
+                {
+                    return serde_json::json!({"error":"SyntaxError"}).to_string();
+                }
+                let _ = url::quirks::set_protocol(&mut url, &scheme);
+                if !matches!(url.scheme(), "http" | "https") {
+                    return serde_json::json!({"noop":true}).to_string();
+                }
+            }
+            "host" | "hostname" | "pathname" if url.cannot_be_a_base() => {
+                return serde_json::json!({"noop":true}).to_string();
+            }
+            "host" => {
+                let _ = url::quirks::set_host(&mut url, &arg2);
+            }
+            "hostname" => {
+                let _ = url::quirks::set_hostname(&mut url, &arg2);
+            }
+            "port" => {
+                if url.host_str().is_none_or(str::is_empty) || url.scheme() == "file" {
+                    return serde_json::json!({"noop":true}).to_string();
+                }
+                let _ = url::quirks::set_port(&mut url, &arg2);
+            }
+            "pathname" => url::quirks::set_pathname(&mut url, &arg2),
+            "search" => url::quirks::set_search(&mut url, &arg2),
+            _ => return serde_json::json!({"error":"SyntaxError"}).to_string(),
+        }
+        return serde_json::json!({"url":url.as_str()}).to_string();
+    }
+
+    #[cfg(feature = "render")]
+    if cmd == "history_scroll_capture" {
+        return serde_json::json!(crate::runtime::capture_history_scroll(&mut shared.borrow_mut())).to_string();
+    }
+    #[cfg(feature = "render")]
+    if cmd == "history_scroll_restore" {
+        return match crate::runtime::restore_history_scroll(&mut shared.borrow_mut(), &arg1) {
+            Ok(events) => serde_json::json!({"events":events.into_iter().map(|(kind,node)| (kind,node.raw())).collect::<Vec<_>>()}),
+            Err(error) => serde_json::json!({"error":error}),
+        }.to_string();
+    }
+    #[cfg(feature = "render")]
+    if cmd == "fragment_landing" {
+        let mut state = shared.borrow_mut();
+        return match crate::runtime::prepare_fragment_landing(&mut state, &arg1, arg2 != "manual") {
+            Ok((focus, events)) => serde_json::json!({"focus":focus,"events":events.into_iter()
+                .map(|(kind,node)| (kind,node.raw())).collect::<Vec<_>>()})
+            .to_string(),
+            Err(error) => serde_json::json!({"error":error}).to_string(),
+        };
+    }
+    if cmd == "fragment_url_resolve" {
+        let state = shared.borrow();
+        let resolved = (|| {
+            let mut current = url::Url::parse(&state.dom.as_ref()?.document_url()?).ok()?;
+            let next = url::Url::parse(&document_base_url(&state)?)
+                .ok()?
+                .join(&arg1)
+                .ok()?;
+            if !matches!(next.scheme(), "http" | "https") || next.fragment().is_none() {
+                return None;
+            }
+            let mut comparison = next.clone();
+            current.set_fragment(None);
+            comparison.set_fragment(None);
+            (current == comparison).then(|| next.to_string())
+        })();
+        return serde_json::json!(resolved).to_string();
+    }
+
+    if cmd == "history_entry" {
+        let mut state = shared.borrow_mut();
+        let current_url = state
+            .dom
+            .as_ref()
+            .and_then(DomTree::document_url)
+            .unwrap_or_else(|| state.url.clone());
+        let session = state.session_history.clone();
+        let mut history = session.borrow_mut();
+        if history.initial {
+            history.entries[0].url = current_url.clone();
+        }
+        let result = (|| -> Result<serde_json::Value, &'static str> {
+            match arg1.as_str() {
+                "get" => {}
+                "scroll_for" => {
+                    let id = arg2.parse::<u64>().map_err(|_| "HISTORY_ENTRY_INVALID")?;
+                    return Ok(history
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            entry.id == id && entry.document == history.current().document
+                        })
+                        .map(|entry| serde_json::json!(entry.scroll))
+                        .unwrap_or(serde_json::Value::Null));
+                }
+                "scroll" => {
+                    if matches!(arg2.as_str(), "auto" | "manual") {
+                        let index = history.index;
+                        history.entries[index].scroll = arg2.clone();
+                    }
+                }
+                "push" | "replace" => {
+                    #[derive(serde::Deserialize)]
+                    struct Update {
+                        url: String,
+                        data: Vec<u8>,
+                        fragment: bool,
+                    }
+                    let update: Update =
+                        serde_json::from_str(&arg2).map_err(|_| "HISTORY_STATE_INVALID")?;
+                    let old = url::Url::parse(&current_url).map_err(|_| "SecurityError")?;
+                    let next = url::Url::parse(&update.url).map_err(|_| "SecurityError")?;
+                    if next.origin() != old.origin()
+                        || next.scheme() != old.scheme()
+                        || next.username() != old.username()
+                        || next.password() != old.password()
+                    {
+                        return Err("SecurityError");
+                    }
+                    let mut entry = history.current().clone();
+                    entry.id = history.allocate_id();
+                    entry.url = next.to_string();
+                    entry.data = Some(update.data);
+                    entry.position = None;
+                    if arg1 == "replace" {
+                        let index = history.index;
+                        history.entries[index] = entry;
+                    } else {
+                        #[cfg(feature = "render")]
+                        history.save_position(crate::runtime::capture_history_scroll(&mut state));
+                        let index = history.index;
+                        history.entries.truncate(index + 1);
+                        history.entries.push(entry);
+                        history.index += 1;
+                    }
+                    history.initial = false;
+                    if let Some(dom) = &state.dom {
+                        dom.set_document_url(next.as_str());
+                    }
+                    state.url = next.to_string();
+                    state.same_document_navigation = true;
+                    if update.fragment {
+                        state.pending_navigation = None;
+                    }
+                    invalidate_input_render(&mut state);
+                }
+                "traverse" => {
+                    let delta = arg2.parse::<i32>().map_err(|_| "HISTORY_DELTA_INVALID")?;
+                    let next = history.index as i64 + i64::from(delta);
+                    if next < 0 || next >= history.entries.len() as i64 {
+                        return Ok(serde_json::Value::Null);
+                    }
+                    let entry = history.entries[next as usize].clone();
+                    if delta == 0 || entry.document != history.current().document {
+                        if entry.post {
+                            return Err("HISTORY_POST_REQUIRES_AUTHORIZATION");
+                        }
+                        state.pending_navigation = Some(PendingNavigation {
+                            url: entry.url.clone(),
+                            method: "GET".into(),
+                            body: String::new(),
+                            request: entry.request,
+                            history: if delta == 0 {
+                                HistoryNavigation::Reload
+                            } else {
+                                HistoryNavigation::Traverse(entry.id)
+                            },
+                        });
+                        state.url = entry.url;
+                        state.same_document_navigation = false;
+                        return Ok(serde_json::json!({"cross_document":true}));
+                    }
+                    #[cfg(feature = "render")]
+                    history.save_position(crate::runtime::capture_history_scroll(&mut state));
+                    history.index = next as usize;
+                    if let Some(dom) = &state.dom {
+                        dom.set_document_url(&entry.url);
+                    }
+                    state.url = entry.url;
+                    state.same_document_navigation = true;
+                    invalidate_input_render(&mut state);
+                }
+                _ => return Err("HISTORY_ACTION_INVALID"),
+            }
+            Ok(history.describe())
+        })();
+        return result
+            .unwrap_or_else(|error| serde_json::json!({"error":error}))
+            .to_string();
+    }
+
+    if cmd == "history_url_resolve" {
+        let state = shared.borrow();
+        let current = state
+            .dom
+            .as_ref()
+            .and_then(DomTree::document_url)
+            .unwrap_or_else(|| state.url.clone());
+        let resolved = (|| {
+            let current = url::Url::parse(&current).ok()?;
+            let next = if arg1.is_empty() {
+                current.clone()
+            } else {
+                url::Url::parse(&document_base_url(&state)?)
+                    .ok()?
+                    .join(&arg1)
+                    .ok()?
+            };
+            (next.origin() == current.origin()
+                && next.scheme() == current.scheme()
+                && next.username() == current.username()
+                && next.password() == current.password())
+            .then_some(next)
+        })();
+        let Some(url) = resolved else {
+            return "null".into();
+        };
+        let next = url.to_string();
+        return serde_json::json!(next).to_string();
+    }
+
+    if matches!(
+        cmd.as_str(),
+        "form_reset_begin" | "form_reset_apply" | "form_reset_end" | "attribute_value"
+    ) {
+        let mut state = shared.borrow_mut();
+        let Some(dom) = state.dom.as_ref() else {
+            return "null".into();
+        };
+        let Ok(id) = arg1.parse::<u32>().map(NodeId::new) else {
+            return "null".into();
+        };
+        return match cmd.as_str() {
+            "attribute_value" => serde_json::json!(dom.attribute_value(id)).to_string(),
+            "form_reset_begin" => serde_json::json!(dom.begin_form_reset(id)).to_string(),
+            "form_reset_end" => {
+                dom.end_form_reset(id);
+                "null".into()
+            }
+            _ => {
+                let applied = dom.reset_form_controls(id);
+                if applied {
+                    invalidate_input_render(&mut state);
+                }
+                applied.to_string()
+            }
+        };
+    }
+
+    if matches!(
+        cmd.as_str(),
+        "checked_state"
+            | "checked_set"
+            | "indeterminate_set"
+            | "checked_reset"
+            | "form_owner"
+            | "form_controls"
+            | "label_forwarding"
+    ) {
+        return checked_dom_op(&shared, &cmd, &arg1, &arg2);
+    }
+
+    if matches!(cmd.as_str(), "text_state"|"text_value_set"|"text_selection_set"|"text_reset"|"text_take_change") {
+        return text_dom_op(&shared, &cmd, &arg1, &arg2);
+    }
+    if matches!(cmd.as_str(), "focus_state" | "focusable" | "focus_set") {
+        return focus_dom_op(&shared, &cmd, &arg1, &arg2);
+    }
+
     {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,
@@ -1552,6 +2528,35 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             });
             "null".to_string()
         }
+        "ancestor_path" => {
+            let Some(id) = arg1.parse::<u32>().ok().map(NodeId::new).filter(|id| dom.get_node(*id).is_some()) else { return "[]".into(); };
+            let nodes = std::iter::once(id).chain(dom.ancestors(id)).map(|id| id.raw()).collect::<Vec<_>>();
+            serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".into())
+        }
+        "document_ready_state" => serde_json::to_string(match gs.document_lifecycle {
+            0 => "loading",
+            1 | 2 => "interactive",
+            _ => "complete",
+        })
+        .unwrap(),
+        "scroll_event_identity" => {
+            let result = (|| {
+                let node = NodeId::new(arg1.parse::<u32>().ok()?);
+                dom.get_node(node)?;
+                let node = if dom.is_html_element(node, "html") || dom.is_html_element(node, "body")
+                {
+                    dom.document()
+                } else {
+                    node
+                };
+                Some((
+                    gs.document_generation.to_string(),
+                    node.raw(),
+                    dom.node_generation(node)?.to_string(),
+                ))
+            })();
+            serde_json::to_string(&result).unwrap()
+        }
         "document_node_id" => dom.document().index().to_string(),
         "document_title" => {
             // The DOM is authoritative after parsing. In particular, script
@@ -1571,7 +2576,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .unwrap_or_default();
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
-        "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_url" => serde_json::to_string(
+            &gs.dom.as_ref().and_then(DomTree::document_url).unwrap_or_else(|| gs.url.clone()),
+        ).unwrap_or("\"\"".into()),
         // The base for relative URLs. It differs from document_url exactly when the page carries
         // a <base href>, and that is the point: HTML resolves against the base, not the document.
         "document_base_url" => serde_json::to_string(
@@ -1848,6 +2855,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 } else {
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                 }
+                if name == "href" && dom.refresh_base_href(node_id) {
+                    drop(gs);
+                    invalidate_input_render(&mut shared.borrow_mut());
+                }
             }
             "true".into()
         }
@@ -1947,6 +2958,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     dom.with_node_mut(node_id, |n| {
                         n.set_attribute_ns(ns, qualified, value.to_string())
                     });
+                }
+                if ns.is_empty() && local == "href" && dom.refresh_base_href(node_id) {
+                    drop(gs);
+                    invalidate_input_render(&mut shared.borrow_mut());
                 }
             }
             "true".into()
@@ -2480,6 +3495,38 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+fn scripted_fetch_metadata(source: &str, target: &str, mode: &str) -> Vec<(&'static str, &'static str)> {
+    let (Ok(source), Ok(target)) = (url::Url::parse(source), url::Url::parse(target)) else {
+        return Vec::new();
+    };
+    let mut request = ResourceRequest::subresource(ResourceType::Fetch, &source);
+    request.mode = match mode {
+        "no-cors" => RequestMode::NoCors,
+        "same-origin" => RequestMode::SameOrigin,
+        _ => RequestMode::Cors,
+    };
+    request.fetch_metadata_headers(&target).to_vec()
+}
+
+// Fetch appends Origin to scripted non-GET/HEAD requests even when same-origin.
+// In no-cors mode the document's referrer policy can require an opaque origin.
+fn fetch_origin_header<'a>(
+    method: &str, source: &'a str, target: &str, mode: &str, policy: ReferrerPolicy,
+) -> Option<&'a str> {
+    let cross_origin = request_origin(target).is_some_and(|origin| origin != source);
+    if mode == "cors" && cross_origin { return Some(source); }
+    if matches!(method, "GET" | "HEAD") { return None; }
+    let downgrade = source.starts_with("https://") && target.starts_with("http://");
+    let opaque = mode != "cors" && match policy {
+        ReferrerPolicy::NoReferrer => true,
+        ReferrerPolicy::SameOrigin => cross_origin,
+        ReferrerPolicy::NoReferrerWhenDowngrade | ReferrerPolicy::StrictOrigin
+            | ReferrerPolicy::StrictOriginWhenCrossOrigin => downgrade,
+        _ => false,
+    };
+    Some(if opaque { "null" } else { source })
+}
+
 fn cors_response_allows(
     credentials: FetchCredentials,
     page_origin: &str,
@@ -2690,7 +3737,7 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, mut referrer, mut referrer_policy) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -2740,6 +3787,8 @@ async fn op_fetch_url(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            gs.dom.as_ref().and_then(DomTree::document_url).and_then(|url| url::Url::parse(&url).ok()),
+            gs.referrer_policy,
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -2877,8 +3926,9 @@ async fn op_fetch_url(
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
-    let custom_headers: std::collections::HashMap<String, String> =
+    let mut custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    custom_headers.retain(|key, _| !key.eq_ignore_ascii_case("referer") && !key.eq_ignore_ascii_case("origin") && !key.to_ascii_lowercase().starts_with("sec-"));
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -2918,6 +3968,10 @@ async fn op_fetch_url(
                 "Access-Control-Request-Headers",
                 unsafe_header_names.join(","),
             );
+        }
+        if let Some(value) = url::Url::parse(&url).ok()
+            .and_then(|target| referrer_policy.referrer(referrer.as_ref(), &target)) {
+            preflight_request = preflight_request.header("Referer", value.as_str());
         }
         let preflight = preflight_request
             .send()
@@ -3009,6 +4063,7 @@ async fn op_fetch_url(
                 credentials,
                 callbacks.clone(),
                 allow_private_network,
+                referrer, referrer_policy,
             )
             .await;
         }
@@ -3033,10 +4088,17 @@ async fn op_fetch_url(
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
         crossed_origin |= current_is_cross_origin;
-        if current_is_cross_origin {
-            req = req.header("Origin", &page_origin);
+        referrer = url::Url::parse(&current_url).ok()
+            .and_then(|target| referrer_policy.referrer(referrer.as_ref(), &target));
+        if let Some(value) = &referrer { req = req.header("Referer", value.as_str()); }
+
+        if let Some(origin) = fetch_origin_header(current_method.as_str(), &page_origin, &current_url, &mode, referrer_policy) {
+            req = req.header("Origin", origin);
         }
 
+        for (name, value) in scripted_fetch_metadata(&page_origin, &current_url, &mode) {
+            req = req.header(name, value);
+        }
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         if credentials_allowed {
             if let Some(ref jar) = cookie_jar {
@@ -3063,6 +4125,7 @@ async fn op_fetch_url(
         }
 
         for (k, v) in &custom_headers {
+            if k.eq_ignore_ascii_case("referer") { continue; }
             req = req.header(k.as_str(), v.as_str());
         }
 
@@ -3155,6 +4218,10 @@ async fn op_fetch_url(
         }
 
         redirected_from.push(base);
+        if let Some(policy) = resp.headers().get_all("referrer-policy").iter()
+            .filter_map(|v| v.to_str().ok().and_then(ReferrerPolicy::from_header)).last() {
+            referrer_policy = policy;
+        }
         current_url = next_url.to_string();
     };
 
@@ -3305,6 +4372,7 @@ fn fetch_response(
         headers,
         body,
         redirected_from,
+        request_referrer: None,
     }
 }
 
@@ -3326,6 +4394,8 @@ async fn stealth_fetch_all(
     credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    mut referrer: Option<url::Url>,
+    mut referrer_policy: ReferrerPolicy,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -3347,16 +4417,20 @@ async fn stealth_fetch_all(
             }
         };
 
-        let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         crossed_origin |= current_is_cross_origin;
-        if current_is_cross_origin {
-            req_headers.insert("origin".to_string(), page_origin.clone());
+        let mut req_headers: HashMap<String, String> = scripted_fetch_metadata(&page_origin, &current_url, &mode)
+            .into_iter().map(|(name, value)| (name.into(), value.into())).collect();
+        if let Some(origin) = fetch_origin_header(&current_method, &page_origin, &current_url, &mode, referrer_policy) {
+            req_headers.insert("origin".to_string(), origin.into());
         }
         for (k, v) in &custom_headers {
+            if k.eq_ignore_ascii_case("referer") { continue; }
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
+        referrer = referrer_policy.referrer(referrer.as_ref(), &parsed_current);
+        if let Some(value) = &referrer { req_headers.insert("referer".into(), value.to_string()); }
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let r = stealth
             .send_single(
@@ -3405,6 +4479,9 @@ async fn stealth_fetch_all(
             current_body.clear();
         }
         redirected_from.push(parsed_current);
+        if let Some(policy) = r.header("referrer-policy").and_then(ReferrerPolicy::from_header) {
+            referrer_policy = policy;
+        }
         current_url = next_url.to_string();
     };
 
@@ -4525,6 +5602,75 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+struct HistorySerializer<'s> {
+    error: v8::Local<'s, v8::Function>,
+}
+
+impl v8::ValueSerializerImpl for HistorySerializer<'_> {
+    fn throw_data_clone_error<'s>(
+        &self,
+        scope: &mut v8::HandleScope<'s>,
+        message: v8::Local<'s, v8::String>,
+    ) {
+        let scope = &mut v8::TryCatch::new(scope);
+        let undefined = v8::undefined(scope).into();
+        self.error.call(scope, undefined, &[message.into()]);
+        if scope.has_caught() || scope.has_terminated() {
+            scope.rethrow();
+        }
+    }
+
+    fn get_shared_array_buffer_id<'s>(
+        &self,
+        scope: &mut v8::HandleScope<'s>,
+        _: v8::Local<'s, v8::SharedArrayBuffer>,
+    ) -> Option<u32> {
+        let message = v8::String::new(scope, "SharedArrayBuffer cannot be stored").unwrap();
+        self.throw_data_clone_error(scope, message);
+        None
+    }
+
+    fn get_wasm_module_transfer_id(
+        &self,
+        scope: &mut v8::HandleScope<'_>,
+        _: v8::Local<v8::WasmModuleObject>,
+    ) -> Option<u32> {
+        let message = v8::String::new(scope, "WebAssembly.Module cannot be stored").unwrap();
+        self.throw_data_clone_error(scope, message);
+        None
+    }
+}
+
+// SerializeForStorage needs a DataCloneError even on V8's shared-memory path.
+// User getters run inside write_value; rethrow their original exceptions.
+#[op2(reentrant)]
+#[buffer]
+fn op_history_serialize(
+    scope: &mut v8::HandleScope,
+    value: v8::Local<v8::Value>,
+    error: v8::Local<v8::Function>,
+) -> Vec<u8> {
+    use v8::ValueSerializerHelper;
+    let serializer = v8::ValueSerializer::new(scope, Box::new(HistorySerializer { error }));
+    serializer.write_header();
+    let scope = &mut v8::TryCatch::new(scope);
+    let result = serializer.write_value(scope.get_current_context(), value);
+    if scope.has_caught() || scope.has_terminated() {
+        scope.rethrow();
+        Vec::new()
+    } else if result == Some(true) {
+        serializer.release()
+    } else {
+        let message = v8::String::new(scope, "Value cannot be stored").unwrap();
+        v8::ValueSerializerImpl::throw_data_clone_error(
+            &HistorySerializer { error },
+            scope,
+            message,
+        );
+        Vec::new()
+    }
+}
+
 // A frame that navigates itself must not move the top document. Recording the
 // navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
@@ -4534,6 +5680,7 @@ fn op_navigate(
     #[string] url: &str,
     #[string] method: &str,
     #[string] body: &str,
+    #[string] behavior: &str,
 ) {
     let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
@@ -4542,7 +5689,27 @@ fn op_navigate(
     // Moving it early let synchronous JS run between two navigations read and
     // write another origin's cookies through document.cookie, whose ops derive
     // the cookie domain from this URL (SOP bypass, #940).
-    gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+    let source = gs
+        .dom
+        .as_ref()
+        .and_then(DomTree::document_url)
+        .and_then(|url| url::Url::parse(&url).ok());
+    let mut request = ResourceRequest::navigation();
+    request.referrer_policy = gs.referrer_policy;
+    request.referrer = source.clone();
+    request.initiator = source;
+    gs.pending_navigation = Some(PendingNavigation {
+        history: match behavior {
+            "replace" => HistoryNavigation::Replace,
+            "reload" => HistoryNavigation::Reload,
+            _ => HistoryNavigation::Push,
+        },
+        url: url.to_string(),
+        method: method.to_string(),
+        body: body.to_string(),
+        request,
+    });
+    gs.same_document_navigation = false;
 }
 
 fn frame_message_queue_entry_limit() -> usize {
@@ -5533,6 +6700,7 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
+        op_history_serialize(),
         op_frame_document_ready(),
         op_post_frame_message(),
         op_sleep(),
@@ -5750,47 +6918,27 @@ fn op_waapi_control(
 // Not tied to `render`: the JS layer resolves every relative URL through here, in all build
 // variants.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
-    let document_url = url::Url::parse(&state.url).ok()?;
-    let base_href = state.dom.as_ref().and_then(|dom| {
-        dom.query_selector("base[href]")
-            .ok()
-            .flatten()
-            .and_then(|id| {
-                dom.get_node(id)
-                    .and_then(|node| node.get_attribute("href").map(str::to_string))
-            })
-    });
-    match base_href {
-        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
-        // A data: or javascript: base falls back to the document URL. Accepting it would instead
-        // make every later relative resolution fail.
-        Some(href) => match document_url.join(&href) {
-            Ok(base) if base.scheme() != "data" && base.scheme() != "javascript" => {
-                Some(base.to_string())
-            }
-            _ => Some(document_url.to_string()),
-        },
-        None => Some(document_url.to_string()),
+    let document_url = state.dom.as_ref().and_then(DomTree::document_url)
+        .unwrap_or_else(|| state.url.clone());
+    let document_url = url::Url::parse(&document_url).ok()?;
+    if let Some((href, fallback)) = state.dom.as_ref().and_then(DomTree::frozen_base) {
+        let fallback = url::Url::parse(&fallback).ok()?;
+        return Some(match fallback.join(&href) {
+            Ok(base) if !matches!(base.scheme(), "data" | "javascript") => base.to_string(),
+            _ => fallback.to_string(),
+        });
     }
+    Some(document_url.to_string())
 }
 
-/// The raw `href` attribute of the first `<base href>`, unresolved. The JS layer needs it after
-/// `history.pushState`: the document URL has moved, only JS knows the new one, so only JS can
-/// resolve a relative base against it.
+/// Raw href of the first HTML base; URL consumers use document_base_url.
 fn document_base_href(state: &ObscuraState) -> Option<String> {
-    state.dom.as_ref().and_then(|dom| {
-        dom.query_selector("base[href]")
-            .ok()
-            .flatten()
-            .and_then(|id| {
-                dom.get_node(id)
-                    .and_then(|node| node.get_attribute("href").map(str::to_string))
-            })
-    })
+    state.dom.as_ref()?.frozen_base().map(|(href, _)| href)
 }
 
-/// What the cached values were computed from. If any of the three changes, they are recomputed.
+/// Native base changes, document replacement and fallback URL changes invalidate the cache.
 pub struct BaseUrlCache {
+    base_generation: u64,
     activity_generation: u64,
     document_generation: u64,
     url: String,
@@ -5801,8 +6949,10 @@ pub struct BaseUrlCache {
 /// Both base values behind a cache. Uncached, each one walks the tree and runs the selector
 /// engine, which would make `a.href` an O(nodes) read.
 fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>) {
+    let base_generation = state.dom.as_ref().map_or(0, DomTree::base_generation);
     if let Some(cached) = state.base_url_cache.borrow().as_ref() {
-        if cached.activity_generation == state.activity_generation
+        if cached.base_generation == base_generation
+            && cached.activity_generation == state.activity_generation
             && cached.document_generation == state.document_generation
             && cached.url == state.url
         {
@@ -5812,6 +6962,7 @@ fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>
     let resolved = document_base_url(state);
     let raw_href = document_base_href(state);
     *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
+        base_generation,
         activity_generation: state.activity_generation,
         document_generation: state.document_generation,
         url: state.url.clone(),
@@ -6266,6 +7417,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.referrer_policy = gs.referrer_policy;
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;
@@ -6786,6 +7938,7 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
         }
         gs.activity_generation = gs.activity_generation.wrapping_add(1);
         gs.scroll_generation = gs.scroll_generation.wrapping_add(1);
+        gs.script_scroll_generation = gs.script_scroll_generation.wrapping_add(1);
         gs.resolved_scroll = None;
         return format!("{{\"x\":{},\"y\":{}}}", requested.0, requested.1);
     }
@@ -6811,6 +7964,10 @@ fn op_scroll_to(state: &OpState, x: f64, y: f64) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
+    let previous = gs.scroll_offset;
     let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, (x as f32, y as f32));
+    if previous != (x, y) {
+        gs.script_scroll_generation = gs.script_scroll_generation.wrapping_add(1);
+    }
     format!("{{\"x\":{},\"y\":{}}}", x, y)
 }

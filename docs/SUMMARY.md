@@ -19,6 +19,7 @@
 * [Use the MCP server](Use-the-MCP-server.md)
 * [Watch agent sessions live](Watch-agent-sessions-live.md)
 * [Use as a Rust library](Use-as-a-Rust-library.md)
+* [Use the isolated runtime](Use-the-isolated-runtime.md)
 * [Persist cookies and storage](Persist-cookies-and-storage.md)
 * [Intercept and modify requests](Intercept-and-modify-requests.md)
 * [Run in production at scale](Run-in-production-at-scale.md)

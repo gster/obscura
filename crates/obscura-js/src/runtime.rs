@@ -20,12 +20,12 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    build_extension, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
+    build_extension, invalidate_input_render, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
     StoredNetworkResponseBody,
 };
 #[cfg(feature = "render")]
 use crate::ops::{
-    begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
+    begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll, input_focusable,
 };
 
 #[cfg(feature = "render")]
@@ -45,7 +45,27 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
     }
 }
 
-static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
+#[cfg(not(obscura_runtime_snapshot))]
+fn startup_snapshot() -> &'static [u8] {
+    include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"))
+}
+
+#[cfg(obscura_runtime_snapshot)]
+fn startup_snapshot() -> &'static [u8] {
+    static SNAPSHOT: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
+    SNAPSHOT.get_or_init(|| {
+        // The higher-level create_snapshot helper prints build diagnostics to
+        // stdout. Use the same primitives without polluting the browser RPC.
+        let mut runtime = deno_core::JsRuntimeForSnapshot::new(deno_core::RuntimeOptions {
+            startup_snapshot: None,
+            skip_op_registration: true,
+            ..Default::default()
+        });
+        runtime.execute_script("<obscura:bootstrap>", include_str!("../js/bootstrap.js").to_string())
+            .expect("target bootstrap snapshot creation failed");
+        runtime.snapshot()
+    }).as_ref()
+}
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main
@@ -170,6 +190,356 @@ pub struct CdpObjectState {
     evaluation_recipes: HashMap<String, String>,
 }
 
+/// A freshly verified input location. Never retained across a browser operation.
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct InputTarget {
+    pub node: NodeId,
+    pub hit_node: NodeId,
+    pub x: f32,
+    pub y: f32,
+}
+
+#[cfg(feature = "render")]
+pub struct NativeFill {
+    pub node: NodeId,
+    pub value: String,
+    pub changed: bool,
+}
+
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct NativeClick {
+    pub node: NodeId,
+    pub default_prevented: bool,
+}
+
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickActivation {
+    None,
+    Check(NodeId),
+    Label(NodeId, Option<NodeId>),
+    Reset(NodeId, NodeId),
+    Submit(NodeId, NodeId),
+    Link(NodeId),
+}
+
+/// A new document's pending fragment landing, owned by its load lifecycle.
+#[cfg(feature = "render")]
+pub struct DocumentFragment {
+    url: String,
+    script_scroll_generation: u64,
+}
+
+#[cfg(feature = "render")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryScrollPosition {
+    epoch: u64,
+    viewport: (f32, f32),
+    regions: Vec<(u32, u64, (f32, f32))>,
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn capture_history_scroll(state: &mut ObscuraState) -> Option<String> {
+    with_sync_render_loading_disabled(state, |state| {
+        ensure_resolved_scroll(state)?;
+        let dom = state.dom.as_ref()?;
+        let prepared = state.prepared_render.as_ref()?;
+        let (_, scroll) = state.resolved_scroll.as_ref()?;
+        let regions = prepared
+            .scroll_container_nodes()
+            .filter_map(|id| {
+                let node = dom.get_node(id)?;
+                if !node.connected
+                    || node.as_element().is_some_and(|name| {
+                        name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                            && matches!(name.local.as_ref(), "iframe" | "frame")
+                    })
+                {
+                    return None;
+                }
+                Some((
+                    id.raw(),
+                    dom.node_generation(id)?,
+                    prepared.element_scroll_metrics(id, scroll)?.offset,
+                ))
+            })
+            .collect();
+        serde_json::to_string(&HistoryScrollPosition {
+            epoch: state.history_epoch,
+            viewport: state.scroll_offset,
+            regions,
+        })
+        .ok()
+    })
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn restore_history_scroll(
+    state: &mut ObscuraState,
+    data: &str,
+) -> Result<Vec<(u8, NodeId)>, &'static str> {
+    let position: HistoryScrollPosition =
+        serde_json::from_str(data).map_err(|_| "INVALID_SCROLL_POSITION")?;
+    with_sync_render_loading_disabled(state, |state| {
+        ensure_resolved_scroll(state).ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+        let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+        let prepared = state
+            .prepared_render
+            .as_ref()
+            .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+        let (_, scroll) = state
+            .resolved_scroll
+            .as_ref()
+            .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+        let valid: std::collections::HashSet<_> = prepared.scroll_container_nodes().collect();
+        let mut offsets = state.element_scroll_offsets.clone();
+        let mut events = Vec::new();
+        for (raw, generation, offset) in position.regions {
+            if position.epoch != state.history_epoch { continue; }
+            let node = NodeId::new(raw);
+            if dom.node_generation(node) != Some(generation) || !valid.contains(&node) {
+                continue;
+            }
+            let Some(metrics) = prepared.element_scroll_metrics(node, scroll) else {
+                continue;
+            };
+            let next = (
+                offset.0.clamp(0.0, metrics.max_offset.0),
+                offset.1.clamp(0.0, metrics.max_offset.1),
+            );
+            if next == metrics.offset {
+                continue;
+            }
+            if next == (0.0, 0.0) {
+                offsets.remove(&node);
+            } else {
+                offsets.insert(node, next);
+            }
+            events.push((3, node));
+        }
+        let root = prepared.clamp_scroll(position.viewport);
+        if root != state.scroll_offset {
+            events.push((4, dom.document()));
+        }
+        if !events.is_empty() {
+            state.element_scroll_offsets = offsets;
+            state.scroll_offset = root;
+            state.activity_generation = state.activity_generation.wrapping_add(1);
+            state.scroll_generation = state.scroll_generation.wrapping_add(1);
+            state.resolved_scroll = None;
+        }
+        Ok(events)
+    })
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn prepare_fragment_landing(
+    state: &mut ObscuraState,
+    url: &str,
+    scroll: bool,
+) -> Result<(Option<i64>, Vec<(u8, NodeId)>), &'static str> {
+    let (target, top) = {
+        let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+        let current = dom
+            .document_url()
+            .and_then(|value| url::Url::parse(&value).ok());
+        let destination = url::Url::parse(url).ok();
+        match (current, destination) {
+            (Some(mut current), Some(mut destination)) => {
+                let fragment = destination.fragment().map(str::to_string);
+                current.set_fragment(None);
+                destination.set_fragment(None);
+                if current != destination {
+                    (None, false)
+                } else if let Some(fragment) = fragment {
+                    if fragment.is_empty() {
+                        (None, true)
+                    } else {
+                        let decoded =
+                            percent_encoding::percent_decode_str(&fragment).decode_utf8_lossy();
+                        let node = dom
+                            .potential_fragment_target(&fragment)
+                            .or_else(|| dom.potential_fragment_target(&decoded));
+                        let top = node.is_none() && decoded.eq_ignore_ascii_case("top");
+                        (node, top)
+                    }
+                } else {
+                    (None, false)
+                }
+            }
+            _ => (None, false),
+        }
+    };
+    {
+        if state
+            .dom
+            .as_ref()
+            .is_some_and(|dom| dom.set_target_element(target))
+        {
+            invalidate_input_render(state);
+        }
+    }
+    if !scroll {
+        return Ok((None, Vec::new()));
+    }
+    let events = if let Some(node) = target {
+        match scroll_node_into_view(state, node, true) {
+            Ok(events) => events,
+            // Hidden or boxless targets still establish :target and use
+            // viewport focus fallback; they have no scrollable rectangle.
+            Err("ELEMENT_NOT_VISIBLE") => Vec::new(),
+            Err(error) => return Err(error),
+        }
+    } else if top {
+        if state.scroll_offset == (0.0, 0.0) {
+            Vec::new()
+        } else {
+            state.scroll_offset = (0.0, 0.0);
+            state.activity_generation = state.activity_generation.wrapping_add(1);
+            state.scroll_generation = state.scroll_generation.wrapping_add(1);
+            state.resolved_scroll = None;
+            vec![(4, state.dom.as_ref().ok_or("NO_DOCUMENT")?.document())]
+        }
+    } else {
+        Vec::new()
+    };
+    let focus = target.map(|node| {
+        if input_focusable(state, node) {
+            i64::from(node.raw())
+        } else {
+            -1
+        }
+    });
+    Ok((focus, events))
+}
+
+#[cfg(feature = "render")]
+fn scroll_node_into_view(
+    state: &mut ObscuraState,
+    node: NodeId,
+    fragment: bool,
+) -> Result<Vec<(u8, NodeId)>, &'static str> {
+    use obscura_render::quantize_scroll_value;
+    with_sync_render_loading_disabled(state, |state| {
+        ensure_resolved_scroll(state).ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+        let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+        let prepared = state
+            .prepared_render
+            .as_ref()
+            .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+        let style = prepared
+            .layout()
+            .styles
+            .get(&node)
+            .ok_or("ELEMENT_NOT_VISIBLE")?;
+        if !fragment && style.effectively_invisible {
+            return Err("ELEMENT_NOT_VISIBLE");
+        }
+        let ancestors = dom.ancestors(node);
+        if ancestors.len() > 512 {
+            return Err("INPUT_PATH_LIMIT");
+        }
+        if std::iter::once(&node).chain(ancestors.iter()).any(|id| {
+            prepared
+                .layout()
+                .transforms
+                .get(id)
+                .is_some_and(|matrix| !matrix.is_translation())
+        }) {
+            return Err("INPUT_GEOMETRY_UNSUPPORTED");
+        }
+        let mut offsets = state.element_scroll_offsets.clone();
+        let mut root = state.scroll_offset;
+        let mut scroll = prepared.resolve_scroll_state(dom, root, &offsets);
+        let mut events = Vec::new();
+        let axis = |start: f32, size: f32, clip: f32, extent: f32, block: bool| {
+            if fragment && block {
+                return start - clip;
+            }
+            let end = start + size;
+            let clip_end = clip + extent;
+            if (start >= clip && end <= clip_end) || (fragment && start < clip && end > clip_end) {
+                0.0
+            } else if fragment {
+                if (start < clip && size <= extent) || (end > clip_end && size > extent) {
+                    start - clip
+                } else {
+                    end - clip_end
+                }
+            } else {
+                start + size / 2.0 - clip - extent / 2.0
+            }
+        };
+        for ancestor in ancestors {
+            let Some(metrics) = prepared.element_scroll_metrics(ancestor, &scroll) else {
+                continue;
+            };
+            if metrics.max_offset == (0.0, 0.0) {
+                continue;
+            }
+            let target = prepared
+                .viewport_rect_with_scroll(node, &scroll)
+                .ok_or("ELEMENT_NOT_VISIBLE")?;
+            let rect = prepared
+                .viewport_rect_with_scroll(ancestor, &scroll)
+                .ok_or("ELEMENT_NOT_VISIBLE")?;
+            let style = prepared
+                .layout()
+                .styles
+                .get(&ancestor)
+                .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let delta = (
+                axis(
+                    target.x,
+                    target.width,
+                    rect.x + style.border.left,
+                    metrics.client_size.0,
+                    false,
+                ),
+                axis(
+                    target.y,
+                    target.height,
+                    rect.y + style.border.top,
+                    metrics.client_size.1,
+                    true,
+                ),
+            );
+            let requested = (
+                quantize_scroll_value(metrics.offset.0 + delta.0, 1.0)
+                    .clamp(0.0, metrics.max_offset.0),
+                quantize_scroll_value(metrics.offset.1 + delta.1, 1.0)
+                    .clamp(0.0, metrics.max_offset.1),
+            );
+            if requested != metrics.offset {
+                offsets.insert(ancestor, requested);
+                events.push((3, ancestor));
+                scroll = prepared.resolve_scroll_state(dom, root, &offsets);
+            }
+        }
+        let target = prepared
+            .viewport_rect_with_scroll(node, &scroll)
+            .ok_or("ELEMENT_NOT_VISIBLE")?;
+        let next = prepared.clamp_scroll((
+            root.0 + axis(target.x, target.width, 0.0, state.viewport.0, false),
+            root.1 + axis(target.y, target.height, 0.0, state.viewport.1, true),
+        ));
+        if next != root {
+            root = next;
+            events.push((4, dom.document()));
+        }
+        if !events.is_empty() {
+            state.element_scroll_offsets = offsets;
+            state.scroll_offset = root;
+            state.activity_generation = state.activity_generation.wrapping_add(1);
+            state.scroll_generation = state.scroll_generation.wrapping_add(1);
+            state.resolved_scroll = None;
+        }
+        Ok(events)
+    })
+}
+
 pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
@@ -205,6 +575,14 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    native_mouse: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_focus: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_text: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_submit: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_fragment: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_lifecycle: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    mouse_buttons: u8,
+    suppress_mouse: bool,
     // Keep the runtime last: custom `Drop` enters its isolate, then every
     // V8-backed field above is released before `OwnedIsolate` performs the
     // matching exit and disposes the isolate.
@@ -556,7 +934,7 @@ impl ObscuraJsRuntime {
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
-                startup_snapshot: Some(SNAPSHOT),
+                startup_snapshot: Some(startup_snapshot()),
                 ..Default::default()
             });
 
@@ -600,11 +978,33 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
+            native_mouse: None,
+            native_focus: None,
+            native_text: None,
+            native_submit: None,
+            native_fragment: None,
+            native_lifecycle: None,
+            mouse_buttons: 0,
+            suppress_mouse: false,
             js_runtime: runtime,
         };
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
         instance.ops_handoff = instance.take_ops_handoff();
+        instance.native_mouse = Some(
+            instance
+                .take_native_input("__obscura_native_mouse_handoff")
+                .expect("native mouse handoff"),
+        );
+        instance.native_focus = Some(
+            instance
+                .take_native_input("__obscura_native_focus_handoff")
+                .expect("native focus handoff"),
+        );
+        instance.native_text = Some(instance.take_native_input("__obscura_native_text_handoff").expect("native text handoff"));
+        instance.native_submit = Some(instance.take_native_input("__obscura_native_submit_handoff").expect("native submit handoff"));
+        instance.native_fragment = Some(instance.take_native_input("__obscura_native_fragment_handoff").expect("native fragment handoff"));
+        instance.native_lifecycle = Some(instance.take_native_input("__obscura_native_lifecycle_handoff").expect("native lifecycle handoff"));
 
         // `JsRuntime::new` entered this isolate and rusty_v8 would leave it
         // entered for life. Leave the thread's entry stack empty instead; every
@@ -683,6 +1083,32 @@ impl ObscuraJsRuntime {
         let ops = v8::Global::new(scope, ops);
         global.delete(scope, handoff_key.into());
         Some(ops)
+    }
+
+    fn take_native_input(&mut self, name: &str) -> Option<deno_core::v8::Global<deno_core::v8::Function>> {
+        let main = self.runtime().main_context();
+        self.take_realm_native_input(&main, name)
+    }
+
+    pub(crate) fn take_realm_native_input(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        name: &str,
+    ) -> Option<deno_core::v8::Global<deno_core::v8::Function>> {
+        use deno_core::v8;
+
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let global = context.global(scope);
+        let key = v8::String::new(scope, name)?;
+        let value = global.get(scope, key.into())?;
+        let function = v8::Local::<v8::Function>::try_from(value).ok()?;
+        if !global.delete(scope, key.into()).unwrap_or(false) {
+            return None;
+        }
+        Some(v8::Global::new(scope, function))
     }
 
     /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
@@ -785,6 +1211,15 @@ impl ObscuraJsRuntime {
                 copied += 1;
             }
         }
+        // Child realms cannot expose native input authority either.
+        for name in ["__obscura_native_mouse_handoff", "__obscura_native_focus_handoff", "__obscura_native_text_handoff", "__obscura_native_submit_handoff", "__obscura_native_fragment_handoff", "__obscura_native_lifecycle_handoff"] {
+            let Some(input_key) = v8::String::new(scope, name) else {
+                return false;
+            };
+            if !global.delete(scope, input_key.into()).unwrap_or(false) {
+                return false;
+            }
+        }
         // The child realm must not expose the handoff to frame script either.
         global.delete(scope, handoff_key.into());
         copied > 0
@@ -884,6 +1319,7 @@ impl ObscuraJsRuntime {
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
         frame.encoding = parent.encoding.clone();
+        frame.device_identity = parent.device_identity.clone();
         frame.blocked_urls = parent.blocked_urls.clone();
         frame.intercept_enabled = parent.intercept_enabled;
         frame.page_in_flight = parent.page_in_flight.clone();
@@ -1119,11 +1555,61 @@ impl ObscuraJsRuntime {
         state.render_resources.set_sync_loading_enabled(false);
     }
 
+    /// Advance readiness and dispatch each document lifecycle event once.
+    pub fn document_lifecycle(&mut self, phase: u8) -> Result<(), &'static str> {
+        if !(1..=4).contains(&phase) {
+            return Err("DOCUMENT_LIFECYCLE_INVALID");
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            if phase <= state.document_lifecycle {
+                return Ok(());
+            }
+            state.document_lifecycle = phase;
+        }
+        let function = self
+            .native_lifecycle
+            .clone()
+            .ok_or("DOCUMENT_LIFECYCLE_UNAVAILABLE")?;
+        let main = self.runtime().main_context();
+        self.dispatch_document_lifecycle(&main, &function, phase)
+    }
+
+    pub(crate) fn dispatch_document_lifecycle(
+        &mut self,
+        context: &deno_core::v8::Global<deno_core::v8::Context>,
+        function: &deno_core::v8::Global<deno_core::v8::Function>,
+        phase: u8,
+    ) -> Result<(), &'static str> {
+        self.begin_javascript_task();
+        {
+            use deno_core::v8;
+            let mut entered = self.runtime();
+            let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+            let context = v8::Local::new(scope, context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let scope = &mut v8::TryCatch::new(scope);
+            let function = v8::Local::new(scope, function);
+            let phase = v8::Integer::new_from_unsigned(scope, phase as u32).into();
+            let receiver = v8::undefined(scope).into();
+            function
+                .call(scope, receiver, &[phase])
+                .ok_or("DOCUMENT_LIFECYCLE_FAILED")?;
+        }
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        if self.runtime().v8_isolate().is_execution_terminating() {
+            return Err("DOCUMENT_LIFECYCLE_FAILED");
+        }
+        Ok(())
+    }
+
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
+        dom.set_document_url(&gs.url);
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
+        gs.document_lifecycle = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
         // A new document owns a fresh retained scene and resource cache.
@@ -1157,6 +1643,7 @@ impl ObscuraJsRuntime {
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
+            gs.script_scroll_generation = 0;
             gs.resolved_scroll = None;
         }
     }
@@ -1164,6 +1651,10 @@ impl ObscuraJsRuntime {
     pub fn set_url(&self, url: &str) {
         let mut state = self.state.borrow_mut();
         if state.url != url {
+            if let Some(dom) = &state.dom {
+                dom.set_document_url(url);
+                dom.reset_document_base();
+            }
             state.url = url.to_string();
             #[cfg(feature = "render")]
             {
@@ -1180,6 +1671,32 @@ impl ObscuraJsRuntime {
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
+    pub fn set_session_history(&self, history: crate::ops::SharedSessionHistory) {
+        let mut state = self.state.borrow_mut();
+        state.history_epoch = history.borrow().epoch;
+        state.session_history = history;
+    }
+
+    #[cfg(feature = "render")]
+    pub fn save_session_scroll(&self) {
+        let mut state = self.state.borrow_mut();
+        let position = capture_history_scroll(&mut state);
+        state.session_history.borrow_mut().save_position(position);
+    }
+
+    #[cfg(feature = "render")]
+    pub fn restore_session_scroll(&self) -> Result<(), &'static str> {
+        let mut state = self.state.borrow_mut();
+        let entry = state.session_history.borrow().current().clone();
+        state.restoring_history_scroll = entry.position.is_some();
+        if entry.scroll == "auto" {
+            if let Some(position) = entry.position {
+                restore_history_scroll(&mut state, &position)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_encoding(&self, encoding: &str) {
         self.state.borrow_mut().encoding = encoding.to_string();
     }
@@ -1192,6 +1709,14 @@ impl ObscuraJsRuntime {
     /// owns this value; it is not derived from the current URL because direct
     /// navigations and document-initiated navigations have different
     /// referrer semantics.
+    pub fn set_referrer_policy(&self, policy: obscura_net::ReferrerPolicy) {
+        self.state.borrow_mut().referrer_policy = policy;
+    }
+
+    pub fn referrer_policy(&self) -> obscura_net::ReferrerPolicy {
+        self.state.borrow().referrer_policy
+    }
+
     pub fn set_referrer(&self, referrer: &str) {
         self.state.borrow_mut().referrer = referrer.to_string();
     }
@@ -1201,7 +1726,30 @@ impl ObscuraJsRuntime {
     }
 
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
+        self.take_pending_navigation_request().map(|nav| (nav.url, nav.method, nav.body))
+    }
+
+    pub fn take_pending_navigation_request(&self) -> Option<crate::ops::PendingNavigation> {
         self.state.borrow_mut().pending_navigation.take()
+    }
+
+    pub fn document_url(&self) -> String {
+        let state = self.state.borrow();
+        state.dom.as_ref().and_then(DomTree::document_url).unwrap_or_else(|| state.url.clone())
+    }
+
+    pub fn pending_navigation_url(&self) -> Option<String> {
+        let state = self.state.borrow();
+        state
+            .pending_navigation
+            .as_ref()
+            .map(|navigation| navigation.url.clone())
+            .or_else(|| state.same_document_navigation.then(|| state.url.clone()))
+    }
+
+    pub fn take_same_document_navigation(&self) -> Option<String> {
+        let mut state = self.state.borrow_mut();
+        std::mem::take(&mut state.same_document_navigation).then(|| state.url.clone())
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
@@ -1352,6 +1900,11 @@ impl ObscuraJsRuntime {
     #[cfg(feature = "render")]
     pub fn set_intercept_block_patterns(&self, patterns: Vec<String>) {
         self.state.borrow_mut().intercept_block_patterns = patterns;
+    }
+
+    /// Apply before page init; script has no setter for this native state.
+    pub fn set_device_identity(&self, identity: Option<crate::ops::DeviceIdentity>) {
+        self.state.borrow_mut().device_identity = identity;
     }
 
     pub fn set_user_agent(&mut self, ua: &str) {
@@ -1766,6 +2319,1512 @@ impl ObscuraJsRuntime {
         })
     }
 
+    #[cfg(feature = "render")]
+    pub fn hit_test(&self, x: f32, y: f32) -> Result<Option<NodeId>, &'static str> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let tree = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+            let prepared = state
+                .prepared_render
+                .as_ref()
+                .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let (_, scroll) = state
+                .resolved_scroll
+                .as_ref()
+                .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            prepared.hit_test(tree, scroll, (x, y))
+        })
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_mouse_move(&mut self, x: f32, y: f32) -> Result<bool, &'static str> {
+        self.native_mouse_event(0, x, y)
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_mouse_down(&mut self, x: f32, y: f32) -> Result<bool, &'static str> {
+        self.native_mouse_event(1, x, y)
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_mouse_up(&mut self, x: f32, y: f32) -> Result<bool, &'static str> {
+        self.native_mouse_event(2, x, y)
+    }
+
+    #[cfg(feature = "render")]
+    fn clear_pressed_input(&mut self) {
+        self.mouse_buttons = 0;
+        self.suppress_mouse = false;
+        let mut state = self.state.borrow_mut();
+        if state
+            .dom
+            .as_ref()
+            .is_some_and(|dom| dom.set_pointer_state(dom.input_state().hovered, None))
+        {
+            invalidate_input_render(&mut state);
+        }
+    }
+
+    #[cfg(feature = "render")]
+    fn verify_pointer_hit(&self, hit: NodeId, x: f32, y: f32) -> Result<(), &'static str> {
+        if self.has_pending_navigation() {
+            return Err("UNEXPECTED_NAVIGATION");
+        }
+        if !self
+            .with_dom(|dom| {
+                dom.is_light_document_element(hit)
+                    && !dom.is_disabled(hit)
+                    && !dom.is_inert(hit)
+                    && !dom.ancestors(hit).iter().any(|id| {
+                        ["input", "button", "select", "textarea"]
+                            .iter()
+                            .any(|tag| dom.is_html_element(*id, tag))
+                            && dom.is_disabled(*id)
+                    })
+            })
+            .unwrap_or(false)
+            || self.hit_test(x, y)? != Some(hit)
+        {
+            return Err("INPUT_TARGET_CHANGED");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    fn native_mouse_event(&mut self, kind: u8, x: f32, y: f32) -> Result<bool, &'static str> {
+        if (kind == 1 && self.mouse_buttons != 0) || (kind == 2 && self.mouse_buttons == 0) {
+            return Err("INPUT_BUTTON_SEQUENCE");
+        }
+        let hit = self.hit_test(x, y)?.ok_or("INPUT_NO_TARGET")?;
+        self.mouse_buttons = match kind {
+            1 => 1,
+            2 => 0,
+            _ => self.mouse_buttons,
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            if state.dom.as_ref().is_some_and(|dom| {
+                let pressed = match kind {
+                    1 => Some(hit),
+                    2 => None,
+                    _ => dom.input_state().pressed,
+                };
+                dom.set_pointer_state(Some(hit), pressed)
+            }) {
+                invalidate_input_render(&mut state);
+            }
+        }
+        let result = (|| {
+            self.verify_pointer_hit(hit, x, y)?;
+            let pointer_allowed = self.native_mouse_at(kind, hit, x, y)?;
+            if kind == 1 {
+                self.suppress_mouse = !pointer_allowed;
+            }
+            self.native_input_checkpoint()?;
+            self.verify_pointer_hit(hit, x, y)?;
+            let mouse_allowed = if self.suppress_mouse {
+                false
+            } else {
+                let allowed = self.native_mouse_at(kind + 4, hit, x, y)?;
+                self.native_input_checkpoint()?;
+                self.verify_pointer_hit(hit, x, y)?;
+                allowed
+            };
+            if kind == 1 && pointer_allowed && mouse_allowed {
+                let candidate = self
+                    .with_dom(|dom| {
+                        std::iter::once(hit)
+                            .chain(dom.ancestors(hit))
+                            .find(|id| dom.can_focus(*id))
+                    })
+                    .flatten();
+                self.native_focus_node(candidate)?;
+                self.native_input_checkpoint()?;
+                self.verify_pointer_hit(hit, x, y)?;
+            }
+            Ok(pointer_allowed && mouse_allowed)
+        })();
+        if kind == 2 {
+            self.suppress_mouse = false;
+        }
+        if result.is_err() {
+            self.clear_pressed_input();
+        }
+        result
+    }
+
+    /// Dispatch exactly one event to the native path. Kind 3 is click; 0..2
+    /// are pointer events and 4..6 their compatibility mouse events.
+    #[cfg(feature = "render")]
+    fn native_mouse_at(
+        &mut self,
+        kind: u8,
+        hit: NodeId,
+        x: f32,
+        y: f32,
+    ) -> Result<bool, &'static str> {
+        use deno_core::v8;
+        let nodes = self
+            .with_dom(|dom| {
+                let mut nodes = vec![hit];
+                nodes.extend(dom.ancestors(hit));
+                nodes
+            })
+            .ok_or("NO_DOCUMENT")?;
+        if nodes.len() > 512 {
+            return Err("INPUT_PATH_LIMIT");
+        }
+        let function = self.native_mouse.clone().ok_or("INPUT_UNAVAILABLE")?;
+        let buttons = self.mouse_buttons;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let path = v8::Array::new(scope, nodes.len() as i32);
+        for (index, node) in nodes.iter().enumerate() {
+            let value = v8::Integer::new_from_unsigned(scope, node.index() as u32);
+            if !path
+                .set_index(scope, index as u32, value.into())
+                .unwrap_or(false)
+            {
+                return Err("INPUT_DISPATCH_FAILED");
+            }
+        }
+        let arguments = [
+            v8::Integer::new_from_unsigned(scope, kind as u32).into(),
+            path.into(),
+            v8::Number::new(scope, x as f64).into(),
+            v8::Number::new(scope, y as f64).into(),
+            v8::Integer::new_from_unsigned(scope, buttons as u32).into(),
+        ];
+        let receiver = v8::undefined(scope).into();
+        let result = function
+            .call(scope, receiver, &arguments)
+            .ok_or("INPUT_DISPATCH_FAILED")?;
+        if !result.is_boolean() {
+            return Err("INPUT_DISPATCH_FAILED");
+        }
+        Ok(result.boolean_value(scope))
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_focus(&mut self, selector: &str) -> Result<bool, &'static str> {
+        let target = self.input_target(selector)?;
+        if !self
+            .with_dom(|dom| dom.can_focus(target.node))
+            .unwrap_or(false)
+        {
+            return Err("INPUT_ELEMENT_UNSUPPORTED");
+        }
+        self.native_focus_node(Some(target.node))
+    }
+
+    #[cfg(feature = "render")]
+    fn native_focus_node(&mut self, node: Option<NodeId>) -> Result<bool, &'static str> {
+        use deno_core::v8;
+        let function = self.native_focus.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let applied = {
+            let main = self.runtime().main_context();
+            let mut entered = self.runtime();
+            let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+            let context = v8::Local::new(scope, main);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let scope = &mut v8::TryCatch::new(scope);
+            let function = v8::Local::new(scope, function);
+            let node = v8::Integer::new(scope, node.map(|id| id.raw() as i32).unwrap_or(-1)).into();
+            let receiver = v8::undefined(scope).into();
+            let result = function
+                .call(scope, receiver, &[node])
+                .ok_or("INPUT_DISPATCH_FAILED")?;
+            if !result.is_boolean() {
+                return Err("INPUT_DISPATCH_FAILED");
+            }
+            result.boolean_value(scope)
+        };
+        Ok(applied
+            && self
+                .with_dom(|dom| dom.input_state().focused == node)
+                .unwrap_or(false))
+    }
+
+    pub fn has_pending_navigation(&self) -> bool {
+        let state = self.state.borrow();
+        state.pending_navigation.is_some() || state.same_document_navigation
+    }
+
+    #[cfg(feature = "render")]
+    pub fn input_node(&self, selector: &str) -> Result<NodeId, &'static str> {
+        if selector.is_empty() || selector.len() > 1024 {
+            return Err("INVALID_SELECTOR");
+        }
+        self.with_dom(|dom| {
+            let nodes = dom
+                .query_selector_all(selector)
+                .map_err(|_| "INVALID_SELECTOR")?;
+            match nodes.as_slice() {
+                [] => Err("ELEMENT_NOT_FOUND"),
+                [node] if dom.is_light_document_element(*node) => Ok(*node),
+                [_] => Err("INPUT_ELEMENT_UNSUPPORTED"),
+                _ => Err("ELEMENT_AMBIGUOUS"),
+            }
+        })
+        .ok_or("NO_DOCUMENT")?
+    }
+
+    #[cfg(feature = "render")]
+    pub fn begin_document_fragment(&self) -> Option<DocumentFragment> {
+        let mut state = self.state.borrow_mut();
+        let url = state.dom.as_ref()?.document_url()?;
+        url::Url::parse(&url).ok()?.fragment()?;
+        prepare_fragment_landing(&mut state, &url, false).ok()?;
+        if state.restoring_history_scroll { return None; }
+        Some(DocumentFragment {
+            url,
+            script_scroll_generation: state.script_scroll_generation,
+        })
+    }
+
+    #[cfg(feature = "render")]
+    pub fn try_document_fragment(
+        &mut self,
+        pending: &mut Option<DocumentFragment>,
+    ) -> Result<(), &'static str> {
+        let Some(fragment) = pending.as_ref() else {
+            return Ok(());
+        };
+        let ready = {
+            let mut state = self.state.borrow_mut();
+            if state.pending_navigation.is_some()
+                || state
+                    .dom
+                    .as_ref()
+                    .and_then(obscura_dom::DomTree::document_url)
+                    .as_deref()
+                    != Some(&fragment.url)
+                || state.script_scroll_generation != fragment.script_scroll_generation
+            {
+                *pending = None;
+                return Ok(());
+            }
+            prepare_fragment_landing(&mut state, &fragment.url, false)?;
+            state
+                .dom
+                .as_ref()
+                .and_then(obscura_dom::DomTree::target_element)
+                .is_some()
+                || url::Url::parse(&fragment.url)
+                    .ok()
+                    .and_then(|url| url.fragment().map(str::to_owned))
+                    .is_some_and(|value| value.is_empty() || value.eq_ignore_ascii_case("top"))
+        };
+        if ready {
+            let fragment = pending.take().unwrap();
+            self.scroll_to_fragment(&fragment.url)?;
+        }
+        Ok(())
+    }
+    /// Present a fragment through the same native plan used by History.
+    #[cfg(feature = "render")]
+    pub fn scroll_to_fragment(&mut self, url: &str) -> Result<(), &'static str> {
+        let (focus, events) = prepare_fragment_landing(&mut self.state.borrow_mut(), url, true)?;
+        if let Some(focus) = focus {
+            self.native_focus_node((focus >= 0).then(|| NodeId::new(focus as u32)))?;
+        }
+        for (kind, scroller) in events {
+            self.native_text_event(kind, scroller, "")?;
+        }
+        self.native_input_checkpoint()
+    }
+
+    /// Compute all offsets before committing them. No page geometry or scroll
+    /// helper runs; callers dispatch scroll events and revalidate afterwards.
+    #[cfg(feature = "render")]
+    fn scroll_input_into_view(&self, node: NodeId) -> Result<Vec<(u8, NodeId)>, &'static str> {
+        scroll_node_into_view(&mut self.state.borrow_mut(), node, false)
+    }
+
+    #[cfg(feature = "render")]
+    fn editable_text(
+        &self,
+        node: NodeId,
+        value: &str,
+    ) -> Result<obscura_dom::tree::TextControlState, &'static str> {
+        self.with_dom(|dom| {
+            if !dom.is_light_document_element(node) {
+                return Err("INPUT_TARGET_CHANGED");
+            }
+            if !dom.can_focus(node) {
+                return Err("ELEMENT_DISABLED");
+            }
+            let state = dom.text_control(node).ok_or("INPUT_ELEMENT_UNSUPPORTED")?;
+            let element = dom.get_node(node).ok_or("INPUT_TARGET_CHANGED")?;
+            if element.get_attribute("readonly").is_some() {
+                return Err("ELEMENT_READONLY");
+            }
+            let length = state.kind.normalize(value).encode_utf16().count();
+            if element
+                .get_attribute("maxlength")
+                .and_then(|value| {
+                    let value = value.trim_start_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'));
+                    let value = value.strip_prefix('+').unwrap_or(value);
+                    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+                    digits.parse::<usize>().ok().filter(|max| *max <= i32::MAX as usize)
+                })
+                .is_some_and(|max| length > max)
+            {
+                return Err("INPUT_TOO_LONG");
+            }
+            Ok(state)
+        })
+        .ok_or("NO_DOCUMENT")?
+    }
+
+    #[cfg(feature = "render")]
+    fn verify_fill_target(
+        &self,
+        selector: &str,
+        node: NodeId,
+        focus_generation: u64,
+        edit_generation: u64,
+        value: &str,
+    ) -> Result<(), &'static str> {
+        if self.has_pending_navigation() {
+            return Err("UNEXPECTED_NAVIGATION");
+        }
+        if self.input_target(selector)?.node != node {
+            return Err("INPUT_TARGET_CHANGED");
+        }
+        let current = self.editable_text(node, value)?;
+        let focus = self
+            .with_dom(|dom| dom.input_state())
+            .ok_or("NO_DOCUMENT")?;
+        if focus.focused != Some(node) || focus.focus_generation != focus_generation {
+            return Err("INPUT_FOCUS_CHANGED");
+        }
+        if current.generation != edit_generation {
+            return Err("INPUT_VALUE_CHANGED");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    fn native_input_checkpoint(&mut self) -> Result<(), &'static str> {
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        if self.runtime().v8_isolate().is_execution_terminating() {
+            return Err("INPUT_DISPATCH_FAILED");
+        }
+        self.native_focus_fixup()?;
+        Ok(())
+    }
+
+    /// One fixup per rendering/input opportunity. A handler's newly invalid
+    /// focus belongs to the next opportunity, avoiding a synchronous loop.
+    fn native_focus_fixup(&mut self) -> Result<bool, &'static str> {
+        #[cfg(feature = "render")]
+        {
+            let invalid = {
+                let mut state = self.state.borrow_mut();
+                let focused = state.dom.as_ref().and_then(|dom| dom.input_state().focused);
+                focused.is_some_and(|id| !input_focusable(&mut state, id))
+            };
+            if invalid {
+                self.native_focus_node(None)?;
+                self.runtime().v8_isolate().perform_microtask_checkpoint();
+                if self.runtime().v8_isolate().is_execution_terminating() {
+                    return Err("INPUT_DISPATCH_FAILED");
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(feature = "render")]
+    fn direct_click_activation(
+        dom: &obscura_dom::DomTree,
+        id: NodeId,
+    ) -> Result<Option<ClickActivation>, &'static str> {
+        let node = dom.get_node(id).ok_or("INPUT_TARGET_CHANGED")?;
+        let Some(name) = node.as_element() else {
+            return Ok(None);
+        };
+        if name.ns.as_ref() != "http://www.w3.org/1999/xhtml" {
+            return Err("INPUT_ELEMENT_UNSUPPORTED");
+        }
+        if ["popovertarget", "commandfor", "command"]
+            .iter()
+            .any(|attr| node.get_attribute(attr).is_some())
+        {
+            return Err("INPUT_ELEMENT_UNSUPPORTED");
+        }
+        let tag = name.local.as_ref();
+        if matches!(tag, "input" | "button")
+            && node
+                .get_attribute("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("reset"))
+        {
+            return match dom.form_owner(id) {
+                Some(form) if dom.can_reset_form(form) => {
+                    Ok(Some(ClickActivation::Reset(id, form)))
+                }
+                Some(_) => Err("INPUT_ELEMENT_UNSUPPORTED"),
+                None => Ok(Some(ClickActivation::None)),
+            };
+        }
+        if dom.is_submit_button(id) && dom.input_type(id).as_deref() != Some("image") {
+            return Ok(Some(match dom.form_owner(id) {
+                Some(form) => ClickActivation::Submit(id, form),
+                None => ClickActivation::None,
+            }));
+        }
+        if tag == "input" {
+            let kind = dom.input_type(id).unwrap();
+            return match kind.as_str() {
+                "checkbox" | "radio" => Ok(Some(ClickActivation::Check(id))),
+                "text" | "search" | "tel" | "url" | "email" | "password" | "button" => {
+                    Ok(Some(ClickActivation::None))
+                }
+                "submit" | "reset" if dom.form_owner(id).is_none() => {
+                    Ok(Some(ClickActivation::None))
+                }
+                _ => Err("INPUT_ELEMENT_UNSUPPORTED"),
+            };
+        }
+        if tag == "button" {
+            if node
+                .get_attribute("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("button"))
+                || dom.form_owner(id).is_none()
+            {
+                return Ok(Some(ClickActivation::None));
+            }
+            return Err("INPUT_ELEMENT_UNSUPPORTED");
+        }
+        if matches!(tag, "textarea" | "meter" | "output" | "progress") {
+            return Ok(Some(ClickActivation::None));
+        }
+        if tag == "a" && node.get_attribute("href").is_some() {
+            return Ok(Some(ClickActivation::Link(id)));
+        }
+        if matches!(
+            tag,
+            "select" | "option" | "iframe" | "object" | "embed" | "summary" | "audio" | "video"
+        ) || (tag == "area" && node.get_attribute("href").is_some())
+        {
+            return Err("INPUT_ELEMENT_UNSUPPORTED");
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "render")]
+    fn click_activation(&self, hit: NodeId) -> Result<ClickActivation, &'static str> {
+        let activation = self.with_dom(|dom| {
+            if !dom.is_light_document_element(hit) {
+                return Err("INPUT_TARGET_CHANGED");
+            }
+            if dom.is_disabled(hit) || dom.is_inert(hit) {
+                return Err("ELEMENT_DISABLED");
+            }
+            for id in std::iter::once(hit).chain(dom.ancestors(hit)) {
+                if let Some(activation) = Self::direct_click_activation(dom, id)? {
+                    if dom.is_disabled(id) {
+                        return Err("ELEMENT_DISABLED");
+                    }
+                    return Ok(activation);
+                }
+                if dom.is_html_element(id, "label") {
+                    let control = dom
+                        .labeled_control(id)
+                        .filter(|control| !dom.is_disabled(*control) && !dom.is_inert(*control));
+                    if let Some(control) = control {
+                        Self::direct_click_activation(dom, control)?;
+                    }
+                    return Ok(ClickActivation::Label(id, control));
+                }
+            }
+            Ok(ClickActivation::None)
+        })
+        .ok_or("NO_DOCUMENT")??;
+        if let ClickActivation::Link(link) = activation {
+            self.native_link_url(link, hit)?;
+        }
+        let submit = match activation {
+            ClickActivation::Submit(button, form) => Some((button, form)),
+            ClickActivation::Label(_, Some(control)) => self.with_dom(|dom| {
+                if let Ok(Some(ClickActivation::Submit(button, form))) = Self::direct_click_activation(dom, control) {
+                    Some((button, form))
+                } else { None }
+            }).flatten(),
+            _ => None,
+        };
+        if let Some((button, form)) = submit {
+            crate::ops::preflight_form_submission(&self.state.borrow(), form, button)?;
+        }
+        Ok(activation)
+    }
+
+    /// Read the supported hyperlink default action from native state. Resolve
+    /// again after click callbacks; href is deliberately not the target identity.
+    #[cfg(feature = "render")]
+    fn native_link_url(&self, link: NodeId, hit: NodeId) -> Result<Option<(String, obscura_net::ReferrerPolicy)>, &'static str> {
+        let state = self.state.borrow();
+        let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+        if !dom.is_connected(link) {
+            return Ok(None);
+        }
+        let node = dom.get_node(link).ok_or("INPUT_TARGET_CHANGED")?;
+        let Some(href) = node.get_attribute("href") else {
+            return Ok(None);
+        };
+        if node.get_attribute("download").is_some()
+            || node.get_attribute("ping").is_some_and(|value| !value.is_empty())
+        {
+            return Err("INPUT_ELEMENT_UNSUPPORTED");
+        }
+        for id in std::iter::once(hit)
+            .chain(dom.ancestors(hit))
+            .take_while(|id| *id != link)
+        {
+            if dom.is_html_element(id, "img")
+                && dom.get_node(id)
+                    .is_some_and(|node| node.get_attribute("ismap").is_some())
+            {
+                return Err("INPUT_ELEMENT_UNSUPPORTED");
+            }
+        }
+        let base_target = dom.query_selector("base[target]")
+            .ok().flatten()
+            .and_then(|id| dom.get_node(id))
+            .and_then(|node| node.get_attribute("target").map(str::to_string));
+        let target = node.get_attribute("target")
+            .or(base_target.as_deref()).unwrap_or("");
+        if !["", "_self", "_top", "_parent"].iter()
+            .any(|allowed| target.eq_ignore_ascii_case(allowed))
+        {
+            return Err("INPUT_ELEMENT_UNSUPPORTED");
+        }
+        let base = document_base_url(&state).ok_or("INPUT_ELEMENT_UNSUPPORTED")?;
+        let target = url::Url::parse(&base)
+            .and_then(|base| base.join(href))
+            .map_err(|_| "INPUT_ELEMENT_UNSUPPORTED")?;
+        if !matches!(target.scheme(), "http" | "https") { return Err("INPUT_ELEMENT_UNSUPPORTED"); }
+        let mut policy = node.get_attribute("referrerpolicy")
+            .and_then(|value| obscura_net::ReferrerPolicy::parse(&value.to_ascii_lowercase()))
+            .unwrap_or(state.referrer_policy);
+        if node.get_attribute("rel").is_some_and(|value| value.split_ascii_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("noreferrer"))) {
+            policy = obscura_net::ReferrerPolicy::NoReferrer;
+        }
+        Ok(Some((target.to_string(), policy)))
+    }
+
+    #[cfg(feature = "render")]
+    fn verify_click_target(
+        &self,
+        selector: &str,
+        target: &InputTarget,
+        activation: ClickActivation,
+    ) -> Result<(), &'static str> {
+        if self.input_node(selector)? != target.node {
+            return Err("INPUT_TARGET_CHANGED");
+        }
+        self.verify_pointer_hit(target.hit_node, target.x, target.y)?;
+        if self.click_activation(target.hit_node)? != activation {
+            return Err("INPUT_TARGET_CHANGED");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    fn activate_native_click(
+        &mut self,
+        hit: NodeId,
+        activation: ClickActivation,
+        x: f32,
+        y: f32,
+    ) -> Result<bool, &'static str> {
+        let original = if let ClickActivation::Check(node) = activation {
+            let mut state = self.state.borrow_mut();
+            let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+            let checked = dom.checked_state(node).ok_or("INPUT_TARGET_CHANGED")?;
+            let radio = dom.input_type(node).as_deref() == Some("radio");
+            let previous = if checked.checked {
+                Some(node)
+            } else {
+                dom.checked_radio_peer(node)
+            };
+            dom.set_checked(node, radio || !checked.checked);
+            if !radio {
+                dom.set_indeterminate(node, false);
+            }
+            invalidate_input_render(&mut state);
+            Some((node, checked, previous))
+        } else {
+            None
+        };
+        let allowed = self.native_mouse_at(3, hit, x, y)?;
+        if let Some((node, old, previous)) = original {
+            if !allowed {
+                let mut state = self.state.borrow_mut();
+                let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+                match dom.input_type(node).as_deref() {
+                    Some("checkbox") => {
+                        dom.set_checked(node, old.checked);
+                        dom.set_indeterminate(node, old.indeterminate);
+                    }
+                    Some("radio") => {
+                        if let Some(previous) =
+                            previous.filter(|previous| dom.same_radio_group(node, *previous))
+                        {
+                            dom.set_checked(previous, true);
+                        } else {
+                            dom.set_checked(node, false);
+                        }
+                    }
+                    _ => {}
+                }
+                invalidate_input_render(&mut state);
+            } else {
+                let send_change = self
+                    .with_dom(|dom| -> Result<bool, &'static str> {
+                        if !dom.is_connected(node) {
+                            return Ok(false);
+                        }
+                        Self::direct_click_activation(dom, node)?;
+                        Ok(match dom.input_type(node).as_deref() {
+                            Some("checkbox") => true,
+                            Some("radio") => {
+                                !old.checked
+                                    && dom.checked_state(node).is_some_and(|state| state.checked)
+                            }
+                            _ => false,
+                        })
+                    })
+                    .ok_or("NO_DOCUMENT")??;
+                if send_change {
+                    self.native_text_event(5, node, "")?;
+                    self.native_text_event(6, node, "")?;
+                }
+            }
+        } else if allowed {
+            if let ClickActivation::Label(label, original_control) = activation {
+                let current = self
+                    .with_dom(|dom| {
+                        dom.is_connected(label)
+                            .then(|| dom.labeled_control(label))
+                            .flatten()
+                    })
+                    .flatten();
+                // A label becoming disconnected or disabled no longer activates.
+                if let Some(control) = current {
+                    let enabled = self
+                        .with_dom(|dom| !dom.is_disabled(control) && !dom.is_inert(control))
+                        .unwrap_or(false);
+                    if enabled {
+                        if Some(control) != original_control {
+                            return Err("INPUT_TARGET_CHANGED");
+                        }
+                        self.forward_native_label(label, control, x, y)?;
+                    }
+                }
+            } else if self.with_dom(|dom| dom.is_connected(hit)).unwrap_or(false) {
+                if let ClickActivation::Link(link) = activation {
+                    if let Some((url, policy)) = self.native_link_url(link, hit)? {
+                        if self.has_pending_navigation() {
+                            return Err("UNEXPECTED_NAVIGATION");
+                        }
+                        let same_document_fragment = self.with_dom(|dom| {
+                            let mut target = url::Url::parse(&url).ok()?;
+                            target.fragment()?;
+                            let mut current = url::Url::parse(&dom.document_url()?).ok()?;
+                            target.set_fragment(None);
+                            current.set_fragment(None);
+                            Some(target == current)
+                        }).flatten().unwrap_or(false);
+                        if same_document_fragment {
+                            self.navigate_native_fragment(&url)?;
+                            self.native_input_checkpoint()?;
+                            return Ok(allowed);
+                        }
+                        let mut state = self.state.borrow_mut();
+                        let source = state.dom.as_ref().and_then(obscura_dom::DomTree::document_url)
+                            .and_then(|url| url::Url::parse(&url).ok());
+                        let mut request = obscura_net::ResourceRequest::navigation();
+                        request.referrer_policy = policy;
+                        request.referrer = source.clone();
+                        request.initiator = source;
+                        state.url = url.clone();
+                        state.pending_navigation = Some(crate::ops::PendingNavigation {
+                            url, method: "GET".into(), body: String::new(), request, history: crate::ops::HistoryNavigation::Push,
+                        });
+                        state.same_document_navigation = false;
+                    }
+                    self.native_input_checkpoint()?;
+                    return Ok(allowed);
+                }
+                if let ClickActivation::Submit(button, form) = activation {
+                    let enabled = self.with_dom(|dom| dom.is_connected(button)
+                        && !dom.is_disabled(button) && !dom.is_inert(button)).unwrap_or(false);
+                    if enabled {
+                        if self.click_activation(hit)? != activation { return Err("INPUT_TARGET_CHANGED"); }
+                        if self.has_pending_navigation() { return Err("UNEXPECTED_NAVIGATION"); }
+                        self.submit_native_form(form, button)?;
+                    }
+                    self.native_input_checkpoint()?;
+                    return Ok(allowed);
+                }
+                if self.click_activation(hit)? != activation {
+                    return Err("INPUT_TARGET_CHANGED");
+                }
+                if let ClickActivation::Reset(_, form) = activation {
+                    self.reset_native_form(form)?;
+                }
+            }
+        }
+        self.native_input_checkpoint()?;
+        Ok(allowed)
+    }
+
+    #[cfg(feature = "render")]
+    fn navigate_native_fragment(&mut self, url: &str) -> Result<(), &'static str> {
+        use deno_core::v8;
+        let function = self.native_fragment.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let argument = v8::String::new(scope, url)
+            .ok_or("INPUT_DISPATCH_FAILED")?
+            .into();
+        let receiver = v8::undefined(scope).into();
+        let result = function
+            .call(scope, receiver, &[argument])
+            .ok_or("INPUT_DISPATCH_FAILED")?;
+        if result.is_true() {
+            Ok(())
+        } else {
+            Err("INPUT_DISPATCH_FAILED")
+        }
+    }
+
+    #[cfg(feature = "render")]
+    fn submit_native_form(&mut self, form: NodeId, button: NodeId) -> Result<(), &'static str> {
+        use deno_core::v8;
+        let function = self.native_submit.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let arguments = [
+            v8::Integer::new_from_unsigned(scope, form.raw()).into(),
+            v8::Integer::new_from_unsigned(scope, button.raw()).into(),
+        ];
+        let receiver = v8::undefined(scope).into();
+        let result = function
+            .call(scope, receiver, &arguments)
+            .ok_or("INPUT_DISPATCH_FAILED")?;
+        if result.is_null() {
+            return Ok(());
+        }
+        if result.is_string() {
+            return Err(match result.to_rust_string_lossy(scope).as_str() {
+                "INPUT_ELEMENT_UNSUPPORTED" => "INPUT_ELEMENT_UNSUPPORTED",
+                "FORM_INVALID"
+                | "FORM_SUBMITTER_TYPE"
+                | "FORM_SUBMITTER_OWNER"
+                | "FORM_SUBMITTER_INVALID" => "INPUT_TARGET_CHANGED",
+                _ => "INPUT_DISPATCH_FAILED",
+            });
+        }
+        Err("INPUT_DISPATCH_FAILED")
+    }
+
+    #[cfg(feature = "render")]
+    fn reset_native_form(&mut self, form: NodeId) -> Result<(), &'static str> {
+        if !self
+            .with_dom(|dom| dom.begin_form_reset(form))
+            .flatten()
+            .ok_or("INPUT_TARGET_CHANGED")?
+        {
+            return Ok(());
+        }
+        let result = (|| {
+            if self.native_text_event(7, form, "")? {
+                let mut state = self.state.borrow_mut();
+                if !state
+                    .dom
+                    .as_ref()
+                    .ok_or("NO_DOCUMENT")?
+                    .reset_form_controls(form)
+                {
+                    return Err("INPUT_ELEMENT_UNSUPPORTED");
+                }
+                invalidate_input_render(&mut state);
+            }
+            Ok(())
+        })();
+        self.with_dom(|dom| dom.end_form_reset(form));
+        result
+    }
+
+    #[cfg(feature = "render")]
+    fn forward_native_label(
+        &mut self,
+        label: NodeId,
+        control: NodeId,
+        x: f32,
+        y: f32,
+    ) -> Result<(), &'static str> {
+        if !self
+            .with_dom(|dom| dom.begin_label_forwarding(label))
+            .ok_or("NO_DOCUMENT")?
+        {
+            return Ok(());
+        }
+        let result = (|| {
+            let forwarded = self
+                .with_dom(|dom| Self::direct_click_activation(dom, control))
+                .ok_or("NO_DOCUMENT")??
+                .unwrap_or(ClickActivation::None);
+            self.native_focus_node(Some(control))?;
+            self.native_input_checkpoint()?;
+            if !self
+                .with_dom(|dom| {
+                    dom.is_connected(label)
+                        && dom.labeled_control(label) == Some(control)
+                        && dom.is_light_document_element(control)
+                        && !dom.is_disabled(control)
+                        && !dom.is_inert(control)
+                })
+                .unwrap_or(false)
+            {
+                return Err("INPUT_TARGET_CHANGED");
+            }
+            if self.has_pending_navigation() {
+                return Err("UNEXPECTED_NAVIGATION");
+            }
+            if self
+                .with_dom(|dom| Self::direct_click_activation(dom, control))
+                .ok_or("NO_DOCUMENT")??
+                .unwrap_or(ClickActivation::None)
+                != forwarded
+            {
+                return Err("INPUT_TARGET_CHANGED");
+            }
+            self.activate_native_click(control, forwarded, x, y)?;
+            Ok(())
+        })();
+        self.with_dom(|dom| dom.end_label_forwarding(label));
+        result
+    }
+
+    /// Internal click primitive with supported link, reset, and submit defaults.
+    #[cfg(feature = "render")]
+    pub fn native_click(
+        &mut self,
+        selector: &str,
+    ) -> Result<NativeClick, (&'static str, &'static str)> {
+        let before = |code| (code, "NOT_SENT");
+        let after = |code| {
+            (
+                code,
+                if code == "INPUT_DISPATCH_FAILED" {
+                    "UNKNOWN"
+                } else {
+                    "SENT"
+                },
+            )
+        };
+        if self.mouse_buttons != 0 {
+            return Err(before("INPUT_BUTTON_SEQUENCE"));
+        }
+        if self.has_pending_navigation() {
+            return Err(before("UNEXPECTED_NAVIGATION"));
+        }
+        let node = self.input_node(selector).map_err(before)?;
+        self.click_activation(node).map_err(before)?;
+        let events = self.scroll_input_into_view(node).map_err(before)?;
+        let scrolled = !events.is_empty();
+        for (kind, scroller) in events {
+            self.native_text_event(kind, scroller, "").map_err(after)?;
+            self.native_input_checkpoint().map_err(after)?;
+            if self.has_pending_navigation() {
+                return Err(after("UNEXPECTED_NAVIGATION"));
+            }
+            if self.input_node(selector).map_err(after)? != node {
+                return Err(after("INPUT_TARGET_CHANGED"));
+            }
+            self.click_activation(node).map_err(after)?;
+        }
+        let target = self.input_target(selector).map_err(|code| {
+            if scrolled {
+                after(code)
+            } else {
+                before(code)
+            }
+        })?;
+        let activation = self.click_activation(target.hit_node).map_err(|code| {
+            if scrolled {
+                after(code)
+            } else {
+                before(code)
+            }
+        })?;
+        let result = (|| {
+            for kind in 0..3 {
+                self.native_mouse_event(kind, target.x, target.y)
+                    .map_err(after)?;
+                self.verify_click_target(selector, &target, activation)
+                    .map_err(after)?;
+            }
+            let allowed = self
+                .activate_native_click(target.hit_node, activation, target.x, target.y)
+                .map_err(after)?;
+            Ok(NativeClick {
+                node,
+                default_prevented: !allowed,
+            })
+        })();
+        self.clear_pressed_input();
+        result
+    }
+
+    /// Coordinate input uses the renderer's current hit, never a page-provided selector.
+    #[cfg(feature = "render")]
+    pub fn native_pointer_click(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<NativeClick, (&'static str, &'static str)> {
+        let before = |code| (code, "NOT_SENT");
+        let after = |code| (code, if code == "INPUT_DISPATCH_FAILED" { "UNKNOWN" } else { "SENT" });
+        if self.mouse_buttons != 0 {
+            return Err(before("INPUT_BUTTON_SEQUENCE"));
+        }
+        let hit = self
+            .hit_test(x, y)
+            .map_err(before)?
+            .ok_or(before("INPUT_NO_TARGET"))?;
+        let activation = self.click_activation(hit).map_err(before)?;
+        let result = (|| {
+            for kind in 0..3 {
+                self.native_mouse_event(kind, x, y).map_err(after)?;
+                self.verify_pointer_hit(hit, x, y).map_err(after)?;
+                if self.click_activation(hit).map_err(after)? != activation {
+                    return Err(after("INPUT_TARGET_CHANGED"));
+                }
+            }
+            let allowed = self
+                .activate_native_click(hit, activation, x, y)
+                .map_err(after)?;
+            Ok(NativeClick {
+                node: hit,
+                default_prevented: !allowed,
+            })
+        })();
+        self.clear_pressed_input();
+        result
+    }
+
+    /// Retained with each manual frame, including changes invisible in a PNG.
+    #[cfg(feature = "render")]
+    pub fn native_text_identity(&self) -> Option<(u64, Option<u64>)> {
+        self.with_dom(|dom| {
+            let focus = dom.input_state();
+            (
+                focus.focus_generation,
+                focus
+                    .focused
+                    .and_then(|node| dom.text_control(node))
+                    .map(|s| s.generation),
+            )
+        })
+    }
+
+    #[cfg(feature = "render")]
+    fn verify_manual_text(
+        &self,
+        node: NodeId,
+        focus_generation: u64,
+        edit_generation: u64,
+        value: &str,
+    ) -> Result<(), &'static str> {
+        if self.has_pending_navigation() {
+            return Err("UNEXPECTED_NAVIGATION");
+        }
+        let current = self.editable_text(node, value)?;
+        let mut state = self.state.borrow_mut();
+        if !input_focusable(&mut state, node) {
+            return Err("INPUT_TARGET_CHANGED");
+        }
+        let focus = state.dom.as_ref().ok_or("NO_DOCUMENT")?.input_state();
+        if focus.focused != Some(node) || focus.focus_generation != focus_generation {
+            return Err("INPUT_FOCUS_CHANGED");
+        }
+        if current.generation != edit_generation {
+            return Err("INPUT_VALUE_CHANGED");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_insert_text(&mut self, text: &str) -> Result<bool, (&'static str, &'static str)> {
+        if text.is_empty() || text.len() > 4096 {
+            return Err(("INPUT_VALUE_LIMIT", "NOT_SENT"));
+        }
+        self.native_manual_edit(text, None)
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_edit_key(&mut self, key: &str) -> Result<bool, (&'static str, &'static str)> {
+        if !matches!(
+            key,
+            "Backspace" | "Delete" | "ArrowLeft" | "ArrowRight" | "Home" | "End"
+        ) {
+            return Err(("INPUT_KEY_UNSUPPORTED", "NOT_SENT"));
+        }
+        self.native_manual_edit("", Some(key))
+    }
+
+    #[cfg(feature = "render")]
+    fn native_manual_edit(
+        &mut self,
+        text: &str,
+        key: Option<&str>,
+    ) -> Result<bool, (&'static str, &'static str)> {
+        let before = |code| (code, "NOT_SENT");
+        let after = |code| {
+            (
+                code,
+                if code == "INPUT_DISPATCH_FAILED" {
+                    "UNKNOWN"
+                } else {
+                    "SENT"
+                },
+            )
+        };
+        let focus = self
+            .with_dom(|dom| dom.input_state())
+            .ok_or(before("NO_DOCUMENT"))?;
+        let node = focus.focused.ok_or(before("INPUT_NO_FOCUS"))?;
+        let initial = self.editable_text(node, "").map_err(before)?;
+        if !initial.kind.supports_selection() {
+            return Err(before("INPUT_ELEMENT_UNSUPPORTED"));
+        }
+        if initial.value.len() > 65536 {
+            return Err(before("INPUT_VALUE_LIMIT"));
+        }
+        // Only scalar boundaries are representable by the engine's UTF-8 DOM.
+        let mut offsets = vec![0usize];
+        let mut units = vec![0u32];
+        for (offset, ch) in initial.value.char_indices() {
+            offsets.push(offset + ch.len_utf8());
+            units.push(units.last().unwrap() + ch.len_utf16() as u32);
+        }
+        let mut start = units
+            .binary_search(&initial.start)
+            .map_err(|_| before("INPUT_SELECTION_UNSUPPORTED"))?;
+        let mut end = units
+            .binary_search(&initial.end)
+            .map_err(|_| before("INPUT_SELECTION_UNSUPPORTED"))?;
+        let mut value = initial.value.clone();
+        let caret;
+        let editing = key.is_none() || matches!(key, Some("Backspace" | "Delete"));
+        let kind = match key {
+            Some("Backspace") => 10,
+            Some("Delete") => 12,
+            _ => 8,
+        };
+        if editing {
+            if start == end {
+                if key == Some("Backspace") {
+                    start = start.saturating_sub(1);
+                }
+                if key == Some("Delete") {
+                    end = (end + 1).min(offsets.len() - 1);
+                }
+            }
+            value.replace_range(offsets[start]..offsets[end], text);
+            let prefix = &value[..offsets[start] + text.len()];
+            let prefix = if initial.kind == obscura_dom::tree::TextControlKind::TextArea {
+                initial.kind.normalize(prefix)
+            } else {
+                let prefix = prefix.replace(['\r', '\n'], "");
+                if initial.kind == obscura_dom::tree::TextControlKind::Url {
+                    prefix
+                        .trim_start_matches(|c| matches!(c, ' ' | '\t' | '\x0c'))
+                        .to_owned()
+                } else {
+                    prefix
+                }
+            };
+            value = initial.kind.normalize(&value);
+            caret = (prefix.encode_utf16().count() as u32).min(value.encode_utf16().count() as u32);
+        } else {
+            let active = if initial.direction == "backward" {
+                start
+            } else {
+                end
+            };
+            let index = match key.unwrap() {
+                "ArrowLeft" => {
+                    if start != end {
+                        start
+                    } else {
+                        start.saturating_sub(1)
+                    }
+                }
+                "ArrowRight" => {
+                    if start != end {
+                        end
+                    } else {
+                        (end + 1).min(offsets.len() - 1)
+                    }
+                }
+                "Home" => {
+                    let byte = initial.value[..offsets[active]]
+                        .rfind('\n')
+                        .map(|v| v + 1)
+                        .unwrap_or(0);
+                    offsets.binary_search(&byte).unwrap()
+                }
+                "End" => {
+                    let byte = initial.value[offsets[active]..]
+                        .find('\n')
+                        .map(|v| offsets[active] + v)
+                        .unwrap_or(initial.value.len());
+                    offsets.binary_search(&byte).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            caret = units[index];
+        }
+        self.verify_manual_text(node, focus.focus_generation, initial.generation, &value)
+            .map_err(before)?;
+        let mut prevented = false;
+        if let Some(key) = key {
+            prevented = !self.native_text_event(14, node, key).map_err(after)?;
+            self.native_input_checkpoint().map_err(after)?;
+            self.verify_manual_text(node, focus.focus_generation, initial.generation, &value)
+                .map_err(after)?;
+        }
+        let mut generation = initial.generation;
+        if !prevented && editing && (value != initial.value || initial.start != initial.end) {
+            prevented = !self.native_text_event(kind, node, text).map_err(after)?;
+            self.native_input_checkpoint().map_err(after)?;
+            self.verify_manual_text(node, focus.focus_generation, generation, &value)
+                .map_err(after)?;
+            if !prevented {
+                let mut state = self.state.borrow_mut();
+                let dom = state.dom.as_ref().ok_or(after("NO_DOCUMENT"))?;
+                dom.set_user_text_value(node, &value)
+                    .ok_or(after("INPUT_TARGET_CHANGED"))?;
+                generation = dom
+                    .set_text_selection(node, caret, caret, "none")
+                    .ok_or(after("INPUT_TARGET_CHANGED"))?
+                    .generation;
+                invalidate_input_render(&mut state);
+                drop(state);
+                self.native_text_event(kind + 1, node, text)
+                    .map_err(after)?;
+                self.native_input_checkpoint().map_err(after)?;
+                self.verify_manual_text(node, focus.focus_generation, generation, &value)
+                    .map_err(after)?;
+            }
+        } else if !prevented && !editing && (initial.start != caret || initial.end != caret) {
+            let mut state = self.state.borrow_mut();
+            generation = state
+                .dom
+                .as_ref()
+                .ok_or(after("NO_DOCUMENT"))?
+                .set_text_selection(node, caret, caret, "none")
+                .ok_or(after("INPUT_TARGET_CHANGED"))?
+                .generation;
+            invalidate_input_render(&mut state);
+            drop(state);
+            self.native_text_event(0, node, "").map_err(after)?;
+            self.native_input_checkpoint().map_err(after)?;
+            self.verify_manual_text(node, focus.focus_generation, generation, &value)
+                .map_err(after)?;
+        }
+        if let Some(key) = key {
+            // No pressed-key state survives a bounded editing operation.
+            self.native_text_event(15, node, key).map_err(after)?;
+            self.native_input_checkpoint().map_err(after)?;
+            self.verify_manual_text(
+                node,
+                focus.focus_generation,
+                generation,
+                if prevented { &initial.value } else { &value },
+            )
+            .map_err(after)?;
+        }
+        Ok(prevented)
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_fill(
+        &mut self,
+        selector: &str,
+        value: &str,
+    ) -> Result<NativeFill, (&'static str, &'static str)> {
+        let before = |code| (code, "NOT_SENT");
+        let after = |code| {
+            (
+                code,
+                if code == "INPUT_DISPATCH_FAILED" {
+                    "UNKNOWN"
+                } else {
+                    "SENT"
+                },
+            )
+        };
+        if value.len() > 16384 {
+            return Err(before("INPUT_VALUE_LIMIT"));
+        }
+        if self.has_pending_navigation() {
+            return Err(before("UNEXPECTED_NAVIGATION"));
+        }
+        let node = self.input_node(selector).map_err(before)?;
+        let initial = self.editable_text(node, value).map_err(before)?;
+        let value = initial.kind.normalize(value);
+        let events = self.scroll_input_into_view(node).map_err(before)?;
+        let scrolled = !events.is_empty();
+        for (kind, scroller) in events {
+            self.native_text_event(kind, scroller, "").map_err(after)?;
+            self.native_input_checkpoint().map_err(after)?;
+            if self.has_pending_navigation() {
+                return Err(after("UNEXPECTED_NAVIGATION"));
+            }
+            if self.input_node(selector).map_err(after)? != node {
+                return Err(after("INPUT_TARGET_CHANGED"));
+            }
+            if self.editable_text(node, &value).map_err(after)?.generation != initial.generation {
+                return Err(after("INPUT_VALUE_CHANGED"));
+            }
+        }
+        let target = self.input_target(selector).map_err(|code| {
+            if scrolled {
+                after(code)
+            } else {
+                before(code)
+            }
+        })?;
+        if !self.native_focus(selector).map_err(after)? {
+            return Err(after("INPUT_FOCUS_CHANGED"));
+        }
+        let focus_generation = self
+            .with_dom(|dom| dom.input_state().focus_generation)
+            .ok_or(after("NO_DOCUMENT"))?;
+        self.native_input_checkpoint().map_err(after)?;
+        self.verify_fill_target(
+            selector,
+            target.node,
+            focus_generation,
+            initial.generation,
+            &value,
+        )
+        .map_err(after)?;
+        let selected = {
+            let mut state = self.state.borrow_mut();
+            let control = state
+                .dom
+                .as_ref()
+                .ok_or(after("NO_DOCUMENT"))?
+                .set_text_selection(
+                    target.node,
+                    0,
+                    initial.value.encode_utf16().count() as u32,
+                    "none",
+                )
+                .ok_or(after("INPUT_TARGET_CHANGED"))?;
+            invalidate_input_render(&mut state);
+            control
+        };
+        self.native_text_event(0, target.node, "").map_err(after)?;
+        self.native_input_checkpoint().map_err(after)?;
+        self.verify_fill_target(
+            selector,
+            target.node,
+            focus_generation,
+            selected.generation,
+            &value,
+        )
+        .map_err(after)?;
+        if !self
+            .native_text_event(1, target.node, &value)
+            .map_err(after)?
+        {
+            return Err(after("INPUT_CANCELLED"));
+        }
+        self.native_input_checkpoint().map_err(after)?;
+        self.verify_fill_target(
+            selector,
+            target.node,
+            focus_generation,
+            selected.generation,
+            &value,
+        )
+        .map_err(after)?;
+        {
+            let mut state = self.state.borrow_mut();
+            let dom = state.dom.as_ref().ok_or(after("NO_DOCUMENT"))?;
+            dom.set_user_text_value(target.node, &value)
+                .ok_or(after("INPUT_TARGET_CHANGED"))?;
+            let end = value.encode_utf16().count() as u32;
+            dom.set_text_selection(target.node, end, end, "none");
+            invalidate_input_render(&mut state);
+        }
+        self.native_text_event(2, target.node, &value)
+            .map_err(after)?;
+        self.native_input_checkpoint().map_err(after)?;
+        if self.has_pending_navigation() {
+            return Err(after("UNEXPECTED_NAVIGATION"));
+        }
+        let current = self
+            .with_dom(|dom| {
+                dom.is_connected(target.node)
+                    .then(|| dom.text_control(target.node))
+                    .flatten()
+            })
+            .flatten()
+            .ok_or(after("INPUT_TARGET_CHANGED"))?;
+        if current.value != value {
+            return Err(after("INPUT_VALUE_CHANGED"));
+        }
+        Ok(NativeFill {
+            node: target.node,
+            changed: initial.value != value,
+            value,
+        })
+    }
+
+    #[cfg(feature = "render")]
+    fn native_text_event(
+        &mut self,
+        kind: u8,
+        node: NodeId,
+        value: &str,
+    ) -> Result<bool, &'static str> {
+        use deno_core::v8;
+        let nodes = self
+            .with_dom(|dom| {
+                let mut nodes = vec![node];
+                nodes.extend(dom.ancestors(node));
+                nodes
+            })
+            .ok_or("NO_DOCUMENT")?;
+        if nodes.len() > 512 {
+            return Err("INPUT_PATH_LIMIT");
+        }
+        let function = self.native_text.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let path = v8::Array::new(scope, nodes.len() as i32);
+        for (index, node) in nodes.iter().enumerate() {
+            let value = v8::Integer::new_from_unsigned(scope, node.raw());
+            if !path
+                .set_index(scope, index as u32, value.into())
+                .unwrap_or(false)
+            {
+                return Err("INPUT_DISPATCH_FAILED");
+            }
+        }
+        let text = v8::String::new(scope, value).ok_or("INPUT_DISPATCH_FAILED")?;
+        let arguments = [
+            v8::Integer::new_from_unsigned(scope, kind as u32).into(),
+            path.into(),
+            text.into(),
+        ];
+        let receiver = v8::undefined(scope).into();
+        let result = function
+            .call(scope, receiver, &arguments)
+            .ok_or("INPUT_DISPATCH_FAILED")?;
+        if !result.is_boolean() {
+            return Err("INPUT_DISPATCH_FAILED");
+        }
+        Ok(result.boolean_value(scope))
+    }
+
+    /// Resolve an automation target from the native DOM and prepared renderer.
+    /// No page JavaScript, DOM helper, or script-provided geometry is consulted.
+    #[cfg(feature = "render")]
+    pub fn input_target(&self, selector: &str) -> Result<InputTarget, &'static str> {
+        if selector.is_empty() || selector.len() > 1024 {
+            return Err("INVALID_SELECTOR");
+        }
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let tree = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+            let nodes = tree
+                .query_selector_all(selector)
+                .map_err(|_| "INVALID_SELECTOR")?;
+            if nodes.is_empty() {
+                return Err("ELEMENT_NOT_FOUND");
+            }
+            if nodes.len() != 1 {
+                return Err("ELEMENT_AMBIGUOUS");
+            }
+            let id = nodes[0];
+            if tree.is_disabled(id) || tree.is_inert(id) {
+                return Err("ELEMENT_DISABLED");
+            }
+            let prepared = state
+                .prepared_render
+                .as_ref()
+                .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let style = prepared
+                .layout()
+                .styles
+                .get(&id)
+                .ok_or("ELEMENT_NOT_VISIBLE")?;
+            if style.effectively_invisible {
+                return Err("ELEMENT_NOT_VISIBLE");
+            }
+            let (_, scroll) = state
+                .resolved_scroll
+                .as_ref()
+                .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let rect = prepared
+                .visible_rect(id, scroll)
+                .ok_or("ELEMENT_NOT_VISIBLE")?;
+            let point = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            let hit = prepared
+                .hit_test(tree, scroll, point)?
+                .ok_or("ELEMENT_NOT_VISIBLE")?;
+            if hit != id && !tree.ancestors(hit).contains(&id) {
+                return Err("ELEMENT_OCCLUDED");
+            }
+            Ok(InputTarget {
+                node: id,
+                hit_node: hit,
+                x: point.0,
+                y: point.1,
+            })
+        })
+    }
+
     /// Return the retained layout's scrollable document size without changing
     /// the live viewport or scroll position. PDF/full-document consumers use
     /// this to paginate document-space captures from the same geometry.
@@ -2060,6 +4119,7 @@ impl ObscuraJsRuntime {
             return 0;
         }
         let initiator = initiator.expect("checked above");
+        let referrer_policy = state.referrer_policy;
         let callbacks = state.callbacks.clone();
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
@@ -2098,6 +4158,7 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.referrer_policy = referrer_policy;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
                             request.mode = RequestMode::Cors;
@@ -3429,11 +5490,22 @@ impl ObscuraJsRuntime {
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
         self.begin_javascript_task();
         self.runtime().v8_isolate().perform_microtask_checkpoint();
+        let focus = self.native_focus_fixup();
+        if focus != Ok(false) {
+            return self.finish_heap_checked(focus.map(|_| false).map_err(str::to_owned));
+        }
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let tick = self
                 .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            if !matches!(&tick, std::task::Poll::Ready(Err(_))) {
+                match self.native_focus_fixup() {
+                    Ok(true) => return std::task::Poll::Ready(Ok(false)),
+                    Err(error) => return std::task::Poll::Ready(Err(error.to_owned())),
+                    Ok(false) => {}
+                }
+            }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
@@ -3477,12 +5549,16 @@ impl ObscuraJsRuntime {
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
         );
         self.runtime().v8_isolate().perform_microtask_checkpoint();
+        let focus = self.native_focus_fixup();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
+        }
+        if focus != Ok(false) {
+            return focus.map(|_| false).map_err(str::to_owned);
         }
 
         let isolate_handle = self.isolate_handle();
@@ -3495,12 +5571,20 @@ impl ObscuraJsRuntime {
             let tick = self
                 .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            let focus = if matches!(&tick, std::task::Poll::Ready(Err(_))) {
+                Ok(false)
+            } else {
+                self.native_focus_fixup()
+            };
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
                 self.runtime().v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
+            }
+            if focus != Ok(false) {
+                return std::task::Poll::Ready(focus.map(|_| false).map_err(str::to_owned));
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
@@ -4396,7 +6480,7 @@ mod tests {
     fn cloned_controls_keep_current_value_and_checked_state() {
         let mut rt = setup_runtime("<html><body><div id=group><input id=field value=default><input id=box type=checkbox></div></body></html>");
         let result = rt.evaluate("(() => {const field=document.getElementById('field'), box=document.getElementById('box');field.value='current';box.checked=true;box.indeterminate=true;const clone=document.getElementById('group').cloneNode(true);return [clone.children[0].value,clone.children[0].getAttribute('value'),clone.children[1].checked,clone.children[1].indeterminate];})()").unwrap();
-        assert_eq!(result, serde_json::json!(["current", "default", true, false]));
+        assert_eq!(result, serde_json::json!(["current", "default", true, true]));
     }
 
     #[cfg(feature = "render")]
@@ -4412,9 +6496,10 @@ mod tests {
         rt.evaluate("document.getElementById('form').reset()").unwrap();
         assert_eq!(
             rt.evaluate("[field.value,field.getAttribute('value'),box.checked,box.indeterminate,box.hasAttribute('checked')]").unwrap(),
-            serde_json::json!(["default", "default", true, false, true])
+            serde_json::json!(["default", "default", true, true, true])
         );
-        assert_eq!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
+        // Reset preserves indeterminate, as does Chrome; the mark still differs.
+        assert_ne!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
     }
 
     // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
@@ -5611,7 +7696,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let path = rt
             .evaluate(
-                "(function(){history.pushState({}, '', '/dashboard'); history.replaceState({scroll:1}); return location.pathname;})()",
+                "(function(){history.pushState({}, '', '/dashboard'); history.replaceState({scroll:1}, ''); return location.pathname;})()",
             )
             .unwrap();
         assert_eq!(path, serde_json::json!("/dashboard"));
@@ -5622,7 +7707,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let path = rt
             .evaluate(
-                "(function(){history.pushState({}, '', '/a'); history.pushState({b:1}); return location.pathname;})()",
+                "(function(){history.pushState({}, '', '/a'); history.pushState({b:1}, ''); return location.pathname;})()",
             )
             .unwrap();
         assert_eq!(path, serde_json::json!("/a"));
@@ -11655,7 +13740,7 @@ mod tests {
                     window.addEventListener("scroll", () => win++);
                     document.addEventListener("scroll", () => doc++);
                     window.scrollTo(0, 100);
-                    setTimeout(() => resolve([win, doc, window.scrollY]), 5);
+                    requestAnimationFrame(() => resolve([win, doc, window.scrollY]));
                 })
                 "#,
                 true,
@@ -11676,7 +13761,7 @@ mod tests {
                     document.addEventListener("scroll", () => doc++);
                     const before = window.scrollY;
                     window.scrollTo(0, 99999);
-                    setTimeout(() => resolve([win, doc, before, window.scrollY]), 5);
+                    requestAnimationFrame(() => resolve([win, doc, before, window.scrollY]));
                 })
                 "#,
                 true,
@@ -12855,7 +14940,7 @@ mod tests {
                     window.addEventListener("scroll", () => win++);
                     document.addEventListener("scroll", () => doc++);
                     document.getElementById("target").scrollIntoView({ block: "nearest" });
-                    setTimeout(() => resolve([win, doc, scrollY]), 5);
+                    requestAnimationFrame(() => resolve([win, doc, scrollY]));
                 })
                 "#,
                 true,
@@ -12875,7 +14960,7 @@ mod tests {
                     window.addEventListener("scroll", () => win++);
                     document.addEventListener("scroll", () => doc++);
                     document.getElementById("target").scrollIntoView({ block: "center" });
-                    setTimeout(() => resolve([win, doc, scrollY]), 5);
+                    requestAnimationFrame(() => resolve([win, doc, scrollY]));
                 })
                 "#,
                 true,
@@ -15497,7 +17582,7 @@ mod tests {
         let href = rt
             .evaluate("const next = '/next'; location.href = next; return location.href;")
             .unwrap();
-        assert_eq!(href, serde_json::json!("http://example.com/next"));
+        assert_eq!(href, serde_json::json!("http://example.com/test"));
         assert_eq!(
             rt.take_pending_navigation(),
             Some((
@@ -15526,9 +17611,9 @@ mod tests {
         assert_eq!(
             hrefs,
             serde_json::json!([
-                "http://example.com/from-href",
-                "http://example.com/from-assign",
-                "http://example.com/from-replace"
+                "http://example.com/test",
+                "http://example.com/test",
+                "http://example.com/test"
             ])
         );
         assert_eq!(
@@ -15558,7 +17643,7 @@ mod tests {
         "#,
             )
             .unwrap();
-        assert_eq!(href, serde_json::json!("http://example.com/submitted"));
+        assert_eq!(href, serde_json::json!("http://example.com/test"));
         assert_eq!(
             rt.take_pending_navigation(),
             Some((
@@ -16664,7 +18749,11 @@ mod tests {
         rt.evaluate("location.href = 'users/42'").unwrap();
 
         let landed = rt.evaluate("location.href").unwrap();
-        assert_eq!(landed.as_str().unwrap(), "http://example.com/app/users/42");
+        // A scheduled navigation does not change the active document URL.
+        assert_eq!(landed.as_str().unwrap(), "http://example.com/deep/page");
+        assert_eq!(rt.take_pending_navigation(), Some((
+            "http://example.com/app/users/42".into(), "GET".into(), String::new(),
+        )));
     }
 
     #[test]
@@ -16796,7 +18885,7 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_base_href_resolves_against_the_push_state_url() {
+    fn a_relative_base_href_stays_frozen_until_its_attribute_changes() {
         let mut rt = setup_runtime_at_deep_url(
             r#"<html><head><base href="assets/"></head><body>
                 <a id="link" href="x.json"></a>
@@ -16807,7 +18896,10 @@ mod tests {
         let link = rt
             .evaluate("document.getElementById('link').href")
             .unwrap();
-        assert_eq!(link.as_str().unwrap(), "http://example.com/other/assets/x.json");
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/assets/x.json");
+        rt.evaluate("document.querySelector('base').setAttribute('href','updated/')").unwrap();
+        let link = rt.evaluate("document.getElementById('link').href").unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/updated/x.json");
     }
 
     /// Guards the cache in `document_base_url_memoized`. Without it, each of these reads walked

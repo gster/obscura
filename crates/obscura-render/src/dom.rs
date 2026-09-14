@@ -2691,6 +2691,7 @@ fn cascade_node_style(
             }
             match input_type.as_str() {
                 "checkbox" | "radio" => {
+                    style.background_color = None;
                     style.margin = crate::Edges {
                         top: 3.0,
                         right: 3.0,
@@ -7072,6 +7073,7 @@ fn layout_dom_once(
             synthesize_row_rects(tree, &mut rects);
         }
     }
+    inline_fragments.extend(synthesize_block_inline_fragments(tree, &mut rects, &styles));
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
 
     let mut clip_rects = HashMap::new();
@@ -7285,6 +7287,87 @@ fn layout_dom_once(
         query_stats,
         cascade_time,
     )
+}
+
+// Undecorated block-only inlines are flattened for block layout, but still own the
+// anonymous block continuation between their empty inline continuations.
+// Preserve that geometry from the laid-out flow, not from text measurements.
+// Blink exposes this continuation as the middle getClientRects() entry:
+// https://github.com/w3c/csswg-drafts/issues/13711
+fn synthesize_block_inline_fragments(
+    tree: &DomTree,
+    rects: &mut HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> HashMap<NodeId, Vec<Rect>> {
+    let mut fragments = HashMap::new();
+    for (&id, style) in styles {
+        if style.display_contents
+            || rects.contains_key(&id)
+            || !is_flattenable_inline(tree, id, styles)
+            || style.padding != crate::Edges::default()
+            || !inline_wraps_only_in_flow_blocks(tree, id, styles)
+        {
+            continue;
+        }
+        let mut children = Vec::new();
+        flatten_boxless_inline_children(tree, &rendered_children(tree, id), styles, &mut children);
+        let flow = children
+            .iter()
+            .filter_map(|cid| rects.get(cid))
+            .collect::<Vec<_>>();
+        let (Some(first), Some(last)) = (flow.first(), flow.last()) else {
+            continue;
+        };
+        let top = first.y;
+        let bottom = last.y + last.height;
+        let mut ancestor = rendered_parent(tree, id);
+        let mut containing = None;
+        while let Some(parent) = ancestor {
+            if let (Some(rect), Some(parent_style)) = (rects.get(&parent), styles.get(&parent)) {
+                if !parent_style.ignores_used_box_sizes() && !parent_style.display_contents {
+                    containing = Some((*rect, parent_style));
+                    break;
+                }
+            }
+            ancestor = rendered_parent(tree, parent);
+        }
+        let Some((container, parent_style)) = containing else {
+            continue;
+        };
+        let left = container.x + parent_style.border.left + parent_style.padding.left;
+        let width = (container.width
+            - parent_style.border.left
+            - parent_style.border.right
+            - parent_style.padding.left
+            - parent_style.padding.right)
+            .max(0.0);
+        let middle = Rect {
+            x: left,
+            y: top,
+            width,
+            height: (bottom - top).max(0.0),
+        };
+        fragments.insert(
+            id,
+            vec![
+                Rect {
+                    x: left,
+                    y: top,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                middle,
+                Rect {
+                    x: left,
+                    y: bottom,
+                    width: 0.0,
+                    height: 0.0,
+                },
+            ],
+        );
+        rects.insert(id, middle);
+    }
+    fragments
 }
 
 /// Convert Taffy's ordinary-inline line surrogate into the element's actual
@@ -9259,6 +9342,10 @@ fn style_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
 /// ordinary children remain its fallback content.
 /// Return the flattened-tree children that generate boxes for `id`.
 pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
+    if tree.text_control_kind(id) == Some(obscura_dom::tree::TextControlKind::TextArea) {
+        // The light children are the default value, not the live editor contents.
+        return Vec::new();
+    }
     if let Some(shadow_children) = tree.shadow_children(id) {
         // A shadow host's light children stay in the DOM but its box tree is
         // generated from the shadow root. Matching light children re-enter at
@@ -13439,8 +13526,13 @@ fn flatten_boxless_inline_children(
             .get(&cid)
             .map(|style| style.display_contents && style.display != crate::Display::None)
             .unwrap_or(false);
+        // Keep shaping provenance for ordinary inlines that can share the
+        // anonymous run's buffer. Flattening them here paints their text but
+        // loses their canonical fragments and therefore their input geometry.
+        let mut has_text = false;
+        let foldable = crate::inline::inline_child_ok(tree, cid, styles, &mut has_text);
         if display_contents
-            || is_flattenable_inline(tree, cid, styles)
+            || (is_flattenable_inline(tree, cid, styles) && !foldable)
             || inline_wraps_only_in_flow_blocks(tree, cid, styles)
         {
             let kids = rendered_children(tree, cid);

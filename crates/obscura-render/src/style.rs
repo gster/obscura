@@ -247,9 +247,9 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // A native textarea is an atomic inline-block control whose
         // intrinsic box comes from rows/cols (resolved in dom.rs once the
         // attributes are readable), not from its text content. Unlike the
-        // other controls it keeps its content in the tree (the value is the
-        // text child), laid out inside the sized box; line breaks in the
-        // value must survive, hence pre-wrap. Chromium defaults the control
+        // other controls its default value is a text child; the current value
+        // is painted from native text state. Line breaks in the value must
+        // survive, hence pre-wrap. Chromium defaults the control
         // to the fixed-pitch face and to border-box sizing.
         style.display = Display::Inline;
         style.is_inline_block = true;
@@ -1465,7 +1465,30 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 0
             };
         }
-        "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
+        "appearance" | "-webkit-appearance" => match value.to_ascii_lowercase().as_str() {
+            "none" => {
+                style.appearance_none = true;
+                style.appearance_inherit = false;
+            }
+            "auto" | "initial" | "unset" | "revert" | "revert-layer" => {
+                style.appearance_none = false;
+                style.appearance_inherit = false;
+            }
+            "inherit" => style.appearance_inherit = true,
+            _ => {}
+        },
+        "pointer-events" => match value.to_ascii_lowercase().as_str() {
+            "none" => style.pointer_events_none = Some(true),
+            "auto" | "initial" => style.pointer_events_none = Some(false),
+            "inherit" | "unset" | "revert" | "revert-layer" => style.pointer_events_none = None,
+            _ => {},
+        },
+        "visibility" => match value.to_ascii_lowercase().as_str() {
+            "hidden" | "collapse" => style.visibility_hidden = Some(true),
+            "visible" | "initial" => style.visibility_hidden = Some(false),
+            "inherit" | "unset" | "revert" | "revert-layer" => style.visibility_hidden = None,
+            _ => {},
+        },
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
         "animation" => apply_animation_shorthand(style, value),
         "animation-name" => {
@@ -2123,6 +2146,9 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "overflow-y"
             | "scrollbar-gutter"
             | "visibility"
+            | "pointer-events"
+            | "appearance"
+            | "-webkit-appearance"
             | "opacity"
             | "animation"
             | "animation-name"
@@ -2305,6 +2331,8 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                         || px_value(token).is_some_and(f32::is_finite)
                 })
         }
+        "pointer-events" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "none"),
+        "appearance" | "-webkit-appearance" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "none"),
         "visibility" => matches!(
             value.to_ascii_lowercase().as_str(),
             "visible" | "hidden" | "collapse"

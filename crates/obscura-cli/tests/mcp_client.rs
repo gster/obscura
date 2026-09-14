@@ -47,8 +47,13 @@ impl TestPageServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                        let mut request = [0u8; 2048];
-                        let _ = stream.read(&mut request);
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while request.len() < 16384 && !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let Ok(read) = stream.read(&mut chunk) else { break; };
+                            if read == 0 { break; }
+                            request.extend_from_slice(&chunk[..read]);
+                        }
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             TEST_PAGE.len(),
