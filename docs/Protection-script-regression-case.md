@@ -115,52 +115,12 @@ case proves the local browser contract; the live workflow must still return a
 successful shopping response before the 403 investigation is considered
 complete.
 
-## Validation checkpoint, 2026-09-16
+## Verification boundary
 
-The subsequent [computer-use and transport comparison](Southwest-search-comparison.md)
-records fresh Chrome successes, failed matched transport probes, and a separate
-empty-ARIA-label locator fix. The locator fix does not resolve shopping 403.
-
-Chrome computer use again displayed 26 LGA to LAS itineraries for September
-30. A normal query through the existing isolated SDK returned
-`SEARCH_HTTP_403`. The live workflow has not passed, and the server's rejection
-cause remains unconfirmed.
-
-The SDK's 30 local tests and the Southwest workflow's 12 local tests passed.
-The final render nextest run executed 1723 tests: 1722 passed, one font-loading
-test failed, and four were skipped. The font test also failed with two test
-threads; reducing concurrency did not eliminate it.
-
-The companion obstacle course at revision `e4a5490` reported 32/33. Its
-IntersectionObserver fixture expects 50 items without changing the sentinel's
-intersection or observing it again. Running that fixture through Chrome
-computer use and through the isolated SDK produced the same 10 items. Preserve
-the original failing gate result while treating this fixture expectation as
-a separate benchmark issue.
-
-## Recheck against the installed runtime
-
-The referenced Worker protocol and asynchronous-script corrections are still
-present. A focused release nextest rerun passed all four tests:
-`southwest_style_protection_probe_remains_coherent`,
-`dynamic_classic_script_runs_after_post_insertion_callback_assignment`,
-`worker_eventtarget_listener_can_filter_bootstrap_protocol_messages`, and
-`worker_onmessage_wrapper_keeps_filtered_native_callback`.
-
-A separate local HTTP fixture was opened through the installed protocol-2 SDK
-runtime, SHA-256
-`70e4c92329cb2bcb0a013728ef93f1f77873ff3735a8fa2a92838997fe6b8f6f`.
-It verified a Worker.prototype.onmessage setter, filtering of an internal
-worker message, and a real fetched dynamic script invoking a callback assigned
-after insertion. The application received only `application`, and the script
-returned `network-script-ready`. This confirms these behaviors in the binary
-used for the live searches, not merely in source tests. It does not add a
-Chrome task-queue comparison or prove every protected-site execution branch.
-
-The [Cookie provenance audit](Southwest-search-comparison.md#cookie-provenance-audit-and-corrected-count)
-found a separate pre-request execution difference: the www-only origin policy
-blocks an Adobe request, causing its analytics session-cookie write to occur
-before shopping. With the two observed Adobe origins temporarily allowed, the
-write occurs after the network response and after initial shopping. This is
-not evidence that the earlier Worker fix regressed. The resulting first
-Cookie-name set matched Chrome and shopping still returned 403.
+The reduced tests document the specific browser contracts above. The current
+Worker implementation has separate realm support, but the September 16 review
+found regressions in structured message cloning and Worker termination. Passing
+the protection-protocol fixture does not establish complete Worker conformance.
+See the [final Southwest repair and review record](Southwest-fix-record.md) for
+current findings, reproduced failures, historical business samples, and gates
+that have not passed. This fixture alone does not explain a live shopping 403.

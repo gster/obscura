@@ -6,6 +6,7 @@ pub mod module_loader;
 pub mod ops;
 pub mod runtime;
 pub mod v8_flags;
+pub mod worker;
 mod write_stream;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;

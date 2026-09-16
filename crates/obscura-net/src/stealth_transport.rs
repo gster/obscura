@@ -73,6 +73,7 @@ impl Client {
                 StealthProfile::WindowsChrome145 => r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#,
             }),
             ("sec-ch-ua-mobile", "?0"), ("sec-ch-ua-platform", match profile { StealthProfile::MacChrome152 => "\"macOS\"", StealthProfile::WindowsChrome145 => "\"Windows\"" }),
+            ("accept", "*/*"),
             ("accept-language", accept_language.unwrap_or("en-US,en;q=0.9")),
             ("accept-encoding", "gzip, deflate, br, zstd"), ("priority", "u=0, i"),
         ] { headers.insert(name, HeaderValue::from_str(value).expect("valid persona header")); }

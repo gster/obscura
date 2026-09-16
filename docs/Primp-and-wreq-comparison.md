@@ -1,7 +1,7 @@
 # Primp and wreq comparison
 
 For the current Southwest business result and the limits of a matched
-transport probe, see [Southwest search comparison](Southwest-search-comparison.md).
+transport probe, see [Southwest repair and review record](Southwest-fix-record.md).
 
 Source review: 2026-09-15. Scope: Chrome 152 on macOS, TLS signatures and trust-anchor extension, and integration into Obscura. This note separates source facts, supplied capture evidence, and recommendations. The source-review sections precede the integration work; the implementation status below records the subsequent changes.
 

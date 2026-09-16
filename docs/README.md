@@ -49,7 +49,7 @@ the primp/Rustls transport and browser-identity protections.
 - [Architecture overview](Architecture-overview.md)
 - [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 - [Testing and debugging](Testing-and-debugging.md)
-- [Southwest 任务进度与后续排查](Southwest-task-status.md)
+- [Southwest 修复与审查记录](Southwest-fix-record.md)
 - [Protection script regression case](Protection-script-regression-case.md)
 
 ## Links

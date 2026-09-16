@@ -363,6 +363,16 @@ async function __fetchDynClassicScript(task) {
   let body;
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
+  } else if (task.url.startsWith('blob:')) {
+    const store = globalThis.__blobStore || {};
+    const bytesStore = globalThis.__blobBytes || {};
+    if (store[task.url] !== undefined) {
+      body = store[task.url];
+    } else if (bytesStore[task.url] !== undefined) {
+      body = new TextDecoder().decode(bytesStore[task.url]);
+    } else {
+      throw new Error('HTTP 404');
+    }
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
       task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, task.mode, task.credentials, "script"
@@ -2001,7 +2011,8 @@ function __prepareInsertedScript(script) {
     const pageOrigin = (function() { try { return new URL(docUrl).origin; } catch(e) { return ""; } })();
     // Snapshot the CORS settings at preparation time. The base URL resolves
     // src but does not change the document's origin or credential policy.
-    const crossOrigin = script.getAttribute('crossorigin');
+    const crossOrigin = script.getAttribute('crossorigin')
+      ?? (typeof script.crossOrigin === 'string' ? script.crossOrigin : null);
     const task = {
       url: fullUrl,
       isModule,
@@ -5128,6 +5139,20 @@ function _convertNodes(nodes) {
     function () { return this.getAttribute(attr); },
     function (v) { if (v === null || v === undefined) this.removeAttribute(attr); else this.setAttribute(attr, String(v)); });
 
+  // CORS settings attributes reflected as enumerated IDL attributes limited to
+  // known values ("anonymous" | "use-credentials", invalid default "anonymous",
+  // missing default null). Setter removes on null/undefined.
+  const reflectCORS = (name, attr) => def(name,
+    function () {
+      const v = this.getAttribute(attr);
+      if (v === null) return null;
+      return String(v).toLowerCase() === "use-credentials" ? "use-credentials" : "anonymous";
+    },
+    function (v) {
+      if (v === null || v === undefined) this.removeAttribute(attr);
+      else this.setAttribute(attr, String(v));
+    });
+
   // Global content attributes reflected on every element (HTML "global attributes").
   reflectStr("title", "title");
   reflectStr("lang", "lang");
@@ -5136,6 +5161,7 @@ function _convertNodes(nodes) {
   reflectEnum("dir", "dir", ["ltr", "rtl", "auto"], "", "");
   reflectBool("autofocus", "autofocus");
   reflectBool("hidden", "hidden");
+  reflectCORS("crossOrigin", "crossorigin");
   // tabIndex default is element-dependent (0 for natively-focusable, else -1);
   // reflection.js does not assert it, but match the common case anyway.
   reflectLong("tabIndex", "tabindex", function () {
@@ -6184,10 +6210,14 @@ class HTMLImageElement extends Element {
   set decoding(value) { this.setAttribute("decoding", value); }
   get fetchPriority() { return this.getAttribute("fetchpriority") || "auto"; }
   set fetchPriority(value) { this.setAttribute("fetchpriority", value); }
-  get crossOrigin() { return this.getAttribute("crossorigin"); }
+  get crossOrigin() {
+    const v = this.getAttribute("crossorigin");
+    if (v === null) return null;
+    return String(v).toLowerCase() === "use-credentials" ? "use-credentials" : "anonymous";
+  }
   set crossOrigin(value) {
-    if (value === null) this.removeAttribute("crossorigin");
-    else this.setAttribute("crossorigin", value);
+    if (value === null || value === undefined) this.removeAttribute("crossorigin");
+    else this.setAttribute("crossorigin", String(value));
   }
 
   setAttribute(name, value) {
@@ -6655,7 +6685,7 @@ Object.assign(_locationObj, {
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
   set(value) { _locationNavigate(value); },
-  configurable: false,
+  configurable: true,
   enumerable: true,
 });
 
@@ -7378,6 +7408,22 @@ globalThis.fetch = async (input, init = {}) => {
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
+  if (url.startsWith('blob:')) {
+    const store = globalThis.__blobStore || {};
+    const meta = globalThis.__blobMeta || {};
+    const bytesStore = globalThis.__blobBytes || {};
+    if (store[url] !== undefined || bytesStore[url] !== undefined) {
+      const type = (meta[url] && meta[url].type) || 'text/html';
+      const bodyBytes = bytesStore[url] || (store[url] !== undefined ? new TextEncoder().encode(store[url]) : new Uint8Array(0));
+      return new Response(bodyBytes, {
+        status: 200,
+        statusText: "OK",
+        headers: { 'content-type': type },
+        type: "basic",
+        url: url,
+      });
+    }
+  }
   const method = init.method || (request ? request.method : "GET");
   const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
   let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
@@ -14474,155 +14520,101 @@ function _workerError(worker, error) {
   else if (handler && typeof handler.handleEvent === 'function') handler.handleEvent.call(handler, error);
 }
 
-function _makeWorkerScope(worker) {
-    const state = _workerInstanceState.get(worker);
-    function WorkerGlobalScope() {}
-    Object.setPrototypeOf(WorkerGlobalScope.prototype, globalThis.EventTarget.prototype);
-    Object.defineProperty(WorkerGlobalScope.prototype, Symbol.toStringTag, {
-      value: 'WorkerGlobalScope', configurable: true,
+const _workerById = new Map();
+
+function _serializeWorkerMsg(msg) {
+  try {
+    return JSON.stringify({ v: msg }, (key, val) => {
+      if (typeof val === 'string' && val.startsWith('__obscura_')) return '__obscura_str_' + val;
+      if (val === undefined) return '__obscura_val_undefined__';
+      return val;
     });
-    function DedicatedWorkerGlobalScope() {}
-    Object.setPrototypeOf(DedicatedWorkerGlobalScope.prototype, WorkerGlobalScope.prototype);
-    Object.defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
-      value: 'DedicatedWorkerGlobalScope', configurable: true,
-    });
-    function WorkerNavigator() {}
-    Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, {
-      value: 'WorkerNavigator', configurable: true,
-    });
-    const workerNavigator = Object.create(WorkerNavigator.prototype);
-    const navigatorValues = {
-      userAgent: globalThis.navigator.userAgent,
-      platform: globalThis.navigator.platform,
-      hardwareConcurrency: globalThis.navigator.hardwareConcurrency,
-      deviceMemory: globalThis.navigator.deviceMemory,
-      language: globalThis.navigator.language,
-      languages: globalThis.navigator.languages,
-      onLine: globalThis.navigator.onLine,
-      userAgentData: globalThis.navigator.userAgentData,
-      storage: globalThis.navigator.storage,
-      locks: globalThis.navigator.locks,
-      mediaCapabilities: globalThis.navigator.mediaCapabilities,
-      permissions: globalThis.navigator.permissions,
-      gpu: globalThis.navigator.gpu,
-    };
-    for (const [name, value] of Object.entries(navigatorValues)) {
-      Object.defineProperty(WorkerNavigator.prototype, name, {
-        configurable: true, enumerable: true, get() { return value; },
-      });
-    }
-    const scope = Object.create(DedicatedWorkerGlobalScope.prototype);
-    Object.assign(scope, {
-      WorkerGlobalScope,
-      DedicatedWorkerGlobalScope,
-      WorkerNavigator,
-      importScripts: (...urls) => {
-        for (const rawUrl of urls) {
-          let resolved = String(rawUrl);
-          try { resolved = new URL(resolved, globalThis.location?.href || '').href; } catch (e) {}
-          const source = globalThis.__blobStore?.[resolved];
-          if (source === undefined) {
-            // importScripts is synchronous in browsers. Obscura's network
-            // bridge is asynchronous, so fail with the same exception class
-            // instead of silently claiming that a remote worker dependency ran.
-            throw new DOMException(`Failed to execute 'importScripts': The script at '${resolved}' could not be loaded.`, 'NetworkError');
-          }
-          const run = new Function('scope', 'source', 'with (scope) { eval(source); }');
-          run.call(scope, scope, source);
-        }
-      },
-      postMessage: (msg) => {
-        if (state.terminated) return;
-        const data = typeof structuredClone === 'function' ? structuredClone(msg) : msg;
-        // A real worker never re-enters the caller during postMessage(). Some
-        // protection clients register their response callback immediately
-        // after sending; synchronous delivery races that registration and
-        // produces an impossible Chrome execution order.
-        setTimeout(() => {
-          if (state.terminated) return;
-          const evt = new MessageEvent('message', { data });
-          try { Object.defineProperties(evt, { target: { value: worker }, currentTarget: { value: worker } }); } catch (e) {}
-          _eventTargetDispatch(worker, evt);
-        }, 0);
-      },
-      close: () => { worker.terminate(); },
-      crypto: globalThis.crypto,
-      Crypto: globalThis.Crypto,
-      TextEncoder: globalThis.TextEncoder,
-      TextDecoder: globalThis.TextDecoder,
-      atob: globalThis.atob,
-      btoa: globalThis.btoa,
-      setTimeout: globalThis.setTimeout,
-      setInterval: globalThis.setInterval,
-      clearTimeout: globalThis.clearTimeout,
-      clearInterval: globalThis.clearInterval,
-      scheduler: globalThis.scheduler,
-      Scheduler: globalThis.Scheduler,
-      fetch: globalThis.fetch,
-      console: globalThis.console,
-      performance: globalThis.performance,
-      location: globalThis.location,
-      navigator: workerNavigator,
-    });
-    // A worker is a separate global realm. This implementation still executes
-    // in the page isolate, so copy the realm-neutral browser and ECMAScript
-    // globals that worker scripts observe through `self`/`globalThis`.
-    for (const name of [
-      'Object', 'Function', 'Array', 'Number', 'BigInt', 'Math', 'Date',
-      'String', 'Boolean', 'RegExp', 'Error', 'EvalError', 'RangeError',
-      'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'AggregateError',
-      'JSON', 'Promise', 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef',
-      'FinalizationRegistry', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView',
-      'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
-      'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
-      'BigInt64Array', 'BigUint64Array', 'Atomics', 'Intl', 'WebAssembly',
-      'URL', 'URLSearchParams', 'Blob', 'File', 'FormData', 'Headers',
-      'Request', 'Response', 'AbortController', 'AbortSignal',
-      'Event', 'EventTarget', 'CustomEvent', 'MessageEvent', 'MessageChannel', 'MessagePort',
-      'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'WebSocket',
-      'EventSource', 'BroadcastChannel', 'FileReader', 'FileReaderSync',
-      'indexedDB', 'IDBKeyRange', 'caches', 'OffscreenCanvas', 'ImageData',
-      'DOMMatrix', 'DOMMatrixReadOnly', 'DOMPoint', 'DOMPointReadOnly',
-      'DOMRect', 'DOMRectReadOnly',
-      'DOMException', 'structuredClone', 'queueMicrotask',
-      'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'decodeURI',
-      'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
-    ]) {
-      if (name in globalThis) scope[name] = globalThis[name];
-    }
-    scope.self = scope;
-    scope.globalThis = scope;
-    _installWorkerScopeMessageHandler(scope, DedicatedWorkerGlobalScope.prototype);
-    // Window-only globals are absent in DedicatedWorkerGlobalScope.
-    scope.window = undefined;
-    scope.document = undefined;
-    scope.localStorage = undefined;
-    scope.sessionStorage = undefined;
-    return scope;
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
 }
 
-function _autoRunWorker(worker) {
-    const state = _workerInstanceState.get(worker);
-    if (state.terminated || state.scope || state.code === undefined) return;
-    const scope = _makeWorkerScope(worker);
-    try {
-      const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, state.code);
-    } catch(e) {
-      console.error('Worker error:', e.message);
-      _workerError(worker, e);
-    } finally {
-      if (!state.terminated) {
-        state.scope = scope;
-        for (const data of state.pendingMessages.splice(0)) worker.postMessage(data);
+function _deserializeWorkerMsg(json) {
+  try {
+    const raw = JSON.parse(json);
+    function restore(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj)) {
+        for (let i = 0; i < obj.length; i++) {
+          if (obj[i] === '__obscura_val_undefined__') obj[i] = undefined;
+          else restore(obj[i]);
+        }
+      } else {
+        for (const k of Object.keys(obj)) {
+          if (obj[k] === '__obscura_val_undefined__') {
+            obj[k] = undefined;
+          } else if (typeof obj[k] === 'string' && obj[k].startsWith('__obscura_str_')) {
+            obj[k] = obj[k].slice('__obscura_str_'.length);
+          } else {
+            restore(obj[k]);
+          }
+        }
       }
     }
+    if (raw && raw.v === '__obscura_val_undefined__') {
+      raw.v = undefined;
+    } else {
+      restore(raw);
+    }
+    return raw;
+  } catch (_) {
+    return null;
+  }
+}
+
+globalThis.__obscura_worker_dispatch_to_page = function(workerId, json) {
+  setTimeout(() => {
+    const worker = _workerById.get(workerId);
+    if (!worker) return;
+    const state = _workerInstanceState.get(worker);
+    if (!state || state.terminated) return;
+    const payload = _deserializeWorkerMsg(json);
+    if (!payload) return;
+    const event = new MessageEvent('message', { data: payload.v });
+    try {
+      Object.defineProperties(event, { target: { value: worker }, currentTarget: { value: worker } });
+    } catch (e) {}
+    _eventTargetDispatch(worker, event);
+  }, 0);
+};
+
+function _autoRunWorker(worker) {
+  const state = _workerInstanceState.get(worker);
+  if (state.terminated || state.workerId !== null || state.code === undefined) return;
+  try {
+    const workerId = Deno.core.ops.op_worker_create(state.url || '');
+    state.workerId = workerId;
+    _workerById.set(workerId, worker);
+    const err = Deno.core.ops.op_worker_run(workerId, state.code);
+    if (err) {
+      _workerError(worker, new Error(err));
+    }
+  } catch (e) {
+    console.error('Worker error:', e.message);
+    _workerError(worker, e);
+  } finally {
+    if (!state.terminated && state.workerId !== null) {
+      for (const json of state.pendingMessages.splice(0)) {
+        const wid = state.workerId;
+        setTimeout(() => {
+          const s = _workerInstanceState.get(worker);
+          if (!s || s.terminated || s.workerId === null) return;
+          Deno.core.ops.op_worker_post_to_worker(wid, json);
+        }, 0);
+      }
+    }
+  }
 }
 
 function Worker(url) {
     if (!new.target) throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator.");
     const worker = this;
-    const state = {terminated: false, scope: null, pendingMessages: [], code: undefined, onerror: null};
+    const state = {terminated: false, workerId: null, pendingMessages: [], code: undefined, onerror: null, url: ''};
     _workerInstanceState.set(worker, state);
     _initializeWorkerMessageHandler(worker);
 
@@ -14631,6 +14623,7 @@ function Worker(url) {
       const blob = globalThis.__blobStore?.[url];
       if (blob) {
         state.code = blob;
+        state.url = url;
         // Auto-start on next tick so caller can set onmessage first.
         setTimeout(() => _autoRunWorker(worker), 0);
         return;
@@ -14639,6 +14632,7 @@ function Worker(url) {
       if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
         try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
       }
+      state.url = resolvedUrl;
       (async () => {
         try {
           const resp = await fetch(resolvedUrl);
@@ -14652,32 +14646,30 @@ function Worker(url) {
 function workerPostMessage(data) {
     const state = _workerInstanceState.get(this);
     if (!state || state.terminated) return;
-    const cloned = typeof structuredClone === 'function' ? structuredClone(data) : data;
-    if (!state.scope) {
-      state.pendingMessages.push(cloned);
+    const json = _serializeWorkerMsg(data);
+    if (state.workerId === null) {
+      state.pendingMessages.push(json);
       return;
     }
+    const workerId = state.workerId;
     const worker = this;
     setTimeout(() => {
-      const state = _workerInstanceState.get(worker);
-      if (!state || state.terminated || !state.scope) return;
-      const scope = state.scope;
-      try {
-        const event = new MessageEvent('message', { data: cloned });
-        try { Object.defineProperties(event, { target: { value: scope }, currentTarget: { value: scope } }); } catch (e) {}
-        _eventTargetDispatch(scope, event);
-      } catch(e) {
-        console.error('Worker error:', e.message);
-        _workerError(worker, e);
-      }
+      const s = _workerInstanceState.get(worker);
+      if (!s || s.terminated || s.workerId === null) return;
+      Deno.core.ops.op_worker_post_to_worker(workerId, json);
     }, 0);
 }
+
 function workerTerminate() {
     const state = _workerInstanceState.get(this);
     if (!state) return;
     state.terminated = true;
     state.pendingMessages.length = 0;
-    state.scope = null;
+    if (state.workerId !== null) {
+      _workerById.delete(state.workerId);
+      Deno.core.ops.op_worker_terminate(state.workerId);
+      state.workerId = null;
+    }
 }
 
 const workerPrototype = Object.create(globalThis.EventTarget.prototype);
@@ -14702,6 +14694,7 @@ Object.defineProperty(workerPrototype, 'onerror', {
 Worker.prototype = workerPrototype;
 globalThis.Worker = Worker;
 _markNative(Worker); _markNative(workerPostMessage); _markNative(workerTerminate);
+
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
@@ -14740,22 +14733,33 @@ URL.createObjectURL = function(blob) {
     // real browsers; the previous async blob.text().then() store raced the
     // Worker constructor, so new Worker(blobURL) fell through to fetch() and
     // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
+    globalThis.__blobBytes = globalThis.__blobBytes || {};
+    globalThis.__blobMeta = globalThis.__blobMeta || {};
+    const blobType = blob.type || 'text/html';
     // The obscura Blob materializes _bytes in its constructor; fall back to
     // the async text() store only for foreign Blob shims without _bytes.
     if (blob._bytes) {
+      globalThis.__blobBytes[id] = blob._bytes;
       let text = '';
       try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
       globalThis.__blobStore[id] = text;
+      globalThis.__blobMeta[id] = { type: blobType };
     } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+      blob.text().then(text => {
+        globalThis.__blobStore[id] = text;
+        globalThis.__blobMeta[id] = { type: blobType };
+      });
     } else {
       globalThis.__blobStore[id] = '';
+      globalThis.__blobMeta[id] = { type: blobType };
     }
     return id;
   }
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
+  delete globalThis.__blobMeta[url];
+  delete globalThis.__blobBytes[url];
 };
 
 // Window-level scrolling (issue #468). #431 gave elements functional
@@ -17315,7 +17319,7 @@ for (const [name, members] of Object.entries({
   HTMLScriptElement: 'src type text async defer crossOrigin integrity referrerPolicy noModule',
   HTMLIFrameElement: 'src srcdoc name width height contentDocument contentWindow',
   HTMLStyleElement: 'media type disabled sheet',
-  HTMLLinkElement: 'href rel media type disabled sheet',
+  HTMLLinkElement: 'href rel media type disabled sheet crossOrigin',
   HTMLAnchorElement: 'href target download rel hreflang type protocol username password host hostname port pathname search hash origin',
   HTMLAreaElement: 'href target download rel protocol username password host hostname port pathname search hash origin',
 })) {

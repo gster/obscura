@@ -597,6 +597,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_single_defaults_to_wildcard_accept_and_preserves_explicit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if bytes.windows(4).any(|v| v == b"\r\n\r\n") { break; }
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                requests.push(String::from_utf8(bytes).unwrap().to_ascii_lowercase());
+            }
+            requests
+        });
+        let url = Url::parse(&format!("http://{address}/data")).unwrap();
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+
+        // First request: no explicit accept header. Must send `accept: */*`.
+        let empty_headers = std::collections::HashMap::new();
+        client.send_single("GET", &url, &empty_headers, &[], false, false).await.unwrap();
+
+        // Second request: explicit uppercase Accept header. Must keep it without duplicates.
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert("Accept".to_string(), "application/xml".to_string());
+        client.send_single("GET", &url, &custom_headers, &[], false, false).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].matches("accept:").count(), 1, "{}", requests[0]);
+        assert!(requests[0].contains("accept: */*\r\n"), "{}", requests[0]);
+
+        assert_eq!(requests[1].matches("accept:").count(), 1, "{}", requests[1]);
+        assert!(requests[1].contains("accept: application/xml\r\n"), "{}", requests[1]);
+    }
+
+    #[tokio::test]
     async fn form_redirects_preserve_or_drop_body_and_keep_cookie_origin() {
         for status in [302, 303, 307, 308] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

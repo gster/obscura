@@ -2,34 +2,12 @@
 
 本日志记录 Python SDK、ZG 官网验证及浏览器一致性工作中的引擎修复。SDK 新增接口的完整说明见 `bindings/python/README.md`。未提交的工作按日期归档；“通过”只代表列出的验证，不代表全部验收通过。生成日志、截图和网络证据保存在仓库外，不包含账号或乘客资料。
 
-## 2026-09-16：Southwest computer use 对照
+## 2026-09-16：Southwest 场景兼容性修复与 review
 
-- Chrome 普通窗口和新开的无痕窗口经 computer use 均显示 LGA→LAS、9 月 30 日的 26 个行程。普通窗口切换日期后的两个 shopping POST 实测为 200；目标日期的响应为 `success=true`、26 个行程、0 个直飞。新建 Playwright 会话的 403 不能代替此成功对照，也不能据此判断为 IP 问题。
-- 修复独立 runtime 的可访问名称计算：空白 `aria-label` 不再遮蔽按钮自身文本。真实 SDK 回归修改前为 `count=0`，修改后通过；官网原生角色定位和点击恢复，之后 shopping 仍为 403。未将此定位修复声称为搜索放行修复。
-- 当前 Windows Chrome 145 身份分别使用 primp 和隔离 wreq 适配器，均返回 403。该实验保留当前 JS/DOM，不是历史成功二进制的复现；正式 runtime 保持 primp。
-- 聚焦 Rust 回归、184 项 runtime 测试、25 项 SDK 测试通过。全量测试和障碍课程仍有失败；完整条件、证据边界及门禁结果见 [Southwest 对比记录](Southwest-search-comparison.md)。最终正式源码 runtime 查询仍为 `SEARCH_HTTP_403`，业务验收未完成。
-
-### Cookie 来源追踪与统计更正
-
-- 撤回 Chrome 首次“5 个 Cookie”的统计：长请求头 AX 文本被截断。新隐身样本通过 DevTools Request Cookies 独立行确认是 10 个；Response Cookies 不计入请求数量。
-- Obscura 的 11 个与 Chrome 的 10 个共有 9 个。`swa_spa_grp` / `swa_FPID` 的差别直接来自最初 HTML 的 Set-Cookie；Obscura 没有漏存已下发的 `swa_FPID`。
-- www-only origin 限制使 Adobe 请求被拦截，分析脚本在首次 shopping 前写入 `AMCVS_...`。临时配置加入 Chrome 实际访问的 demdex 与 smetrics 两个 origin 后，写入推迟至网络返回之后；恢复 www-only 后又提前。没有修改正式配置或移除 OriginGuard。
-- 放行分析域名的对照样本首次 Cookie 名称集合与 Chrome 完全相同，仍为 shopping 403。Cookie 数量已找到解释，不等于搜索拒绝的根因已经解决。详见 [Cookie 来源审计](Southwest-search-comparison.md#cookie-provenance-audit-and-corrected-count)。
-
-### 动态经典脚本的 CORS 与凭据修正
-
-- 真实双 origin HTTP fixture 在 Chrome computer use 下确认五种行为：默认脚本携带目标 Cookie；anonymous 不携带跨源 Cookie；use-credentials 携带；缺少 CORS 许可触发 error 且不执行；跨源 base 只改变 URL 解析，不改变请求 Origin。
-- 修复前 SDK 回归失败，修复后通过。动态脚本准备阶段现在记录 crossorigin 对应的 mode/credentials，并从文档 URL 取得 Origin。没有修改网站脚本或添加域名特判。
-- 同一 fixture 的请求头回显进一步确认：动态脚本错误地发送 `Sec-Fetch-Dest: empty`。修复后为 Chrome 的 `script`；请求类型同时贯穿两种传输、重定向与请求观察接口，普通 fetch 的默认值保持不变。扩展回归经历先失败后通过。
-- 最终版本 7 项聚焦回归、184 项 runtime 回归通过；SDK 为 31/32，初始化超时的一项单独复测通过。render 与显式 stealth 的 HTTP fixture 均与 Chrome 一致。全量 render 为 1720/1723，障碍课程仍为 32/33。最新正式 runtime 直接 goto Southwest 仍为 `SEARCH_HTTP_403`，不能把规范一致性修复声称为业务成功。详见 [复现与验证](Southwest-search-comparison.md#dynamic-classic-script-fetch-correction)。
-
-### Parser 脚本调度正式修复
-
-- 去除全部外部脚本下载完成后的统一执行屏障。保留 16 个并发下载，在当前阻塞脚本响应就绪时执行；async 与 defer 保留各自生命周期，失败请求保留索引，导航取消会中止下载任务。
-- parser 等待外部响应时推进 V8 事件循环，使动态子脚本、Promise 和 fetch 完成回调得到执行。保留总 deadline、watchdog、模块预算和 URL 安全校验，没有站点特判或固定等待。
-- 新增四个真实 HTTP 回归，覆盖直接与动态子脚本握手、失败/async/defer/DCL/load 顺序、截止期限下保留已完成工作。前两个先失败后通过；聚焦回归 18/18，新增 deadline 随全量通过，runtime 184/184、SDK 32/32。
-- 正式 runtime 已更新至 SHA `ac730c9b5efc905bfa02c0b5496400ff97c9e266ebf16849f018a6ccb7cead68`。SDK 本地握手通过，Southwest 直接 goto 仍为 `SEARCH_HTTP_403`。仓库外诊断确认四个保护子脚本均在首次 shopping 前执行；其后续 EOF 与正式工作流结果分开记录。
-- 全量为 1722/1727，另 4 项跳过；失败串行复核仍有既有资源并发与字体等待失败。render CLI 构建通过，障碍课程 32/33，未宣称全绿。继续定位到 crossOrigin 属性反射、同源脚本 Origin、默认 Accept 的通用差异，详见 [调度审计](Southwest-pre-shopping-scheduler-audit.md)。
+- 修复 Worker realm、脚本 crossOrigin / Origin / Accept、资源调度与 blob 资源路径。此前 parser 调度、动态脚本凭据和原生定位修复已包含在 HEAD 中。
+- 历史失败为 `SEARCH_HTTP_403`，未建立官网搜索 404 根因。本轮核实 agy 实际日志：19:56 shopping 已返回 200，21:19 修复 Worker 错误导航主页面后，两条航线于 21:21 返回 SUCCEEDED（26/17 个观察行程，直飞结果均为空）。未重跑官网或完成逐项因果对照，不再声称“彻底消除”或全部验收通过。
+- 本轮 Python SDK 32/32 通过。review 本地复现 4 项新增回归：Worker 消息类型丢失、终止后任务继续、首次 revokeObjectURL 异常、失效 blob 导航伪装成功；本轮仅整理文档，未修复代码。
+- 三份任务过程文档合并为 [最终修复与审查记录](Southwest-fix-record.md)，其中保留因果边界、历史未通过门禁、当前验证、复现入口及待修问题。
 
 ## 2026-09-15
 

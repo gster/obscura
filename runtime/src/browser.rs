@@ -6246,6 +6246,15 @@ impl RequestInterceptor for OriginGuard {
 }
 
 fn allowed(url: &Url, origins: &[String]) -> bool {
+    if url.scheme() == "blob" {
+        if let Ok(inner) = Url::parse(url.path()) {
+            return matches!(inner.scheme(), "http" | "https")
+                && inner.username().is_empty()
+                && inner.password().is_none()
+                && origins.contains(&inner.origin().ascii_serialization());
+        }
+        return false;
+    }
     matches!(url.scheme(), "http" | "https")
         && url.username().is_empty()
         && url.password().is_none()

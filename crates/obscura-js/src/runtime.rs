@@ -998,7 +998,23 @@ impl ObscuraJsRuntime {
         };
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
-        instance.ops_handoff = instance.take_ops_handoff();
+        let ops_handoff = instance.take_ops_handoff();
+        if let Some(ref ops) = ops_handoff {
+            instance
+                .runtime()
+                .op_state()
+                .borrow_mut()
+                .put(crate::worker::OpsHandoff(ops.clone()));
+        }
+        let worker_reg = std::rc::Rc::new(std::cell::RefCell::new(crate::worker::WorkerRegistry::default()));
+        let main_ctx = instance.runtime().main_context();
+        worker_reg.borrow_mut().main_context = Some(main_ctx);
+        instance
+            .runtime()
+            .op_state()
+            .borrow_mut()
+            .put(worker_reg);
+        instance.ops_handoff = ops_handoff;
         instance.native_mouse = Some(
             instance
                 .take_native_input("__obscura_native_mouse_handoff")
@@ -1768,6 +1784,78 @@ impl ObscuraJsRuntime {
             .as_ref()
             .map(|navigation| navigation.url.clone())
             .or_else(|| state.same_document_navigation.then(|| state.url.clone()))
+    }
+
+    pub fn resolve_blob(&mut self, url: &str) -> Option<(Vec<u8>, String)> {
+        let mut entered = self.runtime();
+        let scope = &mut entered.handle_scope();
+        let context = scope.get_current_context();
+        let global = context.global(scope);
+
+        let url_key = deno_core::v8::String::new(scope, url)?;
+
+        let bytes_key = deno_core::v8::String::new(scope, "__blobBytes");
+        let blob_bytes = if let Some(bytes_key) = bytes_key {
+            if let Some(bytes_obj) = global.get(scope, bytes_key.into()).and_then(|v| v.to_object(scope)) {
+                if let Some(val) = bytes_obj.get(scope, url_key.into()) {
+                    if let Ok(u8_arr) = deno_core::v8::Local::<deno_core::v8::Uint8Array>::try_from(val) {
+                        let mut data = vec![0u8; u8_arr.byte_length()];
+                        u8_arr.copy_contents(&mut data);
+                        Some(data)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let blob_bytes = if let Some(bytes) = blob_bytes {
+            Some(bytes)
+        } else {
+            let store_key = deno_core::v8::String::new(scope, "__blobStore")?;
+            let store = global.get(scope, store_key.into())?.to_object(scope)?;
+            let val = store.get(scope, url_key.into())?;
+            if val.is_string() {
+                Some(val.to_rust_string_lossy(scope).into_bytes())
+            } else {
+                None
+            }
+        };
+
+        let bytes = blob_bytes?;
+
+        let meta_key = deno_core::v8::String::new(scope, "__blobMeta");
+        let content_type = if let Some(meta_key) = meta_key {
+            if let Some(meta_obj) = global.get(scope, meta_key.into()).and_then(|v| v.to_object(scope)) {
+                if let Some(entry) = meta_obj.get(scope, url_key.into()).and_then(|v| v.to_object(scope)) {
+                    let type_key = deno_core::v8::String::new(scope, "type");
+                    type_key
+                        .and_then(|k| entry.get(scope, k.into()))
+                        .filter(|v| v.is_string())
+                        .map(|v| v.to_rust_string_lossy(scope))
+                        .unwrap_or_else(|| "text/html".to_string())
+                } else {
+                    "text/html".to_string()
+                }
+            } else {
+                "text/html".to_string()
+            }
+        } else {
+            "text/html".to_string()
+        };
+        let content_type = if content_type.is_empty() {
+            "text/html".to_string()
+        } else {
+            content_type
+        };
+
+        Some((bytes, content_type))
     }
 
     pub fn take_same_document_navigation(&self) -> Option<String> {
@@ -7810,6 +7898,41 @@ mod tests {
         )
         .unwrap();
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_realm_isolation_matches_browser_semantics() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-isolation", r#"
+            globalThis.__isolationResults = null;
+            Object.prototype.__pagePollution = 'polluted';
+            const source = `
+                postMessage({
+                    globalThisIsSelf: Function('return this')() === self,
+                    typeofDocument: Function('return typeof document')(),
+                    typeofWindow: Function('return typeof window')(),
+                    readsPageObjectPollution: ({}).__pagePollution !== undefined,
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                globalThis.__isolationResults = event.data;
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__isolationResults").unwrap(),
+            serde_json::json!({
+                "globalThisIsSelf": true,
+                "typeofDocument": "undefined",
+                "typeofWindow": "undefined",
+                "readsPageObjectPollution": false,
+            })
+        );
+    }
+
+
+
 
     #[tokio::test(flavor = "current_thread")]
     async fn self_requeueing_message_channel_yields_to_timers() {
@@ -23033,4 +23156,555 @@ mod tests {
         );
     }
 
+    #[test]
+    fn crossorigin_idl_attribute_reflection() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    const s = document.createElement('script');
+                    const l = document.createElement('link');
+                    const img = document.createElement('img');
+
+                    // Default is null
+                    const s_init = s.crossOrigin;
+                    const l_init = l.crossOrigin;
+                    const img_init = img.crossOrigin;
+
+                    // Setting anonymous via property sets attribute
+                    s.crossOrigin = 'anonymous';
+                    const s_anon_attr = s.getAttribute('crossorigin');
+                    const s_anon_prop = s.crossOrigin;
+
+                    // Setting use-credentials
+                    s.crossOrigin = 'use-credentials';
+                    const s_cred_attr = s.getAttribute('crossorigin');
+                    const s_cred_prop = s.crossOrigin;
+
+                    // Setting empty string reflects as anonymous
+                    s.crossOrigin = '';
+                    const s_empty_attr = s.getAttribute('crossorigin');
+                    const s_empty_prop = s.crossOrigin;
+
+                    // Setting invalid value reflects as anonymous
+                    s.crossOrigin = 'foobar';
+                    const s_invalid_attr = s.getAttribute('crossorigin');
+                    const s_invalid_prop = s.crossOrigin;
+
+                    // Setting null removes attribute
+                    s.crossOrigin = null;
+                    const s_null_attr = s.getAttribute('crossorigin');
+                    const s_null_prop = s.crossOrigin;
+
+                    // Setting undefined removes attribute
+                    s.crossOrigin = 'anonymous';
+                    s.crossOrigin = undefined;
+                    const s_undef_attr = s.getAttribute('crossorigin');
+                    const s_undef_prop = s.crossOrigin;
+
+                    // setAttribute reflects to property
+                    s.setAttribute('crossorigin', 'anonymous');
+                    const s_set_anon = s.crossOrigin;
+                    s.setAttribute('crossorigin', 'use-credentials');
+                    const s_set_cred = s.crossOrigin;
+                    s.setAttribute('crossorigin', '');
+                    const s_set_empty = s.crossOrigin;
+                    s.setAttribute('crossorigin', 'invalid');
+                    const s_set_invalid = s.crossOrigin;
+
+                    // Link and Img reflection
+                    l.crossOrigin = 'anonymous';
+                    img.crossOrigin = 'use-credentials';
+
+                    return JSON.stringify({
+                        s_init, l_init, img_init,
+                        s_anon_attr, s_anon_prop,
+                        s_cred_attr, s_cred_prop,
+                        s_empty_attr, s_empty_prop,
+                        s_invalid_attr, s_invalid_prop,
+                        s_null_attr, s_null_prop,
+                        s_undef_attr, s_undef_prop,
+                        s_set_anon, s_set_cred, s_set_empty, s_set_invalid,
+                        l_prop: l.crossOrigin, l_attr: l.getAttribute('crossorigin'),
+                        img_prop: img.crossOrigin, img_attr: img.getAttribute('crossorigin'),
+                    });
+                })()"#,
+            )
+            .unwrap();
+
+        let val: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(val["s_init"], serde_json::Value::Null);
+        assert_eq!(val["l_init"], serde_json::Value::Null);
+        assert_eq!(val["img_init"], serde_json::Value::Null);
+
+        assert_eq!(val["s_anon_attr"], "anonymous");
+        assert_eq!(val["s_anon_prop"], "anonymous");
+
+        assert_eq!(val["s_cred_attr"], "use-credentials");
+        assert_eq!(val["s_cred_prop"], "use-credentials");
+
+        assert_eq!(val["s_empty_attr"], "");
+        assert_eq!(val["s_empty_prop"], "anonymous");
+
+        assert_eq!(val["s_invalid_attr"], "foobar");
+        assert_eq!(val["s_invalid_prop"], "anonymous");
+
+        assert_eq!(val["s_null_attr"], serde_json::Value::Null);
+        assert_eq!(val["s_null_prop"], serde_json::Value::Null);
+
+        assert_eq!(val["s_undef_attr"], serde_json::Value::Null);
+        assert_eq!(val["s_undef_prop"], serde_json::Value::Null);
+
+        assert_eq!(val["s_set_anon"], "anonymous");
+        assert_eq!(val["s_set_cred"], "use-credentials");
+        assert_eq!(val["s_set_empty"], "anonymous");
+        assert_eq!(val["s_set_invalid"], "anonymous");
+
+        assert_eq!(val["l_prop"], "anonymous");
+        assert_eq!(val["l_attr"], "anonymous");
+
+        assert_eq!(val["img_prop"], "use-credentials");
+        assert_eq!(val["img_attr"], "use-credentials");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_cors_script_origin_and_accept_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut captured = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 { break; }
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                }
+                let body = "console.log('ok');";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                captured.push(String::from_utf8_lossy(&req).to_string());
+            }
+            captured
+        });
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        let page_origin = format!("http://{}", address);
+        rt.set_url(&format!("{}/index.html", page_origin));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        // 1. Same-origin script with crossOrigin = 'anonymous' (mode: cors, dest: script)
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await new Promise(resolve => {{
+                        const s = document.createElement('script');
+                        s.crossOrigin = 'anonymous';
+                        s.onload = resolve;
+                        s.onerror = resolve;
+                        s.src = '{}/test1.js';
+                        document.head.appendChild(s);
+                    }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 2. Same-origin script without crossOrigin (mode: no-cors, dest: script)
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await new Promise(resolve => {{
+                        const s = document.createElement('script');
+                        s.onload = resolve;
+                        s.onerror = resolve;
+                        s.src = '{}/test2.js';
+                        document.head.appendChild(s);
+                    }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 3. Same-origin ordinary GET fetch without explicit Accept
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await fetch('{}/test3');
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 4. Same-origin ordinary GET fetch with explicit Accept
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await fetch('{}/test4', {{ headers: {{ 'Accept': 'application/json' }} }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 5. Same-origin ordinary GET fetch with uppercase ACCEPT
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await fetch('{}/test5', {{ headers: {{ 'ACCEPT': 'text/plain' }} }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+
+        // Req 1: Same-origin CORS script
+        // Chrome sends Origin and Accept: */*
+        let r1 = &requests[0];
+        assert!(r1.to_ascii_lowercase().contains(&format!("origin: {}", page_origin.to_ascii_lowercase())), "r1: {r1}");
+        assert!(r1.to_ascii_lowercase().contains("accept: */*"), "r1: {r1}");
+
+        // Req 2: Same-origin no-cors script
+        // Chrome does NOT send Origin, sends Accept: */*
+        let r2 = &requests[1];
+        assert!(!r2.to_ascii_lowercase().contains("origin:"), "r2 should not contain Origin: {r2}");
+        assert!(r2.to_ascii_lowercase().contains("accept: */*"), "r2: {r2}");
+
+        // Req 3: Same-origin ordinary GET fetch
+        // Chrome does NOT send Origin on same-origin GET fetch, sends Accept: */*
+        let r3 = &requests[2];
+        assert!(!r3.to_ascii_lowercase().contains("origin:"), "r3 should not contain Origin: {r3}");
+        assert!(r3.to_ascii_lowercase().contains("accept: */*"), "r3: {r3}");
+
+        // Req 4: Fetch with explicit Accept: application/json
+        let r4 = &requests[3];
+        assert_eq!(r4.to_ascii_lowercase().matches("accept:").count(), 1, "r4: {r4}");
+        assert!(r4.to_ascii_lowercase().contains("accept: application/json"), "r4: {r4}");
+
+        // Req 5: Fetch with explicit ACCEPT: text/plain
+        let r5 = &requests[4];
+        assert_eq!(r5.to_ascii_lowercase().matches("accept:").count(), 1, "r5: {r5}");
+        assert!(r5.to_ascii_lowercase().contains("accept: text/plain"), "r5: {r5}");
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_same_origin_cors_script_origin_and_accept_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut captured = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 { break; }
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                }
+                let body = "console.log('ok');";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                captured.push(String::from_utf8_lossy(&req).to_string());
+            }
+            captured
+        });
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        let page_origin = format!("http://{}", address);
+        rt.set_url(&format!("{}/index.html", page_origin));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+
+        // 1. Same-origin script with crossOrigin = 'anonymous' (mode: cors, dest: script)
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await new Promise(resolve => {{
+                        const s = document.createElement('script');
+                        s.crossOrigin = 'anonymous';
+                        s.onload = resolve;
+                        s.onerror = resolve;
+                        s.src = '{}/test1.js';
+                        document.head.appendChild(s);
+                    }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 2. Same-origin script without crossOrigin (mode: no-cors, dest: script)
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await new Promise(resolve => {{
+                        const s = document.createElement('script');
+                        s.onload = resolve;
+                        s.onerror = resolve;
+                        s.src = '{}/test2.js';
+                        document.head.appendChild(s);
+                    }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 3. Same-origin ordinary GET fetch without explicit Accept
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await fetch('{}/test3');
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 4. Same-origin ordinary GET fetch with explicit Accept
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await fetch('{}/test4', {{ headers: {{ 'Accept': 'application/json' }} }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 5. Same-origin ordinary GET fetch with uppercase ACCEPT
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await fetch('{}/test5', {{ headers: {{ 'ACCEPT': 'text/plain' }} }});
+                }}"#,
+                page_origin
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+
+        // Req 1: Same-origin CORS script
+        let r1 = &requests[0];
+        assert!(r1.to_ascii_lowercase().contains(&format!("origin: {}", page_origin.to_ascii_lowercase())), "r1: {r1}");
+        assert!(r1.to_ascii_lowercase().contains("accept: */*"), "r1: {r1}");
+
+        // Req 2: Same-origin no-cors script
+        let r2 = &requests[1];
+        assert!(!r2.to_ascii_lowercase().contains("origin:"), "r2 should not contain Origin: {r2}");
+        assert!(r2.to_ascii_lowercase().contains("accept: */*"), "r2: {r2}");
+
+        // Req 3: Same-origin ordinary GET fetch
+        let r3 = &requests[2];
+        assert!(!r3.to_ascii_lowercase().contains("origin:"), "r3 should not contain Origin: {r3}");
+        assert!(r3.to_ascii_lowercase().contains("accept: */*"), "r3: {r3}");
+
+        // Req 4: Fetch with explicit Accept: application/json
+        let r4 = &requests[3];
+        assert_eq!(r4.to_ascii_lowercase().matches("accept:").count(), 1, "r4: {r4}");
+        assert!(r4.to_ascii_lowercase().contains("accept: application/json"), "r4: {r4}");
+
+        // Req 5: Fetch with explicit ACCEPT: text/plain
+        let r5 = &requests[4];
+        assert_eq!(r5.to_ascii_lowercase().matches("accept:").count(), 1, "r5: {r5}");
+        assert!(r5.to_ascii_lowercase().contains("accept: text/plain"), "r5: {r5}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_url_create_fetch_resolve_and_revoke() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        rt.set_url("https://example.com/index.html");
+        rt.run_page_init();
+
+        let blob_url = rt
+            .evaluate(
+                r#"
+            (function() {
+                const blob = new Blob(["<h1>Hello Blob</h1>"], { type: "text/html" });
+                window.__blob_url = URL.createObjectURL(blob);
+                return window.__blob_url;
+            })()
+        "#,
+            )
+            .unwrap();
+        let url_str = blob_url.as_str().unwrap();
+        assert!(url_str.starts_with("blob:https://example.com/"));
+
+        // 1. Test rt.resolve_blob()
+        let (bytes, content_type) = rt.resolve_blob(url_str).expect("should resolve blob");
+        assert_eq!(bytes, b"<h1>Hello Blob</h1>");
+        assert_eq!(content_type, "text/html");
+
+        // 2. Test JS fetch(blob_url)
+        let fetched = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const res = await fetch(window.__blob_url);
+                return {
+                    status: res.status,
+                    contentType: res.headers.get("content-type"),
+                    text: await res.text()
+                };
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let val = fetched.value.unwrap();
+        assert_eq!(val["status"], 200);
+        assert_eq!(val["contentType"], "text/html");
+        assert_eq!(val["text"], "<h1>Hello Blob</h1>");
+
+        // 3. Test URL.revokeObjectURL
+        rt.evaluate(r#"URL.revokeObjectURL(window.__blob_url);"#)
+            .unwrap();
+        assert!(rt.resolve_blob(url_str).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_location_and_navigation_isolation() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        rt.set_url("https://example.com/page.html");
+        rt.run_page_init();
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const blob = new Blob([`
+                    self.onmessage = function(e) {
+                        try {
+                            // Attempt setting location
+                            location.href = 'https://malicious.com';
+                        } catch (err) {}
+                        postMessage({
+                            isWorkerLocation: (location instanceof WorkerLocation),
+                            href: String(location.href),
+                            str: String(location)
+                        });
+                    };
+                `], { type: 'application/javascript' });
+                const workerUrl = URL.createObjectURL(blob);
+                const worker = new Worker(workerUrl);
+                return await new Promise((resolve) => {
+                    worker.onmessage = (e) => resolve(e.data);
+                    worker.postMessage('ping');
+                });
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let val = result.value.unwrap();
+        assert_eq!(val["isWorkerLocation"], true);
+        assert!(val["href"].as_str().unwrap().starts_with("blob:https://example.com/"));
+        assert!(val["str"].as_str().unwrap().starts_with("blob:https://example.com/"));
+        // Top-level document URL must remain https://example.com/page.html
+        assert_eq!(rt.document_url(), "https://example.com/page.html");
+        // No pending navigation queued for the main page
+        assert!(rt.take_pending_navigation().is_none());
+    }
 }

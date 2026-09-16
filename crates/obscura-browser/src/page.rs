@@ -1313,11 +1313,15 @@ impl Page {
             let source = if self.should_block_url(&url) {
                 None
             } else if let Ok(parsed) = Url::parse(&url) {
-                match self.do_fetch(&parsed, ResourceRequest::navigation()).await {
-                    Ok(response) => Some(String::from_utf8_lossy(&response.body).into_owned()),
-                    Err(error) => {
-                        tracing::warn!("frame script {} failed: {}", url, error);
-                        None
+                if parsed.scheme() == "blob" {
+                    self.js.as_mut().and_then(|js| js.resolve_blob(&url)).map(|(b, _)| String::from_utf8_lossy(&b).into_owned())
+                } else {
+                    match self.do_fetch(&parsed, ResourceRequest::navigation()).await {
+                        Ok(response) => Some(String::from_utf8_lossy(&response.body).into_owned()),
+                        Err(error) => {
+                            tracing::warn!("frame script {} failed: {}", url, error);
+                            None
+                        }
                     }
                 }
             } else {
@@ -3465,6 +3469,22 @@ impl Page {
                 redirected_from: Vec::new(),
                 request_referrer: None,
             })
+        } else if url.scheme() == "blob" {
+            let (body_bytes, content_type) = if let Some(js) = &mut self.js {
+                js.resolve_blob(url_str).unwrap_or_else(|| (Vec::new(), "text/html".to_string()))
+            } else {
+                (Vec::new(), "text/html".to_string())
+            };
+            let mut headers = std::collections::HashMap::new();
+            headers.insert("content-type".to_string(), content_type);
+            Ok(obscura_net::Response {
+                url: url.clone(),
+                status: 200,
+                headers,
+                body: body_bytes,
+                redirected_from: Vec::new(),
+                request_referrer: None,
+            })
         } else if method == "POST" {
             self.do_post_form(&url, body, request).await
         } else {
@@ -3563,21 +3583,20 @@ impl Page {
                 "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
         }
 
-        // Scripts can synchronously flush style/layout through
-        // getComputedStyle(), geometry, ResizeObserver, or IntersectionObserver.
-        // Seed their image/font dependencies concurrently through the page
-        // transport first. Otherwise the first CSSOM read falls into the
-        // renderer's synchronous resource loader and serial network latency pins
-        // V8, making framework startup take many seconds. This is deliberately
-        // bounded: navigation should not wait indefinitely for decorative
-        // resources.
+        // Speculative preloads from HTML (images, preloaded fonts) are seeded
+        // concurrently through the page transport so they fetch in parallel with
+        // parser-blocking scripts, matching browser preload behavior. Script
+        // execution starts immediately without pausing for decorative resources.
         #[cfg(feature = "render")]
         {
+            self.spawn_pending_render_resources();
             let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_WARMUP_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(1_000);
-            let _ = self.prepare_screenshot_resources(warmup_ms).await;
+                .unwrap_or(0);
+            if warmup_ms > 0 {
+                let _ = self.prepare_screenshot_resources(warmup_ms).await;
+            }
         }
 
         #[cfg(feature = "render")]
@@ -3594,19 +3613,7 @@ impl Page {
         self.execute_scripts().await?;
 
         #[cfg(feature = "render")]
-        {
-            // Page scripts and their bounded post-script event-loop pass can
-            // create responsive images, inline styles, and @font-face rules
-            // that did not exist during the parser warmup above. Discover them
-            // before navigation becomes capture-ready. Known parser resources
-            // are filtered by the render cache, so ordinary pages pay only the
-            // inexpensive scan on this second pass.
-            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(1_000);
-            let _ = self.prepare_screenshot_resources(warmup_ms).await;
-        }
+        self.drain_render_resource_results();
 
         self.lifecycle = LifecycleState::DomContentLoaded;
 
@@ -3619,6 +3626,21 @@ impl Page {
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             return Ok(());
+        }
+
+        #[cfg(feature = "render")]
+        {
+            // Page scripts and their bounded post-script event-loop pass can
+            // create responsive images, inline styles, and @font-face rules
+            // that did not exist during the parser warmup above. Discover them
+            // before navigation transitions to Loaded / becomes capture-ready.
+            // Known parser resources are filtered by the render cache, so
+            // ordinary pages pay only the inexpensive scan on this second pass.
+            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000);
+            let _ = self.prepare_screenshot_resources(warmup_ms).await;
         }
 
         if let Some(js) = &mut self.js {
@@ -3796,37 +3818,58 @@ impl Page {
                 candidates.insert((url.to_string(), Some(profile), false));
             }
         }
-        let css_sources = js
+        let (css_sources, link_preloads) = js
             .with_dom(|dom| {
                 let mut sources = Vec::new();
+                let mut preloads = Vec::new();
                 for id in dom.descendants(dom.document()) {
                     let Some(node) = dom.get_node(id) else {
                         continue;
                     };
-                    if node
-                        .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "style")
-                    {
-                        sources.push(dom.text_content(id));
+                    if let Some(element) = node.as_element() {
+                        if element.local.as_ref() == "style" {
+                            // Materialized external stylesheets contain complete @font-face
+                            // descriptor sets and unused declarations. Browsers do not
+                            // eagerly fetch font-face rules from external sheets; layout
+                            // requests required fonts on demand. Authored inline styles
+                            // and dynamically created style elements are retained.
+                            if node.get_attribute("data-obscura-external-stylesheets").is_none() {
+                                sources.push(dom.text_content(id));
+                            }
+                        } else if element.local.as_ref() == "link" {
+                            let rel = node.get_attribute("rel").unwrap_or("");
+                            if rel
+                                .split_ascii_whitespace()
+                                .any(|token| token.eq_ignore_ascii_case("preload"))
+                            {
+                                if let Some(href) = node.get_attribute("href") {
+                                    let as_val = node.get_attribute("as").unwrap_or("");
+                                    let is_font = as_val.eq_ignore_ascii_case("font");
+                                    preloads.push((href.to_string(), is_font));
+                                }
+                            }
+                        } else if element.local.as_ref() == "use" {
+                            if let Some(href) = node
+                                .get_attribute("href")
+                                .or_else(|| node.get_attribute("xlink:href"))
+                            {
+                                sources.push(format!("url({href})"));
+                            }
+                        }
                     }
                     if let Some(style) = node.get_attribute("style") {
                         sources.push(style.to_string());
                     }
-                    if node
-                        .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "use")
-                    {
-                        if let Some(href) = node
-                            .get_attribute("href")
-                            .or_else(|| node.get_attribute("xlink:href"))
-                        {
-                            sources.push(format!("url({href})"));
-                        }
-                    }
                 }
-                sources
+                (sources, preloads)
             })
             .unwrap_or_default();
+        for (raw, is_font) in link_preloads {
+            if let Ok(mut url) = base_url.join(&raw) {
+                url.set_fragment(None);
+                candidates.insert((url.to_string(), None, is_font));
+            }
+        }
         for css in css_sources {
             for raw in css_resource_urls(&css, &base_url) {
                 if let Ok(mut url) = url::Url::parse(&raw) {
@@ -8721,6 +8764,201 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_stylesheet_font_face_is_not_eagerly_fetched_before_layout() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_tx.send(path.clone()).unwrap();
+                let (content_type, body): (&str, &[u8]) = match path.as_str() {
+                    "/page" => (
+                        "text/html",
+                        br#"<!doctype html><html><head><link rel="stylesheet" href="/style.css"></head><body><p>Standard text</p></body></html>"#,
+                    ),
+                    "/style.css" => (
+                        "text/css",
+                        br#"@font-face { font-family: Unused; src: url('/unused.woff2'); } body { color: black; }"#,
+                    ),
+                    "/unused.woff2" => ("font/woff2", b"font-bytes"),
+                    _ => ("text/plain", b"not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "external-font-no-flood".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("external-font-no-flood".to_string(), context);
+        let page_url = format!("http://{address}/page");
+        page.navigate(&page_url).await.unwrap();
+
+        let mut paths = Vec::new();
+        while let Ok(path) = seen_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            paths.push(path);
+        }
+        assert!(
+            paths.contains(&"/page".to_string()),
+            "expected /page in {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/style.css".to_string()),
+            "expected /style.css in {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/unused.woff2".to_string()),
+            "unused @font-face from external stylesheet must not be eagerly fetched: {paths:?}"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn link_preload_font_is_discovered_and_fetched() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_tx.send(path.clone()).unwrap();
+                let (content_type, body): (&str, &[u8]) = match path.as_str() {
+                    "/page" => (
+                        "text/html",
+                        br#"<!doctype html><html><head><link rel="preload" href="/preloaded.woff2" as="font" type="font/woff2" crossorigin></head><body></body></html>"#,
+                    ),
+                    "/preloaded.woff2" => ("font/woff2", b"font-bytes"),
+                    _ => ("text/plain", b"not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "link-preload-font".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("link-preload-font".to_string(), context);
+        let page_url = format!("http://{address}/page");
+        page.navigate(&page_url).await.unwrap();
+
+        let mut paths = Vec::new();
+        while let Ok(path) = seen_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            paths.push(path);
+        }
+        assert!(
+            paths.contains(&"/preloaded.woff2".to_string()),
+            "preloaded font must be fetched via link preload: {paths:?}"
+        );
+        let js = page.js.as_ref().expect("navigation runtime");
+        assert!(js.render_resource_is_known(&format!(
+            "http://{address}/preloaded.woff2"
+        )));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dom_content_loaded_wait_returns_without_waiting_for_subresource_warmup() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                if path == "/slow.png" {
+                    std::thread::sleep(std::time::Duration::from_millis(1_200));
+                }
+                let (content_type, body): (&str, &[u8]) = match path.as_str() {
+                    "/page" => (
+                        "text/html",
+                        br#"<!doctype html><html><head></head><body><img src="/slow.png"><script>window.__script_ran = true;</script></body></html>"#,
+                    ),
+                    "/slow.png" => ("image/png", b"fake-png-bytes"),
+                    _ => ("text/plain", b"not found"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "dcl-no-subresource-block".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("dcl-no-subresource-block".to_string(), context);
+        let page_url = format!("http://{address}/page");
+        let started = std::time::Instant::now();
+        page.navigate_with_wait(&page_url, crate::lifecycle::WaitUntil::DomContentLoaded)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "DOMContentLoaded must not wait for subresource warmup, took {elapsed:?}"
+        );
+        let js = page.js.as_mut().expect("runtime");
+        assert_eq!(
+            js.evaluate("window.__script_ran").unwrap(),
+            serde_json::json!(true)
+        );
+    }
+
+    #[cfg(feature = "render")]
     #[test]
     fn page_screenshot_uses_the_live_window_scroll_offset() {
         let context = std::sync::Arc::new(crate::BrowserContext::new("scroll-test".to_string()));
@@ -9278,6 +9516,42 @@ mod tests {
             "*://*.gstatic.com/*.woff2",
             "https://fonts.gstatic.com/s/inter/v18/font.woff",
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigate_to_blob_url_renders_blob_content() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "blob-nav-test".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("blob-nav-test".to_string(), context);
+        page.navigate("about:blank").await.unwrap();
+
+        // Create blob URL from JS and navigate to it
+        let js = page.js.as_mut().unwrap();
+        let blob_url_val = js
+            .evaluate(
+                r#"
+            (function() {
+                const blob = new Blob(["<!doctype html><html><body><h1 id='title'>Loaded from Blob</h1></body></html>"], { type: "text/html" });
+                return URL.createObjectURL(blob);
+            })()
+        "#,
+            )
+            .unwrap();
+        let blob_url = blob_url_val.as_str().unwrap().to_string();
+
+        page.navigate(&blob_url).await.unwrap();
+        assert_eq!(page.url_string(), blob_url);
+        let js = page.js.as_mut().unwrap();
+        let title_text = js
+            .evaluate("document.getElementById('title').textContent")
+            .unwrap();
+        assert_eq!(title_text, serde_json::json!("Loaded from Blob"));
     }
 }
 

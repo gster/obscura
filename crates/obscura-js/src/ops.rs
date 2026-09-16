@@ -3558,12 +3558,23 @@ fn scripted_fetch_metadata(source: &str, target: &str, mode: &str, resource_type
 
 // Fetch appends Origin to scripted non-GET/HEAD requests even when same-origin.
 // In no-cors mode the document's referrer policy can require an opaque origin.
+// Same-origin CORS scripts (destination: script) also carry Origin in Chromium.
 fn fetch_origin_header<'a>(
-    method: &str, source: &'a str, target: &str, mode: &str, policy: ReferrerPolicy,
+    method: &str,
+    source: &'a str,
+    target: &str,
+    mode: &str,
+    policy: ReferrerPolicy,
+    destination: Option<&str>,
 ) -> Option<&'a str> {
     let cross_origin = request_origin(target).is_some_and(|origin| origin != source);
-    if mode == "cors" && cross_origin { return Some(source); }
-    if matches!(method, "GET" | "HEAD") { return None; }
+    let is_script_dest = matches!(destination, Some("script"));
+    if mode == "cors" && (cross_origin || is_script_dest) {
+        return Some(source);
+    }
+    if matches!(method, "GET" | "HEAD") {
+        return None;
+    }
     let downgrade = source.starts_with("https://") && target.starts_with("http://");
     let opaque = mode != "cors" && match policy {
         ReferrerPolicy::NoReferrer => true,
@@ -4147,6 +4158,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 mode.clone(),
                 credentials,
+                destination.clone(),
                 resource_type,
                 callbacks.clone(),
                 allow_private_network,
@@ -4179,7 +4191,7 @@ async fn op_fetch_url(
             .and_then(|target| referrer_policy.referrer(referrer.as_ref(), &target));
         if let Some(value) = &referrer { req = req.header("Referer", value.as_str()); }
 
-        if let Some(origin) = fetch_origin_header(current_method.as_str(), &page_origin, &current_url, &mode, referrer_policy) {
+        if let Some(origin) = fetch_origin_header(current_method.as_str(), &page_origin, &current_url, &mode, referrer_policy, destination.as_deref()) {
             req = req.header("Origin", origin);
         }
 
@@ -4209,6 +4221,13 @@ async fn op_fetch_url(
                 "User-Agent",
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             );
+        }
+
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("accept"))
+        {
+            req = req.header("Accept", "*/*");
         }
 
         for (k, v) in &custom_headers {
@@ -4480,6 +4499,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
+    destination: Option<String>,
     resource_type: ResourceType,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
@@ -4510,8 +4530,14 @@ async fn stealth_fetch_all(
         crossed_origin |= current_is_cross_origin;
         let mut req_headers: HashMap<String, String> = scripted_fetch_metadata(&page_origin, &current_url, &mode, resource_type)
             .into_iter().map(|(name, value)| (name.into(), value.into())).collect();
-        if let Some(origin) = fetch_origin_header(&current_method, &page_origin, &current_url, &mode, referrer_policy) {
+        if let Some(origin) = fetch_origin_header(&current_method, &page_origin, &current_url, &mode, referrer_policy, destination.as_deref()) {
             req_headers.insert("origin".to_string(), origin.into());
+        }
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("accept"))
+        {
+            req_headers.insert("accept".to_string(), "*/*".to_string());
         }
         for (k, v) in &custom_headers {
             if k.eq_ignore_ascii_case("referer") { continue; }
@@ -5792,6 +5818,16 @@ fn op_navigate(
     #[string] body: &str,
     #[string] behavior: &str,
 ) {
+    if let Some(registry) = state.try_borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>() {
+        let current_ctx = scope.get_entered_or_microtask_context();
+        let is_worker = registry.borrow().workers.values().any(|w| {
+            let w_ctx = v8::Local::new(scope, &w.context);
+            w_ctx == current_ctx
+        });
+        if is_worker {
+            return;
+        }
+    }
     let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is
@@ -6834,6 +6870,12 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        crate::worker::op_worker_create(),
+        crate::worker::op_worker_run(),
+        crate::worker::op_worker_post_to_worker(),
+        crate::worker::op_worker_post_to_parent(),
+        crate::worker::op_worker_terminate(),
+        crate::worker::op_worker_load_script(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
