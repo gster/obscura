@@ -224,7 +224,7 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 ```
 
 Validated with Rust 1.98.1 ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
-The stealth build also compiles BoringSSL and generates bindings, so it needs
+The stealth build uses primp with Rustls/AWS-LC. Native crypto builds need
 CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
 
 ```bash
@@ -232,7 +232,7 @@ sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 ```
 
 The rendering build uses rustls. The rendering-and-stealth build uses
-wreq/BoringSSL and therefore needs the additional build tools above.
+primp with Rustls/AWS-LC and needs the native build tools above.
 
 ## Quick Start
 

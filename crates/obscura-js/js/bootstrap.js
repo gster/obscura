@@ -15,6 +15,9 @@
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
+    '__obscura_ua_full_version', '__obscura_ua_architecture',
+    '__obscura_do_not_track', '__obscura_language', '__obscura_languages',
+    '__obscura_webgl_vendor', '__obscura_webgl_renderer',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
@@ -24,6 +27,7 @@
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
+    '__obscura_deviceOrientationScheduled',
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
@@ -52,6 +56,7 @@
     // Pre-declaring them non-enumerable here is enough -- per the note above,
     // the later `globalThis.X = X` assignments only update the value.
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
+    'DeviceOrientationEvent',
     'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
@@ -61,7 +66,15 @@
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
-    'SVGSVGElement',
+    'SVGSVGElement', 'SVGGElement', 'SVGRectElement', 'SVGCircleElement',
+    'SVGEllipseElement', 'SVGLineElement', 'SVGPolylineElement', 'SVGPolygonElement',
+    'SVGTextContentElement', 'SVGTextElement', 'SVGImageElement', 'SVGUseElement',
+    'SVGDefsElement', 'SVGGradientElement', 'SVGLinearGradientElement',
+    'SVGRadialGradientElement', 'SVGStopElement', 'SVGClipPathElement',
+    'SVGMaskElement', 'SVGFilterElement', 'SVGFEBlendElement',
+    'SVGFECompositeElement', 'SVGComponentTransferFunctionElement',
+    'SVGFEDisplacementMapElement', 'SVGFEMorphologyElement', 'SVGFETurbulenceElement',
+    'SVGPreserveAspectRatio', 'SVGLength', 'SVGTransform', 'SVGPoint', 'SVGRect',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -89,6 +102,25 @@ globalThis.__windowListeners = {};
 globalThis.addEventListener = function(type, fn) {
   if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
   globalThis.__windowListeners[type].push(fn);
+  // Desktop Chrome exposes DeviceOrientationEvent and delivers one initial
+  // null-valued sample when a listener is installed without an active sensor.
+  // Collectors use that sample to distinguish a supported desktop surface
+  // from an absent API.
+  if (type === 'deviceorientation' && !globalThis.__obscura_deviceOrientationScheduled) {
+    globalThis.__obscura_deviceOrientationScheduled = true;
+    const dispatchInitialOrientation = () => {
+      const event = new DeviceOrientationEvent('deviceorientation', {
+        absolute: false, alpha: null, beta: null, gamma: null,
+      });
+      try { globalThis.__obscura_markTrusted(event); } catch (_) {}
+      globalThis.dispatchEvent(event);
+    };
+    if (typeof globalThis._scheduleAfter === 'function') {
+      globalThis._scheduleAfter(0, dispatchInitialOrientation);
+    } else {
+      queueMicrotask(dispatchInitialOrientation);
+    }
+  }
 };
 globalThis.removeEventListener = function(type, fn) {
   if (globalThis.__windowListeners[type]) {
@@ -333,7 +365,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, task.mode, task.credentials, "script"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -366,21 +398,14 @@ async function __runDynScriptTask(task) {
       if (fetched.error) throw fetched.error;
       const body = fetched.body;
       if (body) {
-        // A fetched async script is executed by a ScriptRunner task, not by
-        // the fetch promise's microtask continuation. Besides matching event
-        // loop ordering, this prevents a batch of concurrently completed
-        // third-party scripts from being charged to (and pinning) whichever
-        // parser script happened to trigger the microtask checkpoint.
-        await new Promise(resolve => {
-          const execute = () => {
-            globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(body); }
-            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
-            resolve();
-          };
-          if (_scheduleAfter(0, execute) === undefined) execute();
-        });
+        // The completed script-fetch task must run the script before an older
+        // collector deadline can observe the response but miss the callback.
+        // Adding another zero-delay timer here put execution behind already
+        // queued timers, unlike Chromium's networking/script task ordering.
+        globalThis.__currentScriptNid = task.nid;
+        try { (0, eval)(body); }
+        catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+        finally { globalThis.__currentScriptNid = task.prevNid || 0; }
       }
     }
     // Fire load via dispatchEvent only: it invokes the element's onload
@@ -555,9 +580,7 @@ function _cssImportApplies(media) {
   return true;
 }
 
-async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
-  if (depth > 4 || seen.has(url)) return "";
-  seen.add(url);
+async function _fetchLinkedCssText(url, pageOrigin) {
   const raw = await Deno.core.ops.op_fetch_url(
     url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
   );
@@ -565,7 +588,13 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
     throw new Error("Stylesheet fetch failed: " + url);
   }
-  let css = parsed.body || "";
+  return parsed.body || "";
+}
+
+async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
+  if (depth > 4 || seen.has(url)) return "";
+  seen.add(url);
+  let css = await _fetchLinkedCssText(url, pageOrigin);
   const imports = [];
   // @import is only valid before ordinary rules. Removing it here lets the
   // renderer consume the imported rules from the materialized <style>.
@@ -598,13 +627,22 @@ async function _loadLinkedStylesheet(c) {
   // Read both so the property-assignment form (the common framework pattern)
   // and the parsed-from-HTML form are both recognized.
   const rel = (c.getAttribute('rel') || c.rel || '').toString().toLowerCase();
-  if (!rel.split(/\s+/).includes('stylesheet')) return;
+  const tokens = rel.split(/\s+/);
+  const preload = tokens.includes('preload') && (c.getAttribute('as') || c.as || '').toLowerCase() === 'style';
+  if (!tokens.includes('stylesheet') && !preload) return;
   const href = c.getAttribute('href');
   if (!href) return;
   const fullUrl = _resolveResourceUrl(href);
   let pageOrigin = "";
   try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
   try {
+    if (preload) {
+      // Preloading fetches the resource but does not parse imports or apply it.
+      // Route loaders wait for this event before attaching a stylesheet link.
+      await _fetchLinkedCssText(fullUrl, pageOrigin);
+      c.dispatchEvent(new Event('load'));
+      return;
+    }
     const css = await _fetchLinkedCss(fullUrl, pageOrigin);
     const previous = _linkedStylesheetNodes.get(c);
     if (previous?.parentNode) previous.parentNode.removeChild(previous);
@@ -766,6 +804,19 @@ const _consoleObjectId = (value) => {
   store[objectId] = value;
   return objectId;
 };
+const _consoleErrorDescription = (value) => {
+  const stack = Object.getOwnPropertyDescriptor(value, "stack");
+  if (stack && typeof stack.value === "string") return stack.value;
+  const name = Object.getOwnPropertyDescriptor(value, "name");
+  const message = Object.getOwnPropertyDescriptor(value, "message");
+  const safeName = name && typeof name.value === "string" ? name.value : "Error";
+  const safeMessage = message && typeof message.value === "string" ? message.value : "";
+  return safeMessage ? safeName + ": " + safeMessage : safeName;
+};
+const _consoleFunctionDescription = (value) => {
+  try { return Function.prototype.toString.call(value); }
+  catch { return "function () { [native code] }"; }
+};
 const _consoleRemoteObject = (value) => {
   const type = typeof value;
   if (value === null) return { type: "object", subtype: "null", value: null, description: "null" };
@@ -784,10 +835,7 @@ const _consoleRemoteObject = (value) => {
   }
   if (type === "symbol") return { type, description: String(value) };
   if (value instanceof Error) {
-    const _pst = Error.prepareStackTrace;
-    if (_pst !== undefined) Error.prepareStackTrace = undefined;
-    const description = value.stack || value.message || String(value);
-    if (_pst !== undefined) Error.prepareStackTrace = _pst;
+    const description = _consoleErrorDescription(value);
     return {
       type: "object", subtype: "error",
       className: (value.constructor && value.constructor.name) || "Error",
@@ -797,7 +845,7 @@ const _consoleRemoteObject = (value) => {
   const className = type === "function"
     ? "Function"
     : ((value.constructor && value.constructor.name) || "Object");
-  const remote = { type, className, description: type === "function" ? String(value) : className };
+  const remote = { type, className, description: type === "function" ? _consoleFunctionDescription(value) : className };
   if (Array.isArray(value)) {
     remote.subtype = "array";
     remote.description = "Array(" + value.length + ")";
@@ -813,19 +861,9 @@ const _consoleFn = (level, args) => {
     const text = args.map(a => {
       if (a === null) return "null";
       if (a === undefined) return "undefined";
-      if (a instanceof Error) {
-        const _pst = Error.prepareStackTrace;
-        if (_pst !== undefined) Error.prepareStackTrace = undefined;
-        const _s = a.stack || a.message || String(a);
-        if (_pst !== undefined) Error.prepareStackTrace = _pst;
-        return _s;
-      }
-      if (typeof a === "object") {
-        try {
-          const s = JSON.stringify(a);
-          return s === "{}" && a.message ? a.message : s;
-        } catch { return String(a); }
-      }
+      if (a instanceof Error) return _consoleErrorDescription(a);
+      if (typeof a === "function") return _consoleFunctionDescription(a);
+      if (typeof a === "object") return Array.isArray(a) ? "Array(" + a.length + ")" : "Object";
       return String(a);
     }).join(" ");
     const eventArgs = Deno.core.ops.op_runtime_events_enabled()
@@ -1734,6 +1772,11 @@ class CSSStyleDeclaration {
   get length() { this._pull(); return Object.keys(this._props).length; }
   item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
 }
+Object.defineProperty(CSSStyleDeclaration.prototype, 'webkitBoxReflect', {
+  configurable: true, enumerable: true,
+  get() { return this.getPropertyValue('-webkit-box-reflect'); },
+  set(value) { this.setProperty('-webkit-box-reflect', value); },
+});
 
 const _styleProxy = (decl) => new Proxy(decl, {
   get(t, p) {
@@ -1955,13 +1998,19 @@ function __prepareInsertedScript(script) {
       console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
       fullUrl = src;
     }
-    const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
+    const pageOrigin = (function() { try { return new URL(docUrl).origin; } catch(e) { return ""; } })();
+    // Snapshot the CORS settings at preparation time. The base URL resolves
+    // src but does not change the document's origin or credential policy.
+    const crossOrigin = script.getAttribute('crossorigin');
     const task = {
       url: fullUrl,
       isModule,
       nid: script._nid,
       prevNid,
       pageOrigin,
+      mode: crossOrigin === null ? "no-cors" : "cors",
+      credentials: crossOrigin === null || crossOrigin.toLowerCase() === 'use-credentials'
+        ? "include" : "same-origin",
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
     };
     // Non-parser-inserted external scripts are async by default, but scripts
@@ -2416,6 +2465,8 @@ class Node {
   }
 }
 class CharacterData extends Node {
+  get textContent() { return this.data; }
+  set textContent(v) { this.data = v == null ? "" : v; }
   get data() {
     return _domParse("text_content", this._nid) ?? "";
   }
@@ -3512,6 +3563,7 @@ class Element extends Node {
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
       if (this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
+        _registerDocumentNamedElement(this);
       }
       if (previousWindowName && previousWindowName !== value) {
         _reconcileWindowNamedProperty(previousWindowName);
@@ -5355,7 +5407,19 @@ class Document extends Node {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
   }
   createElement(t) {
-    const localName = String(t).toLowerCase();
+    const suppliedName = String(t);
+    const localName = suppliedName.toLowerCase();
+    // DOM's createElement() validates the supplied local name before creating
+    // anything.  Protection collectors intentionally pass an old IE-style
+    // string such as "<object ...>" and expect Chromium's
+    // InvalidCharacterError rather than a synthetic element with that name.
+    if (!_ns_isValidXmlName(localName)) {
+      throw new DOMException(
+        "Failed to execute 'createElement' on 'Document': The tag name provided ('" +
+          suppliedName + "') is not a valid name.",
+        'InvalidCharacterError',
+      );
+    }
     const nid = +_dom("create_element", localName);
     const C = _elementClassForKnownName(
       "http://www.w3.org/1999/xhtml",
@@ -6361,7 +6425,10 @@ class HTMLMediaElement extends Element {
   static HAVE_CURRENT_DATA = 2;
   static HAVE_FUTURE_DATA = 3;
   static HAVE_ENOUGH_DATA = 4;
-  canPlayType(_type) { return ''; }
+  canPlayType(type) {
+    return /(?:application|audio)\/x-mpegurl|application\/vnd\.apple\.mpegurl/i.test(String(type))
+      ? 'maybe' : '';
+  }
   load() {}
   play() {
     return Promise.reject(new DOMException(
@@ -6465,9 +6532,8 @@ function _elementClassFor(nid) {
   // namespace for possible SVG wrappers.
   if (tag && tag !== tag.toUpperCase()
       && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
-    if (tag === "script" && globalThis.SVGScriptElement) return globalThis.SVGScriptElement;
-    if (tag === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (tag === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    const svgType = globalThis.__obscura_svg_types?.[tag];
+    if (svgType) return svgType;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (_htmlElementClasses[tag] && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") return _htmlElementClasses[tag];
@@ -6491,9 +6557,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
   if (namespace === "http://www.w3.org/2000/svg") {
-    if (localName === "script" && globalThis.SVGScriptElement) return globalThis.SVGScriptElement;
-    if (localName === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (localName === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    const svgType = globalThis.__obscura_svg_types?.[localName];
+    if (svgType) return svgType;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
@@ -6811,7 +6876,7 @@ class NetworkInformation {
   get downlink() { return 10; }
   get downlinkMax() { return Infinity; }
   get effectiveType() { return '4g'; }
-  get rtt() { return 50; }
+  get rtt() { return globalThis.__obscura_network_rtt ?? 100; }
   get saveData() { return false; }
   get type() { return 'wifi'; }
   get onchange() { return this._onchange || null; }
@@ -6876,7 +6941,7 @@ globalThis.navigator = {
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
-  doNotTrack: null,
+  get doNotTrack() { return globalThis.__obscura_do_not_track ?? null; },
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   userAgentData: {
@@ -6886,15 +6951,15 @@ globalThis.navigator = {
     getHighEntropyValues(hints) {
       var brands = _uaBrands();
       return Promise.resolve({
-        architecture: "x86",
+        architecture: globalThis.__obscura_ua_architecture || "x86",
         bitness: "64",
         brands: brands,
-        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
+        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: (b.brand === "Chromium" || b.brand === "Google Chrome") ? (globalThis.__obscura_ua_full_version || b.version + ".0.0.0") : b.version + ".0.0.0"}; }),
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
         platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: _chromeMajor() + ".0.0.0",
+        uaFullVersion: globalThis.__obscura_ua_full_version || _chromeMajor() + ".0.0.0",
         wow64: false,
       });
     },
@@ -6904,10 +6969,9 @@ globalThis.navigator = {
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
-        {deviceId:"default",kind:"audioinput",label:"",groupId:"default"},
-        {deviceId:"comms",kind:"audioinput",label:"",groupId:"comms"},
-        {deviceId:"default",kind:"audiooutput",label:"",groupId:"default"},
+        {deviceId:"",kind:"audioinput",label:"",groupId:""},
         {deviceId:"",kind:"videoinput",label:"",groupId:""},
+        {deviceId:"",kind:"audiooutput",label:"",groupId:""},
       ]);
     },
     getUserMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
@@ -6917,13 +6981,31 @@ globalThis.navigator = {
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: { query(params){
     var n = params && params.name;
-    // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
-    // returning "granted" for camera/microphone is a bot tell.
-    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
-    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
-    return Promise.resolve({state: 'granted', onchange: null});
+    // Match a fresh desktop Chrome profile. Invalid and context-dependent
+    // descriptors reject instead of silently turning into "granted".
+    if (n === 'accessibility-events' || n === 'ambient-light-sensor' || n === 'top-level-storage-access') {
+      return Promise.reject(new TypeError(`Invalid permission descriptor: ${n}`));
+    }
+    if (n === 'push') {
+      return Promise.reject(new DOMException('Push permission requires userVisibleOnly', 'NotSupportedError'));
+    }
+    if (['camera','clipboard-read','geolocation','local-fonts','microphone','midi',
+         'notifications','persistent-storage','window-management'].includes(n)) {
+      return Promise.resolve({state: 'prompt', onchange: null});
+    }
+    if (['accelerometer','background-sync','clipboard-write','gyroscope','magnetometer',
+         'payment-handler','screen-wake-lock','storage-access'].includes(n)) {
+      return Promise.resolve({state: 'granted', onchange: null});
+    }
+    return Promise.reject(new TypeError(`Invalid permission descriptor: ${n}`));
   } },
-  getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
+  getBattery() {
+    const charging = globalThis.__obscura_battery_charging ?? _fp('batteryCharging');
+    const level = globalThis.__obscura_battery_level ?? _fp('batteryLevel');
+    return Promise.resolve({ charging, chargingTime: Infinity,
+      dischargingTime: charging ? Infinity : Math.floor(3600 + _fpRand(250) * 7200),
+      level, addEventListener(){} });
+  },
   getGamepads() { return []; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
@@ -6959,10 +7041,12 @@ globalThis.navigator = {
     clearWatch() {},
   },
   storage: {
-    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
+    estimate() { return Promise.resolve({ quota: globalThis.__obscura_storage_quota ?? 10738064711, usage: Math.floor(_fpRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
   },
+  webkitTemporaryStorage: { queryUsageAndQuota(success) { if (success) success(0, globalThis.__obscura_storage_quota ?? 10738064711); }, requestQuota(bytes, success) { if (success) success(bytes); } },
+  webkitPersistentStorage: { queryUsageAndQuota(success) { if (success) success(0, globalThis.__obscura_storage_quota ?? 10738064711); }, requestQuota(bytes, success) { if (success) success(bytes); } },
 };
 
 // Put spoofed navigator props on a thin prototype above Navigator.prototype
@@ -6979,6 +7063,8 @@ globalThis.navigator = {
   }
 
   defGetter('webdriver', function() { return false; });
+  defGetter('appCodeName', function() { return 'Mozilla'; });
+  defGetter('appName', function() { return 'Netscape'; });
   defGetter('userAgent', function() {
     return globalThis.__obscura_ua ||
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -6992,21 +7078,32 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return "en-US"; });
-  defGetter('languages', function() { return ["en-US", "en"]; });
+  defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
+  defGetter('languages', function() {
+    return Array.isArray(globalThis.__obscura_languages)
+      ? globalThis.__obscura_languages.slice()
+      : ["en-US", "en"];
+  });
 
-  // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
-  var _plugins = new PluginArray([
-    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-  ]);
-  var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
-  ]);
+  // Chrome exposes the same two PDF MIME types through every built-in PDF
+  // plugin. navigator.mimeTypes uses the PDF Viewer instances and points their
+  // enabledPlugin back at that plugin.
+  var _pluginNames = [
+    "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
+  ];
+  var _pluginItems = _pluginNames.map(function(name) {
+    var plugin = new Plugin(name, "internal-pdf-viewer", "Portable Document Format", []);
+    var mimeTypes = [
+      new MimeType("application/pdf", "Portable Document Format", "pdf", plugin),
+      new MimeType("text/pdf", "Portable Document Format", "pdf", plugin),
+    ];
+    for (var i = 0; i < mimeTypes.length; i++) plugin[i] = mimeTypes[i];
+    plugin.length = mimeTypes.length;
+    return plugin;
+  });
+  var _plugins = new PluginArray(_pluginItems);
+  var _mimeTypes = new MimeTypeArray([_pluginItems[0][0], _pluginItems[0][1]]);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
@@ -7018,13 +7115,18 @@ globalThis.navigator = {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
   });
   _navProto.canShare = _markNative(function canShare() { return false; });
+  _navProto.registerProtocolHandler = _markNative(function registerProtocolHandler(scheme, url) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'registerProtocolHandler': 2 arguments required");
+  });
+  _navProto.unregisterProtocolHandler = _markNative(function unregisterProtocolHandler() {});
+  _navProto.vibrate = _markNative(function vibrate() { return true; });
 
   Object.setPrototypeOf(globalThis.navigator, _navProto);
+  globalThis.clientInformation = globalThis.navigator;
 })();
 
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
-  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
     return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
@@ -7049,6 +7151,22 @@ globalThis.chrome = {
     };
   },
 };
+
+// Deprecated but still present in desktop Chrome. Fingerprinting libraries use
+// it to distinguish an ordinary profile from private browsing. The API is
+// asynchronous and grants an origin-scoped temporary filesystem in Chrome;
+// Obscura exposes the observable success path without a host filesystem.
+globalThis.webkitRequestFileSystem = globalThis.requestFileSystem = _markNative(
+  function webkitRequestFileSystem(_type, _size, success, error) {
+    setTimeout(function() {
+      if (typeof success === 'function') {
+        success({ name: '', root: { name: '', fullPath: '/', isFile: false, isDirectory: true } });
+      } else if (typeof error === 'function') {
+        error(new DOMException('Invalid callback', 'TypeMismatchError'));
+      }
+    }, 0);
+  }
+);
 
 globalThis.Notification = class Notification {
   static permission = "default";
@@ -10060,6 +10178,16 @@ globalThis.CustomEvent = class extends Event {
     this.detail = detail;
   }
 };
+globalThis.DeviceOrientationEvent = class DeviceOrientationEvent extends Event {
+  constructor(type, options = {}) {
+    super(type, options);
+    this.absolute = !!options.absolute;
+    this.alpha = options.alpha == null ? null : Number(options.alpha);
+    this.beta = options.beta == null ? null : Number(options.beta);
+    this.gamma = options.gamma == null ? null : Number(options.gamma);
+  }
+};
+_markNative(DeviceOrientationEvent);
 globalThis.MouseEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
@@ -10992,35 +11120,62 @@ globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 // the named getter/setter so length/key()/iteration stay in sync with the
 // backing map. Plain prototype methods alone could not intercept direct
 // property access, so `localStorage.foo = x` never updated length before.
+const _storageAreas = new WeakMap();
+const _storageCall = (store, operation, ...args) => {
+  const area = _storageAreas.get(store);
+  if (!area) throw new TypeError('Illegal invocation');
+  const result = _domJSONParse(_dom('web_storage', area, _domJSONStringify([operation, ...args])));
+  if (result && result.error) throw new DOMException('Storage quota exceeded', result.error);
+  return result;
+};
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
-Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
+Storage.prototype.getItem = function(k) { return _storageCall(this, 'get', String(k)); };
+Storage.prototype.setItem = function(k, v) { _storageCall(this, 'set', String(k), String(v)); };
+Storage.prototype.removeItem = function(k) { _storageCall(this, 'remove', String(k)); };
+Storage.prototype.clear = function() { _storageCall(this, 'clear'); };
+Storage.prototype.key = function(i) { return _storageCall(this, 'keys')[i >>> 0] ?? null; };
+Object.defineProperty(Storage.prototype, 'length', { get: function() { return _storageCall(this, 'keys').length; }, configurable: true });
 
-const _mkStore = () => {
+const _mkStore = (area) => {
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
-  return new Proxy(target, {
+  _storageAreas.set(target, area);
+  const isReal = (p) => p === 'constructor' || (p in Storage.prototype);
+  const proxy = new Proxy(target, {
     get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
     set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return t.getItem(p) !== null; },
     deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    ownKeys(t) { return _storageCall(t, 'keys'); },
     getOwnPropertyDescriptor(t, p) {
-      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
-        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      const value = typeof p === 'symbol' ? null : t.getItem(p);
+      if (value !== null) return { value, writable: true, enumerable: true, configurable: true };
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
+  _storageAreas.set(proxy, area);
+  return proxy;
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore('local');
+globalThis.sessionStorage = _mkStore('session');
 
-globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
+globalThis.btoa = globalThis.btoa || ((value) => {
+  const s = String(value);
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code > 0xFF) throw new DOMException('The string to be encoded contains characters outside of the Latin1 range.', 'InvalidCharacterError');
+    bytes[i] = code;
+  }
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let result = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i], b = bytes[i + 1] ?? 0, c = bytes[i + 2] ?? 0;
+    result += alphabet[a >> 2] + alphabet[((a & 3) << 4) | (b >> 4)]
+      + (i + 1 < bytes.length ? alphabet[((b & 15) << 2) | (c >> 6)] : "=")
+      + (i + 2 < bytes.length ? alphabet[c & 63] : "=");
+  }
+  return result;
+});
 globalThis.atob = globalThis.atob || ((s) => {
   const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const r=[];
@@ -11811,6 +11966,8 @@ globalThis.CSS = {
   escape(s){ return s; }
 };
 
+// Platform objects must not look like plain records to configuration mergers.
+Object.defineProperty(Element.prototype, Symbol.toStringTag, {value: 'Element', configurable: true});
 globalThis.HTMLElement = Element;
 // Distinct prototypes keep interface-specific instrumentation on its own tag.
 // Sharing Element as every HTML constructor made a script.src hook apply to
@@ -11852,9 +12009,13 @@ for (const [tag, name] of Object.entries({
   DIALOG: "HTMLDialogElement",
 })) {
   const type = { [name]: class extends Element {} }[name];
+  Object.defineProperty(type.prototype, Symbol.toStringTag, {value: name, configurable: true});
   _htmlElementClasses[tag] = type;
   globalThis[name] = type;
 }
+Object.defineProperty(globalThis.HTMLInputElement.prototype, 'onsearch', {
+  configurable: true, enumerable: true, writable: true, value: null,
+});
 for (const tag of ['H2','H3','H4','H5','H6']) _htmlElementClasses[tag] = _htmlElementClasses.H1;
 globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
@@ -11931,6 +12092,11 @@ globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
   assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
 };
 _htmlElementClasses.SLOT = globalThis.HTMLSlotElement;
+for (const type of [HTMLImageElement, HTMLFormElement, HTMLTextAreaElement,
+                    HTMLSlotElement, HTMLAudioElement, HTMLVideoElement, HTMLTrackElement]) {
+  Object.defineProperty(type.prototype, Symbol.toStringTag, {value: type.name, configurable: true});
+}
+
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.
@@ -11957,17 +12123,201 @@ Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, { value: 
 _markNative(SVGAnimatedString);
 
 class SVGElement extends Element {}
-class SVGGraphicsElement extends SVGElement {}
-class SVGGeometryElement extends SVGGraphicsElement {}
+class SVGGraphicsElement extends SVGElement {
+  getBBox() { return _svgBBox(this); }
+  getCTM() { return typeof DOMMatrix === 'function' ? new DOMMatrix() : null; }
+  getScreenCTM() { return this.getCTM(); }
+}
+class SVGGeometryElement extends SVGGraphicsElement {
+  isPointInFill() { return false; }
+  isPointInStroke() { return false; }
+  getTotalLength() { return _svgSegments(this).total; }
+  getPointAtLength(distance) { return _svgPointAtLength(this, Number(distance) || 0); }
+}
 class SVGPathElement extends SVGGeometryElement {}
-class SVGSVGElement extends SVGGraphicsElement {}
+class SVGSVGElement extends SVGGraphicsElement {
+  createSVGPoint() { return new SVGPoint(); }
+  createSVGRect() { return new SVGRect(); }
+  createSVGMatrix() { return typeof DOMMatrix === 'function' ? new DOMMatrix() : null; }
+  getElementById(id) { return this.querySelector('#' + CSS.escape(String(id))); }
+}
 class SVGScriptElement extends SVGElement {}
+class SVGGElement extends SVGGraphicsElement {}
+class SVGRectElement extends SVGGeometryElement {}
+class SVGCircleElement extends SVGGeometryElement {}
+class SVGEllipseElement extends SVGGeometryElement {}
+class SVGLineElement extends SVGGeometryElement {}
+class SVGPolylineElement extends SVGGeometryElement {}
+class SVGPolygonElement extends SVGGeometryElement {}
+class SVGTextContentElement extends SVGGraphicsElement {
+  getComputedTextLength() {
+    const size = Number.parseFloat(getComputedStyle(this).fontSize) || 16;
+    return Array.from(this.textContent || '').length * size * 0.6;
+  }
+  getSubStringLength(start, length) {
+    const text = Array.from(this.textContent || '').slice(start >>> 0, (start >>> 0) + (length >>> 0));
+    const size = Number.parseFloat(getComputedStyle(this).fontSize) || 16;
+    return text.length * size * 0.6;
+  }
+  getStartPositionOfChar(index) { return new SVGPoint(this.getSubStringLength(0, index), 0); }
+  getEndPositionOfChar(index) { return new SVGPoint(this.getSubStringLength(0, (index >>> 0) + 1), 0); }
+  getExtentOfChar(index) {
+    const x = this.getSubStringLength(0, index), width = this.getSubStringLength(index, 1);
+    const height = Number.parseFloat(getComputedStyle(this).fontSize) || 16;
+    return new SVGRect(x, -height, width, height);
+  }
+  getCharNumAtPosition(point) {
+    const size = Number.parseFloat(getComputedStyle(this).fontSize) || 16;
+    const index = Math.floor((Number(point?.x) || 0) / (size * 0.6));
+    return index >= 0 && index < Array.from(this.textContent || '').length ? index : -1;
+  }
+  selectSubString() {}
+}
+class SVGTextElement extends SVGTextContentElement {}
+class SVGImageElement extends SVGGraphicsElement {}
+class SVGUseElement extends SVGGraphicsElement {}
+class SVGDefsElement extends SVGGraphicsElement {}
+class SVGGradientElement extends SVGElement {}
+class SVGLinearGradientElement extends SVGGradientElement {}
+class SVGRadialGradientElement extends SVGGradientElement {}
+class SVGStopElement extends SVGElement {}
+class SVGClipPathElement extends SVGGraphicsElement {}
+class SVGMaskElement extends SVGElement {}
+class SVGFilterElement extends SVGElement {}
+class SVGFEBlendElement extends SVGElement {}
+class SVGFECompositeElement extends SVGElement {}
+class SVGComponentTransferFunctionElement extends SVGElement {}
+class SVGFEDisplacementMapElement extends SVGElement {}
+class SVGFEMorphologyElement extends SVGElement {}
+class SVGFETurbulenceElement extends SVGElement {}
+class SVGPoint {
+  constructor(x = 0, y = 0) { this.x = Number(x) || 0; this.y = Number(y) || 0; }
+  matrixTransform(matrix) {
+    return new SVGPoint(this.x * (matrix?.a ?? 1) + this.y * (matrix?.c ?? 0) + (matrix?.e ?? 0),
+      this.x * (matrix?.b ?? 0) + this.y * (matrix?.d ?? 1) + (matrix?.f ?? 0));
+  }
+}
+class SVGRect {
+  constructor(x = 0, y = 0, width = 0, height = 0) {
+    this.x = Number(x) || 0; this.y = Number(y) || 0;
+    this.width = Math.max(0, Number(width) || 0); this.height = Math.max(0, Number(height) || 0);
+  }
+}
+class SVGLength { constructor() { this.value = 0; this.valueInSpecifiedUnits = 0; this.unitType = 1; } }
+class SVGTransform { constructor() { this.type = 0; this.angle = 0; this.matrix = typeof DOMMatrix === 'function' ? new DOMMatrix() : null; } }
+class SVGPreserveAspectRatio { constructor() { this.align = 6; this.meetOrSlice = 1; } }
+
+function _svgAttr(element, name, fallback = 0) {
+  const value = Number.parseFloat(element.getAttribute(name));
+  return Number.isFinite(value) ? value : fallback;
+}
+function _svgPathPoints(path) {
+  const tokens = String(path.getAttribute('d') || '').match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || [];
+  const points = []; let command = '', x = 0, y = 0, startX = 0, startY = 0, i = 0;
+  const number = () => Number(tokens[i++]);
+  while (i < tokens.length) {
+    if (/^[a-zA-Z]$/.test(tokens[i])) command = tokens[i++];
+    if (!command) break;
+    const relative = command === command.toLowerCase();
+    const upper = command.toUpperCase();
+    if (upper === 'Z') { x = startX; y = startY; points.push([x, y]); command = ''; continue; }
+    if (upper === 'H') { const nx = number(); x = relative ? x + nx : nx; points.push([x, y]); continue; }
+    if (upper === 'V') { const ny = number(); y = relative ? y + ny : ny; points.push([x, y]); continue; }
+    const count = upper === 'C' ? 6 : upper === 'S' || upper === 'Q' ? 4 : upper === 'A' ? 7 : 2;
+    if (i + count > tokens.length || /^[a-zA-Z]$/.test(tokens[i])) { command = ''; continue; }
+    const values = Array.from({length: count}, number);
+    let nx = values[count - 2], ny = values[count - 1];
+    if (relative) { nx += x; ny += y; }
+    x = nx; y = ny;
+    if (upper === 'M') { startX = x; startY = y; command = relative ? 'l' : 'L'; }
+    points.push([x, y]);
+  }
+  return points;
+}
+function _svgSegments(element) {
+  let points = [];
+  switch (element.localName) {
+    case 'path': points = _svgPathPoints(element); break;
+    case 'line': points = [[_svgAttr(element,'x1'),_svgAttr(element,'y1')],[_svgAttr(element,'x2'),_svgAttr(element,'y2')]]; break;
+    case 'polyline': case 'polygon': {
+      const values = (element.getAttribute('points') || '').match(/[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g)?.map(Number) || [];
+      for (let i = 0; i + 1 < values.length; i += 2) points.push([values[i], values[i + 1]]);
+      if (element.localName === 'polygon' && points.length) points.push(points[0]);
+      break;
+    }
+  }
+  const segments = []; let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    const length = Math.hypot(points[i][0] - points[i-1][0], points[i][1] - points[i-1][1]);
+    segments.push({from: points[i-1], to: points[i], length, start: total}); total += length;
+  }
+  return { points, segments, total };
+}
+function _svgPointAtLength(element, distance) {
+  const path = _svgSegments(element);
+  if (!path.points.length) return new SVGPoint();
+  distance = Math.max(0, Math.min(path.total, distance));
+  const segment = path.segments.find(item => distance <= item.start + item.length) || path.segments[path.segments.length - 1];
+  if (!segment) return new SVGPoint(path.points[0][0], path.points[0][1]);
+  const ratio = segment.length ? (distance - segment.start) / segment.length : 0;
+  return new SVGPoint(segment.from[0] + (segment.to[0] - segment.from[0]) * ratio,
+    segment.from[1] + (segment.to[1] - segment.from[1]) * ratio);
+}
+function _svgBBox(element) {
+  let x = 0, y = 0, width = 0, height = 0;
+  switch (element.localName) {
+    case 'rect': case 'image': case 'use':
+      x=_svgAttr(element,'x'); y=_svgAttr(element,'y'); width=Math.max(0,_svgAttr(element,'width')); height=Math.max(0,_svgAttr(element,'height')); break;
+    case 'circle': { const cx=_svgAttr(element,'cx'), cy=_svgAttr(element,'cy'), r=Math.max(0,_svgAttr(element,'r')); x=cx-r;y=cy-r;width=height=r*2; break; }
+    case 'ellipse': { const cx=_svgAttr(element,'cx'), cy=_svgAttr(element,'cy'), rx=Math.max(0,_svgAttr(element,'rx')), ry=Math.max(0,_svgAttr(element,'ry')); x=cx-rx;y=cy-ry;width=rx*2;height=ry*2; break; }
+    case 'text': case 'tspan': { x=_svgAttr(element,'x'); y=_svgAttr(element,'y'); width=element.getComputedTextLength?.() || 0; height=Number.parseFloat(getComputedStyle(element).fontSize)||16; y-=height; break; }
+    default: {
+      const points = _svgSegments(element).points;
+      if (points.length) {
+        const xs=points.map(p=>p[0]), ys=points.map(p=>p[1]); x=Math.min(...xs);y=Math.min(...ys);width=Math.max(...xs)-x;height=Math.max(...ys)-y;
+      } else {
+        const boxes = Array.from(element.children || []).filter(child => typeof child.getBBox === 'function').map(child => child.getBBox());
+        if (boxes.length) { x=Math.min(...boxes.map(b=>b.x));y=Math.min(...boxes.map(b=>b.y));width=Math.max(...boxes.map(b=>b.x+b.width))-x;height=Math.max(...boxes.map(b=>b.y+b.height))-y; }
+      }
+    }
+  }
+  return new SVGRect(x, y, width, height);
+}
 globalThis.SVGElement = SVGElement;
 globalThis.SVGGraphicsElement = SVGGraphicsElement;
 globalThis.SVGGeometryElement = SVGGeometryElement;
 globalThis.SVGPathElement = SVGPathElement;
 globalThis.SVGSVGElement = SVGSVGElement;
 globalThis.SVGScriptElement = SVGScriptElement;
+Object.assign(globalThis, {
+  SVGGElement, SVGRectElement, SVGCircleElement, SVGEllipseElement, SVGLineElement,
+  SVGPolylineElement, SVGPolygonElement, SVGTextContentElement, SVGTextElement,
+  SVGImageElement, SVGUseElement, SVGDefsElement, SVGGradientElement,
+  SVGLinearGradientElement, SVGRadialGradientElement, SVGStopElement,
+  SVGClipPathElement, SVGMaskElement, SVGFilterElement, SVGFEBlendElement,
+  SVGFECompositeElement, SVGComponentTransferFunctionElement,
+  SVGFEDisplacementMapElement, SVGFEMorphologyElement, SVGFETurbulenceElement,
+  SVGPoint, SVGRect, SVGLength, SVGTransform, SVGPreserveAspectRatio,
+});
+globalThis.__obscura_svg_types = {
+  svg: SVGSVGElement, script: SVGScriptElement, g: SVGGElement, path: SVGPathElement,
+  rect: SVGRectElement, circle: SVGCircleElement, ellipse: SVGEllipseElement,
+  line: SVGLineElement, polyline: SVGPolylineElement, polygon: SVGPolygonElement,
+  text: SVGTextElement, tspan: SVGTextElement, image: SVGImageElement, use: SVGUseElement,
+  defs: SVGDefsElement, linearGradient: SVGLinearGradientElement,
+  radialGradient: SVGRadialGradientElement, stop: SVGStopElement,
+  clipPath: SVGClipPathElement, mask: SVGMaskElement, filter: SVGFilterElement,
+  feBlend: SVGFEBlendElement, feComposite: SVGFECompositeElement,
+  feFuncR: SVGComponentTransferFunctionElement, feFuncG: SVGComponentTransferFunctionElement,
+  feFuncB: SVGComponentTransferFunctionElement, feFuncA: SVGComponentTransferFunctionElement,
+  feDisplacementMap: SVGFEDisplacementMapElement, feMorphology: SVGFEMorphologyElement,
+  feTurbulence: SVGFETurbulenceElement,
+};
+for (const type of Object.values(globalThis.__obscura_svg_types)) {
+  if (type?.prototype && !Object.prototype.hasOwnProperty.call(type.prototype, Symbol.toStringTag)) {
+    Object.defineProperty(type.prototype, Symbol.toStringTag, {value:type.name, configurable:true});
+  }
+}
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
@@ -11992,6 +12342,9 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+Document.prototype.hasStorageAccess = _markNative(function hasStorageAccess() {
+  return Promise.resolve(true);
+});
 // CSSStyleDeclaration is the type of element.style and getComputedStyle(); it is
 // pre-declared non-enumerable in _preHideInternals, but unlike the other WebIDL
 // interfaces it had no value assignment, leaving `window.CSSStyleDeclaration`
@@ -12094,6 +12447,57 @@ function _nodeList(els) {
 // HTMLCollection in tree order.
 const _windowNamedPropertyNames = new Set();
 const _windowNamedNameTags = new Set(["embed", "form", "iframe", "img", "object"]);
+const _documentNamedProperties = new WeakMap();
+
+function _documentNamedCandidates(name) {
+  return _windowNamedCandidates(name).filter(element => {
+    if (!_windowNameEligibleElement(element)) return false;
+    const declaredName = _domParse("get_attribute", element._nid, "name");
+    return declaredName === name || (element.localName === "object"
+      || (element.localName === "img" && declaredName))
+      && _domParse("get_attribute", element._nid, "id") === name;
+  });
+}
+
+function _ensureDocumentNamedProperty(name) {
+  const doc = globalThis.document;
+  if (!doc || !name || name in doc) return;
+  let installed = _documentNamedProperties.get(doc);
+  if (!installed) _documentNamedProperties.set(doc, installed = new Set());
+  Object.defineProperty(doc, name, {
+    get() {
+      const matches = _documentNamedCandidates(name);
+      if (!matches.length) return undefined;
+      if (matches.length > 1) return HTMLCollection._from(matches);
+      const element = matches[0];
+      return element.localName === "iframe" && element.contentWindow ? element.contentWindow : element;
+    },
+    configurable: true,
+    enumerable: false,
+  });
+  installed.add(name);
+}
+
+function _registerDocumentNamedElement(element) {
+  if (!_windowNameEligibleElement(element)) return;
+  const name = _domParse("get_attribute", element._nid, "name");
+  if (name) _ensureDocumentNamedProperty(name);
+  if (element.localName === "object" || (element.localName === "img" && name)) {
+    _ensureDocumentNamedProperty(_domParse("get_attribute", element._nid, "id"));
+  }
+}
+
+function _reconcileDocumentNamedProperties(names) {
+  const doc = globalThis.document;
+  const installed = doc && _documentNamedProperties.get(doc);
+  if (!installed) return;
+  for (const name of names) {
+    if (installed.has(name) && !_documentNamedCandidates(name).length) {
+      delete doc[name];
+      installed.delete(name);
+    }
+  }
+}
 
 function _windowNameEligibleElement(element) {
   return !!element
@@ -12157,6 +12561,7 @@ function _ensureWindowNamedProperty(name) {
 }
 
 function _reconcileWindowNamedProperty(name) {
+  _reconcileDocumentNamedProperties([name]);
   if (!_windowNamedPropertyNames.has(name)) return;
   if (_windowNamedCandidates(name).length !== 0) return;
   try { delete globalThis[name]; } catch (_error) {}
@@ -12186,12 +12591,19 @@ function _registerWindowNamedTree(root) {
   // connectivity first: getRootNode() walks every ancestor, which made the
   // common framework pattern of building a deep detached subtree quadratic.
   if (!root || !root.isConnected || root.getRootNode() !== globalThis.document) return;
+  _registerDocumentNamedElement(root);
+  if (typeof root.querySelectorAll === "function") {
+    for (const element of root.querySelectorAll("embed[name],form[name],iframe[name],img[name],object")) {
+      _registerDocumentNamedElement(element);
+    }
+  }
   const names = _windowNamedNamesInTree(root);
   for (const name of names) _ensureWindowNamedProperty(name);
 }
 
 function _reconcileWindowNamedProperties(names) {
   if (!names || names.size === 0) return;
+  _reconcileDocumentNamedProperties(names);
   const doc = globalThis.document;
   if (!doc) return;
   const present = new Set();
@@ -13379,21 +13791,244 @@ class HTMLCanvasElement extends Element {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
+const _WEBGL_EXTENSIONS = [
+  'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_clip_control',
+  'EXT_color_buffer_half_float', 'EXT_depth_clamp', 'EXT_disjoint_timer_query',
+  'EXT_float_blend', 'EXT_frag_depth', 'EXT_polygon_offset_clamp',
+  'EXT_shader_texture_lod', 'EXT_texture_compression_bptc',
+  'EXT_texture_compression_rgtc', 'EXT_texture_filter_anisotropic',
+  'EXT_texture_mirror_clamp_to_edge', 'EXT_sRGB', 'KHR_parallel_shader_compile',
+  'OES_element_index_uint', 'OES_fbo_render_mipmap', 'OES_standard_derivatives',
+  'OES_texture_float', 'OES_texture_float_linear', 'OES_texture_half_float',
+  'OES_texture_half_float_linear', 'OES_vertex_array_object',
+  'WEBGL_blend_func_extended', 'WEBGL_color_buffer_float',
+  'WEBGL_compressed_texture_astc', 'WEBGL_compressed_texture_etc',
+  'WEBGL_compressed_texture_etc1', 'WEBGL_compressed_texture_pvrtc',
+  'WEBGL_compressed_texture_s3tc',
+  'WEBGL_compressed_texture_s3tc_srgb', 'WEBGL_debug_renderer_info',
+  'WEBGL_debug_shaders', 'WEBGL_depth_texture', 'WEBGL_draw_buffers',
+  'WEBGL_lose_context', 'WEBGL_multi_draw', 'WEBGL_polygon_mode',
+];
+
+class _SoftwareWebGLContext {
+  constructor(canvas, attributes, webgl2) {
+    this.canvas = canvas;
+    this._attributes = Object.assign({
+      alpha: true, antialias: true, depth: true,
+      failIfMajorPerformanceCaveat: false, powerPreference: 'default',
+      premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false,
+      desynchronized: false,
+    }, attributes || {});
+    this._webgl2 = !!webgl2;
+    this._clearColor = [0, 0, 0, 0];
+    this._viewport = [0, 0, canvas.width, canvas.height];
+    this._boundBuffers = Object.create(null);
+    this._attribs = Object.create(null);
+    this._program = null;
+    this._resizeFromCanvas();
+  }
+  get drawingBufferWidth() { return this.canvas.width; }
+  get drawingBufferHeight() { return this.canvas.height; }
+  _resizeFromCanvas() {
+    const size = Math.max(0, this.canvas.width * this.canvas.height * 4);
+    if (!this._pixels || this._pixels.length !== size) this._pixels = new Uint8Array(size);
+    this._viewport = [0, 0, this.canvas.width, this.canvas.height];
+  }
+  getContextAttributes() { return Object.assign({}, this._attributes); }
+  isContextLost() { return false; }
+  getSupportedExtensions() { return _WEBGL_EXTENSIONS.slice(); }
+  getExtension(name) {
+    name = String(name);
+    if (!_WEBGL_EXTENSIONS.includes(name)) return null;
+    if (name === 'WEBGL_debug_renderer_info') {
+      return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+    }
+    if (/texture_filter_anisotropic/i.test(name)) return { MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF };
+    if (name === 'WEBGL_lose_context') return { loseContext() {}, restoreContext() {} };
+    return {};
+  }
+  getParameter(pname) {
+    switch (pname) {
+      case 0x1F00: return 'WebKit';
+      case 0x1F01: return 'WebKit WebGL';
+      case 0x1F02: return this._webgl2
+        ? 'WebGL 2.0 (OpenGL ES 3.0 Chromium)'
+        : 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
+      case 0x8B8C: return this._webgl2
+        ? 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)'
+        : 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
+      case 0x9245: return globalThis.__obscura_webgl_vendor || _fp('gpuVendor');
+      case 0x9246: return globalThis.__obscura_webgl_renderer || _fp('gpu');
+      case 0x0D33: case 0x84E8: return 16384;
+      case 0x84FF: return 16;
+      case 0x0D3A: return new Int32Array([16384, 16384]);
+      case 0x0BA2: return new Int32Array(this._viewport);
+      case 0x0C22: return new Float32Array(this._clearColor);
+      case 0x8B4D: return 16;
+      case 0x8872: return 16;
+      case 0x8824: return this._webgl2 ? 8 : 1;
+      default: return 0;
+    }
+  }
+  getShaderPrecisionFormat() { return { rangeMin: 127, rangeMax: 127, precision: 23 }; }
+  createBuffer() { return { _data: null }; }
+  bindBuffer(target, buffer) { this._boundBuffers[target] = buffer; }
+  bufferData(target, data) {
+    const buffer = this._boundBuffers[target];
+    if (!buffer) return;
+    if (typeof data === 'number') buffer._data = new Uint8Array(Math.max(0, data));
+    else if (ArrayBuffer.isView(data)) buffer._data = new data.constructor(data);
+    else if (data instanceof ArrayBuffer) buffer._data = data.slice(0);
+  }
+  bufferSubData(target, offset, data) {
+    const buffer = this._boundBuffers[target];
+    if (!buffer || !ArrayBuffer.isView(buffer._data) || !ArrayBuffer.isView(data)) return;
+    new Uint8Array(buffer._data.buffer).set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), offset || 0);
+  }
+  deleteBuffer() {}
+  createShader(type) { return { type, source: '', compiled: true }; }
+  shaderSource(shader, source) { if (shader) shader.source = String(source); }
+  compileShader(shader) { if (shader) shader.compiled = true; }
+  getShaderParameter(shader, pname) { return pname === this.COMPILE_STATUS ? !!shader?.compiled : true; }
+  getShaderInfoLog() { return ''; }
+  deleteShader() {}
+  createProgram() { return { shaders: [], linked: true, validated: true }; }
+  attachShader(program, shader) { if (program && shader) program.shaders.push(shader); }
+  linkProgram(program) { if (program) program.linked = true; }
+  validateProgram(program) { if (program) program.validated = true; }
+  getProgramParameter(program, pname) {
+    if (pname === this.LINK_STATUS) return !!program?.linked;
+    if (pname === this.VALIDATE_STATUS) return !!program?.validated;
+    return true;
+  }
+  getProgramInfoLog() { return ''; }
+  useProgram(program) { this._program = program; }
+  deleteProgram() {}
+  getAttribLocation() { return 0; }
+  enableVertexAttribArray(index) { (this._attribs[index] ||= {}).enabled = true; }
+  disableVertexAttribArray(index) { (this._attribs[index] ||= {}).enabled = false; }
+  vertexAttribPointer(index, size, type, normalized, stride, offset) {
+    this._attribs[index] = { enabled: true, size, type, normalized, stride, offset,
+      buffer: this._boundBuffers[this.ARRAY_BUFFER] };
+  }
+  getUniformLocation(program, name) { return { program, name: String(name) }; }
+  uniform1f() {} uniform1i() {} uniform2f() {} uniform2fv() {} uniform3f() {}
+  uniform3fv() {} uniform4f() {} uniform4fv() {} uniformMatrix3fv() {} uniformMatrix4fv() {}
+  viewport(x, y, width, height) { this._viewport = [x|0, y|0, width|0, height|0]; }
+  clearColor(r, g, b, a) { this._clearColor = [r, g, b, a].map(v => Math.max(0, Math.min(1, Number(v) || 0))); }
+  clearDepth() {}
+  clear(mask) {
+    if (!(mask & this.COLOR_BUFFER_BIT)) return;
+    const color = this._clearColor.map(v => Math.round(v * 255));
+    for (let i = 0; i < this._pixels.length; i += 4) this._pixels.set(color, i);
+  }
+  _fragmentColor() {
+    const shader = this._program?.shaders?.find(item => item.type === this.FRAGMENT_SHADER);
+    const match = shader?.source?.match(/(?:gl_FragColor\s*=\s*)?vec4\s*\(\s*([+\-\d.eE]+)\s*,\s*([+\-\d.eE]+)\s*,\s*([+\-\d.eE]+)\s*,\s*([+\-\d.eE]+)\s*\)/);
+    const values = match ? match.slice(1).map(Number) : [1, 1, 1, 1];
+    return values.map(value => Math.round(Math.max(0, Math.min(1, value)) * 255));
+  }
+  _vertices() {
+    const attrib = this._attribs[0];
+    const data = attrib?.buffer?._data;
+    if (!attrib || !data || !ArrayBuffer.isView(data)) return [];
+    const size = attrib.size || 2;
+    const stride = attrib.stride ? attrib.stride / data.BYTES_PER_ELEMENT : size;
+    const offset = (attrib.offset || 0) / data.BYTES_PER_ELEMENT;
+    const out = [];
+    for (let i = offset; i + size <= data.length; i += stride) out.push([Number(data[i]), Number(data[i + 1])]);
+    return out;
+  }
+  _rasterTriangle(a, b, c, color) {
+    const [vx, vy, vw, vh] = this._viewport;
+    const point = ([x, y]) => [vx + (x + 1) * vw / 2, vy + (y + 1) * vh / 2];
+    [a, b, c] = [point(a), point(b), point(c)];
+    const edge = (p, q, x, y) => (x - p[0]) * (q[1] - p[1]) - (y - p[1]) * (q[0] - p[0]);
+    const area = edge(a, b, c[0], c[1]);
+    if (!area) return;
+    const minX = Math.max(0, Math.floor(Math.min(a[0], b[0], c[0])));
+    const maxX = Math.min(this.drawingBufferWidth - 1, Math.ceil(Math.max(a[0], b[0], c[0])) - 1);
+    const minY = Math.max(0, Math.floor(Math.min(a[1], b[1], c[1])));
+    const maxY = Math.min(this.drawingBufferHeight - 1, Math.ceil(Math.max(a[1], b[1], c[1])) - 1);
+    for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
+      const e0 = edge(a, b, x + .5, y + .5), e1 = edge(b, c, x + .5, y + .5), e2 = edge(c, a, x + .5, y + .5);
+      if ((area > 0 && e0 >= 0 && e1 >= 0 && e2 >= 0) || (area < 0 && e0 <= 0 && e1 <= 0 && e2 <= 0)) {
+        this._pixels.set(color, (y * this.drawingBufferWidth + x) * 4);
+      }
+    }
+  }
+  _draw(indices) {
+    const vertices = this._vertices(), color = this._fragmentColor();
+    for (let i = 0; i + 2 < indices.length; i += 3) {
+      const a = vertices[indices[i]], b = vertices[indices[i + 1]], c = vertices[indices[i + 2]];
+      if (a && b && c) this._rasterTriangle(a, b, c, color);
+    }
+  }
+  drawElements(mode, count, type, offset) {
+    if (mode !== this.TRIANGLES) return;
+    const data = this._boundBuffers[this.ELEMENT_ARRAY_BUFFER]?._data;
+    if (!data || !ArrayBuffer.isView(data)) return;
+    const start = Math.floor((offset || 0) / data.BYTES_PER_ELEMENT);
+    this._draw(Array.from(data.slice(start, start + count)));
+  }
+  drawArrays(mode, first, count) {
+    if (mode === this.TRIANGLES) this._draw(Array.from({length: count}, (_, i) => first + i));
+  }
+  readPixels(x, y, width, height, format, type, destination) {
+    if (!destination || !ArrayBuffer.isView(destination)) return;
+    let out = 0;
+    for (let py = 0; py < height; py++) for (let px = 0; px < width; px++) {
+      const sx = x + px, sy = y + py;
+      if (sx >= 0 && sy >= 0 && sx < this.drawingBufferWidth && sy < this.drawingBufferHeight) {
+        const src = (sy * this.drawingBufferWidth + sx) * 4;
+        for (let channel = 0; channel < 4 && out < destination.length; channel++) destination[out++] = this._pixels[src + channel];
+      } else {
+        for (let channel = 0; channel < 4 && out < destination.length; channel++) destination[out++] = 0;
+      }
+    }
+  }
+  enable() {} disable() {} blendFunc() {} depthFunc() {} pixelStorei() {}
+  createTexture() { return {}; } bindTexture() {} texImage2D() {} texParameteri() {}
+  activeTexture() {} generateMipmap() {} deleteTexture() {}
+  createFramebuffer() { return {}; } bindFramebuffer() {} framebufferTexture2D() {}
+  checkFramebufferStatus() { return this.FRAMEBUFFER_COMPLETE; } deleteFramebuffer() {}
+  createRenderbuffer() { return {}; } bindRenderbuffer() {} renderbufferStorage() {}
+  framebufferRenderbuffer() {} deleteRenderbuffer() {}
+}
+
+Object.assign(_SoftwareWebGLContext.prototype, {
+  DEPTH_BUFFER_BIT: 0x0100, COLOR_BUFFER_BIT: 0x4000, TRIANGLES: 0x0004,
+  ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893, STATIC_DRAW: 0x88E4,
+  FLOAT: 0x1406, UNSIGNED_BYTE: 0x1401, UNSIGNED_SHORT: 0x1403,
+  RGBA: 0x1908, VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30,
+  COMPILE_STATUS: 0x8B81, LINK_STATUS: 0x8B82, VALIDATE_STATUS: 0x8B83,
+  VERSION: 0x1F02, SHADING_LANGUAGE_VERSION: 0x8B8C, VENDOR: 0x1F00,
+  RENDERER: 0x1F01, MAX_TEXTURE_SIZE: 0x0D33, MAX_RENDERBUFFER_SIZE: 0x84E8,
+  MAX_VIEWPORT_DIMS: 0x0D3A, DEPTH_TEST: 0x0B71, TEXTURE_2D: 0x0DE1,
+  FRAMEBUFFER_COMPLETE: 0x8CD5, FALSE: 0,
+});
+globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _SoftwareWebGLContext {};
+globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _SoftwareWebGLContext {};
+
 HTMLCanvasElement.prototype.getContext = function getContext(type) {
+  type = String(type).toLowerCase();
   if (type === '2d') {
+    if (this._contextType && this._contextType !== '2d') return null;
     if (!this._ctx) {
       try { this._ctx = new _Canvas2D(this); }
       catch (_error) { return null; }
     }
+    this._contextType = '2d';
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
-    return null;
+    const family = type === 'webgl2' ? 'webgl2' : 'webgl';
+    if (this._contextType && this._contextType !== family) return null;
+    if (!this._ctx) this._ctx = family === 'webgl2'
+      ? new WebGL2RenderingContext(this, arguments[1], true)
+      : new WebGLRenderingContext(this, arguments[1], false);
+    this._contextType = family;
+    return this._ctx;
   }
   return null;
 };
@@ -13414,10 +14049,16 @@ HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   cb(new Blob([bytes], {type: String(type || 'image/png')}));
 };
-Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
-Element.prototype.getComputedTextLength = function() { return 0; };
-Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
-Element.prototype.getSubStringLength = function(ch, len) { return 0; };
+[
+  SVGGraphicsElement.prototype.getBBox,
+  SVGGraphicsElement.prototype.getCTM,
+  SVGGraphicsElement.prototype.getScreenCTM,
+  SVGGeometryElement.prototype.getTotalLength,
+  SVGGeometryElement.prototype.getPointAtLength,
+  SVGTextContentElement.prototype.getComputedTextLength,
+  SVGTextContentElement.prototype.getExtentOfChar,
+  SVGTextContentElement.prototype.getSubStringLength,
+].forEach(_markNative);
 
 _markNative(HTMLCanvasElement.prototype.getContext);
 _markNative(HTMLCanvasElement.prototype.toDataURL);
@@ -13506,7 +14147,13 @@ globalThis.AudioBuffer = class AudioBuffer {
   copyToChannel(src, ch, start) { var d=this._chs[ch]||this._chs[0]; start=start||0; if(d) for(var i=0;i<src.length;i++) d[start+i]=src[i]; }
 };
 globalThis.AudioContext = class AudioContext {
-  constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; this._listeners={}; }
+  constructor() {
+    this.sampleRate=48000; this.state='suspended'; this.currentTime=0;
+    this.baseLatency=0.005333333333333333; this.outputLatency=0;
+    this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,
+      channelCount:2,channelCountMode:'explicit',channelInterpretation:'speakers'};
+    this._listeners={};
+  }
   addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
   removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
   _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
@@ -13546,7 +14193,7 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
     var data = buf.getChannelData(0);
     // Simulate compressed triangle wave at 10kHz.
     // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
-    var target = 124.04347527516074 + (_fpRand(9991) - 0.5) * 0.002;
+    var target = 124.04347527516074;
     var freq = 10000, sr = 44100;
     for (var i = 0; i < self.length; i++) {
       var phase = ((i * freq / sr) % 1 + 1) % 1;
@@ -13749,6 +14396,14 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
+globalThis.SpeechRecognition = globalThis.webkitSpeechRecognition = class SpeechRecognition {
+  constructor() { this.continuous=false; this.interimResults=false; this.lang=''; this.onresult=null; this.onerror=null; }
+  start() {}
+  stop() {}
+  abort() {}
+};
+_markNative(globalThis.SpeechRecognition);
+
 navigator.mediaCapabilities = {
   decodingInfo(cfg) {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
@@ -13775,55 +14430,120 @@ navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not a
 
 globalThis.opener = null;
 
-globalThis.Worker = class Worker {
-  constructor(url) {
-    this.onmessage = null;
-    this.onerror = null;
-    this._terminated = false;
-    this._listeners = {};
-    this._scope = null;
-    this._pendingMessages = [];
-    const worker = this;
-
-    let resolvedUrl = url;
-    if (typeof url === 'string') {
-      const blob = globalThis.__blobStore?.[url];
-      if (blob) {
-        worker._code = blob;
-        // Auto-start on next tick so caller can set onmessage first.
-        setTimeout(() => worker._autoRun(), 0);
-        return;
-      }
-      // Resolve relative URLs against the current page.
-      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
-        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
-      }
-      (async () => {
-        try {
-          const resp = await fetch(resolvedUrl);
-          worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
-        } catch(e) { if (worker.onerror) worker.onerror(e); }
-      })();
-    }
+const _workerMessageHandlerState = new WeakMap();
+function _initializeWorkerMessageHandler(target) {
+  if (!_workerMessageHandlerState.has(target)) {
+    _workerMessageHandlerState.set(target, { current: null, installed: false });
   }
-  _makeScope() {
-    const worker = this;
-    const scope = {
-      onmessage: null,
-      WorkerGlobalScope: function WorkerGlobalScope() {},
-      DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
-      postMessage: (msg) => {
-        if (worker._terminated) return;
-        const evt = { data: msg };
-        if (worker.onmessage) worker.onmessage(evt);
-        const ls = worker._listeners['message'] || [];
-        for (const h of ls) h(evt);
+}
+function _getWorkerMessageHandler(target) {
+  return _workerMessageHandlerState.get(target)?.current || null;
+}
+function _setWorkerMessageHandler(target, value) {
+  _initializeWorkerMessageHandler(target);
+  const state = _workerMessageHandlerState.get(target);
+  state.current = typeof value === 'function' || (value && typeof value.handleEvent === 'function')
+    ? value : null;
+  if (state.installed || state.current === null) return;
+  state.installed = true;
+  _eventTargetAdd(target, 'message', function(event) {
+    // Keep the callback passed through this native setter. A protection
+    // wrapper may later replace the public descriptor while retaining the
+    // native setter and call it with a filtered callback. Reading the new
+    // public getter here would bypass that filter and leak its internal
+    // protocol messages to the application handler.
+    const callback = state.current;
+    if (typeof callback === 'function') callback.call(target, event);
+    else if (callback && typeof callback.handleEvent === 'function') callback.handleEvent.call(callback, event);
+  });
+}
+function _installWorkerScopeMessageHandler(target, owner = target) {
+  _initializeWorkerMessageHandler(target);
+  Object.defineProperty(owner, 'onmessage', {
+    configurable: true,
+    enumerable: true,
+    get() { return _getWorkerMessageHandler(this); },
+    set(value) { _setWorkerMessageHandler(this, value); },
+  });
+}
+
+const _workerInstanceState = new WeakMap();
+function _workerError(worker, error) {
+  const handler = _workerInstanceState.get(worker)?.onerror;
+  if (typeof handler === 'function') handler.call(worker, error);
+  else if (handler && typeof handler.handleEvent === 'function') handler.handleEvent.call(handler, error);
+}
+
+function _makeWorkerScope(worker) {
+    const state = _workerInstanceState.get(worker);
+    function WorkerGlobalScope() {}
+    Object.setPrototypeOf(WorkerGlobalScope.prototype, globalThis.EventTarget.prototype);
+    Object.defineProperty(WorkerGlobalScope.prototype, Symbol.toStringTag, {
+      value: 'WorkerGlobalScope', configurable: true,
+    });
+    function DedicatedWorkerGlobalScope() {}
+    Object.setPrototypeOf(DedicatedWorkerGlobalScope.prototype, WorkerGlobalScope.prototype);
+    Object.defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, {
+      value: 'DedicatedWorkerGlobalScope', configurable: true,
+    });
+    function WorkerNavigator() {}
+    Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, {
+      value: 'WorkerNavigator', configurable: true,
+    });
+    const workerNavigator = Object.create(WorkerNavigator.prototype);
+    const navigatorValues = {
+      userAgent: globalThis.navigator.userAgent,
+      platform: globalThis.navigator.platform,
+      hardwareConcurrency: globalThis.navigator.hardwareConcurrency,
+      deviceMemory: globalThis.navigator.deviceMemory,
+      language: globalThis.navigator.language,
+      languages: globalThis.navigator.languages,
+      onLine: globalThis.navigator.onLine,
+      userAgentData: globalThis.navigator.userAgentData,
+      storage: globalThis.navigator.storage,
+      locks: globalThis.navigator.locks,
+      mediaCapabilities: globalThis.navigator.mediaCapabilities,
+      permissions: globalThis.navigator.permissions,
+      gpu: globalThis.navigator.gpu,
+    };
+    for (const [name, value] of Object.entries(navigatorValues)) {
+      Object.defineProperty(WorkerNavigator.prototype, name, {
+        configurable: true, enumerable: true, get() { return value; },
+      });
+    }
+    const scope = Object.create(DedicatedWorkerGlobalScope.prototype);
+    Object.assign(scope, {
+      WorkerGlobalScope,
+      DedicatedWorkerGlobalScope,
+      WorkerNavigator,
+      importScripts: (...urls) => {
+        for (const rawUrl of urls) {
+          let resolved = String(rawUrl);
+          try { resolved = new URL(resolved, globalThis.location?.href || '').href; } catch (e) {}
+          const source = globalThis.__blobStore?.[resolved];
+          if (source === undefined) {
+            // importScripts is synchronous in browsers. Obscura's network
+            // bridge is asynchronous, so fail with the same exception class
+            // instead of silently claiming that a remote worker dependency ran.
+            throw new DOMException(`Failed to execute 'importScripts': The script at '${resolved}' could not be loaded.`, 'NetworkError');
+          }
+          const run = new Function('scope', 'source', 'with (scope) { eval(source); }');
+          run.call(scope, scope, source);
+        }
       },
-      addEventListener: (type, fn) => {
-        if (!scope._ev) scope._ev = {};
-        if (!scope._ev[type]) scope._ev[type] = [];
-        scope._ev[type].push(fn);
+      postMessage: (msg) => {
+        if (state.terminated) return;
+        const data = typeof structuredClone === 'function' ? structuredClone(msg) : msg;
+        // A real worker never re-enters the caller during postMessage(). Some
+        // protection clients register their response callback immediately
+        // after sending; synchronous delivery races that registration and
+        // produces an impossible Chrome execution order.
+        setTimeout(() => {
+          if (state.terminated) return;
+          const evt = new MessageEvent('message', { data });
+          try { Object.defineProperties(evt, { target: { value: worker }, currentTarget: { value: worker } }); } catch (e) {}
+          _eventTargetDispatch(worker, evt);
+        }, 0);
       },
       close: () => { worker.terminate(); },
       crypto: globalThis.crypto,
@@ -13842,62 +14562,146 @@ globalThis.Worker = class Worker {
       console: globalThis.console,
       performance: globalThis.performance,
       location: globalThis.location,
-    };
+      navigator: workerNavigator,
+    });
+    // A worker is a separate global realm. This implementation still executes
+    // in the page isolate, so copy the realm-neutral browser and ECMAScript
+    // globals that worker scripts observe through `self`/`globalThis`.
+    for (const name of [
+      'Object', 'Function', 'Array', 'Number', 'BigInt', 'Math', 'Date',
+      'String', 'Boolean', 'RegExp', 'Error', 'EvalError', 'RangeError',
+      'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'AggregateError',
+      'JSON', 'Promise', 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef',
+      'FinalizationRegistry', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView',
+      'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
+      'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
+      'BigInt64Array', 'BigUint64Array', 'Atomics', 'Intl', 'WebAssembly',
+      'URL', 'URLSearchParams', 'Blob', 'File', 'FormData', 'Headers',
+      'Request', 'Response', 'AbortController', 'AbortSignal',
+      'Event', 'EventTarget', 'CustomEvent', 'MessageEvent', 'MessageChannel', 'MessagePort',
+      'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'WebSocket',
+      'EventSource', 'BroadcastChannel', 'FileReader', 'FileReaderSync',
+      'indexedDB', 'IDBKeyRange', 'caches', 'OffscreenCanvas', 'ImageData',
+      'DOMMatrix', 'DOMMatrixReadOnly', 'DOMPoint', 'DOMPointReadOnly',
+      'DOMRect', 'DOMRectReadOnly',
+      'DOMException', 'structuredClone', 'queueMicrotask',
+      'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'decodeURI',
+      'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
+    ]) {
+      if (name in globalThis) scope[name] = globalThis[name];
+    }
     scope.self = scope;
+    scope.globalThis = scope;
+    _installWorkerScopeMessageHandler(scope, DedicatedWorkerGlobalScope.prototype);
+    // Window-only globals are absent in DedicatedWorkerGlobalScope.
+    scope.window = undefined;
+    scope.document = undefined;
+    scope.localStorage = undefined;
+    scope.sessionStorage = undefined;
     return scope;
-  }
-  _autoRun() {
-    if (this._terminated || this._scope || this._code === undefined) return;
-    const scope = this._makeScope();
+}
+
+function _autoRunWorker(worker) {
+    const state = _workerInstanceState.get(worker);
+    if (state.terminated || state.scope || state.code === undefined) return;
+    const scope = _makeWorkerScope(worker);
     try {
-      // Direct eval preserves script directives and resolves bare handler names
-      // against the worker scope. Run once so message closures retain their state.
       const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, this._code);
+      fn.call(scope, scope, state.code);
     } catch(e) {
       console.error('Worker error:', e.message);
-      if (this.onerror) this.onerror(e);
+      _workerError(worker, e);
     } finally {
-      if (!this._terminated) {
-        this._scope = scope;
-        for (const data of this._pendingMessages.splice(0)) this.postMessage(data);
+      if (!state.terminated) {
+        state.scope = scope;
+        for (const data of state.pendingMessages.splice(0)) worker.postMessage(data);
       }
     }
-  }
-  postMessage(data) {
-    if (this._terminated) return;
-    if (!this._scope) {
-      this._pendingMessages.push(data);
+}
+
+function Worker(url) {
+    if (!new.target) throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator.");
+    const worker = this;
+    const state = {terminated: false, scope: null, pendingMessages: [], code: undefined, onerror: null};
+    _workerInstanceState.set(worker, state);
+    _initializeWorkerMessageHandler(worker);
+
+    let resolvedUrl = url;
+    if (typeof url === 'string') {
+      const blob = globalThis.__blobStore?.[url];
+      if (blob) {
+        state.code = blob;
+        // Auto-start on next tick so caller can set onmessage first.
+        setTimeout(() => _autoRunWorker(worker), 0);
+        return;
+      }
+      // Resolve relative URLs against the current page.
+      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
+        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
+      }
+      (async () => {
+        try {
+          const resp = await fetch(resolvedUrl);
+          state.code = await resp.text();
+          if (!state.terminated) _autoRunWorker(worker);
+        } catch(e) { _workerError(worker, e); }
+      })();
+    }
+}
+
+function workerPostMessage(data) {
+    const state = _workerInstanceState.get(this);
+    if (!state || state.terminated) return;
+    const cloned = typeof structuredClone === 'function' ? structuredClone(data) : data;
+    if (!state.scope) {
+      state.pendingMessages.push(cloned);
       return;
     }
     const worker = this;
     setTimeout(() => {
-      if (worker._terminated || !worker._scope) return;
-      const scope = worker._scope;
+      const state = _workerInstanceState.get(worker);
+      if (!state || state.terminated || !state.scope) return;
+      const scope = state.scope;
       try {
-        const event = { data };
-        if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
-        const evs = (scope._ev && scope._ev['message']) || [];
-        for (const handler of evs.slice()) handler.call(scope, event);
+        const event = new MessageEvent('message', { data: cloned });
+        try { Object.defineProperties(event, { target: { value: scope }, currentTarget: { value: scope } }); } catch (e) {}
+        _eventTargetDispatch(scope, event);
       } catch(e) {
         console.error('Worker error:', e.message);
-        if (worker.onerror) worker.onerror(e);
+        _workerError(worker, e);
       }
     }, 0);
-  }
-  terminate() {
-    this._terminated = true;
-    this._pendingMessages.length = 0;
-    this._scope = null;
-  }
-  addEventListener(type, fn) {
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(fn);
-  }
-  removeEventListener(type, fn) {
-    if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-  }
-};
+}
+function workerTerminate() {
+    const state = _workerInstanceState.get(this);
+    if (!state) return;
+    state.terminated = true;
+    state.pendingMessages.length = 0;
+    state.scope = null;
+}
+
+const workerPrototype = Object.create(globalThis.EventTarget.prototype);
+Object.defineProperty(workerPrototype, 'onmessage', {
+  configurable: true,
+  enumerable: true,
+  get() { return _getWorkerMessageHandler(this); },
+  set(value) { _setWorkerMessageHandler(this, value); },
+});
+Object.defineProperty(workerPrototype, 'postMessage', {configurable:true, writable:true, value:workerPostMessage});
+Object.defineProperty(workerPrototype, 'terminate', {configurable:true, writable:true, value:workerTerminate});
+Object.defineProperty(workerPrototype, 'constructor', {configurable:true, writable:true, value:Worker});
+Object.defineProperty(workerPrototype, 'onerror', {
+  configurable: true,
+  enumerable: true,
+  get() { return _workerInstanceState.get(this)?.onerror || null; },
+  set(value) {
+    const state = _workerInstanceState.get(this);
+    if (state) state.onerror = typeof value === 'function' || (value && typeof value.handleEvent === 'function') ? value : null;
+  },
+});
+Worker.prototype = workerPrototype;
+globalThis.Worker = Worker;
+_markNative(Worker); _markNative(workerPostMessage); _markNative(workerTerminate);
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
@@ -15659,10 +16463,15 @@ if (!globalThis.Attr) {
   };
 }
 
-// XML Name validation helper for attribute/processing instruction names
+// XML 1.0 NameStartChar and NameChar, shared by element and attribute names.
+const _ns_xmlNameStart = ':A-Z_a-z\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF'
+  + '\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F'
+  + '\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD\\u{10000}-\\u{EFFFF}';
+const _ns_xmlNamePattern = new RegExp('^[' + _ns_xmlNameStart + ']['
+  + _ns_xmlNameStart + '.0-9\\u00B7\\u0300-\\u036F\\u203F-\\u2040-]*(?![\\s\\S])', 'u');
 const _ns_isValidXmlName = (name) => {
   if (typeof name !== 'string' || !name.length) return false;
-  return /^[A-Za-z_:][\w.\-:]*$/.test(name);
+  return _ns_xmlNamePattern.test(name);
 };
 
 const _ns_validateQualifiedName = (namespaceURI, qualifiedName) => {
@@ -16471,9 +17280,15 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     try { _requestSubmitForm(form,_domString(button));return null; }
     catch(error) { return error?.message || 'INPUT_DISPATCH_FAILED'; }
   }});
+  const nativeSelectValue = Object.getOwnPropertyDescriptor(Element.prototype, 'value').set;
   define(globalThis,'__obscura_native_text_handoff',{configurable:true,value(kind,nodes,value) {
     const path=[];for(const node of nodes) path.push(_wrap(node));
     if (nodes.length && _domParse('node_type',nodes[nodes.length-1]) === 9) path.push(globalThis);
+    if (kind === 17) {
+      apply(nativeSelectValue,path[0],[value]);
+      textEvent(5,path,'');
+      return textEvent(6,path,'');
+    }
     return textEvent(kind,path,value);
   }});
   define(globalThis, '__obscura_native_mouse_handoff', {configurable: true, value(kind, nodes, x, y, buttons) {

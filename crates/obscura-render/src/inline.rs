@@ -1447,7 +1447,13 @@ impl TextEngine {
     /// inline formatting context. The caller measures/finalizes/paints the
     /// returned item immediately against the pseudo's resolved content box.
     pub(crate) fn push_generated_text(&mut self, text: &str, style: &LayoutStyle) -> Option<usize> {
+        self.push_owned_word(text, style, &[])
+    }
+
+    /// Preserve flattened inline ancestry in the word fallback, just as in a full IFC.
+    pub(crate) fn push_owned_word(&mut self, text: &str, style: &LayoutStyle, owners: &[NodeId]) -> Option<usize> {
         let mut collector = Collector::new();
+        for owner in owners { collector.begin_owner(*owner, &LayoutStyle::default()); }
         let font = resolve_loaded_font(
             style.font_family.as_deref(),
             crate::style::used_font_weight(style),
@@ -1484,6 +1490,7 @@ impl TextEngine {
             &mut spans,
             &mut collector,
         );
+        for owner in owners.iter().rev() { collector.end_owner(*owner); }
         self.push_shaped_item(
             style,
             line_height,

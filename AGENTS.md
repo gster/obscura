@@ -29,9 +29,9 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
   `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
   avoid touching it when you don't need to.
 - **Stealth:** `--features render,stealth` retains the complete rendering
-  surface and adds the wreq/BoringSSL transport, fingerprint protections, and
-  tracker blocklist. BoringSSL builds through CMake, so `cmake` must be
-  installed. The rendering build uses rustls and needs neither CMake nor OpenSSL.
+  surface and adds the primp/Rustls transport, fingerprint protections, and
+  tracker blocklist. Its AWS-LC build needs CMake, Clang, and libclang; see
+  `docs/Build-from-source.md` for platform requirements.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.
 
@@ -70,7 +70,7 @@ For any code change:
 5. For render changes, run deterministic fixtures and broad top/bottom real-site
    captures using the methodology below.
 6. For stealth changes, re-test with `--stealth` (a non-stealth binary won't
-   exercise the `wreq` path).
+   exercise the `primp` path).
 
 Do not bulk-run `cargo fmt`: the tree is not rustfmt-clean, so a blanket format
 produces a huge unrelated diff. Match the surrounding style in the files you
@@ -84,7 +84,7 @@ edit instead.
   distinct session ids so Playwright and Puppeteer can open raw page sessions.
 - **obscura-js** — V8/`deno_core` runtime. `js/bootstrap.js` is the DOM/browser shim; `src/ops.rs` bridges JS to Rust DOM ops; `src/runtime.rs` owns the isolate and the per-page `ObscuraState`.
 - **obscura-dom** — DOM tree (`src/tree.rs`).
-- **obscura-net** — HTTP client (`client.rs`), stealth client (`wreq_client.rs`), cookie jar, robots cache, tracker blocklist.
+- **obscura-net** — HTTP client (`client.rs`), stealth client (`stealth_client.rs`, `stealth_transport.rs`), cookie jar, robots cache, tracker blocklist.
 - **obscura-browser** — the `Page` type, navigation, JS evaluation.
 - **obscura-render** — selector cascade, computed style, retained layout,
   scrolling, text shaping, images/SVG/canvas, and CPU-backed paint. The
@@ -168,7 +168,7 @@ One page must never hang or crash a worker:
 
 ## Stealth
 
-The stealth features (the `wreq` client, fingerprint and browser-identity
+The stealth features (the `primp` client, fingerprint and browser-identity
 adjustments) are privacy-first anti-fingerprinting: they present a normal,
 consistent browser fingerprint (user agent, timezone, navigator properties, and
 similar surfaces) so ordinary automation traffic is not singled out. They

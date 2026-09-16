@@ -245,6 +245,8 @@ pub struct DeviceIdentity {
     pub screen_height: u32,
 }
 
+pub type SharedWebStorage = Arc<std::sync::Mutex<HashMap<String, Vec<(String, String)>>>>;
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -261,12 +263,15 @@ pub struct ObscuraState {
     pub device_identity: Option<DeviceIdentity>,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
+    pub local_storage: SharedWebStorage,
+    pub session_storage: SharedWebStorage,
+    pub opaque_storage: SharedWebStorage,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
     /// the page that registered it.
     pub callbacks: Option<Arc<CallbackRegistry>>,
-    /// When set (stealth mode), scripted fetch()/XHR is routed through the wreq
+    /// When set (stealth mode), scripted fetch()/XHR is routed through the primp
     /// client so the request carries the Chrome TLS fingerprint and client
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
     #[cfg(feature = "stealth")]
@@ -500,6 +505,9 @@ impl ObscuraState {
             device_identity: None,
             blocked_urls: Vec::new(),
             cookie_jar: None,
+            local_storage: Default::default(),
+            session_storage: Default::default(),
+            opaque_storage: Default::default(),
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -1877,6 +1885,41 @@ fn control_validity(state: &ObscuraState, id: NodeId) -> Result<serde_json::Valu
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "web_storage" {
+        let state = shared.borrow();
+        let mut origin = url::Url::parse(&state.url).ok().map(|u| u.origin().ascii_serialization())
+            .unwrap_or_else(|| "null".into());
+        let storage = if origin == "null" {
+            origin = format!("{arg1}:null");
+            &state.opaque_storage
+        } else if arg1 == "local" { &state.local_storage } else { &state.session_storage };
+        let args: Vec<String> = serde_json::from_str(&arg2).unwrap_or_default();
+        let Some(operation) = args.first().map(String::as_str) else { return "null".into(); };
+        let mut storage = storage.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = storage.entry(origin).or_default();
+        let key = args.get(1).map(String::as_str).unwrap_or("");
+        let index = entries.iter().position(|(k, _)| k == key);
+        let result = match operation {
+            "get" => index.map(|i| serde_json::json!(entries[i].1)).unwrap_or(serde_json::Value::Null),
+            "keys" => serde_json::json!(entries.iter().map(|(k, _)| k).collect::<Vec<_>>()),
+            "clear" => { entries.clear(); serde_json::Value::Null }
+            "remove" => { if let Some(i) = index { entries.remove(i); } serde_json::Value::Null }
+            "set" => {
+                let value = args.get(2).cloned().unwrap_or_default();
+                let size: usize = entries.iter().filter(|(k, _)| k != key)
+                    .map(|(k, v)| k.encode_utf16().count() + v.encode_utf16().count()).sum();
+                if size + key.encode_utf16().count() + value.encode_utf16().count() > 2_621_440 {
+                    serde_json::json!({"error":"QuotaExceededError"})
+                } else {
+                    if let Some(i) = index { entries[i].1 = value; }
+                    else { entries.push((key.to_owned(), value)); }
+                    serde_json::Value::Null
+                }
+            }
+            _ => serde_json::Value::Null,
+        };
+        return result.to_string();
+    }
     if matches!(
         cmd.as_str(),
         "control_validity" | "custom_validity_set" | "validation_controls" | "form_no_validate"
@@ -3495,17 +3538,22 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
-fn scripted_fetch_metadata(source: &str, target: &str, mode: &str) -> Vec<(&'static str, &'static str)> {
+fn scripted_fetch_metadata(source: &str, target: &str, mode: &str, resource_type: ResourceType) -> Vec<(&'static str, &'static str)> {
     let (Ok(source), Ok(target)) = (url::Url::parse(source), url::Url::parse(target)) else {
         return Vec::new();
     };
-    let mut request = ResourceRequest::subresource(ResourceType::Fetch, &source);
+    let mut request = ResourceRequest::subresource(resource_type, &source);
     request.mode = match mode {
         "no-cors" => RequestMode::NoCors,
         "same-origin" => RequestMode::SameOrigin,
         _ => RequestMode::Cors,
     };
-    request.fetch_metadata_headers(&target).to_vec()
+    let mut headers = request.fetch_metadata_headers(&target).to_vec();
+    // Chromium marks fetch()/XHR as an incremental, urgency-1 request.  The
+    // stealth transport has a navigation-safe `u=0, i` default, so this must
+    // travel with the per-request metadata and replace that default.
+    headers.push(("priority", "u=1, i"));
+    headers
 }
 
 // Fetch appends Origin to scripted non-GET/HEAD requests even when same-origin.
@@ -3729,7 +3777,12 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    #[string] destination: Option<String>,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let resource_type = match destination.as_deref() {
+        Some("script") => ResourceType::Script,
+        _ => ResourceType::Fetch,
+    };
     let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
@@ -3836,7 +3889,7 @@ async fn op_fetch_url(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
-            resource_type: "Fetch".to_string(),
+            resource_type: format!("{:?}", resource_type),
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
@@ -3938,10 +3991,11 @@ async fn op_fetch_url(
         if cbs.has_request_callbacks().await {
             if let Ok(parsed) = url::Url::parse(&url) {
                 let info = RequestInfo {
+                    body: body.clone(),
                     url: parsed,
                     method: method.clone(),
                     headers: custom_headers.clone(),
-                    resource_type: ResourceType::Fetch,
+                    resource_type,
                 };
                 cbs.fire_request(&info).await;
             }
@@ -3973,21 +4027,53 @@ async fn op_fetch_url(
             .and_then(|target| referrer_policy.referrer(referrer.as_ref(), &target)) {
             preflight_request = preflight_request.header("Referer", value.as_str());
         }
-        let preflight = preflight_request
-            .send()
-            .await
-            .map_err(|e| {
-                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
-            })?;
+        let preflight_request = preflight_request.build()
+            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+        #[cfg(feature = "stealth")]
+        let stealth_preflight = {
+            let stealth = {
+                let st = state.borrow();
+                let gs = st.borrow::<SharedState>().clone();
+                let client = gs.borrow().stealth_client.clone();
+                client
+            };
+            if let Some(stealth) = stealth {
+                let headers = preflight_request.headers().iter()
+                    .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+                    .collect();
+                // Preflights are credential-free and may not follow redirects.
+                let response = tokio::time::timeout(fetch_timeout(), stealth.send_single(
+                    "OPTIONS", preflight_request.url(), &headers, &[], false, false))
+                    .await.map_err(|_| deno_error::JsErrorBox::generic("CORS preflight timed out"))?
+                    .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+                let mut headers = reqwest::header::HeaderMap::new();
+                for (name, value) in response.headers {
+                    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
+                    let value = reqwest::header::HeaderValue::from_str(&value)
+                        .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
+                    headers.append(name, value);
+                }
+                Some((response.status, headers))
+            } else { None }
+        };
+        #[cfg(not(feature = "stealth"))]
+        let stealth_preflight: Option<(u16, reqwest::header::HeaderMap)> = None;
+        let (preflight_status, preflight_headers) = match stealth_preflight {
+            Some(response) => response,
+            None => {
+                let response = client.execute(preflight_request).await
+                    .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+                (response.status().as_u16(), response.headers().clone())
+            }
+        };
 
-        let allowed_origin = preflight
-            .headers()
+        let allowed_origin = preflight_headers
             .get("access-control-allow-origin")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        let allow_credentials = preflight
-            .headers()
+        let allow_credentials = preflight_headers
             .get("access-control-allow-credentials")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
@@ -3997,15 +4083,15 @@ async fn op_fetch_url(
                 page_origin, allowed_origin
             )));
         }
-        if !preflight.status().is_success() {
+        if !(200..300).contains(&preflight_status) {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight returned HTTP {}",
-                preflight.status()
+                preflight_status
             )));
         }
 
         let allowed_methods = parse_cors_header_list(
-            preflight.headers(),
+            &preflight_headers,
             "access-control-allow-methods",
         )
         .ok_or_else(|| {
@@ -4014,7 +4100,7 @@ async fn op_fetch_url(
             )
         })?;
         let allowed_headers = parse_cors_header_list(
-            preflight.headers(),
+            &preflight_headers,
             "access-control-allow-headers",
         )
         .ok_or_else(|| {
@@ -4040,7 +4126,7 @@ async fn op_fetch_url(
         }
     }
 
-    // Stealth mode: route scripted requests through wreq after the CORS
+    // Stealth mode: route scripted requests through the same client after CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
     #[cfg(feature = "stealth")]
@@ -4061,6 +4147,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 mode.clone(),
                 credentials,
+                resource_type,
                 callbacks.clone(),
                 allow_private_network,
                 referrer, referrer_policy,
@@ -4096,7 +4183,7 @@ async fn op_fetch_url(
             req = req.header("Origin", origin);
         }
 
-        for (name, value) in scripted_fetch_metadata(&page_origin, &current_url, &mode) {
+        for (name, value) in scripted_fetch_metadata(&page_origin, &current_url, &mode, resource_type) {
             req = req.header(name, value);
         }
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
@@ -4280,10 +4367,11 @@ async fn op_fetch_url(
                 redirected_from,
             );
             let info = RequestInfo {
+                body: current_body.clone(),
                 url: resp.url.clone(),
                 method: current_method.as_str().to_string(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
+                headers: custom_headers.clone(),
+                resource_type,
             };
             cbs.fire_response(&info, &resp).await;
         }
@@ -4377,7 +4465,7 @@ fn fetch_response(
 }
 
 /// Stealth-mode scripted fetch()/XHR: mirrors op_fetch_url's redirect, SSRF,
-/// and CORS semantics but sends every hop through the wreq stealth client so
+/// and CORS semantics but sends every hop through the primp stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
 /// context jar. Response bodies are not mirrored into the CDP
@@ -4392,6 +4480,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
+    resource_type: ResourceType,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     mut referrer: Option<url::Url>,
@@ -4419,7 +4508,7 @@ async fn stealth_fetch_all(
 
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         crossed_origin |= current_is_cross_origin;
-        let mut req_headers: HashMap<String, String> = scripted_fetch_metadata(&page_origin, &current_url, &mode)
+        let mut req_headers: HashMap<String, String> = scripted_fetch_metadata(&page_origin, &current_url, &mode, resource_type)
             .into_iter().map(|(name, value)| (name.into(), value.into())).collect();
         if let Some(origin) = fetch_origin_header(&current_method, &page_origin, &current_url, &mode, referrer_policy) {
             req_headers.insert("origin".to_string(), origin.into());
@@ -4529,10 +4618,11 @@ async fn stealth_fetch_all(
                 redirected_from,
             );
             let info = RequestInfo {
+                body: current_body.clone(),
                 url: resp.url.clone(),
                 method: current_method.clone(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
+                headers: custom_headers.clone(),
+                resource_type,
             };
             cbs.fire_response(&info, &resp).await;
         }
@@ -4583,7 +4673,7 @@ mod tests {
         cors_response_allows, cors_unsafe_request_header_names, glob_match,
         is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
-        validate_fetch_url, FetchCredentials, ObscuraState,
+        scripted_fetch_metadata, validate_fetch_url, FetchCredentials, ObscuraState,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
@@ -4637,6 +4727,26 @@ mod tests {
             "Range",
             "bytes=0-1,4-5"
         ));
+    }
+
+    #[test]
+    fn scripted_fetch_uses_chrome_incremental_priority() {
+        let headers = scripted_fetch_metadata(
+            "https://example.com",
+            "https://example.com/api",
+            "cors",
+            obscura_net::ResourceType::Fetch,
+        );
+        assert!(headers.contains(&("priority", "u=1, i")));
+        assert!(headers.contains(&("sec-fetch-dest", "empty")));
+        let script_headers = scripted_fetch_metadata(
+            "https://example.com",
+            "https://example.com/script.js",
+            "no-cors",
+            obscura_net::ResourceType::Script,
+        );
+        assert!(script_headers.contains(&("sec-fetch-dest", "script")));
+        assert!(script_headers.contains(&("sec-fetch-mode", "no-cors")));
     }
 
     #[test]

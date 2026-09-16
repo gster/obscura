@@ -228,7 +228,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                 // same transport as the document. Upstream sends it through the
                 // plain reqwest client, so a `type="module"` script arrives with
                 // a different TLS fingerprint and none of the browser identity
-                // headers, while the HTML that referenced it came over wreq.
+                // headers, while the HTML that referenced it came over primp.
                 // That cross-transport mismatch is trivially detectable.
                 #[cfg(feature = "stealth")]
                 let stealth = state.stealth_client.clone();

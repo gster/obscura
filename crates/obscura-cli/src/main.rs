@@ -1151,7 +1151,7 @@ async fn fetch_original_response(
     // Page::do_fetch, which is where --stealth is normally applied. Without
     // this, the request stays on plain HTTP/1.1 with no TLS impersonation
     // regardless of --stealth (issue #482). file:// has no TLS handshake to
-    // impersonate and the wreq client only speaks http(s), so it is excluded
+    // impersonate and the primp client only speaks http(s), so it is excluded
     // here the same way ObscuraHttpClient::fetch_with_method excludes it
     // internally.
     if stealth && url.scheme() != "file" {
@@ -2128,8 +2128,8 @@ mod tests {
     }
 
     // A stealth-enabled build routes `--dump original` through
-    // StealthHttpClient (wreq), which only speaks http(s). file:// must keep
-    // working the same as without --stealth instead of being handed to wreq
+    // StealthHttpClient (primp), which only speaks http(s). file:// must keep
+    // working the same as without --stealth instead of being handed to primp
     // (issue #482).
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_original_bytes_file_url_ignores_stealth_flag() {

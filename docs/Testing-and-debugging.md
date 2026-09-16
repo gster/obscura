@@ -104,6 +104,11 @@ The integration suite in `tests/test_all.py` is the fastest path from a one-line
 
 For Puppeteer / Playwright bug reports, the user's repro script usually drops straight in. Save it as `tests/repro_<issue>.js`, run with `node`, fix until it passes.
 
+The reduced airline protection collector is documented in
+[Protection script regression case](Protection-script-regression-case.md). Use
+it when changing Worker message plumbing, persona defaults, WebGL, SVG, or
+Chrome identity surfaces.
+
 ### Rendering regressions
 
 Start with the committed deterministic fixtures, then use the representative

@@ -29,6 +29,8 @@ class ClickResult:
 
 
 class BrowserSession:
+    protocol_version = "1"
+    max_timeout_ms = 30000
     @classmethod
     async def start(cls, spec, workspace, persona, allowed_origins, initial_mode="PAUSED"):
         import psutil
@@ -46,9 +48,12 @@ class BrowserSession:
         self.write_lock = asyncio.Lock()
         self.record = {"owner": "browser_" + uuid.uuid4().hex, "binary": str(binary), "sha256": spec["sha256"]}
         write_json(self.workspace / "browser-runtime.json", self.record)
+        timezone = persona.get("timezone")
+        if not timezone:
+            timezone = "Asia/Shanghai" if persona.get("profile") == "macos_chrome152" else "America/New_York"
         spawn = asyncio.create_task(asyncio.create_subprocess_exec(
             str(binary), "--workspace", str(self.workspace), "--owner", self.record["owner"],
-            cwd=self.workspace, env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "TZ": "UTC"},
+            cwd=self.workspace, env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "TZ": timezone},
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             limit=LINE_LIMIT,
         ))
@@ -72,10 +77,10 @@ class BrowserSession:
         try:
             self.record.update(pid=self.process.pid, create_time=psutil.Process(self.process.pid).create_time())
             write_json(self.workspace / "browser-runtime.json", self.record)
-            ready = await self._call("init", {"protocol_version": "1", "runtime_sha256": spec["sha256"],
+            ready = await self._call("init", {"protocol_version": self.protocol_version, "runtime_sha256": spec["sha256"],
                 "initial_mode": initial_mode, "persona": persona, "allowed_origins": allowed_origins,
                 **({"proxy_url": spec["proxy_url"]} if "proxy_url" in spec else {})}, timeout_ms=5000)
-            if (ready.get("ready") is not True or ready.get("protocol_version") != "1"
+            if (ready.get("ready") is not True or ready.get("protocol_version") != self.protocol_version
                     or ready.get("runtime_sha256") != spec["sha256"]
                     or ready.get("runtime_version") != "br_" + spec["sha256"][:24]
                     or ready.get("mode") != initial_mode or ready.get("generation") != 0):
@@ -104,6 +109,9 @@ class BrowserSession:
     async def _responses(self):
         try:
             while (response := await read_message(self.process.stdout)) is not None:
+                if self.protocol_version == "2" and "event" in response:
+                    self._network_event(response)
+                    continue
                 request_id = response.get("id")
                 if type(request_id) is not int or request_id not in self.pending or type(response.get("ok")) is not bool:
                     raise BrowserError("BROWSER_PROTOCOL_FAILED", "UNKNOWN")
@@ -142,7 +150,7 @@ class BrowserSession:
     async def _call(self, method, params, page=None, timeout_ms=5000):
         if self.broken:
             raise self.broken
-        if type(timeout_ms) is not int or not 1 <= timeout_ms <= 30000:
+        if type(timeout_ms) is not int or not 1 <= timeout_ms <= self.max_timeout_ms:
             raise BrowserError("INVALID_BROWSER_TIMEOUT")
         future = None
         request_id = None
@@ -172,7 +180,9 @@ class BrowserSession:
             if not isinstance(error.get("code"), str) or response.get("dispatch_state") not in {"NOT_SENT", "SENT", "UNKNOWN"}:
                 raise BrowserError("BROWSER_PROTOCOL_FAILED", "UNKNOWN")
             failure = BrowserError(error["code"], response["dispatch_state"])
-            if failure.dispatch_state != "NOT_SENT":
+            failure.page_generation = response.get("page_generation")
+            failure.url = response.get("url")
+            if failure.dispatch_state != "NOT_SENT" and not (self.protocol_version == "2" and failure.code == "WAIT_TIMEOUT"):
                 self._fail(failure)
             raise failure
         except BrowserError:

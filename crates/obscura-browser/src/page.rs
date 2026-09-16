@@ -282,6 +282,7 @@ pub struct Page {
     pub history: Vec<String>,
     pub history_index: usize,
     session_history: obscura_js::ops::SharedSessionHistory,
+    session_storage: obscura_js::ops::SharedWebStorage,
     requested_history: Option<obscura_js::ops::HistoryNavigation>,
     pub network_events: Vec<NetworkEvent>,
     response_bodies: std::collections::HashMap<String, StoredResponseBody>,
@@ -1098,16 +1099,14 @@ impl Page {
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if context.stealth {
-            // The wreq client backing StealthHttpClient does not speak SOCKS5.
-            // Callers must validate the proxy scheme up front and fail loudly
-            // (see obscura-cli) rather than silently rewriting socks5:// to
-            // http://, which only works when the upstream happens to be a
-            // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
-            // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_policy(
+            // Preserve the explicitly configured proxy scheme and endpoint.
+            Some(Arc::new(StealthHttpClient::with_policy_profile_persona(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.http_client.clone(),
+                context.stealth_profile,
+                &context.accept_language,
+                context.do_not_track.as_deref(),
             )))
         } else {
             None
@@ -1139,6 +1138,7 @@ impl Page {
             history: Vec::new(),
             history_index: 0,
             session_history: std::rc::Rc::new(std::cell::RefCell::new(Default::default())),
+            session_storage: Default::default(),
             requested_history: None,
             network_events: Vec::new(),
             response_bodies: std::collections::HashMap::new(),
@@ -1757,6 +1757,13 @@ impl Page {
             .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
             .await
     }
+    async fn do_post_form(&self, url: &Url, body: &str, request: ResourceRequest) -> Result<Response, ObscuraNetError> {
+        #[cfg(feature = "stealth")]
+        if let Some(ref stealth) = self.stealth_client {
+            return stealth.post_form_resource_with_callbacks(url, body, request, Some(&self.callbacks)).await;
+        }
+        self.http_client.post_form_resource_with_callbacks(url, body, request, Some(&self.callbacks)).await
+    }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
@@ -1783,9 +1790,10 @@ impl Page {
         // and op_fetch_url so dynamic imports and JS fetch() honour the
         // configured upstream proxy (#139). When proxy_url is None this is
         // equivalent to with_base_url() (direct connection).
-        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
+        let mut rt = ObscuraJsRuntime::with_base_url_proxy_and_locale(
             &self.url_string(),
             self.context.proxy_url.clone(),
+            &self.context.language,
         );
         rt.set_url(&self.url_string());
         rt.set_session_history(self.session_history.clone());
@@ -1794,16 +1802,20 @@ impl Page {
         rt.set_referrer(&self.referrer);
         rt.set_referrer_policy(self.referrer_policy);
         rt.set_device_identity(self.context.device_identity.clone());
+        rt.set_locale(&self.context.language, &self.context.languages);
+        rt.set_do_not_track(self.context.do_not_track.as_deref());
+        rt.set_webgl_identity(&self.context.webgl_vendor, &self.context.webgl_renderer);
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
-            rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
-            );
+            let profile = self.context.stealth_profile;
+            rt.set_user_agent(profile.user_agent());
+            let (platform, ua_platform, version) = profile.platform();
+            rt.set_platform(platform, ua_platform, version);
+            if profile == obscura_net::StealthProfile::MacChrome152 {
+                rt.set_user_agent_details("152.0.7977.83", "arm");
+            }
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {
                 rt.set_user_agent(&ua);
@@ -1836,6 +1848,7 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_web_storage(self.context.local_storage.clone(), self.session_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -2370,6 +2383,8 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let referrer_policy = self.js.as_ref().map(|js| js.referrer_policy()).unwrap_or(self.referrer_policy);
         let script_initiator = self
@@ -2380,6 +2395,8 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -2410,73 +2427,122 @@ impl Page {
                             redirected_from: Vec::new(),
                             request_referrer: None,
                         };
-                        return Some((idx, url, resp));
+                        return (idx, Some((url, resp)));
                     }
                     let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
                     request.referrer_policy = referrer_policy;
-                    match client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
-                    {
-                        Ok(resp) => Some((idx, url, resp)),
+                    #[cfg(feature = "stealth")]
+                    let response = if let Some(stealth) = stealth_client {
+                        stealth.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
+                    } else {
+                        client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let response = client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await;
+                    match response {
+                        Ok(resp) => (idx, Some((url, resp))),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
-                            None
+                            (idx, None)
                         }
                     }
                 }
             })
             .collect();
 
-        // Bound concurrency: a page with 100 external scripts would
-        // otherwise open 100 sockets at once, exhausting the connection
-        // pool / ephemeral ports and triggering OS-level backpressure.
-        // 16 is well above the per-host pool ceiling most browsers use
-        // and matches what real Chrome does for a given origin.
+        // Fetch ahead concurrently, but never make the parser wait for an
+        // unrelated response. Failed fetches retain their index so a failure
+        // cannot accidentally turn into a wait for every remaining script.
         use futures::StreamExt as _;
-        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
-        let fetch_results = match tokio::time::timeout_at(
-            script_deadline,
-            fetch_stream.collect::<Vec<_>>(),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                tracing::warn!(
-                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
-                );
-                Vec::new()
-            }
-        };
-
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
-            std::collections::HashMap::new();
-        for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
-                if !script_response_is_executable(resp.status) {
-                    self.record_network_event_with_body(
-                        &url,
-                        "GET",
-                        "Script",
-                        resp.status,
-                        &resp.headers,
-                        &resp.body,
-                        false,
-                    );
-                    tracing::warn!(
-                        "Refusing to execute script {} after HTTP {}",
-                        url,
-                        resp.status
-                    );
-                    continue;
+        type ScriptResponse = Option<(String, obscura_net::Response)>;
+        struct ScriptFetches {
+            receiver: tokio::sync::mpsc::Receiver<(usize, ScriptResponse)>,
+            pending: std::collections::HashSet<usize>,
+            ready: std::collections::HashMap<usize, ScriptResponse>,
+            asynchronous: std::collections::HashSet<usize>,
+            error: Option<String>,
+            download_task: tokio::task::JoinHandle<()>,
+        }
+        impl Drop for ScriptFetches {
+            fn drop(&mut self) { self.download_task.abort(); }
+        }
+        impl ScriptFetches {
+            fn accept<F>(&mut self, page: &mut Page, index: usize, response: ScriptResponse, execute: &mut F)
+            where F: FnMut(&mut Page, usize, ScriptResponse) {
+                self.pending.remove(&index);
+                if self.asynchronous.remove(&index) {
+                    execute(page, index, response);
+                } else {
+                    self.ready.insert(index, response);
                 }
-                // Script bodies: only the HTTP Content-Type charset matters
-                // (no in-band meta-charset for JS).
-                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
+            }
+
+            fn poll_ready<F>(&mut self, page: &mut Page, execute: &mut F)
+            where F: FnMut(&mut Page, usize, ScriptResponse) {
+                while let Ok((index, response)) = self.receiver.try_recv() {
+                    self.accept(page, index, response, execute);
+                }
+            }
+
+            async fn wait_for<F>(&mut self, target: Option<usize>, page: &mut Page,
+                deadline: tokio::time::Instant, execute: &mut F)
+            where F: FnMut(&mut Page, usize, ScriptResponse) {
+                let mut js_idle = false;
+                while self.error.is_none() && target.map_or(!self.pending.is_empty(), |i| self.pending.contains(&i)) {
+                    if tokio::time::Instant::now() >= deadline { break; }
+                    // A blocked parser releases the main thread. Dynamic script
+                    // responses, promises and timers must make progress here.
+                    let event_loop = async {
+                        if !js_idle {
+                            if let Some(js) = &mut page.js {
+                                return js.run_autonomous_event_loop_turn().await;
+                            }
+                        }
+                        std::future::pending::<Result<bool, String>>().await
+                    };
+                    let result = tokio::select! {
+                        response = self.receiver.recv() => Some(response),
+                        turn = event_loop => {
+                            match turn {
+                                Ok(idle) => js_idle = idle,
+                                Err(error) => self.error = Some(error),
+                            }
+                            None
+                        },
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    };
+                    match result {
+                        Some(Some((index, response))) => {
+                            self.accept(page, index, response, execute);
+                            // Executing a ready async script can enqueue JS work
+                            // even if the event loop was idle before its response.
+                            js_idle = false;
+                        }
+                        Some(None) => break,
+                        None => {}
+                    }
+                }
             }
         }
+        // Keep transport progressing while module graph loading owns the JS
+        // runtime too. A lazy stream polled only at classic-script waits can
+        // otherwise strand an already opened connection during module loading.
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let download_task = tokio::spawn(async move {
+            let stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
+            futures::pin_mut!(stream);
+            while let Some(response) = stream.next().await {
+                if sender.send(response).await.is_err() { break; }
+            }
+        });
+        let mut fetched = ScriptFetches {
+            receiver,
+            pending: fetch_tasks.iter().map(|(index, _)| *index).collect(),
+            ready: std::collections::HashMap::new(),
+            asynchronous: std::collections::HashSet::new(),
+            error: None,
+            download_task,
+        };
 
         // CDP `Page.addScriptToEvaluateOnNewDocument` contract: preload
         // sources must run BEFORE any of the page's own scripts. This is
@@ -2578,10 +2644,9 @@ impl Page {
         let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
-             fetched_script: Option<(String, String, obscura_net::Response)>| {
+             fetched_script: ScriptResponse| {
                 if script.src.is_some() {
-                    if let Some((url, code, resp)) = fetched_script {
-                        tracing::info!("Executing script ({} bytes): {}", code.len(), url);
+                    if let Some((url, resp)) = fetched_script {
                         let execution_url = resp.url.to_string();
                         page.record_network_event_with_body(
                             &url,
@@ -2592,6 +2657,12 @@ impl Page {
                             &resp.body,
                             false,
                         );
+                        if !script_response_is_executable(resp.status) {
+                            tracing::warn!("Refusing to execute script {} after HTTP {}", url, resp.status);
+                            return;
+                        }
+                        let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                        tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                         if let Some(js) = &mut page.js {
                             let _ = js.execute_script(
                                 "<current-script>",
@@ -2623,12 +2694,17 @@ impl Page {
                 }
             };
 
+        let mut execute_ready = |page: &mut Self, index: usize, response: ScriptResponse| {
+            execute_classic(page, &all_scripts[index], response);
+        };
         let mut post_parse = Vec::new();
 
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
         // evaluation of non-async modules remains post-parse.
         for (index, script) in all_scripts.iter().enumerate() {
+            fetched.poll_ready(self, &mut execute_ready);
+            if fetched.error.is_some() { break; }
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!(
                     "execute_scripts: deadline reached, skipping {} remaining scripts",
@@ -2650,11 +2726,19 @@ impl Page {
                     }
                 }
                 ScriptKind::Classic => {
-                    if script.is_defer && !script.is_async && script.src.is_some() {
+                    if script.is_async && script.src.is_some() {
+                        if let Some(response) = fetched.ready.remove(&index) {
+                            execute_ready(self, index, response);
+                        } else if fetched.pending.contains(&index) {
+                            fetched.asynchronous.insert(index);
+                        }
+                    } else if script.is_defer && script.src.is_some() {
                         post_parse.push(ScheduledScript::Classic(index));
                     } else {
-                        let fetched_script = fetched.remove(&index);
-                        execute_classic(self, script, fetched_script);
+                        fetched.wait_for(Some(index), self, script_deadline, &mut execute_ready).await;
+                        if fetched.error.is_some() { break; }
+                        let response = fetched.ready.remove(&index).flatten();
+                        execute_ready(self, index, response);
                     }
                 }
                 ScriptKind::Module => {
@@ -2813,15 +2897,17 @@ impl Page {
         let lifecycle_error = self.js.as_mut().and_then(|js| js.document_lifecycle(1).err());
 
         for scheduled in post_parse {
+            if fetched.error.is_some() { break; }
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!("execute_scripts: deadline reached during post-parse scripts");
                 break;
             }
             match scheduled {
                 ScheduledScript::Classic(index) => {
-                    let script = &all_scripts[index];
-                    let fetched_script = fetched.remove(&index);
-                    execute_classic(self, script, fetched_script);
+                    fetched.wait_for(Some(index), self, script_deadline, &mut execute_ready).await;
+                    if fetched.error.is_some() { break; }
+                    let response = fetched.ready.remove(&index).flatten();
+                    execute_ready(self, index, response);
                 }
                 ScheduledScript::Module {
                     prepared,
@@ -2878,6 +2964,7 @@ impl Page {
         }
 
         let completion = async {
+            if let Some(error) = fetched.error.take() { return Err(PageError::LifecycleError(error)); }
             if let Some(error) = lifecycle_error { return Err(PageError::LifecycleError(error.into())); }
             if let Some(js) = &mut self.js {
                 #[cfg(feature = "render")]
@@ -2888,7 +2975,11 @@ impl Page {
                 // document's load-event delay set, including scripts inserted by
                 // a DOMContentLoaded listener.
                 js.document_lifecycle(2).map_err(|error| PageError::LifecycleError(error.into()))?;
-
+            }
+            // Parser-inserted async scripts gate load, but not DOMContentLoaded.
+            fetched.wait_for(None, self, script_deadline, &mut execute_ready).await;
+            if let Some(error) = fetched.error.take() { return Err(PageError::LifecycleError(error)); }
+            if let Some(js) = &mut self.js {
                 let load_blockers_finished =
                     Self::drive_load_delaying_scripts(js, script_deadline).await;
                 if !load_blockers_finished {
@@ -2985,6 +3076,16 @@ impl Page {
     /// after `max_ms`. Without this the page is observed exactly as it stood at
     /// the load event, before any async work settles, which silently strands
     /// timer-driven tests and dynamic pages.
+    pub async fn advance_automation(&mut self, task_deadline: std::time::Instant) -> Result<(), String> {
+        if let Some(js) = &mut self.js {
+            js.run_automation_event_loop(20, task_deadline).await?;
+        }
+        #[cfg(feature = "render")]
+        self.queue_pending_render_resources();
+        self.advance_frames().await;
+        Ok(())
+    }
+
     pub async fn settle(&mut self, max_ms: u64) {
         if max_ms == 0 {
             return;
@@ -3365,9 +3466,7 @@ impl Page {
                 request_referrer: None,
             })
         } else if method == "POST" {
-            self.http_client
-                .post_form_resource_with_callbacks(&url, body, request, Some(&self.callbacks))
-                .await
+            self.do_post_form(&url, body, request).await
         } else {
             self.do_fetch(&url, request).await
         }
@@ -4781,6 +4880,41 @@ impl Drop for Page {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_uses_page_stealth_transport() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut data = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buf[..n]);
+                if data.ends_with(b"name=value") { break; }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 15\r\nConnection: close\r\n\r\n<p>accepted</p>").unwrap();
+            String::from_utf8(data).unwrap()
+        });
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "form-transport".into(), None, true, None, None, true,
+        ));
+        let mut page = super::Page::new("form-transport".into(), context);
+        page.stealth_client.as_ref().unwrap().set_extra_headers(
+            [("x-transport-test".into(), "stealth".into())].into_iter().collect(),
+        ).await;
+        page.navigate_with_wait_post(&format!("http://{address}/login"),
+            crate::lifecycle::WaitUntil::DomContentLoaded, "POST", "name=value").await.unwrap();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /login "));
+        assert!(request.contains("x-transport-test: stealth\r\n"), "form bypassed the page transport");
+        assert!(request.contains("content-type: application/x-www-form-urlencoded\r\n"));
+    }
+
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
         materialize_stylesheet_graph, navigation_chain_limit_from_env_value, navigation_referrer,
@@ -5578,6 +5712,7 @@ mod tests {
                     .to_string();
                 request_tx.send(path.clone()).unwrap();
                 let (status, body) = match path.as_str() {
+                    "/app/noop.js" => ("200 OK", ""),
                     "/app/before.js" => ("200 OK", "export const value = 'before-first-module';"),
                     "/app/later.js" => ("200 OK", "export const value = 'later-map';"),
                     "/app/async.js" => (
@@ -6469,6 +6604,116 @@ mod tests {
         page
     }
 
+    async fn parser_script_handshake(dynamic: bool, deadline: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let marker = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let marker = marker.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let body = match path {
+                        "/never.js" => std::future::pending::<String>().await,
+                        "/first.js" if dynamic => "var child=document.createElement('script');child.src='/child.js';document.head.appendChild(child);".to_owned(),
+                        "/first.js" | "/child.js" => "fetch('/marker');".to_owned(),
+                        "/marker" => { marker.notify_one(); "ok".to_owned() },
+                        "/second.js" => {
+                            let passed = tokio::time::timeout(std::time::Duration::from_secs(2), marker.notified()).await.is_ok();
+                            format!("window.handshake={passed};")
+                        }
+                        _ => panic!("unexpected path {path}"),
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let tail = if deadline { "<script async src='/never.js'></script>" } else { "" };
+        let mut page = import_map_test_page("parser-handshake", &base,
+            &format!("<html><head><script src='/first.js'></script><script src='/second.js'></script>{tail}</head><body></body></html>"));
+        if deadline { std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "500"); }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), page.execute_scripts()).await;
+        if deadline { std::env::remove_var("OBSCURA_SCRIPT_DEADLINE_MS"); }
+        let result = result.expect("script deadline must bound pending downloads");
+        server.abort();
+        result.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("window.handshake").unwrap(), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_executes_before_later_response_finishes() {
+        parser_script_handshake(false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_wait_drives_dynamic_script_and_fetch_continuations() {
+        parser_script_handshake(true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_deadline_preserves_completed_scripts_and_bounds_pending_downloads() {
+        parser_script_handshake(false, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_async_defer_and_failed_fetch_preserve_lifecycle_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let parsed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let dcl = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let parsed = parsed.clone();
+                let dcl = dcl.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let (status, body) = match path {
+                        "/gone.js" => return,
+                        "/failed.js" => (404, "order.push('must-not-execute')".to_owned()),
+                        "/parsed" => { parsed.notify_one(); (200, "ok".to_owned()) },
+                        "/dcl" => { dcl.notify_one(); (200, "ok".to_owned()) },
+                        "/async.js" | "/defer1.js" => {
+                            let signal = if path == "/async.js" { dcl } else { parsed };
+                            let passed = tokio::time::timeout(std::time::Duration::from_secs(2), signal.notified()).await.is_ok();
+                            let name = if path == "/async.js" { "async" } else { "defer1" };
+                            (200, format!("order.push('{}:'+document.readyState);", if passed { name } else { "timeout" }))
+                        }
+                        "/defer2.js" => (200, "order.push('defer2:'+document.readyState)".to_owned()),
+                        _ => panic!("unexpected path {path}"),
+                    };
+                    let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let mut page = import_map_test_page("parser-lifecycle-order", &base, r#"<html><head>
+            <script>
+                window.order=[];
+                document.addEventListener('DOMContentLoaded',()=>{order.push('dcl');fetch('/dcl')});
+                window.addEventListener('load',()=>order.push('load'));
+            </script>
+            <script async src='/async.js'></script>
+            <script defer src='/defer1.js'></script>
+            <script defer src='/defer2.js'></script>
+            <script src='/gone.js'></script><script src='/failed.js'></script>
+            <script>order.push('inline:'+document.readyState);fetch('/parsed')</script>
+            </head><body></body></html>"#);
+        let result = page.execute_scripts().await;
+        server.abort();
+        result.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("order").unwrap(),
+            serde_json::json!(["inline:loading", "defer1:interactive", "defer2:interactive", "dcl", "async:interactive", "load"]));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn module_graph_and_evaluation_share_one_active_budget() {
         use std::io::{Read as _, Write as _};
@@ -6696,12 +6941,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn ready_async_classic_script_runs_before_a_later_parser_import_map() {
-        let (base, requests) = spawn_parser_import_map_server(2);
+        let (base, requests) = spawn_parser_import_map_server(1);
         let mut page = import_map_test_page(
             "async-classic-before-map",
             &base,
             r#"<html><head>
-            <script async src="./async.js"></script>
+            <!-- The following blocking response gives the already available async
+                 script a task opportunity before the parser reaches the map. -->
+            <script async src="data:text/javascript,import('too-late').then(module=>globalThis.__async_before_map=module.value).catch(()=>globalThis.__async_before_map='rejected')"></script>
+            <script src="./noop.js"></script>
             <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
         </head><body></body></html>"#,
         );
@@ -6719,7 +6967,7 @@ mod tests {
             requests
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap(),
-            "/app/async.js"
+            "/app/noop.js"
         );
         assert!(requests.try_recv().is_err());
     }

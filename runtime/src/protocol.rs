@@ -19,12 +19,14 @@ pub struct Request {
 pub struct Input {
     pub actions: mpsc::Receiver<Request>,
     pub controls: mpsc::Receiver<Request>,
+    pub evidence: mpsc::Receiver<Request>,
     pub closed: watch::Receiver<Option<&'static str>>,
 }
 
 pub fn input() -> Input {
     let (actions_tx, actions) = mpsc::channel(16);
     let (controls_tx, controls) = mpsc::channel(16);
+    let (evidence_tx, evidence) = mpsc::channel(16);
     let (closed_tx, closed) = watch::channel(None);
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -43,10 +45,12 @@ pub fn input() -> Input {
                     match request {
                         Ok(request)
                             if request.id > previous
-                                && (1..=30000).contains(&request.timeout_ms) =>
+                                && (1..=300000).contains(&request.timeout_ms) =>
                         {
                             previous = request.id;
-                            let tx = if matches!(
+                            let tx = if request.method == "network_body" {
+                                &evidence_tx
+                            } else if matches!(
                                 request.method.as_str(),
                                 "set_mode" | "begin_recheck" | "finish_recheck" | "close"
                             ) {
@@ -71,6 +75,7 @@ pub fn input() -> Input {
     Input {
         actions,
         controls,
+        evidence,
         closed,
     }
 }

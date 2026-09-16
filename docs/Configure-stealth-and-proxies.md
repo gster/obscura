@@ -11,7 +11,7 @@ obscura mcp --stealth
 
 What `--stealth` changes:
 
-- Uses the wreq HTTP client with browser-matching TLS fingerprints (ClientHello, ALPN, cipher order).
+- Uses the primp HTTP client with Chrome TLS profiles (ClientHello, ALPN, cipher order). See [known fidelity gaps](Primp-and-wreq-comparison.md).
 - Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
 - Bundles webpki roots instead of relying on the system store.
 

@@ -15,7 +15,7 @@ use url::Url;
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
-fn configured_root_paths() -> Vec<std::path::PathBuf> {
+pub(crate) fn configured_root_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) {
         paths.push(path.into());
@@ -59,23 +59,6 @@ fn configured_root_certificates() -> &'static [reqwest::Certificate] {
         }
         certificates
     })
-}
-
-/// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
-/// variable that is set but empty (e.g. `SSL_CERT_FILE=""`, a common shell
-/// accident) is treated as unset, matching the `!is_empty()` filter in
-/// `configured_root_paths` above. The stealth client (wreq) relies on this:
-/// supplying a store to `tls_cert_store` REPLACES the bundled webpki roots, so
-/// an empty value would otherwise build a near-empty store and break all HTTPS.
-///
-/// The only non-test caller is the stealth (wreq) client, so a plain build
-/// without the `stealth` feature sees it as unused.
-#[cfg_attr(not(feature = "stealth"), allow(dead_code))]
-pub(crate) fn custom_cert_store_requested(
-    cert_file: Option<&std::ffi::OsStr>,
-    cert_dir: Option<&std::ffi::OsStr>,
-) -> bool {
-    cert_file.is_some_and(|v| !v.is_empty()) || cert_dir.is_some_and(|v| !v.is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +125,8 @@ pub(crate) fn merge_response_header(map: &mut HashMap<String, String>, name: Str
 
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
+    /// Request payload, before redirects rewrite the method.
+    pub body: Vec<u8>,
     pub url: Url,
     pub method: String,
     pub headers: HashMap<String, String>,
@@ -380,6 +365,13 @@ impl ResourceRequest {
             ResourceType::Image => "image",
             ResourceType::Font => "font",
             ResourceType::Xhr | ResourceType::Fetch | ResourceType::Other => "empty",
+        }
+    }
+
+    pub(crate) fn priority(&self) -> &'static str {
+        match self.resource_type {
+            ResourceType::Xhr | ResourceType::Fetch => "u=1, i",
+            _ => "u=0, i",
         }
     }
 
@@ -770,7 +762,7 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
 /// lookup passes through unfiltered.
 ///
 /// Implemented for both transports: `reqwest::dns::Resolve` just below, and
-/// `wreq::dns::Resolve` in `wreq_client.rs`, so `--stealth` never trades the
+/// `primp::dns::Resolve` in `stealth_client.rs`, so `--stealth` never trades the
 /// guard away for a better TLS fingerprint.
 pub struct SsrfGuardResolver {
     pub(crate) allow_private: bool,
@@ -1525,6 +1517,7 @@ impl ObscuraHttpClient {
             return;
         };
         let request_info = RequestInfo {
+            body: Vec::new(),
             url: url.clone(),
             method: Method::GET.to_string(),
             headers: self.extra_headers.read().await.clone(),
@@ -1581,6 +1574,7 @@ impl ObscuraHttpClient {
         for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
+                body: body.clone().unwrap_or_default(),
                 url: current_url.clone(),
                 method: method.to_string(),
                 headers: self.extra_headers.read().await.clone(),
@@ -2968,35 +2962,5 @@ mod ssrf_tests {
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
         assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
-    }
-}
-
-#[cfg(test)]
-mod cert_env_tests {
-    use super::custom_cert_store_requested;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn empty_ssl_cert_env_is_treated_as_unset() {
-        // Set-but-empty must NOT request a custom store: for the stealth client
-        // that would replace the webpki roots with a near-empty default-paths
-        // store and break all HTTPS.
-        assert!(!custom_cert_store_requested(Some(OsStr::new("")), None));
-        assert!(!custom_cert_store_requested(None, Some(OsStr::new(""))));
-        assert!(!custom_cert_store_requested(
-            Some(OsStr::new("")),
-            Some(OsStr::new(""))
-        ));
-        // Genuinely unset: no custom store.
-        assert!(!custom_cert_store_requested(None, None));
-        // Set and non-empty: build the custom store (behavior unchanged).
-        assert!(custom_cert_store_requested(
-            Some(OsStr::new("/etc/corp/ca.pem")),
-            None
-        ));
-        assert!(custom_cert_store_requested(
-            None,
-            Some(OsStr::new("/etc/ssl/certs"))
-        ));
     }
 }

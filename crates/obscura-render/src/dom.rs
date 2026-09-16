@@ -9887,7 +9887,14 @@ fn build_text_words(
         }
     }
     if let Some(style) = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)) {
+        let mut owners = Vec::new();
+        for parent in tree.ancestors(id) {
+            if !is_flattenable_inline(tree, parent, styles) { break; }
+            owners.push(parent);
+        }
+        owners.reverse();
         let shaped = build_shaped_word_leaves(
+            &owners,
             id,
             &display_text,
             style,
@@ -9923,6 +9930,7 @@ fn build_text_words(
 /// loaded faces, variable axes, optical sizing, transforms, and glyph
 /// rasterization identical to the full inline-formatting-context path.
 fn build_shaped_word_leaves(
+    owners: &[NodeId],
     source_id: NodeId,
     text: &str,
     style: &crate::LayoutStyle,
@@ -9941,7 +9949,7 @@ fn build_shaped_word_leaves(
         // paragraph path trimming collapsible trailing whitespace.
         let mut token_style = style.clone();
         token_style.white_space = Some(crate::WhiteSpace::Pre);
-        let Some(item) = engine.push_generated_text(&token, &token_style) else {
+        let Some(item) = engine.push_owned_word(&token, &token_style, owners) else {
             // Returning no leaves makes the caller use the deterministic
             // layout-only/static-font fallback for the whole text node.
             return Vec::new();
@@ -10059,7 +10067,7 @@ fn build_pseudo_content(
     engine: &mut crate::inline::TextEngine,
     ifc_items: &mut IfcRegistry,
 ) -> Vec<taffy::NodeId> {
-    let shaped = build_shaped_word_leaves(id, content, style, taffy_tree, words, engine, ifc_items);
+    let shaped = build_shaped_word_leaves(&[], id, content, style, taffy_tree, words, engine, ifc_items);
     if !shaped.is_empty() {
         return shaped;
     }

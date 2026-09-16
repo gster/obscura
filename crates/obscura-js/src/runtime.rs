@@ -898,6 +898,14 @@ impl ObscuraJsRuntime {
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        Self::with_base_url_proxy_and_locale(base_url, proxy_url, "en-US")
+    }
+
+    pub fn with_base_url_proxy_and_locale(
+        base_url: &str,
+        proxy_url: Option<String>,
+        locale: &str,
+    ) -> Self {
         // A runtime is about to initialize the V8 platform; from here on a
         // set_v8_flags call must be refused rather than aborting the process.
         crate::v8_flags::mark_platform_started();
@@ -929,7 +937,7 @@ impl ObscuraJsRuntime {
             // locale the other surfaces claim (#734). Process-global and
             // idempotent; setting it under the create lock guarantees it
             // lands before the first isolate exists.
-            deno_core::v8::icu::set_default_locale("en-US");
+            deno_core::v8::icu::set_default_locale(locale);
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
@@ -1265,11 +1273,18 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 14] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
+            "__obscura_ua_full_version",
+            "__obscura_ua_architecture",
+            "__obscura_do_not_track",
+            "__obscura_language",
+            "__obscura_languages",
+            "__obscura_webgl_vendor",
+            "__obscura_webgl_renderer",
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
@@ -1316,6 +1331,8 @@ impl ObscuraJsRuntime {
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
         let parent = self.state.borrow();
         frame.cookie_jar = parent.cookie_jar.clone();
+        frame.local_storage = parent.local_storage.clone();
+        frame.session_storage = parent.session_storage.clone();
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
         frame.encoding = parent.encoding.clone();
@@ -1530,6 +1547,12 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    pub fn set_web_storage(&self, local: crate::ops::SharedWebStorage, session: crate::ops::SharedWebStorage) {
+        let mut state = self.state.borrow_mut();
+        state.local_storage = local;
+        state.session_storage = session;
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         let mut state = self.state.borrow_mut();
         state.http_client = Some(client);
@@ -1545,7 +1568,7 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().callbacks = Some(callbacks);
     }
 
-    /// Install the stealth (wreq) HTTP client so scripted fetch()/XHR is routed
+    /// Install the stealth (primp) HTTP client so scripted fetch()/XHR is routed
     /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
     #[cfg(feature = "stealth")]
     pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
@@ -1911,6 +1934,46 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-ua>",
             format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
+        );
+    }
+
+    pub fn set_user_agent_details(&mut self, full_version: &str, architecture: &str) {
+        let _ = self.execute_runtime_script("<set-ua-details>", format!(
+            "globalThis.__obscura_ua_full_version={};globalThis.__obscura_ua_architecture={};",
+            js_string_literal(full_version), js_string_literal(architecture),
+        ));
+    }
+
+    pub fn set_do_not_track(&mut self, value: Option<&str>) {
+        let value = value.map(js_string_literal).unwrap_or_else(|| "null".into());
+        let _ = self.execute_runtime_script(
+            "<set-do-not-track>",
+            format!("globalThis.__obscura_do_not_track={value};"),
+        );
+    }
+
+    pub fn set_locale(&mut self, language: &str, languages: &[String]) {
+        // One browser runtime process owns one Persona and one V8 isolate.
+        // Keep Intl's process-wide ICU default aligned with navigator.language;
+        // setting only the JS getters creates an observable locale split.
+        deno_core::v8::icu::set_default_locale(language);
+        let languages = serde_json::to_string(languages).unwrap_or_else(|_| "[]".into());
+        let _ = self.execute_runtime_script(
+            "<set-locale>",
+            format!(
+                "globalThis.__obscura_language={};globalThis.__obscura_languages={languages};",
+                js_string_literal(language),
+            ),
+        );
+    }
+
+    pub fn set_webgl_identity(&mut self, vendor: &str, renderer: &str) {
+        let _ = self.execute_runtime_script(
+            "<set-webgl-identity>",
+            format!(
+                "globalThis.__obscura_webgl_vendor={};globalThis.__obscura_webgl_renderer={};",
+                js_string_literal(vendor), js_string_literal(renderer),
+            ),
         );
     }
 
@@ -2824,16 +2887,21 @@ impl ObscuraJsRuntime {
 
     #[cfg(feature = "render")]
     fn click_activation(&self, hit: NodeId) -> Result<ClickActivation, &'static str> {
+        self.click_activation_state(hit, true)
+    }
+
+    #[cfg(feature = "render")]
+    fn click_activation_state(&self, hit: NodeId, check_enabled: bool) -> Result<ClickActivation, &'static str> {
         let activation = self.with_dom(|dom| {
             if !dom.is_light_document_element(hit) {
                 return Err("INPUT_TARGET_CHANGED");
             }
-            if dom.is_disabled(hit) || dom.is_inert(hit) {
+            if check_enabled && (dom.is_disabled(hit) || dom.is_inert(hit)) {
                 return Err("ELEMENT_DISABLED");
             }
             for id in std::iter::once(hit).chain(dom.ancestors(hit)) {
                 if let Some(activation) = Self::direct_click_activation(dom, id)? {
-                    if dom.is_disabled(id) {
+                    if check_enabled && dom.is_disabled(id) {
                         return Err("ELEMENT_DISABLED");
                     }
                     return Ok(activation);
@@ -3075,6 +3143,15 @@ impl ObscuraJsRuntime {
                         if self.click_activation(hit)? != activation { return Err("INPUT_TARGET_CHANGED"); }
                         if self.has_pending_navigation() { return Err("UNEXPECTED_NAVIGATION"); }
                         self.submit_native_form(form, button)?;
+                    }
+                    self.native_input_checkpoint()?;
+                    return Ok(allowed);
+                }
+                // Disabling a plain button is a normal click-handler update,
+                // but introducing a new browser default is still rejected.
+                if activation == ClickActivation::None {
+                    if self.click_activation_state(hit, false)? != activation {
+                        return Err("INPUT_TARGET_CHANGED");
                     }
                     self.native_input_checkpoint()?;
                     return Ok(allowed);
@@ -3823,6 +3900,72 @@ impl ObscuraJsRuntime {
                 y: point.1,
             })
         })
+    }
+
+    /// SDK geometry inspection is passive and independent of hit testing.
+    #[cfg(feature = "render")]
+    pub fn automation_box(&self, node: NodeId) -> Option<(f32, f32, f32, f32)> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state)?;
+            let prepared = state.prepared_render.as_ref()?;
+            let style = prepared.layout().styles.get(&node)?;
+            if style.effectively_invisible { return None; }
+            let (_, scroll) = state.resolved_scroll.as_ref()?;
+            let rect = prepared.viewport_rect_with_scroll(node, scroll)?;
+            (rect.width > 0.0 && rect.height > 0.0)
+                .then_some((rect.x, rect.y, rect.width, rect.height))
+        })
+    }
+
+    #[cfg(feature = "render")]
+    pub fn automation_visible_nodes(&self) -> std::collections::HashSet<NodeId> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state)?;
+            let prepared = state.prepared_render.as_ref()?;
+            let (_, scroll) = state.resolved_scroll.as_ref()?;
+            Some(prepared.layout().styles.iter().filter_map(|(node, style)| {
+                if style.effectively_invisible { return None; }
+                let rect = prepared.viewport_rect_with_scroll(*node, scroll)?;
+                (rect.width > 0.0 && rect.height > 0.0).then_some(*node)
+            }).collect())
+        }).unwrap_or_default()
+    }
+
+    #[cfg(feature = "render")]
+    pub fn automation_scroll(&mut self, selector: &str) -> Result<(), (&'static str, &'static str)> {
+        let node = self.input_node(selector).map_err(|e| (e, "NOT_SENT"))?;
+        let events = self.scroll_input_into_view(node).map_err(|e| (e, "NOT_SENT"))?;
+        for (kind, scroller) in events {
+            self.native_text_event(kind, scroller, "").map_err(|e| (e, "SENT"))?;
+            self.native_input_checkpoint().map_err(|e| (e, "SENT"))?;
+            if self.input_node(selector).map_err(|e| (e, "SENT"))? != node {
+                return Err(("INPUT_TARGET_CHANGED", "SENT"));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    pub fn automation_select(&mut self, selector: &str, value: &str) -> Result<(), (&'static str, &'static str)> {
+        let node = self.input_node(selector).map_err(|e| (e, "NOT_SENT"))?;
+        let valid = self.with_dom(|dom| {
+            let n = dom.get_node(node).ok_or("ELEMENT_NOT_FOUND")?;
+            if n.as_element().map(|n| n.local.as_ref()) != Some("select") {
+                return Err("INPUT_ELEMENT_UNSUPPORTED");
+            }
+            if dom.is_disabled(node) { return Err("ELEMENT_DISABLED"); }
+            let options = dom.query_selector_all_from(node, "option").map_err(|_| "INVALID_SELECTOR")?;
+            if !options.iter().any(|id| dom.get_node(*id).is_some_and(|n| {
+                !dom.is_disabled(*id) && n.get_attribute("value").map(str::to_owned)
+                    .unwrap_or_else(|| dom.text_content(*id)) == value
+            })) { return Err("OPTION_NOT_FOUND"); }
+            Ok(())
+        }).ok_or(("NO_DOCUMENT", "NOT_SENT"))?;
+        valid.map_err(|e| (e, "NOT_SENT"))?;
+        self.native_text_event(17, node, value).map_err(|e| (e, "SENT"))?;
+        self.native_input_checkpoint().map_err(|e| (e, "SENT"))
     }
 
     /// Return the retained layout's scrollable document size without changing
@@ -5476,6 +5619,26 @@ impl ObscuraJsRuntime {
         self.run_event_loop_bounded(budget_ms).await
     }
 
+    /// Yield between browser tasks while giving each synchronous task the
+    /// caller's remaining action budget. Unlike screenshot settling, a timed
+    /// out task is an execution failure and must not be reported as readiness.
+    pub async fn run_automation_event_loop(
+        &mut self,
+        budget_ms: u64,
+        task_deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let window = (tokio::time::Instant::now() + std::time::Duration::from_millis(budget_ms))
+            .min(tokio::time::Instant::from_std(task_deadline));
+        loop {
+            if tokio::time::Instant::now() >= window { return Ok(()); }
+            match tokio::time::timeout_at(window, self.run_autonomous_event_loop_turn_until(Some(task_deadline))).await {
+                Ok(Ok(true)) | Err(_) => return Ok(()),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => return Err(error),
+            }
+        }
+    }
+
     /// Drive one deno_core event-loop tick at a time. When the first tick
     /// parks, process one more tick after its registered waker fires, then
     /// yield back to the embedder even if that tick schedules more work.
@@ -5537,8 +5700,16 @@ impl ObscuraJsRuntime {
     /// asleep waiting for it.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
-            SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+        self.run_autonomous_event_loop_turn_until(None).await
+    }
+
+    async fn run_autonomous_event_loop_turn_until(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<bool, String> {
+        let task_budget = || deadline.map(|end| end.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS));
+        if task_budget().is_zero() { return Ok(false); }
 
         #[cfg(feature = "render")]
         self.service_render_resources();
@@ -5546,7 +5717,7 @@ impl ObscuraJsRuntime {
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
-            std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+            task_budget(),
         );
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         let focus = self.native_focus_fixup();
@@ -5564,9 +5735,10 @@ impl ObscuraJsRuntime {
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            if task_budget().is_zero() { return std::task::Poll::Ready(Ok(false)); }
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
-                std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+                task_budget(),
             );
             let tick = self
                 .runtime()
@@ -7017,6 +7189,402 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_reply_is_delivered_after_post_message_returns() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-reply-order", r#"
+            globalThis.__workerReplyOrder = [];
+            const source = 'onmessage = () => postMessage("reply")';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            let returned = false;
+            worker.onmessage = () => {
+                __workerReplyOrder.push(returned ? 'after' : 'during');
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            };
+            worker.postMessage(null);
+            returned = true;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplyOrder").unwrap(),
+            serde_json::json!(["after"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_message_listener_can_stop_onmessage_delivery() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-message-propagation", r#"
+            globalThis.__workerMessageHandlers = [];
+            const url = URL.createObjectURL(new Blob(['postMessage("internal")'], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.addEventListener('message', event => {
+                __workerMessageHandlers.push(['listener', event instanceof MessageEvent, event.target === worker]);
+                event.stopImmediatePropagation();
+            });
+            worker.onmessage = () => __workerMessageHandlers.push(['onmessage']);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerMessageHandlers").unwrap(),
+            serde_json::json!([["listener", true, true]])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_eventtarget_listener_can_filter_bootstrap_protocol_messages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-eventtarget-protocol", r#"
+            globalThis.__workerProtocolReplies = [];
+            const source = `
+                const nativeAdd = self.EventTarget.prototype.addEventListener;
+                let applicationHandler = null;
+                nativeAdd.call(self, 'message', function(event) {
+                    if (event.data && event.data.control === true) {
+                        Object.defineProperty(self, 'onmessage', {
+                            configurable: true,
+                            get() { return applicationHandler; },
+                            set(value) { applicationHandler = value; },
+                        });
+                        self.onmessage = event => postMessage({a: event.data.a, b: event.data.b});
+                        return;
+                    }
+                    if (applicationHandler) applicationHandler.call(self, event);
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerProtocolReplies.push(event.data);
+            worker.postMessage({control: true});
+            worker.postMessage({a: 7, b: 'ready'});
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerProtocolReplies").unwrap(),
+            serde_json::json!([{ "a": 7, "b": "ready" }])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_onmessage_wrapper_keeps_filtered_native_callback() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-onmessage-wrapper", r#"
+            globalThis.__workerWrappedReplies = [];
+            const source = `postMessage({internal: true}); postMessage({value: 'application'});`;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            let applicationHandler = null;
+            const nativeSetter = worker.__lookupSetter__('onmessage');
+            Object.defineProperty(worker, 'onmessage', {
+                configurable: true,
+                get() { return applicationHandler; },
+                set(value) {
+                    applicationHandler = value;
+                    nativeSetter.call(this, event => {
+                        if (!event.data.internal) value.call(this, event);
+                    });
+                },
+            });
+            worker.onmessage = event => __workerWrappedReplies.push(event.data.value);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerWrappedReplies").unwrap(),
+            serde_json::json!(["application"])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    /// Reduced regression for the browser surfaces used by a real airline
+    /// protection collector. Keep this host-neutral: the original minified
+    /// script, cookies, and per-request tokens are deliberately not fixtures.
+    #[tokio::test(flavor = "current_thread")]
+    async fn southwest_style_protection_probe_remains_coherent() {
+        let mut rt = ObscuraJsRuntime::with_base_url_proxy_and_locale(
+            "https://example.com/air-shopping",
+            None,
+            "en",
+        );
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/air-shopping");
+        rt.set_device_identity(Some(crate::ops::DeviceIdentity {
+            seed: 152,
+            hardware_concurrency: 15,
+            device_memory: 32.0,
+            screen_width: 1920,
+            screen_height: 1080,
+        }));
+        rt.set_user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
+        rt.set_user_agent_details("152.0.7977.83", "arm");
+        rt.set_platform("MacIntel", "macOS", "26.0.0");
+        rt.set_locale("en", &["en".into(), "zh-CN".into()]);
+        rt.set_do_not_track(Some("1"));
+        rt.set_webgl_identity(
+            "Google Inc. (Apple)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)",
+        );
+        rt.execute_script("persona-metrics", r#"
+            globalThis.__obscura_battery_charging = true;
+            globalThis.__obscura_battery_level = 0.8;
+            globalThis.__obscura_network_rtt = 100;
+            globalThis.__obscura_storage_quota = 10738064711;
+        "#).unwrap();
+        rt.set_runtime_events_enabled(true);
+        rt.run_page_init();
+
+        rt.execute_script("southwest-style-protection-probe", r#"
+            const isProtocolMessage = data => data &&
+                Object.prototype.hasOwnProperty.call(data, 'b') &&
+                typeof data.n === 'number';
+
+            const canvas = document.createElement('canvas');
+            const gl = canvas.getContext('webgl', {preserveDrawingBuffer: true});
+            const debug = gl.getExtension('WEBGL_debug_renderer_info');
+            gl.clearColor(1, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            const pixel = new Uint8Array(4);
+            gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+
+            const ns = 'http://www.w3.org/2000/svg';
+            const path = document.createElementNS(ns, 'path');
+            path.setAttribute('d', 'M0 0 L3 4 L9 4');
+            const point = path.getPointAtLength(7);
+            const rect = document.createElementNS(ns, 'rect');
+            rect.setAttribute('x', '10'); rect.setAttribute('y', '20');
+            rect.setAttribute('width', '30'); rect.setAttribute('height', '40');
+            const box = rect.getBBox();
+
+            let consoleErrorGetterRead = false;
+            const detectorError = new Error();
+            Object.defineProperty(detectorError, 'message', {
+                get() { consoleErrorGetterRead = true; return 'opened'; },
+            });
+            let consoleFunctionStringified = false;
+            function detectorFunction() {}
+            detectorFunction.toString = function() {
+                consoleFunctionStringified = true;
+                return 'opened';
+            };
+            console.log(detectorError);
+            console.log(detectorFunction);
+
+            globalThis.__southwestProtectionProbe = {
+                navigator: [
+                    navigator.userAgent.includes('Chrome/152.'), navigator.platform,
+                    navigator.language, navigator.languages, navigator.hardwareConcurrency,
+                    navigator.deviceMemory, navigator.doNotTrack, navigator.webdriver,
+                ],
+                plugins: {
+                    count: navigator.plugins.length,
+                    lengths: Array.from(navigator.plugins, plugin => plugin.length),
+                    types: Array.from(navigator.plugins[0], mime => mime.type),
+                    enabledPlugin: navigator.mimeTypes[0].enabledPlugin.name,
+                },
+                chrome: [
+                    typeof chrome.app, typeof chrome.csi, typeof chrome.loadTimes,
+                    typeof chrome.runtime, typeof webkitRequestFileSystem,
+                ],
+                browserShape: [
+                    navigator.appCodeName, navigator.appName,
+                    window.clientInformation === navigator,
+                    typeof document.hasStorageAccess,
+                    Object.getOwnPropertyNames(Worker.prototype),
+                    consoleErrorGetterRead, consoleFunctionStringified,
+                    (() => {
+                        try { document.createElement('<object classid="x">'); return null; }
+                        catch (error) { return error.name; }
+                    })(),
+                ],
+                base64: [
+                    btoa(String.fromCharCode(0, 127, 128, 255)),
+                    Array.from(atob('AH+A/w=='), value => value.charCodeAt(0)),
+                    (() => { try { btoa('\u2713'); return null; } catch (error) { return error.name; } })(),
+                ],
+                webgl: [
+                    gl.drawingBufferWidth, gl.drawingBufferHeight,
+                    gl.getParameter(gl.VENDOR), gl.getParameter(gl.RENDERER),
+                    gl.getParameter(debug.UNMASKED_VENDOR_WEBGL),
+                    gl.getParameter(debug.UNMASKED_RENDERER_WEBGL),
+                    Array.from(pixel),
+                ],
+                svg: [
+                    path instanceof SVGPathElement, path.getTotalLength(), [point.x, point.y],
+                    rect instanceof SVGRectElement, [box.x, box.y, box.width, box.height],
+                ],
+                workerReplies: [],
+                asyncSurfaces: {},
+            };
+            navigator.getBattery().then(battery => {
+                __southwestProtectionProbe.asyncSurfaces.battery = [
+                    battery.charging, battery.chargingTime, battery.dischargingTime, battery.level,
+                ];
+            });
+            navigator.storage.estimate().then(storage => {
+                __southwestProtectionProbe.asyncSurfaces.storageQuota = storage.quota;
+            });
+            document.hasStorageAccess().then(value => {
+                __southwestProtectionProbe.asyncSurfaces.storageAccess = value;
+            });
+            __southwestProtectionProbe.asyncSurfaces.network = [
+                navigator.connection.downlink, navigator.connection.effectiveType,
+                navigator.connection.rtt, navigator.connection.saveData,
+            ];
+            window.addEventListener('deviceorientation', event => {
+                __southwestProtectionProbe.asyncSurfaces.orientation = [
+                    event.absolute, event.alpha, event.beta, event.gamma,
+                    event instanceof DeviceOrientationEvent,
+                ];
+            });
+
+            // The protection layer wraps the prototype descriptor so its
+            // internal {n,s,w,b} protocol never reaches the page handler.
+            const nativeOnMessage = Object.getOwnPropertyDescriptor(Worker.prototype, 'onmessage');
+            const pageHandlers = new WeakMap();
+            Object.defineProperty(Worker.prototype, 'onmessage', {
+                configurable: true,
+                enumerable: true,
+                get() { return pageHandlers.get(this) || null; },
+                set(value) {
+                    pageHandlers.set(this, value);
+                    nativeOnMessage.set.call(this, event => {
+                        if (!isProtocolMessage(event.data)) value.call(this, event);
+                    });
+                },
+            });
+
+            const source = `
+                const isProtocolMessage = data => data &&
+                    Object.prototype.hasOwnProperty.call(data, 'b') &&
+                    typeof data.n === 'number';
+                const nativeAdd = self.EventTarget.prototype.addEventListener;
+                let applicationHandler = null;
+                nativeAdd.call(self, 'message', event => {
+                    if (isProtocolMessage(event.data)) {
+                        Object.defineProperty(self, 'onmessage', {
+                            configurable: true,
+                            get() { return applicationHandler; },
+                            set(value) { applicationHandler = value; },
+                        });
+                        self.onmessage = event => postMessage({
+                            value: event.data.value,
+                            scope: [self.constructor.name, Object.prototype.toString.call(self),
+                                self instanceof WorkerGlobalScope,
+                                self instanceof DedicatedWorkerGlobalScope,
+                                navigator.constructor.name,
+                                Object.prototype.toString.call(navigator),
+                                Object.getOwnPropertyNames(navigator)],
+                        });
+                        return;
+                    }
+                    if (applicationHandler) applicationHandler.call(self, event);
+                });
+                postMessage({n: 1, s: 'bootstrap', w: 0, b: undefined});
+            `;
+            const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+            const worker = new Worker(workerUrl);
+            worker.onmessage = event => {
+                __southwestProtectionProbe.workerReplies.push(event.data);
+                worker.terminate();
+                URL.revokeObjectURL(workerUrl);
+            };
+            worker.postMessage({n: 2, s: 'configure', w: 1, b: undefined});
+            worker.postMessage({value: 'application'});
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        let result = rt.evaluate("__southwestProtectionProbe").unwrap();
+        assert_eq!(result["navigator"], serde_json::json!([
+            true, "MacIntel", "en", ["en", "zh-CN"], 15, 32, "1", false
+        ]));
+        assert_eq!(result["plugins"], serde_json::json!({
+            "count": 5,
+            "lengths": [2, 2, 2, 2, 2],
+            "types": ["application/pdf", "text/pdf"],
+            "enabledPlugin": "PDF Viewer",
+        }));
+        assert_eq!(result["chrome"], serde_json::json!([
+            "object", "function", "function", "undefined", "function"
+        ]));
+        assert_eq!(result["browserShape"], serde_json::json!([
+            "Mozilla", "Netscape", true, "function",
+            ["onmessage", "postMessage", "terminate", "constructor", "onerror"],
+            false, false, "InvalidCharacterError"
+        ]));
+        assert_eq!(result["base64"], serde_json::json!([
+            "AH+A/w==", [0, 127, 128, 255], "InvalidCharacterError"
+        ]));
+        assert_eq!(result["webgl"], serde_json::json!([
+            300, 150, "WebKit", "WebKit WebGL", "Google Inc. (Apple)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)",
+            [255, 0, 0, 255]
+        ]));
+        assert_eq!(result["svg"], serde_json::json!([
+            true, 11, [5, 4], true, [10, 20, 30, 40]
+        ]));
+        assert_eq!(result["workerReplies"], serde_json::json!([{
+            "value": "application",
+            "scope": ["DedicatedWorkerGlobalScope", "[object DedicatedWorkerGlobalScope]",
+                true, true, "WorkerNavigator", "[object WorkerNavigator]", []]
+        }]));
+        assert_eq!(result["asyncSurfaces"], serde_json::json!({
+            "battery": [true, null, null, 0.8],
+            "storageQuota": 10738064711u64,
+            "storageAccess": true,
+            "network": [10, "4g", 100, false],
+            "orientation": [false, null, null, null, true],
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_exposes_worker_global_intrinsics_without_window() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-global-intrinsics", r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                const value = {};
+                self.Object.defineProperty(value, 'answer', { value: 42 });
+                postMessage([
+                    value.answer,
+                    globalThis === self,
+                    typeof globalThis.JSON.stringify,
+                    typeof navigator.userAgent,
+                    typeof navigator.deviceMemory,
+                    self.WebSocket.OPEN,
+                    self.XMLHttpRequest.DONE,
+                    typeof self.indexedDB.open,
+                    typeof navigator.storage.estimate,
+                    typeof self.importScripts,
+                    typeof window,
+                    typeof document,
+                    typeof localStorage,
+                ]);
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([[42, true, "function", "string", "number", 1, 4, "function", "function", "function", "undefined", "undefined", "undefined"]])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_scopes_keep_counters_and_handlers_independent() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -7944,6 +8512,26 @@ mod tests {
     }
 
     #[test]
+    fn create_element_accepts_unicode_xml_names_and_rejects_invalid_names() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt.evaluate(r#"(function() {
+            const valid = ['div', '中文', 'élement', 'x:y', '_node', '𐀀node'];
+            const invalid = ['1node', 'a b', 'a/b', '', '\u0300node', '\u{F0000}node', 'a\n', 'a\r'];
+            return [valid.map(name => document.createElement(name).localName),
+                invalid.map(name => {
+                    try { document.createElement(name); return 'accepted'; }
+                    catch (error) { return error.name; }
+                })];
+        })()"#).unwrap();
+        assert_eq!(out, serde_json::json!([
+            ["div", "中文", "élement", "x:y", "_node", "𐀀node"],
+            ["InvalidCharacterError", "InvalidCharacterError", "InvalidCharacterError",
+                "InvalidCharacterError", "InvalidCharacterError", "InvalidCharacterError",
+                "InvalidCharacterError", "InvalidCharacterError"]
+        ]));
+    }
+
+    #[test]
     fn set_attribute_ns_is_retrievable_by_namespace_and_local_name() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let v = rt
@@ -8579,6 +9167,29 @@ mod tests {
                 "undefined"
             ])
         );
+    }
+
+    #[test]
+    fn svg_geometry_exposes_shape_bounds_and_path_metrics() {
+        let mut rt = setup_runtime(
+            r#"<html><body><svg id="root"><rect id="box" x="10" y="20" width="30" height="40"></rect><path id="path" d="M0 0 L3 4 L9 4"></path></svg><div id="html"></div></body></html>"#,
+        );
+        let result = rt.evaluate(r#"(() => {
+            const box = document.getElementById('box');
+            const path = document.getElementById('path');
+            const bbox = box.getBBox();
+            const point = path.getPointAtLength(7);
+            return [
+                box instanceof SVGRectElement,
+                [bbox.x,bbox.y,bbox.width,bbox.height],
+                path.getTotalLength(), [point.x,point.y],
+                typeof document.getElementById('root').createSVGPoint,
+                typeof document.getElementById('html').getBBox,
+            ];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true, [10,20,30,40], 11, [5,4], "function", "undefined"
+        ]));
     }
 
     #[test]
@@ -15634,24 +16245,54 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_webgl_context_does_not_claim_success() {
+    fn software_webgl_context_exposes_chrome_identity_and_rasterizes_triangles() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt
             .evaluate(
                 r#"
                 (() => {
                     const canvas = document.querySelector('canvas');
-                    const fallback = document.createElement('p');
-                    if (!canvas.getContext('webgl')) {
-                        fallback.textContent = 'static fallback';
-                        document.body.appendChild(fallback);
+                    canvas.width = 256; canvas.height = 24;
+                    const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
+                    const vertices = gl.createBuffer();
+                    gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
+                    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+                        -.75,.75,0, -.75,-.75,0, .75,-.75,0, .75,.75,0,
+                    ]), gl.STATIC_DRAW);
+                    const indices = gl.createBuffer();
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indices);
+                    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([3,2,1,3,1,0]), gl.STATIC_DRAW);
+                    const vertex = gl.createShader(gl.VERTEX_SHADER);
+                    gl.shaderSource(vertex, 'attribute vec3 coordinates; void main(){gl_Position=vec4(coordinates,1.0);}');
+                    gl.compileShader(vertex);
+                    const fragment = gl.createShader(gl.FRAGMENT_SHADER);
+                    gl.shaderSource(fragment, 'void main(){gl_FragColor=vec4(255,0,0,1);}');
+                    gl.compileShader(fragment);
+                    const program = gl.createProgram();
+                    gl.attachShader(program, vertex); gl.attachShader(program, fragment);
+                    gl.linkProgram(program); gl.useProgram(program);
+                    gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indices);
+                    const coordinate = gl.getAttribLocation(program, 'coordinates');
+                    gl.vertexAttribPointer(coordinate, 3, gl.FLOAT, false, 0, 0);
+                    gl.enableVertexAttribArray(coordinate);
+                    gl.viewport(0, 0, canvas.width, canvas.height);
+                    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+                    const pixels = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
+                    gl.readPixels(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+                    let red = 0;
+                    for (let i = 0; i < pixels.length; i += 4) {
+                        if (pixels[i] === 255 && pixels[i + 1] === 0 && pixels[i + 2] === 0 && pixels[i + 3] === 255) red++;
                     }
+                    const gl2 = document.createElement('canvas').getContext('webgl2');
                     return [
-                        canvas.getContext('webgl'),
+                        gl instanceof WebGLRenderingContext,
+                        canvas.getContext('experimental-webgl') === gl,
                         canvas.getContext('webgl2'),
-                        canvas.getContext('experimental-webgl'),
-                        fallback.isConnected,
-                        fallback.textContent,
+                        gl2 instanceof WebGL2RenderingContext,
+                        gl.drawingBufferWidth, gl.drawingBufferHeight,
+                        gl.getParameter(gl.VENDOR), gl.getParameter(gl.RENDERER),
+                        gl.getParameter(gl.MAX_TEXTURE_SIZE), red,
                     ];
                 })()
                 "#,
@@ -15659,7 +16300,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!([null, null, null, true, "static fallback"])
+            serde_json::json!([true, true, null, true, 256, 24, "WebKit", "WebKit WebGL", 16384, 3456])
         );
     }
 
@@ -17707,6 +18348,22 @@ mod tests {
         assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
+        let pdf_plugins = rt
+            .evaluate(
+                r#"({
+                    lengths: Array.from(navigator.plugins, plugin => plugin.length),
+                    types: Array.from(navigator.plugins[0], mime => mime.type),
+                    enabledPlugin: navigator.mimeTypes[0].enabledPlugin.name,
+                    chromeRuntime: typeof chrome.runtime,
+                    requestFileSystem: typeof webkitRequestFileSystem,
+                })"#,
+            )
+            .unwrap();
+        assert_eq!(pdf_plugins["lengths"], serde_json::json!([2, 2, 2, 2, 2]));
+        assert_eq!(pdf_plugins["types"], serde_json::json!(["application/pdf", "text/pdf"]));
+        assert_eq!(pdf_plugins["enabledPlugin"], "PDF Viewer");
+        assert_eq!(pdf_plugins["chromeRuntime"], "undefined");
+        assert_eq!(pdf_plugins["requestFileSystem"], "function");
         let plugin_interfaces = rt
             .evaluate(
                 r#"({
@@ -19854,6 +20511,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn css_preload_completes_without_applying_styles_or_fetching_imports() {
+        let mut rt = setup_runtime("<html><head></head><body><div class='card'></div></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const original = Deno.core.ops.op_fetch_url;
+            const requests = [];
+            try {
+                Deno.core.ops.op_fetch_url = url => {
+                    requests.push(url);
+                    return JSON.stringify({status: url.endsWith('missing.css') ? 404 : 200,
+                        body: '@import "nested.css"; .card {color:red}', url});
+                };
+                const load = name => new Promise(resolve => {
+                    const link = document.createElement('link');
+                    link.rel = 'preload'; link.as = 'style'; link.href = '/assets/' + name;
+                    link.onload = () => resolve('load');
+                    link.onerror = () => resolve('error');
+                    document.head.appendChild(link);
+                });
+                const events = await Promise.race([
+                    Promise.all([load('route.css'), load('missing.css')]),
+                    new Promise(resolve => setTimeout(() => resolve(['timeout']), 100))
+                ]);
+                return {events, requests: requests.length, applied: document.styleSheets.length};
+            } finally { Deno.core.ops.op_fetch_url = original; }
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "events": ["load", "error"], "requests": 2, "applied": 0
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
         let mut rt =
             setup_runtime("<html><head></head><body><div class=\"card\"></div></body></html>");
@@ -20041,6 +20729,53 @@ mod tests {
                 "pending": false,
             })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_classic_script_runs_after_post_insertion_callback_assignment() {
+        let mut rt = setup_runtime("<html><head><script></script></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    globalThis.advc = {_cc: {}};
+                    globalThis.__sixValue = null;
+                    try {
+                        let completeFetch;
+                        Deno.core.ops.op_fetch_url = url => new Promise(resolve => {
+                            completeFetch = () => resolve(JSON.stringify({
+                                status: 200,
+                                headers: {"content-type": "text/javascript"},
+                                body: "window['advc']._cc.six('ipv6-proof')",
+                                url,
+                            }));
+                        });
+                        const script = document.createElement("script");
+                        script.async = true;
+                        script.src = "/di/swa6/6.js?namespace=advc";
+                        const loaded = new Promise(resolve => { script.onload = resolve; });
+                        const first = document.getElementsByTagName("script")[0];
+                        first.parentNode.insertBefore(script, first);
+                        window.advc._cc.six = value => { globalThis.__sixValue = value; };
+                        completeFetch();
+                        const deadlineValue = new Promise(resolve => {
+                            setTimeout(() => resolve(globalThis.__sixValue), 0);
+                        });
+                        await loaded;
+                        return [globalThis.__sixValue, await deadlineValue, script.async];
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!(["ipv6-proof", "ipv6-proof", true]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20326,6 +21061,19 @@ mod tests {
                 [true, true, ""]
             ])
         );
+    }
+
+    #[test]
+    fn web_storage_is_origin_scoped_and_quota_failure_preserves_values() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://one.test/start");
+        rt.evaluate("(localStorage.consent='agreed',sessionStorage.tab='one')").unwrap();
+        rt.set_url("https://two.test/");
+        assert_eq!(rt.evaluate("[localStorage.consent,sessionStorage.tab,localStorage.length]").unwrap(), serde_json::json!([null,null,0]));
+        rt.evaluate("localStorage.consent='other'").unwrap();
+        rt.set_url("https://one.test/next");
+        assert_eq!(rt.evaluate("[localStorage.consent,sessionStorage.tab,Object.keys(localStorage)]").unwrap(), serde_json::json!(["agreed","one",["consent"]]));
+        assert_eq!(rt.evaluate("(()=>{try{localStorage.setItem('consent','x'.repeat(2621441))}catch(e){return [e.name,localStorage.consent]}})()").unwrap(), serde_json::json!(["QuotaExceededError","agreed"]));
     }
 
     #[test]
@@ -21306,6 +22054,62 @@ mod tests {
     // conflicts when both this branch and an unrelated bootstrap.js change
     // add tests near the start of `mod tests`).
 
+    #[test]
+    fn text_node_text_content_updates_connected_text_without_children() {
+        let mut rt = setup_runtime("<div id='root'>Tokyo</div>");
+        let value = rt.evaluate(r#"(() => {
+            const parent = document.getElementById('root');
+            const text = parent.firstChild;
+            text.textContent = 'Kuala Lumpur';
+            return [parent.textContent, text.data, text.childNodes.length];
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!(["Kuala Lumpur", "Kuala Lumpur", 0]));
+    }
+
+    #[test]
+    fn named_document_form_submits_callback_and_tracks_replacement() {
+        let mut rt = setup_runtime(r#"<form name="callbackform" action="https://example.com/complete" method="post"><input name="ticket" value="fixture"></form>"#);
+        let result = rt.evaluate(r#"(() => {
+            const original = document.querySelector('form');
+            if (document.callbackform !== original) return false;
+            const replacement = document.createElement('form');
+            replacement.name = 'callbackform';
+            replacement.action = 'https://example.com/complete';
+            replacement.method = 'post';
+            original.replaceWith(replacement);
+            if (document.callbackform !== replacement) return false;
+            document.callbackform.submit();
+            replacement.remove();
+            return document.callbackform === undefined;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(true));
+        let navigation = rt.take_pending_navigation_request().expect("named form submits normally");
+        assert_eq!(navigation.method, "POST");
+        assert_eq!(navigation.url, "https://example.com/complete");
+    }
+
+    #[test]
+    fn element_brand_preserves_dom_references_in_config_merge() {
+        let mut rt = setup_runtime(r#"<div id="slider"><span>slide</span></div>"#);
+        let result = rt.evaluate(r#"(() => {
+            const el = document.getElementById('slider');
+            const plain = value => value !== null && typeof value === 'object' &&
+                value.constructor && Object.prototype.toString.call(value) === '[object Object]';
+            function merge(target, source) {
+                if (source instanceof HTMLElement) return target;
+                for (const key of Object.keys(source)) {
+                    target[key] = plain(source[key]) ? merge({}, source[key]) : source[key];
+                }
+                return target;
+            }
+            const config = merge({}, {el, options: {enabled: true}});
+            return [Object.prototype.toString.call(el),
+                Object.prototype.toString.call(el.firstElementChild),
+                config.el === el, config.options.enabled];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["[object HTMLDivElement]", "[object HTMLSpanElement]", true, true]));
+    }
+
     /// Playwright >= 1.25 calls `element.checkVisibility(...)` before every
     /// input event. If the method isn't defined Playwright retries until its
     /// action timeout fires. Without a layout engine we can't compute it
@@ -22169,6 +22973,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intl_locale_follows_configured_persona_locale() {
+        let mut rt = ObscuraJsRuntime::with_base_url_proxy_and_locale(
+            "http://example.com/test",
+            None,
+            "en",
+        );
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("http://example.com/test");
+        rt.set_locale("en", &["en".into(), "zh-CN".into()]);
+        rt.run_page_init();
+        assert_eq!(
+            rt.evaluate("[Intl.DateTimeFormat().resolvedOptions().locale,navigator.language,navigator.languages]").unwrap(),
+            serde_json::json!(["en", "en", ["en", "zh-CN"]])
+        );
+    }
+
     // Momentic POC / Playwright getByLabel: the label association getters must
     // link <label for> to its control and expose element.labels, both for
     // for-linked and wrapping labels.
@@ -22211,4 +23032,5 @@ mod tests {
             "label association must follow the HTML labelable-element rules"
         );
     }
+
 }

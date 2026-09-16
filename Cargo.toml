@@ -57,6 +57,7 @@ anyhow = "1"
 base64 = "0.22"
 
 [patch.crates-io]
+primp = { path = "vendor/primp" }
 # Keep the grid shrink-to-fit correction local until it lands upstream.
 taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and

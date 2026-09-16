@@ -87,3 +87,12 @@ The deterministic render harness produced 65 paired captures; four assertions
 failed on the Chrome side. Fifteen real sites were captured at both top and
 bottom, with unstable or blank states excluded from fidelity comparisons.
 These checks are local integration evidence, not a release or deployment claim.
+
+## Playwright-style asynchronous SDK
+
+Protocol 2 adds the [high-level Python SDK](../bindings/python/README.md):
+`Browser`, `Page`, locators with native auto-waiting, and bounded network evidence.
+This still embeds Obscura over RPC. Existing `BrowserSession` consumers retain
+protocol 1. The [ZG checkout example](../examples/zg/README.md) exercises a shared
+workflow against a local fixture and, with private inputs, the live payment-before
+boundary. Offline results do not establish website checkout compatibility.

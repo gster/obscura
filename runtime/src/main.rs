@@ -17,10 +17,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut input = protocol::input();
     loop {
         let takeover_deadline = runtime.takeover_deadline();
+        let automation_active = runtime.uses_automation();
         let request = tokio::select! {
             biased;
             _ = input.closed.changed() => break,
             value = input.controls.recv() => value,
+            value = input.evidence.recv() => {
+                if let Some(request)=value {protocol::output(browser::network::evidence_response(&runtime.network_snapshot(),&request))?;}
+                continue;
+            },
             _ = tokio::time::sleep_until(takeover_deadline) => {
                 let deadline=runtime.manual_operation_deadline();
                 let closed=runtime.takeover.as_ref().map(|c|c.closure());
@@ -55,25 +60,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             },
             value = input.actions.recv() => value,
+            _ = tokio::time::sleep(Duration::from_millis(20)), if automation_active => {
+                if !matches!(tokio::time::timeout(Duration::from_millis(30250), runtime.automation_tick()).await, Ok(Ok(()))) {
+                    runtime.poisoned = true;
+                }
+                continue;
+            },
         };
         let Some(request) = request else {
             break;
         };
         let close = request.method == "close";
         let id = request.id;
-        let response = tokio::select! {
-            biased;
-            _ = input.closed.changed() => break,
-            result = tokio::time::timeout(Duration::from_millis(request.timeout_ms), runtime.handle(&request)) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        runtime.poisoned = true;
-                        protocol::error(id, "BROWSER_TIMEOUT", "UNKNOWN")
+        let networks=runtime.network_snapshot();
+        let hard_timeout=request.timeout_ms + if runtime.uses_automation() {250} else {0};
+        let mut timed_out=false;
+        let response = {
+            let operation=tokio::time::timeout(Duration::from_millis(hard_timeout),runtime.handle(&request));
+            tokio::pin!(operation);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = input.closed.changed() => return Ok(()),
+                    value=input.evidence.recv()=>{
+                        if let Some(read)=value {protocol::output(browser::network::evidence_response(&networks,&read))?;}
+                    },
+                    result=&mut operation=>break match result {
+                        Ok(result)=>result,
+                        Err(_)=>{timed_out=true;protocol::error(id,"BROWSER_TIMEOUT","UNKNOWN")}
                     }
                 }
             }
         };
+        if timed_out {runtime.poisoned=true;}
         protocol::output(response)?;
         if close {
             break;

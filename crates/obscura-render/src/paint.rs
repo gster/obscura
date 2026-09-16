@@ -1173,10 +1173,25 @@ impl PreparedRender {
                 // Opacity zero alone is deliberately not an exclusion.
                 if style.display == crate::Display::None
                     || pseudo.display == crate::Display::None
-                    || style.visibility_hidden == Some(true)
+                    || pseudo.visibility_hidden.or(style.visibility_hidden) == Some(true)
+                    || pseudo.pointer_events_none.or(style.pointer_events_none) == Some(true)
                 {
                     continue;
                 }
+                // A display:none ancestor suppresses the entire subtree,
+                // including pseudos whose own computed display is visible.
+                let mut ancestor = crate::dom::rendered_parent(tree, host);
+                let mut suppressed = false;
+                while let Some(candidate) = ancestor {
+                    if self.layout.styles.get(&candidate)
+                        .is_some_and(|style| style.display == crate::Display::None)
+                    {
+                        suppressed = true;
+                        break;
+                    }
+                    ancestor = crate::dom::rendered_parent(tree, candidate);
+                }
+                if suppressed { continue; }
                 let rect = self
                     .viewport_rect_with_scroll(host, scroll)
                     .ok_or("INPUT_GEOMETRY_UNSUPPORTED")?;
@@ -1203,8 +1218,15 @@ impl PreparedRender {
                     self.viewport,
                     self.root_font_size,
                     None,
-                )
-                .ok_or("INPUT_GEOMETRY_UNSUPPORTED")?;
+                );
+                let Some(bounds) = bounds else {
+                    // Match paint_positioned_pseudo: without generated text,
+                    // unresolved/zero dimensions produce no painted box.
+                    if pseudo.before_content.as_deref().is_none_or(str::is_empty) {
+                        continue;
+                    }
+                    return Err("INPUT_GEOMETRY_UNSUPPORTED");
+                };
                 if point_in_rect(point, bounds) {
                     return Err("INPUT_GEOMETRY_UNSUPPORTED");
                 }

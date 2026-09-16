@@ -15,7 +15,7 @@ Obscura is an open-source headless browser engine written in Rust. It runs JavaS
 Rendering and stealth are both first-class capabilities. Release builds
 support screenshots, scroll-aware layout, activity-driven CDP screencasting,
 and raster PDF export; stealth builds retain all of those surfaces while adding
-the wreq/BoringSSL transport and browser-identity protections.
+the primp/Rustls transport and browser-identity protections.
 
 ## Quickstart
 
@@ -34,6 +34,7 @@ the wreq/BoringSSL transport and browser-identity protections.
 - [Use the MCP server](Use-the-MCP-server.md)
 - [Use as a Rust library](Use-as-a-Rust-library.md)
 - [Use the isolated runtime](Use-the-isolated-runtime.md)
+- [Obscura 修复日志](Obscura-fix-changelog.md)
 - [Persist cookies and storage](Persist-cookies-and-storage.md)
 - [Intercept and modify requests](Intercept-and-modify-requests.md)
 - [Run in production at scale](Run-in-production-at-scale.md)
@@ -48,6 +49,8 @@ the wreq/BoringSSL transport and browser-identity protections.
 - [Architecture overview](Architecture-overview.md)
 - [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 - [Testing and debugging](Testing-and-debugging.md)
+- [Southwest 任务进度与后续排查](Southwest-task-status.md)
+- [Protection script regression case](Protection-script-regression-case.md)
 
 ## Links
 
