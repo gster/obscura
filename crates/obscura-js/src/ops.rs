@@ -5302,7 +5302,27 @@ mod tests {
 
     use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
     use super::intercept_fulfill_response;
+    use super::url_set_inner;
     use base64::{engine::general_purpose::STANDARD as FULFILL_BASE64, Engine as _};
+
+    // #1008: URL property setters must follow WHATWG — search/hash keep a bare
+    // delimiter as an empty component, and port parses the leading digits.
+    #[test]
+    fn url_setters_follow_whatwg_search_hash_and_port() {
+        // search = "?" keeps an empty query -> serializes with a trailing "?".
+        let r = url_set_inner("http://example.com/path", "search", "?").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path?"));
+        // search = "" removes the query.
+        let r = url_set_inner("http://example.com/path?a=1", "search", "").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path"));
+        // hash = "#" keeps an empty fragment.
+        let r = url_set_inner("http://example.com/path", "hash", "#").unwrap();
+        assert_eq!(r["href"], serde_json::json!("http://example.com/path#"));
+        // port = "8080abc" parses the leading digits -> 8080.
+        let r = url_set_inner("http://example.com/", "port", "8080abc").unwrap();
+        assert_eq!(r["port"], serde_json::json!("8080"));
+        assert_eq!(r["href"], serde_json::json!("http://example.com:8080/"));
+    }
 
     #[test]
     fn cors_request_header_safelist_checks_values() {
@@ -7101,18 +7121,31 @@ fn url_set_inner(href: &str, part: &str, value: &str) -> Option<serde_json::Valu
         "port" => {
             if value.is_empty() {
                 let _ = u.set_port(None);
-            } else if let Ok(p) = value.parse::<u16>() {
-                let _ = u.set_port(Some(p));
+            } else {
+                // WHATWG port-state parser consumes the leading digits and stops
+                // at the first non-digit, so "8080abc" sets port 8080.
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(p) = digits.parse::<u16>() {
+                    let _ = u.set_port(Some(p));
+                }
             }
         }
         "pathname" => u.set_path(value),
         "search" => {
-            let q = value.strip_prefix('?').unwrap_or(value);
-            u.set_query(if q.is_empty() { None } else { Some(q) });
+            // WHATWG: a null query only for the empty string; a bare "?" is an
+            // empty (not null) query that serializes with a trailing "?".
+            if value.is_empty() {
+                u.set_query(None);
+            } else {
+                u.set_query(Some(value.strip_prefix('?').unwrap_or(value)));
+            }
         }
         "hash" => {
-            let f = value.strip_prefix('#').unwrap_or(value);
-            u.set_fragment(if f.is_empty() { None } else { Some(f) });
+            if value.is_empty() {
+                u.set_fragment(None);
+            } else {
+                u.set_fragment(Some(value.strip_prefix('#').unwrap_or(value)));
+            }
         }
         _ => {}
     }
