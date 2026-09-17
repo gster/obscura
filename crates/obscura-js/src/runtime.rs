@@ -541,7 +541,7 @@ fn scroll_node_into_view(
 }
 
 pub struct ObscuraJsRuntime {
-    state: Rc<RefCell<ObscuraState>>,
+    pub(crate) state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
@@ -743,7 +743,7 @@ const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 /// So the isolate is exited once construction finishes and entered again only
 /// around work that touches V8. Entries are then properly nested no matter how
 /// many pages exist or what order they are used and dropped in.
-struct EnteredRuntime<'a>(&'a mut JsRuntime);
+pub(crate) struct EnteredRuntime<'a>(&'a mut JsRuntime);
 
 /// Enters an isolate only while an async deno_core operation is being polled.
 /// Holding an entry across `.await` would let interleaved page futures violate
@@ -865,7 +865,7 @@ impl ObscuraJsRuntime {
     /// The V8 runtime, with its isolate entered for as long as the returned
     /// guard lives. Every path that touches V8 goes through here; see
     /// [`EnteredRuntime`] for why.
-    fn runtime(&mut self) -> EnteredRuntime<'_> {
+    pub(crate) fn runtime(&mut self) -> EnteredRuntime<'_> {
         // SAFETY: entering is always sound -- it pushes this isolate onto the
         // current thread's entry stack -- and the guard's `Drop` pops it.
         unsafe {
@@ -999,16 +999,7 @@ impl ObscuraJsRuntime {
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
         let ops_handoff = instance.take_ops_handoff();
-        if let Some(ref ops) = ops_handoff {
-            instance
-                .runtime()
-                .op_state()
-                .borrow_mut()
-                .put(crate::worker::OpsHandoff(ops.clone()));
-        }
         let worker_reg = std::rc::Rc::new(std::cell::RefCell::new(crate::worker::WorkerRegistry::default()));
-        let main_ctx = instance.runtime().main_context();
-        worker_reg.borrow_mut().main_context = Some(main_ctx);
         instance
             .runtime()
             .op_state()
@@ -1041,6 +1032,42 @@ impl ObscuraJsRuntime {
         }
 
         instance
+    }
+
+    pub(crate) fn execute_worker_script(&mut self, source: &str) -> Result<(), String> {
+        use deno_core::v8;
+        let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
+        let result = (|| {
+            let mut runtime = self.runtime();
+            let scope = &mut runtime.handle_scope();
+            let scope = &mut v8::TryCatch::new(scope);
+            let source = v8::String::new(scope, source).ok_or("Worker source allocation failed")?;
+            let result = v8::Script::compile(scope, source, None).and_then(|script| script.run(scope));
+            if result.is_some() { Ok(()) } else {
+                Err(crate::worker::extract_exception_message(scope).unwrap_or_else(|| "Worker execution terminated".into()))
+            }
+        })();
+        self.disarm_watchdog(watchdog);
+        result
+    }
+
+    pub(crate) fn initialize_worker_scope(&mut self, id: u32, url: &str) -> Result<(), String> {
+        use deno_core::v8;
+        let ops = self.ops_handoff.clone().ok_or("Worker ops unavailable")?;
+        let main = self.runtime().main_context();
+        let mut runtime = self.runtime();
+        let scope = &mut v8::HandleScope::with_context(runtime.v8_isolate(), main);
+        let scope = &mut v8::TryCatch::new(scope);
+        let source = v8::String::new(scope, crate::worker::WORKER_BOOTSTRAP_JS).ok_or("Worker bootstrap unavailable")?;
+        let script = v8::Script::compile(scope, source, None).ok_or("Worker bootstrap compile failed")?;
+        let value = script.run(scope).ok_or("Worker bootstrap failed")?;
+        let function = v8::Local::<v8::Function>::try_from(value).map_err(|_| "Invalid worker bootstrap")?;
+        let ops = v8::Local::new(scope, &ops);
+        let id = v8::Integer::new_from_unsigned(scope, id);
+        let url = v8::String::new(scope, url).ok_or("Worker URL unavailable")?;
+        let receiver = v8::undefined(scope);
+        function.call(scope, receiver.into(), &[id.into(), url.into(), ops]).ok_or("Worker initialization failed")?;
+        Ok(())
     }
 
     /// Creates an additional realm in this isolate: a second `v8::Context`.
@@ -1762,6 +1789,7 @@ impl ObscuraJsRuntime {
 
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
         self.state.borrow_mut().blocked_urls = patterns;
+        crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
     }
 
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
@@ -1902,10 +1930,12 @@ impl ObscuraJsRuntime {
 
     pub fn set_runtime_events_enabled(&self, enabled: bool) {
         self.state.borrow_mut().runtime_events_enabled = enabled;
+        crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
     }
 
     pub fn set_console_messages_enabled(&self, enabled: bool) {
         self.state.borrow_mut().console_messages_enabled = enabled;
+        crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
     }
 
     pub fn take_pending_console_messages(&self) -> Vec<String> {
@@ -1999,11 +2029,15 @@ impl ObscuraJsRuntime {
     ) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);
+        drop(state);
+        crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
     }
 
     pub fn set_intercept_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.intercept_enabled = enabled;
+        drop(state);
+        crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
     }
 
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
@@ -7213,6 +7247,364 @@ mod tests {
                 0,
             ])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_identity_getters_can_reenter_and_fail_without_leaking_threads() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let resources = rt.runtime().op_state().borrow()
+            .borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>().borrow().resources.clone();
+        rt.execute_script("worker-identity-getter", r#"
+            globalThis.__identityReplies = [];
+            const url = URL.createObjectURL(new Blob(["postMessage('ready');"], {type:'application/javascript'}));
+            Object.defineProperty(globalThis, '__obscura_languages', {configurable:true, get() {
+                console.log('identity getter'); return ['en-US'];
+            }});
+            const worker = new Worker(url);
+            worker.onmessage = event => { __identityReplies.push(event.data); worker.terminate(); };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__identityReplies").unwrap(), serde_json::json!(["ready"]));
+        rt.execute_script("worker-failed-identity", r#"
+            globalThis.__identityErrors = [];
+            Object.defineProperty(globalThis, '__obscura_languages', {configurable:true, get() {
+                throw new Error('identity capture failed');
+            }});
+            const failed = new Worker(url);
+            failed.onerror = error => __identityErrors.push(error.message);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__identityErrors").unwrap(), serde_json::json!(["identity capture failed"]));
+        drop(rt);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while resources.active_workers() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_observes_network_policy_enabled_after_startup() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("http://127.0.0.1:9/page");
+        rt.run_page_init();
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        rt.execute_script("worker-live-policy", r#"
+            globalThis.__policyReady = false;
+            globalThis.__policyReplies = [];
+            const url = URL.createObjectURL(new Blob([`
+                onmessage = async event => {
+                    console.log('worker-policy', event.data);
+                    try { const response = await fetch(event.data); postMessage(await response.text()); }
+                    catch(error) { postMessage(error.name); }
+                };
+                postMessage('ready');
+            `], {type:'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                if(event.data === 'ready') __policyReady = true;
+                else {
+                    __policyReplies.push(event.data);
+                    if (__policyReplies.length === 2) worker.terminate();
+                }
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__policyReady").unwrap(), serde_json::json!(true));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.set_blocked_urls(vec!["blocked".into()]);
+        rt.set_console_messages_enabled(true);
+        rt.execute_script("send-policy-requests", r#"
+            worker.postMessage('http://127.0.0.1:9/allowed');
+            worker.postMessage('http://127.0.0.1:9/blocked');
+        "#).unwrap();
+        let mut intercepted = Vec::new();
+        let intercept = async {
+            while let Some(request) = rx.recv().await {
+                intercepted.push(request.url.clone());
+                request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                    status:200, headers:HashMap::new(), body:"policy-applied".into(), body_base64:String::new(),
+                }).unwrap();
+            }
+        };
+        tokio::select! {
+            result = rt.run_event_loop_bounded(1000) => result.unwrap(),
+            _ = intercept => panic!("interception channel closed"),
+        }
+        assert_eq!(rt.evaluate("__policyReplies.sort()").unwrap(), serde_json::json!(["AbortError", "policy-applied"]));
+        assert_eq!(intercepted, vec!["http://127.0.0.1:9/allowed"]);
+        let console = rt.take_pending_console_messages();
+        assert_eq!(console.iter().filter(|line| line.contains("worker-policy")).count(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_owner_drop_stops_running_nested_workers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let resources = rt.runtime().op_state().borrow()
+            .borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>().borrow().resources.clone();
+        rt.execute_script("nested-worker-teardown", r#"
+            globalThis.__nestedWorkerReady = false;
+            const source = `
+                const childUrl = URL.createObjectURL(new Blob(["postMessage('ready'); while(true) {}"], {type:'application/javascript'}));
+                const child = new Worker(childUrl);
+                child.onmessage = () => postMessage('ready');
+            `;
+            const url = URL.createObjectURL(new Blob([source], {type:'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = () => __nestedWorkerReady = true;
+        "#).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        assert_eq!(rt.evaluate("__nestedWorkerReady").unwrap(), serde_json::json!(true));
+        assert_eq!(resources.active_workers(), 2);
+        drop(rt);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while resources.active_workers() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("owner drop must stop nested workers without waiting for their watchdogs");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_network_keeps_interception_callbacks_and_response_bodies() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while seen.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 2048];
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = socket.read(&mut chunk).unwrap();
+                    if count == 0 { break; }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let body = match path {
+                    "/workers/main.js" => "fetch('data.txt').then(r=>r.text()).then(postMessage);",
+                    "/workers/data.txt" => "worker-data",
+                    "/page-data" => "page-data",
+                    _ => "wrong-path",
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nSet-Cookie: worker_probe=shared; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).unwrap();
+                seen.lock().unwrap().push(request);
+            }
+        });
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url(&format!("http://{address}/pages/index.html"));
+        rt.run_page_init();
+        let jar = Arc::new(obscura_net::CookieJar::new());
+        rt.set_cookie_jar(jar.clone());
+        rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(jar, None, true)));
+        let callbacks = Arc::new(obscura_net::CallbackRegistry::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_callback = observed.clone();
+        callbacks.add_request(Arc::new(move |request| observed_callback.lock().unwrap().push(request.url.clone())));
+        rt.set_callbacks(callbacks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.execute_script("worker-network", r#"
+            globalThis.__workerNetwork = null;
+            globalThis.__parentNetwork = null;
+            const worker = new Worker('/workers/main.js');
+            worker.onmessage = event => { __workerNetwork = event.data; worker.terminate(); };
+            fetch('/page-data').then(r=>r.text()).then(value=>__parentNetwork=value);
+        "#).unwrap();
+        let mut intercepted = Vec::new();
+        let intercept = async {
+            while let Some(request) = rx.recv().await {
+                intercepted.push((request.request_id.clone(), request.url.clone()));
+                request.resolver.send(crate::ops::InterceptResolution::Continue {
+                    url:None, method:None, headers:None, body:None,
+                }).unwrap();
+            }
+        };
+        tokio::select! {
+            result = rt.run_event_loop_bounded(3000) => result.unwrap(),
+            _ = intercept => panic!("interception channel closed unexpectedly"),
+        }
+        assert_eq!(rt.evaluate("[__workerNetwork,__parentNetwork]").unwrap(), serde_json::json!(["worker-data","page-data"]));
+        assert_eq!(intercepted.len(), 3, "worker requests must remain intercepted: {intercepted:?}");
+        let ids: std::collections::HashSet<_> = intercepted.iter().map(|(id,_)| id).collect();
+        assert_eq!(ids.len(), 3, "parent and worker interception IDs must not collide");
+        assert_eq!(observed.lock().unwrap().len(), 3);
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 3, "worker response events must reach the owner");
+        let ids: std::collections::HashSet<_> = events.iter().map(|event| &event.request_id).collect();
+        assert_eq!(ids.len(), 3);
+        let event = events.iter().find(|event| event.url.ends_with("/workers/data.txt")).unwrap();
+        assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, "worker-data");
+        assert!(requests.lock().unwrap().iter().any(|request| request.starts_with("GET /workers/data.txt ") && request.to_lowercase().contains("cookie: worker_probe=shared")));
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_messages_preserve_structured_values_in_both_directions() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-clone", r#"
+            globalThis.__workerClone = null;
+            const url = URL.createObjectURL(new Blob([`onmessage = event => postMessage(event.data);`], {type:'application/javascript'}));
+            const worker = new Worker(url);
+            const shared = {answer: 42};
+            const message = {bytes: new Uint8Array([1, 128, 255]), big: 123n,
+                date: new Date(1234), map: new Map([['key', shared]]),
+                set: new Set([shared]), a: shared, b: shared, missing: undefined};
+            message.self = message;
+            worker.onmessage = event => {
+                const value = event.data;
+                __workerClone = [value.bytes instanceof Uint8Array, Array.from(value.bytes),
+                    typeof value.big, String(value.big), value.date.getTime(),
+                    value.self === value, value.a === value.b,
+                    value.map.get('key') === value.a, value.set.has(value.a),
+                    Object.hasOwn(value, 'missing'), value.missing === undefined,
+                    value.a.answer];
+                worker.terminate(); URL.revokeObjectURL(url);
+            };
+            worker.postMessage(message);
+            shared.answer = 7;
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("__workerClone").unwrap(), serde_json::json!([
+            true, [1, 128, 255], "bigint", "123", 1234, true, true, true, true, true, true, 42
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_arraybuffer_transfer_detaches_only_after_successful_clone() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-transfer", r#"
+            globalThis.__workerTransfer = null;
+            const url = URL.createObjectURL(new Blob([`
+                onmessage = event => {
+                    postMessage(event.data, {transfer:[event.data.buffer]});
+                    postMessage({detached:event.data.buffer.byteLength === 0});
+                };`], {type:'application/javascript'}));
+            const worker = new Worker(url);
+            const bytes = new Uint8Array([3, 4, 5]);
+            const failures = [];
+            for (const [value, transfers] of [
+                [()=>{}, [bytes.buffer]], [bytes, [bytes.buffer, bytes.buffer]], [bytes, [bytes]]
+            ]) {
+                try { worker.postMessage(value, transfers); failures.push('accepted'); }
+                catch (error) { failures.push([error.name, bytes.buffer.byteLength]); }
+            }
+            worker.onmessage = event => {
+                if (event.data instanceof Uint8Array) {
+                    __workerTransfer = {values:Array.from(event.data), parentDetached:bytes.buffer.byteLength === 0, failures};
+                } else {
+                    __workerTransfer.workerDetached = event.data.detached;
+                    worker.terminate(); URL.revokeObjectURL(url);
+                }
+            };
+            worker.postMessage(bytes, [bytes.buffer]);
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("__workerTransfer").unwrap(), serde_json::json!({
+            "values":[3,4,5], "parentDetached":true, "workerDetached":true,
+            "failures":[["DataCloneError",3],["DataCloneError",3],["DataCloneError",3]]
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_cpu_task_does_not_block_parent_termination() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-cpu-task", r#"
+            globalThis.__workerTermination = null;
+            globalThis.__lateWorkerMessage = false;
+            const url = URL.createObjectURL(new Blob([`
+                postMessage('ready');
+                const until = Date.now() + 1000;
+                while (Date.now() < until) {}
+                postMessage('late');
+            `], {type: 'application/javascript'}));
+            const worker = new Worker(url);
+            const began = Date.now();
+            worker.onmessage = event => {
+                if (event.data === 'ready') {
+                    const received = Date.now();
+                    setTimeout(() => {
+                        worker.terminate();
+                        __workerTermination = {readyMs: received - began, terminateMs: Date.now() - began};
+                        URL.revokeObjectURL(url);
+                    }, 20);
+                } else __lateWorkerMessage = true;
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(2000).await.unwrap();
+        let result = rt.evaluate("__workerTermination").unwrap();
+        assert!(result["terminateMs"].as_u64().unwrap() < 800, "parent blocked: {result}");
+        assert_eq!(rt.evaluate("__lateWorkerMessage").unwrap(), serde_json::json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_close_finishes_current_task_but_discards_timers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-close", r#"
+            globalThis.__closedWorkerReplies = [];
+            const url = URL.createObjectURL(new Blob([`
+                setTimeout(() => postMessage('timer'), 20);
+                close();
+                postMessage('current-task');
+            `], {type: 'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = event => __closedWorkerReplies.push(event.data);
+        "#).unwrap();
+        rt.run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(rt.evaluate("__closedWorkerReplies").unwrap(), serde_json::json!(["current-task"]));
+        rt.execute_script("cleanup", "worker.terminate(); URL.revokeObjectURL(url);").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_timer_progresses_while_parent_is_busy() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-independent-timer", r#"
+            globalThis.__workerConcurrentResult = null;
+            const source = `
+                setTimeout(() => postMessage({ fired: Date.now() }), 100);
+                postMessage({ ready: true });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            let busyUntil = 0;
+            worker.onmessage = event => {
+                if (event.data.ready) {
+                    busyUntil = Date.now() + 500;
+                    while (Date.now() < busyUntil) {}
+                } else {
+                    __workerConcurrentResult = {
+                        ranDuringParentTask: event.data.fired < busyUntil,
+                        deliveredAfterParentTask: Date.now() >= busyUntil,
+                    };
+                    worker.terminate();
+                    URL.revokeObjectURL(url);
+                }
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(2000).await.unwrap();
+        assert_eq!(rt.evaluate("__workerConcurrentResult").unwrap(), serde_json::json!({
+            "ranDuringParentTask": true,
+            "deliveredAfterParentTask": true,
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]

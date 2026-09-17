@@ -11,163 +11,213 @@ use std::rc::Rc;
 use deno_core::op2;
 use deno_core::v8;
 use deno_core::OpState;
-
-/// Global holding the ops table taken at runtime startup.
-pub struct OpsHandoff(pub v8::Global<v8::Value>);
+use crate::worker_queue::{self as queue, Size};
 
 /// Registry of active worker instances.
 #[derive(Default)]
 pub struct WorkerRegistry {
+    pub(crate) resources: std::sync::Arc<queue::Resources>,
+    policy: std::sync::Arc<std::sync::Mutex<WorkerPolicy>>,
     pub next_id: u32,
-    pub main_context: Option<v8::Global<v8::Context>>,
     pub workers: HashMap<u32, WorkerInstance>,
 }
 
+#[derive(Default)]
+struct WorkerPolicy {
+    blocked_urls: Vec<String>,
+    intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>>,
+    intercept_enabled: bool,
+    console_enabled: bool,
+    runtime_events_enabled: bool,
+}
+
+pub(crate) fn sync_policy(state: &OpState) {
+    let page = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow();
+    let registry = state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow();
+    let mut policy = registry.policy.lock().unwrap();
+    policy.blocked_urls = page.blocked_urls.clone();
+    policy.intercept_tx = page.intercept_tx.clone();
+    policy.intercept_enabled = page.intercept_enabled;
+    policy.console_enabled = page.console_messages_enabled;
+    policy.runtime_events_enabled = page.runtime_events_enabled;
+}
+
+pub(crate) fn refresh_policy(state: &OpState) {
+    if state.try_borrow::<WorkerEndpoint>().is_none() { return; }
+    let registry = state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow();
+    let policy = registry.policy.lock().unwrap();
+    let mut page = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow_mut();
+    page.blocked_urls = policy.blocked_urls.clone();
+    page.intercept_tx = policy.intercept_tx.clone();
+    page.intercept_enabled = policy.intercept_enabled;
+    page.console_messages_enabled = policy.console_enabled;
+    page.runtime_events_enabled = policy.runtime_events_enabled;
+}
+
 pub struct WorkerInstance {
-    pub id: u32,
-    pub context: v8::Global<v8::Context>,
-    pub terminated: bool,
+    commands: queue::Sender<WorkerCommand>,
+    events: std::sync::Arc<tokio::sync::Mutex<queue::Receiver<WorkerEvent>>>,
+    control: std::sync::Arc<WorkerControl>,
 }
 
-/// Creates a new `v8::Context` for a Worker from the snapshot.
-pub fn create_worker_context<'s>(scope: &mut v8::HandleScope<'s>) -> Option<v8::Local<'s, v8::Context>> {
-    deno_core::v8::Context::from_snapshot(
-        scope,
-        1,
-        deno_core::v8::ContextOptions::default(),
-    )
-    .or_else(|| {
-        deno_core::v8::Context::from_snapshot(
-            scope,
-            0,
-            deno_core::v8::ContextOptions::default(),
-        )
-    })
-    .or_else(|| {
-        Some(deno_core::v8::Context::new(
-            scope,
-            deno_core::v8::ContextOptions::default(),
-        ))
-    })
+#[derive(Default)]
+struct WorkerControl {
+    terminated: std::sync::atomic::AtomicBool,
+    isolate: std::sync::Mutex<Option<v8::IsolateHandle>>,
 }
-
-/// Aliases the main context's Deno embedder slots so promise rejections and module
-/// loaders in the worker realm don't crash deno_core global callbacks.
-pub fn share_deno_context_state(
-    main_ctx: v8::Local<v8::Context>,
-    worker_ctx: v8::Local<v8::Context>,
-) {
-    use deno_core::{CONTEXT_STATE_SLOT_INDEX, MODULE_MAP_SLOT_INDEX};
-    unsafe {
-        let cs = main_ctx.get_aligned_pointer_from_embedder_data(CONTEXT_STATE_SLOT_INDEX);
-        let mm = main_ctx.get_aligned_pointer_from_embedder_data(MODULE_MAP_SLOT_INDEX);
-        worker_ctx.set_aligned_pointer_in_embedder_data(CONTEXT_STATE_SLOT_INDEX, cs);
-        worker_ctx.set_aligned_pointer_in_embedder_data(MODULE_MAP_SLOT_INDEX, mm);
-    }
-}
-
-/// Copies bound op functions into the worker context's `Deno.core.ops`.
-pub fn share_ops_with_context(
-    scope: &mut v8::HandleScope,
-    context: v8::Local<v8::Context>,
-    ops_handoff: &v8::Global<v8::Value>,
-) -> bool {
-    let scope = &mut v8::ContextScope::new(scope, context);
-    let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
-        return false;
-    };
-    let Some(ops_key) = v8::String::new(scope, "ops") else {
-        return false;
-    };
-    let global = context.global(scope);
-    let Some(core) = global.get(scope, handoff_key.into()) else {
-        return false;
-    };
-    let Some(core) = core.to_object(scope) else {
-        return false;
-    };
-    let Some(target) = core
-        .get(scope, ops_key.into())
-        .and_then(|value| value.to_object(scope))
-    else {
-        return false;
-    };
-    let source = v8::Local::new(scope, ops_handoff);
-    let Some(source) = source.to_object(scope) else {
-        return false;
-    };
-    let Some(names) = source.get_own_property_names(scope, Default::default()) else {
-        return false;
-    };
-    for index in 0..names.length() {
-        let Some(key) = names.get_index(scope, index) else {
-            continue;
-        };
-        let Some(value) = source.get(scope, key) else {
-            continue;
-        };
-        let _ = target.set(scope, key, value);
-    }
-    for name in [
-        "__obscura_native_mouse_handoff",
-        "__obscura_native_focus_handoff",
-        "__obscura_native_text_handoff",
-        "__obscura_native_submit_handoff",
-        "__obscura_native_fragment_handoff",
-        "__obscura_native_lifecycle_handoff",
-    ] {
-        if let Some(key) = v8::String::new(scope, name) {
-            let _ = global.delete(scope, key.into());
+impl WorkerControl {
+    fn terminate(&self) {
+        self.terminated.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.isolate.lock().unwrap().as_ref() {
+            handle.terminate_execution();
         }
     }
-    let _ = global.delete(scope, handoff_key.into());
-    true
+    fn stopped(&self) -> bool {
+        self.terminated.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+impl Drop for WorkerInstance {
+    fn drop(&mut self) {
+        self.control.terminate();
+        let _ = self.commands.send(WorkerCommand::Stop);
+    }
+}
+enum WorkerCommand { Run(String), Message(String), Stop }
+impl Size for WorkerCommand {
+    fn queued_bytes(&self) -> usize {
+        match self { Self::Run(source) | Self::Message(source) => source.len(), Self::Stop => 0 }
+    }
 }
 
-/// Copies browser identity globals from `source_ctx` to `target_ctx`.
-pub fn copy_identity_to_context(
-    scope: &mut v8::HandleScope,
-    source_ctx: v8::Local<v8::Context>,
-    target_ctx: v8::Local<v8::Context>,
-) {
-    const IDENTITY_GLOBALS: [&str; 14] = [
-        "__obscura_ua",
-        "__obscura_platform",
-        "__obscura_ua_platform",
-        "__obscura_ua_platform_version",
-        "__obscura_ua_full_version",
-        "__obscura_hardware_concurrency",
-        "__obscura_device_memory",
-        "__obscura_language",
-        "__obscura_languages",
-        "__obscura_accept_language",
-        "__obscura_network_downlink",
-        "__obscura_network_rtt",
-        "__obscura_network_effective_type",
-        "__obscura_network_save_data",
-    ];
-    for name in IDENTITY_GLOBALS {
-        let (has_value, value) = {
-            let scope = &mut v8::ContextScope::new(scope, source_ctx);
-            let Some(key) = v8::String::new(scope, name) else {
-                continue;
-            };
-            let global = source_ctx.global(scope);
-            let value = global.get(scope, key.into());
-            (value.is_some(), value.map(|v| v8::Global::new(scope, v)))
-        };
-        if has_value {
-            if let Some(val) = value {
-                let scope = &mut v8::ContextScope::new(scope, target_ctx);
-                let Some(key) = v8::String::new(scope, name) else {
-                    continue;
-                };
-                let val = v8::Local::new(scope, val);
-                let global = target_ctx.global(scope);
-                let _ = global.set(scope, key.into(), val);
+pub(crate) struct WorkerEndpoint {
+    control: std::sync::Arc<WorkerControl>,
+    events: queue::Sender<WorkerEvent>,
+    closing: std::cell::Cell<bool>,
+    blobs: HashMap<String, String>,
+}
+impl WorkerEndpoint {
+    fn send(&self, event: WorkerEvent) {
+        if let Err(error) = self.events.send(event) {
+            if !self.closing.replace(true) {
+                self.events.terminal(WorkerEvent::Script(serde_json::json!({"kind":"error","data":error}).to_string()));
+            }
+            self.control.terminate();
+        }
+    }
+    fn emit(&self, kind: &str, data: &str) {
+        self.send(WorkerEvent::Script(serde_json::json!({"kind": kind, "data": data}).to_string()));
+    }
+}
+
+enum WorkerEvent {
+    Script(String),
+    Observations(WorkerObservations),
+}
+
+impl Size for WorkerEvent {
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Script(value) => value.len(),
+            Self::Observations(value) => {
+                let network: usize = value.network.iter().map(|(event, body)| {
+                    std::mem::size_of_val(event) + event.request_id.len() + event.url.len() + event.method.len()
+                        + event.response_headers.iter().map(|(k,v)| k.len() + v.len()).sum::<usize>()
+                        + body.as_ref().map_or(0, |body| body.body.len())
+                }).sum();
+                let runtime: usize = value.runtime.iter().map(|event| match event {
+                    crate::ops::RuntimeEvent::Console(event) => event.kind.len() + event.args.iter().map(|arg| arg.to_string().len()).sum::<usize>(),
+                    crate::ops::RuntimeEvent::Exception(event) => event.name.len() + event.description.len() + event.url.len()
+                        + event.stack_trace.iter().map(|frame| frame.to_string().len()).sum::<usize>(),
+                }).sum();
+                network + runtime + value.urls.iter().chain(value.console.iter()).map(String::len).sum::<usize>()
             }
         }
     }
+}
+
+#[derive(Default)]
+struct WorkerObservations {
+    network: Vec<(crate::ops::JsNetworkEvent, Option<crate::ops::StoredNetworkResponseBody>)>,
+    urls: Vec<String>,
+    console: Vec<String>,
+    runtime: Vec<crate::ops::RuntimeEvent>,
+}
+
+pub(crate) fn flush_observations(state: &OpState) {
+    let Some(endpoint) = state.try_borrow::<WorkerEndpoint>() else { return; };
+    let mut worker = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow_mut();
+    let events = std::mem::take(&mut worker.js_network_events);
+    let mut observations = WorkerObservations::default();
+    for event in events {
+        let body = worker.network_response_bodies.remove(&event.request_id);
+        observations.network.push((event, body));
+    }
+    worker.network_response_body_order.clear();
+    observations.urls = std::mem::take(&mut worker.fetched_urls);
+    observations.console = worker.pending_console_messages.drain(..).collect();
+    observations.runtime = worker.pending_runtime_events.drain(..).collect();
+    // Object handles belong to the worker isolate. Preserve inline values and
+    // previews, never pretend they can be dereferenced in the owner's isolate.
+    for event in &mut observations.runtime {
+        if let crate::ops::RuntimeEvent::Console(event) = event {
+            for argument in &mut event.args {
+                if let Some(argument) = argument.as_object_mut() { argument.remove("objectId"); }
+            }
+        }
+    }
+    if !observations.network.is_empty() || !observations.urls.is_empty() ||
+        !observations.console.is_empty() || !observations.runtime.is_empty() {
+        endpoint.send(WorkerEvent::Observations(observations));
+    }
+}
+
+impl WorkerObservations {
+    fn deliver(self, parent: &mut crate::ops::ObscuraState) {
+        for (event, body) in self.network {
+            if let Some(body) = body {
+                parent.network_response_body_order.push_back(event.request_id.clone());
+                parent.network_response_bodies.insert(event.request_id.clone(), body);
+            }
+            parent.js_network_events.push(event);
+        }
+        while parent.network_response_body_order.len() > crate::ops::response_body_entry_limit() {
+            if let Some(id) = parent.network_response_body_order.pop_front() {
+                parent.network_response_bodies.remove(&id);
+            }
+        }
+        let excess = parent.js_network_events.len().saturating_sub(4096);
+        parent.js_network_events.drain(..excess);
+        parent.fetched_urls.extend(self.urls);
+        let excess = parent.fetched_urls.len().saturating_sub(16384);
+        parent.fetched_urls.drain(..excess);
+        parent.pending_console_messages.extend(self.console);
+        parent.pending_runtime_events.extend(self.runtime);
+        while parent.pending_console_messages.len() > 1024 { parent.pending_console_messages.pop_front(); }
+        while parent.pending_runtime_events.len() > 1024 { parent.pending_runtime_events.pop_front(); }
+    }
+}
+
+struct WorkerConfig {
+    policy: std::sync::Arc<std::sync::Mutex<WorkerPolicy>>,
+    resources: std::sync::Arc<queue::Resources>,
+    url: String,
+    globals: serde_json::Map<String, serde_json::Value>,
+    blobs: HashMap<String, String>,
+    identity: Option<crate::ops::DeviceIdentity>,
+    cookies: Option<std::sync::Arc<obscura_net::CookieJar>>,
+    http: Option<std::sync::Arc<obscura_net::ObscuraHttpClient>>,
+    callbacks: Option<std::sync::Arc<obscura_net::CallbackRegistry>>,
+    #[cfg(feature = "stealth")]
+    stealth: Option<std::sync::Arc<obscura_net::StealthHttpClient>>,
+    blocked_urls: Vec<String>,
+    referrer_policy: obscura_net::ReferrerPolicy,
+    intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>>,
+    intercept_enabled: bool,
+    intercept_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    response_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    console_enabled: bool,
+    runtime_events_enabled: bool,
 }
 
 fn exception_text(
@@ -179,7 +229,7 @@ fn exception_text(
     }
 }
 
-fn extract_exception_message(
+pub(crate) fn extract_exception_message(
     scope: &mut v8::TryCatch<'_, v8::HandleScope<'_>>,
 ) -> Option<String> {
     if let Some(obj) = scope.exception().and_then(|e| e.to_object(scope)) {
@@ -194,8 +244,8 @@ fn extract_exception_message(
     Some(exception_text(scope))
 }
 
-const WORKER_BOOTSTRAP_JS: &str = r#"
-(function(workerId, workerUrl) {
+pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
+(function(workerId, workerUrl, ops) {
     delete globalThis.window;
     delete globalThis.document;
     delete globalThis.location;
@@ -223,6 +273,16 @@ const WORKER_BOOTSTRAP_JS: &str = r#"
     delete globalThis.EventTarget;
 
     globalThis.self = globalThis;
+    let closing = false;
+    for (const name of ['setTimeout', 'setInterval']) {
+        const schedule = globalThis[name];
+        globalThis[name] = (callback, delay, ...args) => schedule(() => {
+            if (!closing) {
+                if (typeof callback === 'function') callback(...args);
+                else (0, eval)(String(callback));
+            }
+        }, delay);
+    }
 
     function EventTarget() {
         this._listeners = new Map();
@@ -429,59 +489,26 @@ const WORKER_BOOTSTRAP_JS: &str = r#"
     Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'onerror', onerrorDescriptor);
     Object.defineProperty(globalThis, 'onerror', onerrorDescriptor);
 
-    function _serializeWorkerMsg(msg) {
-        try {
-            return JSON.stringify({ v: msg }, (key, val) => {
-                if (typeof val === 'string' && val.startsWith('__obscura_')) return '__obscura_str_' + val;
-                if (val === undefined) return '__obscura_val_undefined__';
-                return val;
-            });
-        } catch (_) {
-            throw new DOMException('The object could not be cloned.', 'DataCloneError');
-        }
+    function _serializeWorkerMsg(msg, options) {
+        const transfers = options == null ? [] : Array.from(
+            typeof options[Symbol.iterator] === 'function' ? options : (options.transfer || []));
+        return ops.op_worker_serialize(msg, transfers, message => {
+            throw new DOMException(message, 'DataCloneError');
+        });
+    }
+    function _deserializeWorkerMsg(data) {
+        return {v: ops.op_worker_deserialize(data)};
     }
 
-    function _deserializeWorkerMsg(json) {
-        try {
-            const raw = JSON.parse(json);
-            function restore(obj) {
-                if (!obj || typeof obj !== 'object') return;
-                if (Array.isArray(obj)) {
-                    for (let i = 0; i < obj.length; i++) {
-                        if (obj[i] === '__obscura_val_undefined__') obj[i] = undefined;
-                        else restore(obj[i]);
-                    }
-                } else {
-                    for (const k of Object.keys(obj)) {
-                        if (obj[k] === '__obscura_val_undefined__') {
-                            obj[k] = undefined;
-                        } else if (typeof obj[k] === 'string' && obj[k].startsWith('__obscura_str_')) {
-                            obj[k] = obj[k].slice('__obscura_str_'.length);
-                        } else {
-                            restore(obj[k]);
-                        }
-                    }
-                }
-            }
-            if (raw && raw.v === '__obscura_val_undefined__') {
-                raw.v = undefined;
-            } else {
-                restore(raw);
-            }
-            return raw;
-        } catch (_) {
-            return null;
-        }
-    }
-
-    DedicatedWorkerGlobalScope.prototype.postMessage = function(msg) {
-        const json = _serializeWorkerMsg(msg);
-        Deno.core.ops.op_worker_post_to_parent(workerId, json);
+    DedicatedWorkerGlobalScope.prototype.postMessage = function(msg, options = undefined) {
+        const json = _serializeWorkerMsg(msg, options);
+        ops.op_worker_post_to_parent(workerId, json);
     };
     globalThis.postMessage = DedicatedWorkerGlobalScope.prototype.postMessage;
 
     DedicatedWorkerGlobalScope.prototype.close = function() {
-        Deno.core.ops.op_worker_terminate(workerId);
+        closing = true;
+        ops.op_worker_close();
     };
     globalThis.close = DedicatedWorkerGlobalScope.prototype.close;
 
@@ -489,7 +516,7 @@ const WORKER_BOOTSTRAP_JS: &str = r#"
         for (const rawUrl of urls) {
             let resolved = String(rawUrl);
             try { resolved = new URL(resolved, globalThis.location?.href || '').href; } catch (e) {}
-            const source = Deno.core.ops.op_worker_load_script(resolved);
+            const source = ops.op_worker_load_script(resolved);
             if (source === null || source === undefined) {
                 throw new DOMException(`Failed to execute 'importScripts': The script at '${resolved}' could not be loaded.`, 'NetworkError');
             }
@@ -499,6 +526,7 @@ const WORKER_BOOTSTRAP_JS: &str = r#"
     globalThis.importScripts = DedicatedWorkerGlobalScope.prototype.importScripts;
 
     globalThis.__obscura_worker_receive = function(json) {
+        if (closing) return;
         const payload = _deserializeWorkerMsg(json);
         if (!payload) return;
         const event = new MessageEvent('message', { data: payload.v });
@@ -508,208 +536,286 @@ const WORKER_BOOTSTRAP_JS: &str = r#"
 })
 "#;
 
-#[op2(fast)]
-pub fn op_worker_create(
-    scope: &mut v8::HandleScope,
-    state: &OpState,
-    #[string] url: &str,
-) -> u32 {
-    let Some(registry_rc) = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>().cloned() else {
-        return 0;
-    };
-
-    let main_ctx = scope.get_current_context();
-    {
-        let mut reg = registry_rc.borrow_mut();
-        if reg.main_context.is_none() {
-            reg.main_context = Some(v8::Global::new(scope, main_ctx));
-        }
-    }
-
-    let Some(worker_ctx) = create_worker_context(scope) else {
-        return 0;
-    };
-
-    share_deno_context_state(main_ctx, worker_ctx);
-
-    if let Some(ops_handoff) = state.try_borrow::<OpsHandoff>() {
-        share_ops_with_context(scope, worker_ctx, &ops_handoff.0);
-    }
-
-    copy_identity_to_context(scope, main_ctx, worker_ctx);
-
-    let worker_id = {
-        let mut reg = registry_rc.borrow_mut();
-        reg.next_id = reg.next_id.saturating_add(1);
-        reg.next_id
-    };
-
-    // Run bootstrap init in the worker realm
-    let escaped_url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
-    let init_script = format!("({WORKER_BOOTSTRAP_JS})({worker_id}, {escaped_url});");
-    {
-        let scope = &mut v8::ContextScope::new(scope, worker_ctx);
-        let scope = &mut v8::TryCatch::new(scope);
-        if let Some(code) = v8::String::new(scope, &init_script) {
-            if let Some(script) = v8::Script::compile(scope, code, None) {
-                if script.run(scope).is_none() {
-                    let err = exception_text(scope);
-                    eprintln!("worker init script error: {}", err);
-                }
-            } else {
-                let err = exception_text(scope);
-                eprintln!("worker init script compile error: {}", err);
+#[op2(nofast, reentrant)]
+pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] url: &str) -> u32 {
+    let Some(registry) = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>().cloned() else { return 0; };
+    let resources = registry.borrow().resources.clone();
+    let Ok(lease) = resources.worker() else { return 0; };
+    if state.try_borrow::<WorkerEndpoint>().is_some() { refresh_policy(state); }
+    else { sync_policy(state); }
+    let scope = &mut v8::TryCatch::new(scope);
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let mut globals = serde_json::Map::new();
+    for name in ["__obscura_ua", "__obscura_platform", "__obscura_ua_platform",
+        "__obscura_ua_platform_version", "__obscura_ua_full_version", "__obscura_ua_architecture",
+        "__obscura_language", "__obscura_languages", "__obscura_accept_language",
+        "__obscura_hw", "__obscura_mem", "__obscura_network_downlink", "__obscura_network_rtt",
+        "__obscura_network_effective_type", "__obscura_network_save_data"] {
+        let key = v8::String::new(scope, name).unwrap();
+        if let Some(value) = global.get(scope, key.into()).filter(|v| !v.is_undefined()) {
+            if let Ok(value) = deno_core::serde_v8::from_v8::<serde_json::Value>(scope, value) {
+                globals.insert(name.to_string(), value);
             }
         }
     }
-
-    {
-        let mut reg = registry_rc.borrow_mut();
-        reg.workers.insert(
-            worker_id,
-            WorkerInstance {
-                id: worker_id,
-                context: v8::Global::new(scope, worker_ctx),
-                terminated: false,
-            },
-        );
+    let key = v8::String::new(scope, "__blobStore").unwrap();
+    let blobs = global.get(scope, key.into()).and_then(|value|
+        deno_core::serde_v8::from_v8::<HashMap<String, String>>(scope, value).ok()).unwrap_or_default();
+    if scope.has_caught() || scope.has_terminated() {
+        scope.rethrow();
+        return 0;
     }
-
-    worker_id
-}
-
-#[op2(reentrant)]
-#[string]
-pub fn op_worker_run(
-    scope: &mut v8::HandleScope,
-    state: &OpState,
-    worker_id: u32,
-    #[string] source: &str,
-) -> Option<String> {
-    let registry_rc = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>()?.clone();
-    let worker_context = {
-        let registry = registry_rc.borrow();
-        let worker = registry.workers.get(&worker_id)?;
-        if worker.terminated {
-            return None;
+    let parent = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow();
+    let config = WorkerConfig { policy: registry.borrow().policy.clone(), resources: resources.clone(), url: url.into(), globals, blobs,
+        identity: parent.device_identity.clone(), cookies: parent.cookie_jar.clone(),
+        http: parent.http_client.clone(), callbacks: parent.callbacks.clone(),
+        #[cfg(feature = "stealth")]
+        stealth: parent.stealth_client.clone(),
+        blocked_urls: parent.blocked_urls.clone(), referrer_policy: parent.referrer_policy,
+        intercept_tx: parent.intercept_tx.clone(), intercept_enabled: parent.intercept_enabled,
+        intercept_counter: parent.intercept_counter.clone(), response_counter: parent.network_response_body_counter.clone(),
+        in_flight: parent.page_in_flight.clone(), console_enabled: parent.console_messages_enabled,
+        runtime_events_enabled: parent.runtime_events_enabled,
+    };
+    drop(parent);
+    let (commands, command_rx) = queue::channel(resources.clone());
+    let (events, event_rx) = queue::channel(resources);
+    let control = std::sync::Arc::new(WorkerControl::default());
+    let child_control = control.clone();
+    let mut registry = registry.borrow_mut();
+    registry.next_id = registry.next_id.saturating_add(1);
+    let id = registry.next_id;
+    if std::thread::Builder::new().name(format!("obscura-worker-{id}")).spawn(move || {
+        let _lease = lease;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+        if let Ok(runtime) = runtime {
+            runtime.block_on(run_worker(id, config, command_rx, events, child_control));
         }
-        worker.context.clone()
-    };
-    let worker_ctx = v8::Local::new(scope, &worker_context);
-    let scope = &mut v8::ContextScope::new(scope, worker_ctx);
-    let scope = &mut v8::TryCatch::new(scope);
-
-    let code = v8::String::new(scope, source)?;
-    let script = match v8::Script::compile(scope, code, None) {
-        Some(s) => s,
-        None => return extract_exception_message(scope),
-    };
-    match script.run(scope) {
-        Some(_) => None,
-        None => extract_exception_message(scope),
-    }
+    }).is_err() { return 0; }
+    registry.workers.insert(id, WorkerInstance { commands,
+        events: std::sync::Arc::new(tokio::sync::Mutex::new(event_rx)), control });
+    id
 }
 
-#[op2(fast)]
-pub fn op_worker_post_to_worker(
-    scope: &mut v8::HandleScope,
-    state: &OpState,
-    worker_id: u32,
-    #[string] json: &str,
-) {
-    let Some(registry_rc) = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>().cloned() else {
+async fn run_worker(id: u32, config: WorkerConfig,
+    mut commands: queue::Receiver<WorkerCommand>,
+    events: queue::Sender<WorkerEvent>, control: std::sync::Arc<WorkerControl>) {
+    if control.stopped() { return; }
+    let locale = config.globals.get("__obscura_language").and_then(|v| v.as_str()).unwrap_or("en-US");
+    let mut rt = crate::runtime::ObscuraJsRuntime::with_base_url_proxy_and_locale(&config.url, None, locale);
+    {
+        let mut handle = control.isolate.lock().unwrap();
+        *handle = Some(rt.isolate_handle());
+        if control.stopped() { return; }
+    }
+    {
+        let mut state = rt.state.borrow_mut();
+        state.url = config.url.clone();
+        state.device_identity = config.identity;
+        state.cookie_jar = config.cookies;
+        state.http_client = config.http;
+        state.callbacks = config.callbacks;
+        #[cfg(feature = "stealth")]
+        { state.stealth_client = config.stealth; }
+        state.blocked_urls = config.blocked_urls;
+        state.referrer_policy = config.referrer_policy;
+        state.intercept_tx = config.intercept_tx;
+        state.intercept_enabled = config.intercept_enabled;
+        state.intercept_counter = config.intercept_counter;
+        state.network_response_body_counter = config.response_counter;
+        state.page_in_flight = config.in_flight;
+        state.console_messages_enabled = config.console_enabled;
+        state.runtime_events_enabled = config.runtime_events_enabled;
+    }
+    {
+        let state = rt.runtime().op_state();
+        let state = state.borrow();
+        let mut registry = state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow_mut();
+        registry.resources = config.resources;
+        registry.policy = config.policy;
+    }
+    let endpoint = WorkerEndpoint { control: control.clone(), events, closing: std::cell::Cell::new(false), blobs: config.blobs };
+    rt.runtime().op_state().borrow_mut().put(endpoint);
+    let setup = format!("Object.assign(globalThis, {});", serde_json::Value::Object(config.globals));
+    if rt.execute_script("worker-identity", &setup).is_err() { return; }
+    rt.run_page_init();
+    if let Err(error) = rt.initialize_worker_scope(id, &config.url) {
+        rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().emit("error", &error);
         return;
-    };
-    let worker_context = {
-        let registry = registry_rc.borrow();
-        let Some(worker) = registry.workers.get(&worker_id) else {
-            return;
+    }
+    let mut idle = true;
+    loop {
+        flush_observations(&rt.runtime().op_state().borrow());
+        if control.stopped() || rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().closing.get() { break; }
+        let command = if idle { commands.recv().await.map(queue::Queued::into_inner) } else {
+            tokio::select! {
+                command = commands.recv() => command.map(queue::Queued::into_inner),
+                result = rt.run_autonomous_event_loop_turn() => {
+                    match result {
+                        Ok(done) => idle = done,
+                        Err(error) => {
+                            rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().emit("error", &error);
+                            if control.stopped() { break; }
+                            idle = false;
+                        }
+                    }
+                    continue;
+                }
+            }
         };
-        if worker.terminated {
-            return;
+        if control.stopped() { break; }
+        let result = match command {
+            Some(WorkerCommand::Run(source)) => rt.execute_worker_script(&source),
+            Some(WorkerCommand::Message(json)) => rt.execute_worker_script(&format!("__obscura_worker_receive({});", serde_json::to_string(&json).unwrap())),
+            Some(WorkerCommand::Stop) | None => break,
+        };
+        if let Err(error) = result {
+            rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().emit("error", &error);
         }
-        worker.context.clone()
-    };
-    let worker_ctx = v8::Local::new(scope, &worker_context);
-    let scope = &mut v8::ContextScope::new(scope, worker_ctx);
-    let scope = &mut v8::TryCatch::new(scope);
+        idle = false;
+    }
+    // Clear the cross-thread handle before dropping its owning isolate.
+    *control.isolate.lock().unwrap() = None;
+}
 
-    let global = worker_ctx.global(scope);
-    if let Some(key) = v8::String::new(scope, "__obscura_worker_receive") {
-        if let Some(func_val) = global.get(scope, key.into()) {
-            if let Ok(func) = v8::Local::<v8::Function>::try_from(func_val) {
-                if let Some(json_val) = v8::String::new(scope, json) {
-                    let undefined = v8::undefined(scope).into();
-                    func.call(scope, undefined, &[json_val.into()]);
-                }
+#[op2]
+#[string]
+pub fn op_worker_run(state: &OpState, worker_id: u32, #[string] source: &str) -> Option<String> {
+    let registry = state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow();
+    let worker = registry.workers.get(&worker_id)?;
+    worker.commands.send(WorkerCommand::Run(source.into())).err().map(str::to_owned)
+}
+
+#[op2(fast)]
+pub fn op_worker_post_to_worker(state: &OpState, worker_id: u32, #[string] json: &str) -> Result<(), deno_error::JsErrorBox> {
+    if let Some(worker) = state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow().workers.get(&worker_id) {
+        worker.commands.send(WorkerCommand::Message(json.into())).map_err(deno_error::JsErrorBox::generic)?;
+    }
+    Ok(())
+}
+
+#[op2(async)]
+#[string]
+pub async fn op_worker_next_event(state: Rc<RefCell<OpState>>, worker_id: u32) -> Option<String> {
+    let events = {
+        let state = state.borrow();
+        let registry = state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow();
+        registry.workers.get(&worker_id)?.events.clone()
+    };
+    loop {
+        let event = events.lock().await.recv().await?.into_inner();
+        match event {
+            WorkerEvent::Script(data) => return Some(data),
+            WorkerEvent::Observations(observations) => {
+                let state = state.borrow();
+                let mut parent = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow_mut();
+                observations.deliver(&mut parent);
             }
         }
     }
 }
 
 #[op2(fast)]
-pub fn op_worker_post_to_parent(
-    scope: &mut v8::HandleScope,
-    state: &OpState,
-    worker_id: u32,
-    #[string] json: &str,
-) {
-    let Some(registry_rc) = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>().cloned() else {
-        return;
-    };
-    let main_context = registry_rc.borrow().main_context.clone();
-    let Some(main_ctx) = main_context else { return };
-
-    let json_val = v8::String::new(scope, json);
-    let main_ctx = v8::Local::new(scope, &main_ctx);
-    let scope = &mut v8::ContextScope::new(scope, main_ctx);
-    let scope = &mut v8::TryCatch::new(scope);
-
-    let global = main_ctx.global(scope);
-    if let Some(key) = v8::String::new(scope, "__obscura_worker_dispatch_to_page") {
-        if let Some(func_val) = global.get(scope, key.into()) {
-            if let Ok(func) = v8::Local::<v8::Function>::try_from(func_val) {
-                let id_val = v8::Integer::new_from_unsigned(scope, worker_id);
-                let undefined = v8::undefined(scope).into();
-                if let Some(json_v) = json_val {
-                    func.call(scope, undefined, &[id_val.into(), json_v.into()]);
-                }
-            }
-        }
+pub fn op_worker_post_to_parent(state: &OpState, _worker_id: u32, #[string] json: &str) {
+    flush_observations(state);
+    if let Some(endpoint) = state.try_borrow::<WorkerEndpoint>() {
+        endpoint.emit("message", json);
     }
+}
+
+#[op2(fast)]
+pub fn op_worker_close(state: &OpState) {
+    if let Some(endpoint) = state.try_borrow::<WorkerEndpoint>() { endpoint.closing.set(true); }
 }
 
 #[op2(fast)]
 pub fn op_worker_terminate(state: &OpState, worker_id: u32) {
-    if let Some(registry_rc) = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>() {
-        let mut registry = registry_rc.borrow_mut();
-        if let Some(worker) = registry.workers.get_mut(&worker_id) {
-            worker.terminated = true;
-        }
-        registry.workers.remove(&worker_id);
+    state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow_mut().workers.remove(&worker_id);
+}
+
+#[op2]
+#[string]
+pub fn op_worker_load_script(state: &OpState, #[string] url: &str) -> Option<String> {
+    state.try_borrow::<WorkerEndpoint>()?.blobs.get(url).cloned()
+}
+
+struct WorkerSerializer<'s> {
+    error: v8::Local<'s, v8::Function>,
+}
+impl v8::ValueSerializerImpl for WorkerSerializer<'_> {
+    fn throw_data_clone_error<'s>(&self, scope: &mut v8::HandleScope<'s>, message: v8::Local<'s, v8::String>) {
+        let scope = &mut v8::TryCatch::new(scope);
+        let receiver = v8::undefined(scope);
+        self.error.call(scope, receiver.into(), &[message.into()]);
+        if scope.has_caught() || scope.has_terminated() { scope.rethrow(); }
+    }
+    fn get_shared_array_buffer_id<'s>(&self, scope: &mut v8::HandleScope<'s>, _: v8::Local<'s, v8::SharedArrayBuffer>) -> Option<u32> {
+        let message = v8::String::new(scope, "SharedArrayBuffer messaging is not supported").unwrap();
+        self.throw_data_clone_error(scope, message);
+        None
+    }
+    fn get_wasm_module_transfer_id(&self, scope: &mut v8::HandleScope<'_>, _: v8::Local<v8::WasmModuleObject>) -> Option<u32> {
+        let message = v8::String::new(scope, "WebAssembly.Module messaging is not supported").unwrap();
+        self.throw_data_clone_error(scope, message);
+        None
     }
 }
 
+// Copy the value before detaching transfer buffers. A failed clone must not
+// consume the sender's buffers. Only owned bytes cross the thread boundary.
 #[op2(reentrant)]
 #[string]
-pub fn op_worker_load_script(
+pub fn op_worker_serialize(
     scope: &mut v8::HandleScope,
-    state: &OpState,
-    #[string] url: &str,
-) -> Option<String> {
-    let registry_rc = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>()?.clone();
-    let main_context = registry_rc.borrow().main_context.clone()?;
-    let main_ctx = v8::Local::new(scope, &main_context);
-    let scope = &mut v8::ContextScope::new(scope, main_ctx);
-
-    let global = main_ctx.global(scope);
-    let key = v8::String::new(scope, "__blobStore")?;
-    let store = global.get(scope, key.into())?.to_object(scope)?;
-    let url_key = v8::String::new(scope, url)?;
-    let val = store.get(scope, url_key.into())?;
-    if val.is_string() {
-        Some(val.to_rust_string_lossy(scope))
-    } else {
-        None
+    value: v8::Local<v8::Value>,
+    transfers: v8::Local<v8::Array>,
+    error: v8::Local<v8::Function>,
+) -> String {
+    use base64::Engine;
+    use v8::{ValueSerializerHelper, ValueSerializerImpl};
+    let mut buffers = Vec::new();
+    for index in 0..transfers.length() {
+        let Some(value) = transfers.get_index(scope, index) else { return String::new(); };
+        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(value).ok();
+        if buffer.is_none_or(|b| !b.is_detachable() || b.was_detached() || buffers.contains(&b)) {
+            let message = v8::String::new(scope, "Invalid or duplicate transferable ArrayBuffer").unwrap();
+            WorkerSerializer { error }.throw_data_clone_error(scope, message);
+            return String::new();
+        }
+        buffers.push(buffer.unwrap());
     }
+    let serializer = v8::ValueSerializer::new(scope, Box::new(WorkerSerializer { error }));
+    serializer.write_header();
+    let scope = &mut v8::TryCatch::new(scope);
+    let result = serializer.write_value(scope.get_current_context(), value);
+    if scope.has_caught() || scope.has_terminated() {
+        scope.rethrow();
+        return String::new();
+    }
+    if result != Some(true) {
+        let message = v8::String::new(scope, "The object could not be cloned").unwrap();
+        WorkerSerializer { error }.throw_data_clone_error(scope, message);
+        return String::new();
+    }
+    if buffers.iter().any(|buffer| buffer.was_detached()) {
+        let message = v8::String::new(scope, "ArrayBuffer was detached during serialization").unwrap();
+        WorkerSerializer { error }.throw_data_clone_error(scope, message);
+        return String::new();
+    }
+    for buffer in buffers { buffer.detach(None); }
+    base64::engine::general_purpose::STANDARD.encode(serializer.release())
+}
+
+struct WorkerDeserializer;
+impl v8::ValueDeserializerImpl for WorkerDeserializer {}
+
+#[op2]
+pub fn op_worker_deserialize<'s>(scope: &mut v8::HandleScope<'s>, #[string] data: &str) -> v8::Local<'s, v8::Value> {
+    use base64::Engine;
+    use v8::ValueDeserializerHelper;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else { return v8::undefined(scope).into(); };
+    let deserializer = v8::ValueDeserializer::new(scope, Box::new(WorkerDeserializer), &bytes);
+    if deserializer.read_header(scope.get_current_context()) != Some(true) { return v8::undefined(scope).into(); }
+    deserializer.read_value(scope.get_current_context()).unwrap_or_else(|| v8::undefined(scope).into())
 }

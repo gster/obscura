@@ -14522,50 +14522,16 @@ function _workerError(worker, error) {
 
 const _workerById = new Map();
 
-function _serializeWorkerMsg(msg) {
-  try {
-    return JSON.stringify({ v: msg }, (key, val) => {
-      if (typeof val === 'string' && val.startsWith('__obscura_')) return '__obscura_str_' + val;
-      if (val === undefined) return '__obscura_val_undefined__';
-      return val;
-    });
-  } catch (_) {
-    throw new DOMException('The object could not be cloned.', 'DataCloneError');
-  }
-}
-
-function _deserializeWorkerMsg(json) {
-  try {
-    const raw = JSON.parse(json);
-    function restore(obj) {
-      if (!obj || typeof obj !== 'object') return;
-      if (Array.isArray(obj)) {
-        for (let i = 0; i < obj.length; i++) {
-          if (obj[i] === '__obscura_val_undefined__') obj[i] = undefined;
-          else restore(obj[i]);
-        }
-      } else {
-        for (const k of Object.keys(obj)) {
-          if (obj[k] === '__obscura_val_undefined__') {
-            obj[k] = undefined;
-          } else if (typeof obj[k] === 'string' && obj[k].startsWith('__obscura_str_')) {
-            obj[k] = obj[k].slice('__obscura_str_'.length);
-          } else {
-            restore(obj[k]);
-          }
-        }
-      }
+function _serializeWorkerMsg(msg, options) {
+        const transfers = options == null ? [] : Array.from(
+            typeof options[Symbol.iterator] === 'function' ? options : (options.transfer || []));
+        return Deno.core.ops.op_worker_serialize(msg, transfers, message => {
+            throw new DOMException(message, 'DataCloneError');
+        });
     }
-    if (raw && raw.v === '__obscura_val_undefined__') {
-      raw.v = undefined;
-    } else {
-      restore(raw);
+function _deserializeWorkerMsg(data) {
+        return {v: Deno.core.ops.op_worker_deserialize(data)};
     }
-    return raw;
-  } catch (_) {
-    return null;
-  }
-}
 
 globalThis.__obscura_worker_dispatch_to_page = function(workerId, json) {
   setTimeout(() => {
@@ -14588,10 +14554,21 @@ function _autoRunWorker(worker) {
   if (state.terminated || state.workerId !== null || state.code === undefined) return;
   try {
     const workerId = Deno.core.ops.op_worker_create(state.url || '');
+    if (!workerId) throw new Error('Worker resource limit exceeded');
     state.workerId = workerId;
     _workerById.set(workerId, worker);
     const err = Deno.core.ops.op_worker_run(workerId, state.code);
+    (async () => {
+      while (!state.terminated) {
+        const raw = await Deno.core.ops.op_worker_next_event(workerId);
+        if (raw === null || state.terminated) break;
+        const event = JSON.parse(raw);
+        if (event.kind === 'message') globalThis.__obscura_worker_dispatch_to_page(workerId, event.data);
+        else if (event.kind === 'error') setTimeout(() => _workerError(worker, new Error(event.data)), 0);
+      }
+    })();
     if (err) {
+      workerTerminate.call(worker);
       _workerError(worker, new Error(err));
     }
   } catch (e) {
@@ -14604,7 +14581,8 @@ function _autoRunWorker(worker) {
         setTimeout(() => {
           const s = _workerInstanceState.get(worker);
           if (!s || s.terminated || s.workerId === null) return;
-          Deno.core.ops.op_worker_post_to_worker(wid, json);
+          try { Deno.core.ops.op_worker_post_to_worker(wid, json); }
+          catch (error) { _workerError(worker, error); }
         }, 0);
       }
     }
@@ -14643,10 +14621,10 @@ function Worker(url) {
     }
 }
 
-function workerPostMessage(data) {
+function workerPostMessage(data, options = undefined) {
     const state = _workerInstanceState.get(this);
     if (!state || state.terminated) return;
-    const json = _serializeWorkerMsg(data);
+    const json = _serializeWorkerMsg(data, options);
     if (state.workerId === null) {
       state.pendingMessages.push(json);
       return;
@@ -14656,7 +14634,8 @@ function workerPostMessage(data) {
     setTimeout(() => {
       const s = _workerInstanceState.get(worker);
       if (!s || s.terminated || s.workerId === null) return;
-      Deno.core.ops.op_worker_post_to_worker(workerId, json);
+      try { Deno.core.ops.op_worker_post_to_worker(workerId, json); }
+      catch (error) { _workerError(worker, error); }
     }, 0);
 }
 

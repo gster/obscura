@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut runtime = BrowserRuntime::new(PathBuf::from(&args[2]))?;
     let mut input = protocol::input();
+    let mut next_automation_tick = tokio::time::Instant::now() + Duration::from_millis(20);
     loop {
         let takeover_deadline = runtime.takeover_deadline();
         let automation_active = runtime.uses_automation();
@@ -59,13 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if result.is_err() {runtime.poisoned=true;runtime.revoke_takeover("INPUT_TIMEOUT");}
                 continue;
             },
-            value = input.actions.recv() => value,
-            _ = tokio::time::sleep(Duration::from_millis(20)), if automation_active => {
+            // Keep the deadline across read actions, and service it before the
+            // next action once due. Recreating a sleep let frequent queries
+            // indefinitely postpone timers and Worker message delivery.
+            _ = tokio::time::sleep_until(next_automation_tick), if automation_active => {
                 if !matches!(tokio::time::timeout(Duration::from_millis(30250), runtime.automation_tick()).await, Ok(Ok(()))) {
                     runtime.poisoned = true;
                 }
+                next_automation_tick = tokio::time::Instant::now() + Duration::from_millis(20);
                 continue;
             },
+            value = input.actions.recv() => value,
         };
         let Some(request) = request else {
             break;

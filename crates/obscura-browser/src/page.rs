@@ -7998,6 +7998,9 @@ mod tests {
     #[cfg(feature = "render")]
     fn read_fixture_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
         use std::io::Read;
+        // Accepted sockets can inherit the listener's nonblocking mode on
+        // macOS. These fixture handlers use bounded blocking header reads.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];

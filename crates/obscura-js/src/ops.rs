@@ -282,7 +282,7 @@ pub struct ObscuraState {
     pub pending_navigation: Option<PendingNavigation>,
     pub same_document_navigation: bool,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
-    pub intercept_counter: u64,
+    pub intercept_counter: Arc<std::sync::atomic::AtomicU64>,
     pub intercept_enabled: bool,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
@@ -297,7 +297,7 @@ pub struct ObscuraState {
     pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
-    pub network_response_body_counter: u64,
+    pub network_response_body_counter: Arc<std::sync::atomic::AtomicU64>,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
     // just static DOM attributes, are listed (issue #301).
@@ -518,7 +518,7 @@ impl ObscuraState {
             pending_navigation: None,
             same_document_navigation: false,
             intercept_tx: None,
-            intercept_counter: 0,
+            intercept_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             intercept_enabled: false,
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
@@ -528,7 +528,7 @@ impl ObscuraState {
             runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
-            network_response_body_counter: 0,
+            network_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
@@ -719,7 +719,7 @@ fn propagate_script_start_state(
     started.borrow_mut().extend(additions);
 }
 
-fn response_body_entry_limit() -> usize {
+pub(crate) fn response_body_entry_limit() -> usize {
     std::env::var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2543,6 +2543,26 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
     }
     let gs = shared.borrow();
+    // Workers have environment URLs without a DOM document. Resolve these
+    // native URL queries before the DOM-only operations below.
+    match cmd.as_str() {
+        "document_url" => return serde_json::to_string(
+            &gs.dom.as_ref().and_then(DomTree::document_url).unwrap_or_else(|| gs.url.clone()),
+        ).unwrap_or("\"\"".into()),
+        // The base for relative URLs. It differs from document_url exactly when the page carries
+        // a <base href>, and that is the point: HTML resolves against the base, not the document.
+        "document_base_url" => return serde_json::to_string(
+            &document_base_url_memoized(&gs).unwrap_or_else(|| gs.url.clone()),
+        )
+        .unwrap_or("\"\"".into()),
+        // The unresolved attribute. After history.pushState only JS knows the URL, so only JS
+        // can resolve a relative base against it.
+        "document_base_href" => {
+            return serde_json::to_string(&document_base_href_memoized(&gs).unwrap_or_default())
+                .unwrap_or("\"\"".into())
+        }
+        _ => {}
+    }
     let dom = match &gs.dom {
         Some(d) => d,
         None => return "null".to_string(),
@@ -2618,21 +2638,6 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 })
                 .unwrap_or_default();
             serde_json::to_string(&title).unwrap_or("\"\"".into())
-        }
-        "document_url" => serde_json::to_string(
-            &gs.dom.as_ref().and_then(DomTree::document_url).unwrap_or_else(|| gs.url.clone()),
-        ).unwrap_or("\"\"".into()),
-        // The base for relative URLs. It differs from document_url exactly when the page carries
-        // a <base href>, and that is the point: HTML resolves against the base, not the document.
-        "document_base_url" => serde_json::to_string(
-            &document_base_url_memoized(&gs).unwrap_or_else(|| gs.url.clone()),
-        )
-        .unwrap_or("\"\"".into()),
-        // The unresolved attribute. After history.pushState only JS knows the URL, so only JS
-        // can resolve a relative base against it.
-        "document_base_href" => {
-            serde_json::to_string(&document_base_href_memoized(&gs).unwrap_or_default())
-                .unwrap_or("\"\"".into())
         }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
@@ -3373,6 +3378,7 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
 
 #[op2(fast)]
 fn op_runtime_events_enabled(state: &OpState) -> bool {
+    crate::worker::refresh_policy(state);
     state.borrow::<SharedState>().borrow().runtime_events_enabled
 }
 
@@ -3383,6 +3389,7 @@ fn op_console_msg(
     #[string] msg: &str,
     #[string] args_json: &str,
 ) {
+    crate::worker::refresh_policy(state);
     match level {
         "warn" | "warning" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
@@ -3790,6 +3797,7 @@ async fn op_fetch_url(
     #[string] credentials: String,
     #[string] destination: Option<String>,
 ) -> Result<String, deno_error::JsErrorBox> {
+    crate::worker::refresh_policy(&state.borrow());
     let resource_type = match destination.as_deref() {
         Some("script") => ResourceType::Script,
         _ => ResourceType::Fetch,
@@ -3836,10 +3844,10 @@ async fn op_fetch_url(
             gs.intercept_tx.is_some()
         );
         let itx = if gs.intercept_enabled {
-            gs.intercept_counter += 1;
+            let id = gs.intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             gs.intercept_tx
                 .clone()
-                .map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
+                .map(|tx| (tx, format!("intercept-{id}")))
         } else {
             None
         };
@@ -4399,8 +4407,8 @@ async fn op_fetch_url(
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
+        let id = gs.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let request_id = format!("fetch-{id}");
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
         if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
@@ -4442,6 +4450,8 @@ async fn op_fetch_url(
         }
         request_id
     };
+
+    crate::worker::flush_observations(&state.borrow());
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
@@ -5818,16 +5828,7 @@ fn op_navigate(
     #[string] body: &str,
     #[string] behavior: &str,
 ) {
-    if let Some(registry) = state.try_borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>() {
-        let current_ctx = scope.get_entered_or_microtask_context();
-        let is_worker = registry.borrow().workers.values().any(|w| {
-            let w_ctx = v8::Local::new(scope, &w.context);
-            w_ctx == current_ctx
-        });
-        if is_worker {
-            return;
-        }
-    }
+    if state.try_borrow::<crate::worker::WorkerEndpoint>().is_some() { return; }
     let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is
@@ -6870,8 +6871,12 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        crate::worker::op_worker_serialize(),
+        crate::worker::op_worker_deserialize(),
         crate::worker::op_worker_create(),
         crate::worker::op_worker_run(),
+        crate::worker::op_worker_next_event(),
+        crate::worker::op_worker_close(),
         crate::worker::op_worker_post_to_worker(),
         crate::worker::op_worker_post_to_parent(),
         crate::worker::op_worker_terminate(),

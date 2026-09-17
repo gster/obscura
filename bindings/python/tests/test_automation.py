@@ -40,6 +40,13 @@ class Handler(BaseHTTPRequestHandler):
                 <button aria-label="   ">Whitespace label</button><button aria-label="Explicit name">Other text</button><output>Waiting</output></body></html>'''; content='text/html'
         elif self.path == '/binary':
             body=bytes(range(256))*150; content='application/octet-stream'
+        elif self.path == '/query-progress':
+            body=b'''<html><body><output id="ticks">0</output><output id="worker">Pending</output><script>
+                let ticks=0;
+                setInterval(()=>document.querySelector('#ticks').textContent=String(++ticks),50);
+                const worker=new Worker(URL.createObjectURL(new Blob(['postMessage({ready:true})'],{type:'application/javascript'})));
+                worker.onmessage=()=>{document.querySelector('#worker').textContent='Ready';worker.terminate();};
+                </script></body></html>'''; content='text/html'
         else:
             body=HTML.encode();content='text/html; charset=utf-8'
         self.send_response(200);self.send_header('Content-Type',content)
@@ -71,6 +78,18 @@ class RuntimeBase(unittest.IsolatedAsyncioTestCase):
             self.workspace.cleanup()
 
 class RuntimeTests(RuntimeBase):
+    async def test_frequent_queries_allow_worker_and_timer_progress(self):
+        await self.page.goto(self.origin+'/query-progress')
+        deadline=asyncio.get_running_loop().time()+0.6
+        reads=0
+        while asyncio.get_running_loop().time()<deadline:
+            ticks=await self.page.locator('#ticks').text_content()
+            worker=await self.page.locator('#worker').text_content()
+            reads+=1
+        self.assertGreater(reads,3)
+        self.assertGreaterEqual(int(ticks),3,'read actions must not starve page timers')
+        self.assertEqual(worker,'Ready','read actions must not starve Worker delivery')
+
     async def test_empty_aria_label_falls_back_to_button_text(self):
         await self.page.goto(self.origin+'/empty-aria-label')
         button=self.page.get_by_role('button',name='Search flights',exact=True)
