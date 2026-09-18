@@ -1,5 +1,7 @@
 #[path = "stealth_transport.rs"]
-mod transport;
+// Visible to the crate so a client can be rebuilt for another runtime; see
+// `StealthHttpClient::detached`.
+pub(crate) mod transport;
 use transport::header;
 
 #[cfg(feature = "stealth")]
@@ -144,13 +146,18 @@ async fn read_stealth_body_limited(
 }
 
 /// Browser identity is independent of transport preset availability.
-/// MacChrome152 uses primp Chrome152 with explicit macOS identity.
+/// MacChrome152 / MacChrome153 use primp's matching Chrome build with an
+/// explicit macOS identity. The Chrome major version drives everything derived
+/// from the UA string (notably the GREASE sec-ch-ua brand, its version and the
+/// brand order), so the profile must track a real build rather than a generic
+/// "Chrome" persona.
 /// ALPS and trust-anchor contents still differ from the reference Chrome.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StealthProfile {
     #[default]
     WindowsChrome145,
     MacChrome152,
+    MacChrome153,
 }
 
 impl StealthProfile {
@@ -158,14 +165,38 @@ impl StealthProfile {
         match self {
             Self::WindowsChrome145 => STEALTH_USER_AGENT,
             Self::MacChrome152 => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+            Self::MacChrome153 => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        }
+    }
+
+    /// The full Chrome version reported by `navigator.userAgentData.uaFullVersion`.
+    /// Taken from the real build the profile impersonates; the reduced UA string
+    /// alone would report `major.0.0.0`.
+    pub fn full_version(self) -> &'static str {
+        match self {
+            Self::WindowsChrome145 => "145.0.0.0",
+            Self::MacChrome152 => "152.0.7977.83",
+            Self::MacChrome153 => "153.0.8010.50",
         }
     }
     pub fn platform(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Self::WindowsChrome145 => (STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM, STEALTH_UA_PLATFORM_VERSION),
             Self::MacChrome152 => ("MacIntel", "macOS", "26.6.2"),
+            Self::MacChrome153 => ("MacIntel", "macOS", "26.6.2"),
         }
     }
+}
+
+/// The parameters a transport client is built from. Kept on the client so a
+/// sibling can be constructed for a different runtime with the same identity.
+#[cfg(feature = "stealth")]
+#[derive(Clone, Debug)]
+pub struct TransportParams {
+    pub profile: StealthProfile,
+    pub proxy_url: Option<String>,
+    pub accept_language: Option<String>,
+    pub do_not_track: Option<String>,
 }
 
 #[cfg(feature = "stealth")]
@@ -173,9 +204,12 @@ pub struct StealthHttpClient {
     client: transport::Client,
     allow_private_network: bool,
     pub cookie_jar: Arc<CookieJar>,
-    pub extra_headers: RwLock<HashMap<String, String>>,
+    /// Shared so a detached client created for another runtime keeps observing
+    /// the same header overrides.
+    pub extra_headers: Arc<RwLock<HashMap<String, String>>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     policy: Option<Arc<crate::client::ObscuraHttpClient>>,
+    transport: TransportParams,
 }
 
 #[cfg(feature = "stealth")]
@@ -215,9 +249,15 @@ impl StealthHttpClient {
             client,
             allow_private_network,
             cookie_jar,
-            extra_headers: RwLock::new(HashMap::new()),
+            extra_headers: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             policy: Some(policy),
+            transport: TransportParams {
+                profile,
+                proxy_url: proxy_url.map(str::to_owned),
+                accept_language: Some(accept_language.to_owned()),
+                do_not_track: do_not_track.map(str::to_owned),
+            },
         }
     }
 
@@ -228,9 +268,48 @@ impl StealthHttpClient {
             client,
             allow_private_network,
             cookie_jar,
-            extra_headers: RwLock::new(HashMap::new()),
+            extra_headers: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             policy,
+            transport: TransportParams {
+                profile,
+                proxy_url: proxy_url.map(str::to_owned),
+                accept_language: None,
+                do_not_track: None,
+            },
+        }
+    }
+
+    pub fn transport_params(&self) -> &TransportParams {
+        &self.transport
+    }
+
+    /// A client with this one's identity but its own connection pool.
+    ///
+    /// A connection pool belongs to the tokio runtime that drives it: a pooled
+    /// connection handed to a *different* runtime is already dead, so the first
+    /// reuse fails with a broken pipe ("connection closed because of a broken
+    /// pipe"). Workers run on their own thread and runtime, so they must build
+    /// their own transport instead of sharing the page's.
+    ///
+    /// Cookies, in-flight accounting, header overrides and the policy
+    /// (interceptor, blocked trackers) stay shared - only the pool is new.
+    pub fn detached(&self) -> Self {
+        let params = &self.transport;
+        StealthHttpClient {
+            client: transport::Client::new(
+                params.profile,
+                params.proxy_url.as_deref(),
+                self.allow_private_network,
+                params.accept_language.as_deref(),
+                params.do_not_track.as_deref(),
+            ),
+            allow_private_network: self.allow_private_network,
+            cookie_jar: self.cookie_jar.clone(),
+            extra_headers: self.extra_headers.clone(),
+            in_flight: self.in_flight.clone(),
+            policy: self.policy.clone(),
+            transport: params.clone(),
         }
     }
 
@@ -559,6 +638,45 @@ impl StealthHttpClient {
 
 #[cfg(all(test, feature = "stealth"))]
 mod tests {
+    /// A detached client exists so a worker on its own tokio runtime does not
+    /// reuse the page's connection pool: a pooled connection is driven by the
+    /// runtime that created it, and the first reuse from another runtime fails
+    /// with a broken pipe. Detaching must therefore keep every *shared* piece of
+    /// identity (cookies, in-flight accounting, header overrides) and the whole
+    /// transport configuration (profile and proxy), or scraping silently loses
+    /// the proxy.
+    #[test]
+    fn detached_client_shares_identity_and_keeps_transport_configuration() {
+        use std::sync::Arc as StdArc;
+        let policy = StdArc::new(crate::client::ObscuraHttpClient::new());
+        let jar = StdArc::new(crate::cookies::CookieJar::new());
+        let proxy = "http://127.0.0.1:9";
+        let original = super::StealthHttpClient::with_policy_profile_persona(
+            jar.clone(), Some(proxy), policy, super::StealthProfile::MacChrome153,
+            "en-US,en;q=0.9", Some("0"),
+        );
+        original.extra_headers.blocking_write().insert("x-probe".into(), "1".into());
+
+        let sibling = original.detached();
+
+        // identity stays shared
+        assert!(StdArc::ptr_eq(&original.cookie_jar, &sibling.cookie_jar));
+        assert!(StdArc::ptr_eq(&original.in_flight, &sibling.in_flight));
+        assert!(StdArc::ptr_eq(&original.extra_headers, &sibling.extra_headers),
+            "header overrides must reach the worker's requests");
+        assert_eq!(sibling.extra_headers.blocking_read().get("x-probe").map(String::as_str), Some("1"));
+
+        // transport configuration is carried over verbatim
+        let params = sibling.transport_params();
+        assert_eq!(params.profile, super::StealthProfile::MacChrome153);
+        assert_eq!(params.proxy_url.as_deref(), Some(proxy));
+        assert_eq!(params.accept_language.as_deref(), Some("en-US,en;q=0.9"));
+        assert_eq!(params.do_not_track.as_deref(), Some("0"));
+
+        // the sibling has its own transport, not a clone of the same one
+        assert_ne!(original.transport_params().profile, super::StealthProfile::WindowsChrome145);
+    }
+
     #[tokio::test]
     async fn xhr_post_replaces_accept_and_content_type_defaults() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -787,10 +905,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_profiles_send_consistent_identity_without_prefetch_defaults() {
+    async fn all_profiles_send_consistent_identity_without_prefetch_defaults() {
         for (profile, platform, brands) in [
             (super::StealthProfile::WindowsChrome145, "Windows", r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#),
             (super::StealthProfile::MacChrome152, "macOS", r#""Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152""#),
+            // Chrome 153 changed both the GREASE brand name/version and the brand
+            // order versus 152. These goldens come from primp's own captures of
+            // the real builds, so a profile that drifts from them fails loudly.
+            (super::StealthProfile::MacChrome153, "macOS", r#""Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153""#),
         ] {
             let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = Url::parse(&format!("http://{}/", server.local_addr().unwrap())).unwrap();
@@ -877,9 +999,15 @@ mod tests {
             client: super::transport::Client::new(super::StealthProfile::WindowsChrome145, None, true, None, None),
             allow_private_network: true,
             cookie_jar: Arc::new(CookieJar::new()),
-            extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            extra_headers: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             policy: None,
+            transport: super::TransportParams {
+                profile: super::StealthProfile::WindowsChrome145,
+                proxy_url: None,
+                accept_language: None,
+                do_not_track: None,
+            },
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

@@ -179,7 +179,7 @@ mod tests {
         rt.set_url("http://127.0.0.1/identity");
         rt.set_user_agent(obscura_net::StealthProfile::MacChrome152.user_agent());
         rt.set_platform("MacIntel", "macOS", "26.6.2");
-        rt.set_user_agent_details("152.0.7977.83", "arm");
+        rt.set_user_agent_details(obscura_net::StealthProfile::MacChrome152.full_version(), "arm");
         rt.run_page_init();
         let script = "[navigator.userAgent,navigator.platform,JSON.stringify(navigator.userAgentData.brands)]";
         let expected = rt.evaluate(script).unwrap();
@@ -215,7 +215,10 @@ mod tests {
         assert_eq!(macos.languages.as_deref(), Some(&["en".into(), "zh-CN".into()][..]));
         assert_eq!(macos.accept_language.as_deref(), Some("en,zh-CN;q=0.9,zh;q=0.8"));
         assert_eq!(macos.timezone.as_deref(), Some("Asia/Shanghai"));
-        assert_eq!(macos.do_not_track.as_deref(), Some("1"));
+        // Chrome 153 on macOS sends no DNT header and reports
+        // navigator.doNotTrack === null, so the macOS defaults must leave the
+        // preference unset rather than fabricate one.
+        assert_eq!(macos.do_not_track, None);
         assert_eq!((macos.screen_width, macos.screen_height), (Some(2560), Some(1440)));
         assert_eq!((macos.screen_avail_width, macos.screen_avail_height), (Some(2560), Some(1320)));
         assert_eq!((macos.outer_width, macos.outer_height), (Some(640), Some(480)));
@@ -231,7 +234,11 @@ mod tests {
         custom.languages = None;
         custom.accept_language = None;
         custom.apply_defaults();
-        assert_eq!(custom.languages.as_deref(), Some(&["fr-CA".into()][..]));
+        // A single `language` expands to the primary tag plus its base language,
+        // which is what a browser reports and what `accept_language` already
+        // derived. Reporting ["fr-CA"] alongside "fr-CA,fr;q=0.9" was internally
+        // inconsistent.
+        assert_eq!(custom.languages.as_deref(), Some(&["fr-CA".into(), "fr".into()][..]));
         assert_eq!(custom.accept_language.as_deref(), Some("fr-CA,fr;q=0.9"));
         assert!(custom.locale_is_consistent());
         custom.accept_language = Some("en-US,en;q=0.9".into());
@@ -1238,7 +1245,7 @@ mod tests {
             let cookies = Arc::new(CookieJar::new());
             let mut policy = ObscuraHttpClient::with_full_options(cookies.clone(), None, false);
             policy.block_trackers = blocked;
-            *policy.interceptor.write().await = Some(Box::new(FixtureResponse));
+            *policy.interceptor.write().await = Some(std::sync::Arc::new(FixtureResponse));
             let stealth = StealthHttpClient::with_policy(cookies, None, Arc::new(policy));
             assert_eq!(stealth.fetch(&url).await.unwrap().status, status);
             assert_eq!(
@@ -1290,7 +1297,7 @@ mod tests {
         });
         let cookies = Arc::new(CookieJar::new());
         let policy = ObscuraHttpClient::with_full_options(cookies.clone(), None, true);
-        *policy.interceptor.write().await = Some(Box::new(RequestHeaders));
+        *policy.interceptor.write().await = Some(std::sync::Arc::new(RequestHeaders));
         let stealth = StealthHttpClient::with_policy(cookies, None, Arc::new(policy));
         assert_eq!(stealth.fetch(&url).await.unwrap().status, 200);
         assert!(server
@@ -1327,7 +1334,7 @@ mod tests {
         );
         let client = Arc::get_mut(&mut context.http_client).unwrap();
         client.block_trackers = false;
-        *client.interceptor.write().await = Some(Box::new(HtmlFixture(html)));
+        *client.interceptor.write().await = Some(std::sync::Arc::new(HtmlFixture(html)));
         let mut page = Page::new("native-test".into(), Arc::new(context));
         page.set_viewport((640.0, 480.0));
         page.navigate("http://127.0.0.1/native-input-fixture")
@@ -4039,7 +4046,7 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
             );
             let client = Arc::get_mut(&mut context.http_client).unwrap();
             client.block_trackers = false;
-            *client.interceptor.write().await = Some(Box::new(HistoryRedirectFixture {
+            *client.interceptor.write().await = Some(std::sync::Arc::new(HistoryRedirectFixture {
                 enabled: enabled.clone(),
                 destination,
             }));
@@ -4118,7 +4125,7 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
             );
             let client = Arc::get_mut(&mut context.http_client).unwrap();
             client.block_trackers = false;
-            *client.interceptor.write().await = Some(Box::new(HistoryResponseGate(gate.clone())));
+            *client.interceptor.write().await = Some(std::sync::Arc::new(HistoryResponseGate(gate.clone())));
             let mut page = Page::new("history-failure".into(), Arc::new(context));
             page.navigate("http://127.0.0.1/a").await.unwrap();
             history_eval(&mut page, "history.replaceState({name:'A'},'')");
@@ -6060,7 +6067,7 @@ struct Persona {
 
 impl Persona {
     fn apply_defaults(&mut self) {
-        let macos = self.profile == "macos_chrome152";
+        let macos = matches!(self.profile.as_str(), "macos_chrome152" | "macos_chrome153");
         if self.language.is_none() && self.languages.is_none() {
             let defaults = if macos {
                 vec!["en".into(), "zh-CN".into()]
@@ -6072,7 +6079,19 @@ impl Persona {
         } else if self.language.is_none() {
             self.language = self.languages.as_ref().and_then(|v| v.first()).cloned();
         } else if self.languages.is_none() {
-            self.languages = Some(vec![self.language.clone().unwrap()]);
+            // Derive the language list the way a browser reports it: the primary
+            // tag followed by its base language. `accept_language` below already
+            // expands the same way, so a single `language` must not leave
+            // navigator.languages reporting ["en-US"] while Accept-Language says
+            // "en-US,en" -- no real browser is internally inconsistent like that.
+            let primary = self.language.clone().unwrap();
+            let mut derived = vec![primary.clone()];
+            if let Some((base, _)) = primary.split_once('-') {
+                if !derived.iter().any(|tag| tag == base) {
+                    derived.push(base.to_string());
+                }
+            }
+            self.languages = Some(derived);
         }
         self.accept_language.get_or_insert_with(|| {
             let mut expanded = Vec::<String>::new();
@@ -6090,7 +6109,14 @@ impl Persona {
             }).collect::<Vec<_>>().join(",")
         });
         self.timezone.get_or_insert_with(|| if macos { "Asia/Shanghai".into() } else { "America/New_York".into() });
-        if macos && self.do_not_track.is_none() { self.do_not_track = Some("1".into()); }
+        // Do NOT invent a DNT preference. Real Chrome ships no default DNT
+        // value: it sends no `DNT` request header and reports
+        // `navigator.doNotTrack === null` (measured against Chrome 153 on
+        // macOS). Defaulting the macOS profile to "1" asserted the opposite on
+        // both layers at once - a deliberate-looking privacy stance that no
+        // stock Chrome has, and a well-known automation tell. A persona may
+        // still set `do_not_track` explicitly; only the fabricated default is
+        // gone.
         self.hardware_concurrency.get_or_insert(if macos { 15 } else { 8 });
         self.device_memory.get_or_insert(if macos { 32.0 } else { 8.0 });
         self.screen_width.get_or_insert(if macos { 2560 } else { 1920 });
@@ -6157,7 +6183,7 @@ impl Persona {
         ])
         .unwrap();
         let hash = Sha256::digest(source);
-        let macos = self.profile == "macos_chrome152";
+        let macos = matches!(self.profile.as_str(), "macos_chrome152" | "macos_chrome153");
         obscura_browser::DeviceIdentity {
             seed: u32::from_be_bytes(hash[..4].try_into().unwrap()),
             hardware_concurrency: self.hardware_concurrency.unwrap_or(if macos { 15 } else { 8 }),
@@ -6381,7 +6407,9 @@ impl BrowserRuntime {
                     .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
         };
         if persona.schema_version != "1"
-            || !(persona.profile == "windows_chrome145" || (init.protocol_version == "2" && persona.profile == "macos_chrome152"))
+            || !(persona.profile == "windows_chrome145"
+                || (init.protocol_version == "2"
+                    && matches!(persona.profile.as_str(), "macos_chrome152" | "macos_chrome153")))
             || !identifier(&persona.persona_id)
             || !identifier(&persona.revision)
             || !(320..=3840).contains(&persona.viewport.width)
@@ -6436,7 +6464,11 @@ impl BrowserRuntime {
                 return Err(invalid("INVALID_PROXY"));
             }
         }
-        let profile = if persona.profile == "macos_chrome152" { obscura_net::StealthProfile::MacChrome152 } else { obscura_net::StealthProfile::WindowsChrome145 };
+        let profile = match persona.profile.as_str() {
+            "macos_chrome153" => obscura_net::StealthProfile::MacChrome153,
+            "macos_chrome152" => obscura_net::StealthProfile::MacChrome152,
+            _ => obscura_net::StealthProfile::WindowsChrome145,
+        };
         let mut context = BrowserContext::with_storage_and_network(
             "autopilot".into(),
             init.proxy_url,
@@ -6461,7 +6493,7 @@ impl BrowserRuntime {
             Arc::get_mut(&mut context.http_client).ok_or(invalid("CONTEXT_ALREADY_SHARED"))?;
         client.block_trackers = persona.tracker_blocking;
         *client.interceptor.write().await =
-            Some(Box::new(OriginGuard(init.allowed_origins.clone())));
+            Some(std::sync::Arc::new(OriginGuard(init.allowed_origins.clone())));
         self.protocol_version = init.protocol_version;
         self.origins = init.allowed_origins;
         self.mode = init.initial_mode;
@@ -6475,7 +6507,11 @@ impl BrowserRuntime {
             result["browser_identity"] = json!({
                 "profile": persona.profile,
                 "user_agent": profile.user_agent(),
-                "transport_profile": if profile == obscura_net::StealthProfile::MacChrome152 { "primp_chrome152_macos" } else { "primp_chrome145_windows" },
+                "transport_profile": match profile {
+                    obscura_net::StealthProfile::MacChrome153 => "primp_chrome153_macos",
+                    obscura_net::StealthProfile::MacChrome152 => "primp_chrome152_macos",
+                    obscura_net::StealthProfile::WindowsChrome145 => "primp_chrome145_windows",
+                },
                 "chrome152_transport_verified": false,
             });
             result["supported_methods"].as_array_mut().unwrap().extend([json!("automation"), json!("network_body")]);

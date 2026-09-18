@@ -880,11 +880,25 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         }
     }
     globals.insert("__obscura_cross_origin_isolated".into(), serde_json::Value::Bool(false));
+    // The worker runs on its own thread and its own tokio runtime, so it must
+    // NOT reuse the page's transport: a connection pool belongs to the runtime
+    // that drives it, and a pooled connection carried across runtimes is already
+    // dead - its first reuse fails with a broken pipe. Build a sibling transport
+    // that keeps the same identity (cookies, profile, proxy, policy) but owns a
+    // fresh pool.
+    // Same reasoning for the non-stealth client: a pool belongs to the runtime
+    // that drives it, so the worker needs its own instance too.
+    let worker_http = parent.http_client.as_ref()
+        .map(|client| std::sync::Arc::new(client.detached()));
+    #[cfg(feature = "stealth")]
+    let worker_stealth = parent.stealth_client.as_ref().map(|client| {
+        std::sync::Arc::new(obscura_net::StealthHttpClient::detached(client))
+    });
     let config = WorkerConfig { policy: registry.borrow().policy.clone(), resources: resources.clone(), url: url.into(), globals, blobs,
         identity: parent.device_identity.clone(), cookies: parent.cookie_jar.clone(),
-        http: parent.http_client.clone(), callbacks: parent.callbacks.clone(),
+        http: worker_http, callbacks: parent.callbacks.clone(),
         #[cfg(feature = "stealth")]
-        stealth: parent.stealth_client.clone(),
+        stealth: worker_stealth,
         blocked_urls: parent.blocked_urls.clone(), referrer_policy: parent.referrer_policy,
         intercept_tx: parent.intercept_tx.clone(), intercept_enabled: parent.intercept_enabled,
         intercept_counter: parent.intercept_counter.clone(), response_counter: parent.network_response_body_counter.clone(),

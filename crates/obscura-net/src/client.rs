@@ -990,17 +990,23 @@ async fn read_reqwest_body_limited(
 }
 
 pub struct ObscuraHttpClient {
+    /// The connection pool. Belongs to the tokio runtime that drives it, so a
+    /// client handed to a different runtime must get a fresh one - see
+    /// `detached`.
     client: tokio::sync::OnceCell<Client>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
-    pub user_agent: RwLock<String>,
-    pub accept_language: RwLock<String>,
-    pub extra_headers: RwLock<HashMap<String, String>>,
-    pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    // These are shared (`Arc`) rather than owned so a detached client keeps
+    // seeing later configuration changes, exactly like the stealth client's
+    // `extra_headers`.
+    pub user_agent: Arc<RwLock<String>>,
+    pub accept_language: Arc<RwLock<String>>,
+    pub extra_headers: Arc<RwLock<HashMap<String, String>>>,
+    pub interceptor: Arc<RwLock<Option<Arc<dyn RequestInterceptor + Send + Sync>>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -1206,17 +1212,45 @@ impl ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
-            user_agent: RwLock::new(
+            user_agent: Arc::new(RwLock::new(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            ),
-            accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
-            extra_headers: RwLock::new(HashMap::new()),
-            interceptor: RwLock::new(None),
+            )),
+            accept_language: Arc::new(RwLock::new("en-US,en;q=0.9".to_string())),
+            extra_headers: Arc::new(RwLock::new(HashMap::new())),
+            interceptor: Arc::new(RwLock::new(None)),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             allow_private_network,
+        }
+    }
+
+    /// A client with this one's configuration but its own connection pool.
+    ///
+    /// A pool belongs to the tokio runtime that drives it: a pooled connection
+    /// handed to a *different* runtime is already dead, and its first reuse
+    /// fails with a broken pipe. Workers run on their own thread and runtime, so
+    /// they must build their own pool instead of sharing the page's.
+    ///
+    /// Everything observable stays shared - cookies, header overrides, the user
+    /// agent and accept-language (both mutable after construction), in-flight
+    /// accounting, the resource cache and the interceptor - so the worker sees
+    /// the same policy as the page. Only `client` starts empty.
+    pub fn detached(&self) -> Self {
+        ObscuraHttpClient {
+            client: tokio::sync::OnceCell::new(),
+            proxy_url: self.proxy_url.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            user_agent: self.user_agent.clone(),
+            accept_language: self.accept_language.clone(),
+            extra_headers: self.extra_headers.clone(),
+            interceptor: self.interceptor.clone(),
+            timeout: self.timeout,
+            in_flight: self.in_flight.clone(),
+            block_trackers: self.block_trackers,
+            resource_loader: self.resource_loader.clone(),
+            allow_private_network: self.allow_private_network,
         }
     }
 
@@ -1879,6 +1913,54 @@ mod ssrf_tests {
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::sync::Arc;
+
+    /// A detached client exists so a worker on its own tokio runtime does not
+    /// reuse the page's connection pool - a pooled connection is driven by the
+    /// runtime that created it, so its first reuse from another runtime fails
+    /// with a broken pipe. Detaching must keep every shared piece of
+    /// configuration (so the worker sees the same policy as the page) and carry
+    /// the transport settings over verbatim, or scraping silently loses the
+    /// proxy and the user agent.
+    #[tokio::test]
+    async fn detached_client_shares_configuration_and_keeps_transport_settings() {
+        let policy = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()), Some("http://127.0.0.1:9"), false);
+        policy.set_user_agent("Detached/1.0").await;
+        policy.set_accept_language("fr-FR,fr;q=0.9").await;
+        policy.set_extra_headers(HashMap::from([("x-probe".to_string(), "1".to_string())])).await;
+        struct AlwaysContinue;
+        #[async_trait::async_trait]
+        impl crate::interceptor::RequestInterceptor for AlwaysContinue {
+            async fn intercept(&self, _request: &crate::client::RequestInfo) -> crate::interceptor::InterceptAction {
+                crate::interceptor::InterceptAction::Continue
+            }
+        }
+        *policy.interceptor.write().await = Some(Arc::new(AlwaysContinue));
+
+        let sibling = policy.detached();
+
+        // shared identity: later mutations must reach the sibling
+        assert!(Arc::ptr_eq(&policy.cookie_jar, &sibling.cookie_jar));
+        assert!(Arc::ptr_eq(&policy.in_flight, &sibling.in_flight));
+        assert!(Arc::ptr_eq(&policy.extra_headers, &sibling.extra_headers));
+        assert!(Arc::ptr_eq(&policy.user_agent, &sibling.user_agent));
+        assert!(Arc::ptr_eq(&policy.accept_language, &sibling.accept_language));
+        assert!(Arc::ptr_eq(&policy.interceptor, &sibling.interceptor));
+
+        policy.set_user_agent("Changed/2.0").await;
+        assert_eq!(sibling.user_agent.read().await.as_str(), "Changed/2.0",
+            "the worker must observe user-agent changes made after it was created");
+
+        // transport settings carried over verbatim
+        assert_eq!(sibling.proxy_url.as_deref(), Some("http://127.0.0.1:9"),
+            "a detached client that loses the proxy would silently scrape from the local IP");
+        assert_eq!(sibling.timeout, policy.timeout);
+        assert_eq!(sibling.allow_private_network, policy.allow_private_network);
+        assert_eq!(sibling.block_trackers, policy.block_trackers);
+
+        // its own pool, not the page's
+        assert!(sibling.client.get().is_none(), "the sibling must start with an empty pool");
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use url::Url;

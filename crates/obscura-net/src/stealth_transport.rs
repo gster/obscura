@@ -39,6 +39,7 @@ impl Client {
         let (browser, os) = match profile {
             StealthProfile::WindowsChrome145 => (primp::Impersonate::ChromeV145, primp::ImpersonateOS::Windows),
             StealthProfile::MacChrome152 => (primp::Impersonate::ChromeV152, primp::ImpersonateOS::MacOS),
+            StealthProfile::MacChrome153 => (primp::Impersonate::ChromeV153, primp::ImpersonateOS::MacOS),
         };
         let mut builder = primp::Client::builder()
             .impersonate(browser)
@@ -70,9 +71,13 @@ impl Client {
             ("user-agent", profile.user_agent()),
             ("sec-ch-ua", match profile {
                 StealthProfile::MacChrome152 => r#""Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152""#,
+                // Chrome 153 reordered the brands (Google Chrome first) and changed
+                // the GREASE token to "Not_A Brand";v="8". Values match primp's own
+                // captures of the real builds.
+                StealthProfile::MacChrome153 => r#""Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153""#,
                 StealthProfile::WindowsChrome145 => r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#,
             }),
-            ("sec-ch-ua-mobile", "?0"), ("sec-ch-ua-platform", match profile { StealthProfile::MacChrome152 => "\"macOS\"", StealthProfile::WindowsChrome145 => "\"Windows\"" }),
+            ("sec-ch-ua-mobile", "?0"), ("sec-ch-ua-platform", match profile { StealthProfile::MacChrome152 | StealthProfile::MacChrome153 => "\"macOS\"", StealthProfile::WindowsChrome145 => "\"Windows\"" }),
             ("accept", "*/*"),
             ("accept-language", accept_language.unwrap_or("en-US,en;q=0.9")),
             ("accept-encoding", "gzip, deflate, br, zstd"), ("priority", "u=0, i"),
