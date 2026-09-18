@@ -13062,6 +13062,16 @@ return {before,removed,reinsert,moved,cleared};
                         colorBufferFloat2: gl2.getSupportedExtensions().indexOf('EXT_color_buffer_float') !== -1,
                         drawBuffersIndexed1: gl1.getSupportedExtensions().indexOf('OES_draw_buffers_indexed') !== -1,
                         drawBuffersIndexed2: gl2.getSupportedExtensions().indexOf('OES_draw_buffers_indexed') !== -1,
+                        // Everything advertised must be obtainable, in both
+                        // families. A name listed by getSupportedExtensions()
+                        // that getExtension() answers null for is a
+                        // contradiction, not a cosmetic difference.
+                        unfulfilled1: gl1.getSupportedExtensions().filter(function (n) {
+                            try { return gl1.getExtension(n) === null; } catch (e) { return true; }
+                        }),
+                        unfulfilled2: gl2.getSupportedExtensions().filter(function (n) {
+                            try { return gl2.getExtension(n) === null; } catch (e) { return true; }
+                        }),
                         // Integer and float precision formats must not be identical.
                         intPrec1: (function () {
                             const f = gl1.getShaderPrecisionFormat(gl1.VERTEX_SHADER, gl1.HIGH_INT);
@@ -13107,6 +13117,11 @@ return {before,removed,reinsert,moved,cleared};
             "a WebGL2-only constant must not exist on a WebGL1 context");
         assert_eq!(out.get("maxDrawBuffersIn2"), Some(&serde_json::json!(true)));
         assert_eq!(out.get("maxDrawBuffers2"), Some(&serde_json::json!(8)));
+
+        assert_eq!(out.get("unfulfilled1"), Some(&serde_json::json!([])),
+            "every extension a WebGL1 context advertises must be obtainable");
+        assert_eq!(out.get("unfulfilled2"), Some(&serde_json::json!([])),
+            "every extension a WebGL2 context advertises must be obtainable");
 
         assert_ne!(
             out.get("intPrec1"),

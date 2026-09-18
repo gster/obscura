@@ -14678,7 +14678,12 @@ class _SoftwareWebGLContext {
   }
   getExtension(name) {
     name = String(name);
-    if (!_WEBGL_EXTENSIONS.includes(name)) return null;
+    // Gate on THIS context's list. Checking the WebGL1 list from a WebGL2
+    // context advertises extensions that cannot then be obtained, which is a
+    // page-visible contradiction: getSupportedExtensions() lists a name and
+    // getExtension() returns null for it.
+    const supported = this._webgl2 ? _WEBGL2_EXTENSIONS : _WEBGL_EXTENSIONS;
+    if (!supported.includes(name)) return null;
     if (name === 'WEBGL_debug_renderer_info') {
       return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
     }
