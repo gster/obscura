@@ -14623,6 +14623,30 @@ const _WEBGL_EXTENSIONS = [
   'WEBGL_lose_context', 'WEBGL_multi_draw', 'WEBGL_polygon_mode',
 ];
 
+// A WebGL2 context does NOT report the WebGL1 list. Extensions that became core
+// in WebGL2 (instanced arrays, standard derivatives, depth texture, ...) are
+// gone, and WebGL2-only ones appear. Returning one list for both contexts is a
+// divergence a probe sees immediately: no real browser reports the same
+// supported-extension set for a WebGL1 and a WebGL2 context on one machine.
+const _WEBGL2_EXTENSIONS = [
+  'EXT_clip_control', 'EXT_color_buffer_float', 'EXT_color_buffer_half_float',
+  'EXT_conservative_depth', 'EXT_depth_clamp', 'EXT_disjoint_timer_query_webgl2',
+  'EXT_float_blend', 'EXT_polygon_offset_clamp', 'EXT_render_snorm',
+  'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc',
+  'EXT_texture_filter_anisotropic', 'EXT_texture_mirror_clamp_to_edge',
+  'EXT_texture_norm16', 'KHR_parallel_shader_compile',
+  'NV_shader_noperspective_interpolation', 'OES_draw_buffers_indexed',
+  'OES_sample_variables', 'OES_shader_multisample_interpolation',
+  'OES_texture_float_linear', 'WEBGL_blend_func_extended',
+  'WEBGL_clip_cull_distance', 'WEBGL_compressed_texture_astc',
+  'WEBGL_compressed_texture_etc', 'WEBGL_compressed_texture_etc1',
+  'WEBGL_compressed_texture_pvrtc', 'WEBGL_compressed_texture_s3tc',
+  'WEBGL_compressed_texture_s3tc_srgb', 'WEBGL_debug_renderer_info',
+  'WEBGL_debug_shaders', 'WEBGL_lose_context', 'WEBGL_multi_draw',
+  'WEBGL_polygon_mode', 'WEBGL_provoking_vertex', 'WEBGL_render_shared_exponent',
+  'WEBGL_stencil_texturing',
+];
+
 class _SoftwareWebGLContext {
   constructor(canvas, attributes, webgl2) {
     this.canvas = canvas;
@@ -14649,7 +14673,9 @@ class _SoftwareWebGLContext {
   }
   getContextAttributes() { return Object.assign({}, this._attributes); }
   isContextLost() { return false; }
-  getSupportedExtensions() { return _WEBGL_EXTENSIONS.slice(); }
+  getSupportedExtensions() {
+    return (this._webgl2 ? _WEBGL2_EXTENSIONS : _WEBGL_EXTENSIONS).slice();
+  }
   getExtension(name) {
     name = String(name);
     if (!_WEBGL_EXTENSIONS.includes(name)) return null;
@@ -14677,13 +14703,33 @@ class _SoftwareWebGLContext {
       case 0x0D3A: return new Int32Array([16384, 16384]);
       case 0x0BA2: return new Int32Array(this._viewport);
       case 0x0C22: return new Float32Array(this._clearColor);
-      case 0x8B4D: return 16;
-      case 0x8872: return 16;
-      case 0x8824: return this._webgl2 ? 8 : 1;
+      case 0x8869: return 16;                       // MAX_VERTEX_ATTRIBS
+      case 0x8DFB: case 0x8DFD: return 1024;        // vertex / fragment uniform vectors
+      case 0x8DFC: return 30;                       // MAX_VARYING_VECTORS
+      case 0x8B4C: case 0x8872: return 16;          // vertex / texture image units
+      case 0x8B4D: return 32;                       // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+      case 0x851C: return 16384;                    // MAX_CUBE_MAP_TEXTURE_SIZE
+      case 0x0D52: case 0x0D53: case 0x0D54: case 0x0D55: return 8;   // RGBA bits
+      case 0x0D56: return 24;                       // DEPTH_BITS
+      case 0x0D57: case 0x80A9: return 0;           // STENCIL_BITS / SAMPLES
+      case 0x0D50: return 4;                        // SUBPIXEL_BITS
+      case 0x846E: return new Float32Array([1, 1]);     // ALIASED_LINE_WIDTH_RANGE
+      case 0x846D: return new Float32Array([1, 511]);   // ALIASED_POINT_SIZE_RANGE
+      case 0x8824: return this._webgl2 ? 8 : 1;     // MAX_DRAW_BUFFERS
       default: return 0;
     }
   }
-  getShaderPrecisionFormat() { return { rangeMin: 127, rangeMax: 127, precision: 23 }; }
+  // Integer and float precision formats do not share a range. Returning the
+  // float answer for an integer query is a value no GL implementation reports,
+  // and the query exists precisely so callers can pick a type by precision.
+  getShaderPrecisionFormat(shaderType, precisionType) {
+    switch (precisionType) {
+      case 0x8DF3: case 0x8DF4: case 0x8DF5:   // LOW/MEDIUM/HIGH_INT
+        return { rangeMin: 31, rangeMax: 30, precision: 0 };
+      default:                                  // HIGH/MEDIUM/LOW_FLOAT
+        return { rangeMin: 127, rangeMax: 127, precision: 23 };
+    }
+  }
   createBuffer() { return { _data: null }; }
   bindBuffer(target, buffer) { this._boundBuffers[target] = buffer; }
   bufferData(target, data) {
@@ -14819,9 +14865,28 @@ Object.assign(_SoftwareWebGLContext.prototype, {
   RENDERER: 0x1F01, MAX_TEXTURE_SIZE: 0x0D33, MAX_RENDERBUFFER_SIZE: 0x84E8,
   MAX_VIEWPORT_DIMS: 0x0D3A, DEPTH_TEST: 0x0B71, TEXTURE_2D: 0x0DE1,
   FRAMEBUFFER_COMPLETE: 0x8CD5, FALSE: 0,
+  // Constants a fingerprint probe reads. A context that lacks them returns
+  // undefined for the enum, which reads as a shim long before any value is
+  // compared, so the enum has to exist even where the value is mundane.
+  MAX_VERTEX_ATTRIBS: 0x8869, MAX_VERTEX_UNIFORM_VECTORS: 0x8DFB,
+  MAX_VARYING_VECTORS: 0x8DFC, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8DFD,
+  MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8B4C, MAX_TEXTURE_IMAGE_UNITS: 0x8872,
+  MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8B4D, MAX_CUBE_MAP_TEXTURE_SIZE: 0x851C,
+  RED_BITS: 0x0D52, GREEN_BITS: 0x0D53, BLUE_BITS: 0x0D54,
+  ALPHA_BITS: 0x0D55, DEPTH_BITS: 0x0D56, STENCIL_BITS: 0x0D57,
+  SUBPIXEL_BITS: 0x0D50, SAMPLES: 0x80A9,
+  ALIASED_LINE_WIDTH_RANGE: 0x846E, ALIASED_POINT_SIZE_RANGE: 0x846D,
+  // The precision constants are passed straight back to
+  // getShaderPrecisionFormat, so a missing one silently falls through to the
+  // default branch and every integer query answers with the float format.
+  LOW_FLOAT: 0x8DF0, MEDIUM_FLOAT: 0x8DF1, HIGH_FLOAT: 0x8DF2,
+  LOW_INT: 0x8DF3, MEDIUM_INT: 0x8DF4, HIGH_INT: 0x8DF5,
 });
 globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _SoftwareWebGLContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _SoftwareWebGLContext {};
+// Constants that only exist on a WebGL2 context. `'MAX_DRAW_BUFFERS' in gl` is
+// a one-line context-family probe, so a WebGL1 context must not answer for them.
+Object.assign(globalThis.WebGL2RenderingContext.prototype, { MAX_DRAW_BUFFERS: 0x8824 });
 
 HTMLCanvasElement.prototype.getContext = function getContext(type) {
   type = String(type).toLowerCase();

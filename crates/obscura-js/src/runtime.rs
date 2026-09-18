@@ -13020,6 +13020,103 @@ return {before,removed,reinsert,moved,cleared};
         assert_eq!(result, serde_json::json!([true, 300, 90, 90]));
     }
 
+    /// A WebGL2 context must not be a WebGL1 context with a different name.
+    ///
+    /// Two probes separate them in one line: the supported-extension list, and
+    /// whether a WebGL2-only constant exists. Real browsers answer differently
+    /// for each family, so a single shared answer says "one implementation,
+    /// relabelled" - and a shared list also means the extensions that became
+    /// core in WebGL2 are still advertised there, which no browser does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgl2_context_reports_its_own_extensions_and_constants() {
+        let mut rt = setup_runtime(r#"<html><body></body></html>"#);
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const make = kind => {
+                        const c = document.createElement('canvas');
+                        c.width = 32; c.height = 32;
+                        return c.getContext(kind);
+                    };
+                    const gl1 = make('webgl');
+                    const gl2 = make('webgl2');
+                    const out = {
+                        haveBoth: !!gl1 && !!gl2,
+                        ext1: gl1.getSupportedExtensions().slice().sort(),
+                        ext2: gl2.getSupportedExtensions().slice().sort(),
+                        count1: gl1.getSupportedExtensions().length,
+                        count2: gl2.getSupportedExtensions().length,
+                        // WebGL2-only constants: present on webgl2, absent on webgl1.
+                        maxDrawBuffersIn1: 'MAX_DRAW_BUFFERS' in gl1,
+                        maxDrawBuffersIn2: 'MAX_DRAW_BUFFERS' in gl2,
+                        maxDrawBuffers2: gl2.getParameter(gl2.MAX_DRAW_BUFFERS),
+                        // Extensions that became core in WebGL2 must be gone there.
+                        instanced1: gl1.getSupportedExtensions().indexOf('ANGLE_instanced_arrays') !== -1,
+                        instanced2: gl2.getSupportedExtensions().indexOf('ANGLE_instanced_arrays') !== -1,
+                        // A WebGL2-only extension must not be advertised by webgl1.
+                        // Measured against this machine's Chrome: these are
+                        // WebGL2-only, whereas WEBGL_multi_draw is in both lists
+                        // and so would prove nothing either way.
+                        colorBufferFloat1: gl1.getSupportedExtensions().indexOf('EXT_color_buffer_float') !== -1,
+                        colorBufferFloat2: gl2.getSupportedExtensions().indexOf('EXT_color_buffer_float') !== -1,
+                        drawBuffersIndexed1: gl1.getSupportedExtensions().indexOf('OES_draw_buffers_indexed') !== -1,
+                        drawBuffersIndexed2: gl2.getSupportedExtensions().indexOf('OES_draw_buffers_indexed') !== -1,
+                        // Integer and float precision formats must not be identical.
+                        intPrec1: (function () {
+                            const f = gl1.getShaderPrecisionFormat(gl1.VERTEX_SHADER, gl1.HIGH_INT);
+                            return f ? [f.rangeMin, f.rangeMax, f.precision] : null;
+                        })(),
+                        floatPrec1: (function () {
+                            const f = gl1.getShaderPrecisionFormat(gl1.VERTEX_SHADER, gl1.HIGH_FLOAT);
+                            return f ? [f.rangeMin, f.rangeMax, f.precision] : null;
+                        })(),
+                    };
+                    resolve(out);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let out = result.value.unwrap();
+        assert_eq!(out.get("haveBoth"), Some(&serde_json::json!(true)));
+        assert_ne!(
+            out.get("ext1"),
+            out.get("ext2"),
+            "a WebGL2 context must not report the WebGL1 extension list",
+        );
+        // The families differ in size, as Chrome's do, rather than by one or two.
+        let count1 = out.get("count1").and_then(|v| v.as_u64()).unwrap_or(0);
+        let count2 = out.get("count2").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert!(count1 > count2, "WebGL1 lists more extensions than WebGL2: {count1} vs {count2}");
+
+        assert_eq!(out.get("instanced1"), Some(&serde_json::json!(true)),
+            "ANGLE_instanced_arrays is an extension in WebGL1");
+        assert_eq!(out.get("instanced2"), Some(&serde_json::json!(false)),
+            "ANGLE_instanced_arrays is core in WebGL2 and must not be advertised");
+        assert_eq!(out.get("colorBufferFloat1"), Some(&serde_json::json!(false)),
+            "EXT_color_buffer_float is WebGL2-only on this machine's Chrome");
+        assert_eq!(out.get("colorBufferFloat2"), Some(&serde_json::json!(true)));
+        assert_eq!(out.get("drawBuffersIndexed1"), Some(&serde_json::json!(false)),
+            "OES_draw_buffers_indexed is WebGL2-only on this machine's Chrome");
+        assert_eq!(out.get("drawBuffersIndexed2"), Some(&serde_json::json!(true)));
+
+        assert_eq!(out.get("maxDrawBuffersIn1"), Some(&serde_json::json!(false)),
+            "a WebGL2-only constant must not exist on a WebGL1 context");
+        assert_eq!(out.get("maxDrawBuffersIn2"), Some(&serde_json::json!(true)));
+        assert_eq!(out.get("maxDrawBuffers2"), Some(&serde_json::json!(8)));
+
+        assert_ne!(
+            out.get("intPrec1"),
+            out.get("floatPrec1"),
+            "integer precision must not reuse the float format",
+        );
+        assert_eq!(out.get("intPrec1"), Some(&serde_json::json!([31, 30, 0])));
+        assert_eq!(out.get("floatPrec1"), Some(&serde_json::json!([127, 127, 23])));
+    }
+
     /// A version upgrade must hand the handler a real transaction.
     ///
     /// Callers receive it as `request.transaction` and use it to create object
