@@ -246,43 +246,107 @@ pub(crate) fn extract_exception_message(
 
 pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
 (function(workerId, workerUrl, ops) {
-    delete globalThis.window;
-    delete globalThis.document;
-    delete globalThis.location;
-    delete globalThis.history;
-    delete globalThis.localStorage;
-    delete globalThis.sessionStorage;
-    delete globalThis.HTMLDocument;
-    delete globalThis.Document;
-    delete globalThis.Element;
-    delete globalThis.HTMLElement;
-    delete globalThis.Node;
-    delete globalThis.alert;
-    delete globalThis.confirm;
-    delete globalThis.prompt;
-    delete globalThis.parent;
-    delete globalThis.top;
-    delete globalThis.frames;
-    delete globalThis.Window;
-    delete globalThis.onmessage;
-    delete globalThis.onerror;
-    delete globalThis.onmessageerror;
-    delete globalThis.addEventListener;
-    delete globalThis.removeEventListener;
-    delete globalThis.dispatchEvent;
-    delete globalThis.EventTarget;
+    const _origNavigator = globalThis.navigator;
+    const _windowOnlyProps = [
+        "window","document","location","history","localStorage","sessionStorage",
+        "navigator","constructor","self","origin","isSecureContext","crossOriginIsolated",
+        "onlanguagechange","onrejectionhandled","onunhandledrejection",
+        "HTMLDocument","Document","Element","HTMLElement","Node","alert","confirm",
+        "prompt","parent","top","frames","Window","Screen","screen","ScreenOrientation","screenLeft",
+        "screenTop","screenX","screenY","innerHeight","innerWidth","outerHeight",
+        "outerWidth","pageXOffset","pageYOffset","scrollX","scrollY","scroll",
+        "scrollBy","scrollTo","open","opener","print","stop","focus","blur",
+        "frameElement","getComputedStyle","matchMedia","getSelection","visualViewport","VisualViewport",
+        "Audio","Image","onbeforeunload","onunload","onresize","onscroll",
+        "onpopstate","onhashchange","addEventListener","removeEventListener",
+        "dispatchEvent","EventTarget","onmessage","onerror","onmessageerror",
+        "HTMLAnchorElement","HTMLAreaElement","HTMLAudioElement","HTMLBRElement","HTMLBodyElement",
+        "HTMLButtonElement","HTMLCanvasElement","HTMLCollection","HTMLAllCollection","HTMLDataListElement","HTMLDetailsElement",
+        "HTMLDialogElement","HTMLDivElement","HTMLFieldSetElement","HTMLFormElement","HTMLHRElement",
+        "HTMLHeadElement","HTMLHeadingElement","HTMLHtmlElement","HTMLIFrameElement","HTMLImageElement",
+        "HTMLInputElement","HTMLLIElement","HTMLLabelElement","HTMLLegendElement","HTMLLinkElement",
+        "HTMLMediaElement","HTMLMetaElement","HTMLOListElement","HTMLOptionElement","HTMLParagraphElement",
+        "HTMLPreElement","HTMLProgressElement","HTMLScriptElement","HTMLSelectElement","HTMLSlotElement",
+        "HTMLSpanElement","HTMLStyleElement","HTMLTableElement","HTMLTemplateElement","HTMLTextAreaElement",
+        "HTMLTrackElement","HTMLUListElement","HTMLUnknownElement","HTMLVideoElement",
+        "HTMLSourceElement","HTMLObjectElement","HTMLEmbedElement","HTMLParamElement","HTMLOutputElement","HTMLFrameSetElement",
+        "SVGCircleElement","SVGClipPathElement","SVGComponentTransferFunctionElement","SVGDefsElement",
+        "SVGElement","SVGEllipseElement","SVGFEBlendElement","SVGFECompositeElement","SVGFEDisplacementMapElement",
+        "SVGFEMorphologyElement","SVGFETurbulenceElement","SVGFilterElement","SVGGElement","SVGGeometryElement",
+        "SVGGradientElement","SVGGraphicsElement","SVGImageElement","SVGLength","SVGLineElement",
+        "SVGLinearGradientElement","SVGMaskElement","SVGPathElement","SVGPoint","SVGPolygonElement",
+        "SVGPolylineElement","SVGPreserveAspectRatio","SVGRadialGradientElement","SVGRect","SVGRectElement",
+        "SVGSVGElement","SVGScriptElement","SVGStopElement","SVGTextContentElement","SVGTextElement",
+        "SVGTransform","SVGUseElement",
+        "SVGTextPathElement","SVGPatternElement","SVGMPathElement","SVGFEImageElement","SVGAnimationElement",
+        "MutationObserver","IntersectionObserver","IntersectionObserverEntry","ResizeObserver","ResizeObserverEntry","ResizeObserverSize",
+        "NodeFilter","TreeWalker","NodeList","NamedNodeMap","DocumentFragment","CharacterData","Comment","CDATASection","ProcessingInstruction","Text",
+        "XMLDocument","XMLSerializer","XPathResult","DOMParser","Range","Selection","StaticRange",
+        "CSSRule","CSSRuleList","CSSStyleDeclaration","CSSStyleRule","CSSStyleSheet","StyleSheetList",
+        "Animation","AnimationEvent","Attr","AudioBuffer","AudioContext","CSS",
+        "CanvasRenderingContext2D","ClipboardEvent","CompositionEvent","ContentIndex",
+        "CustomElementRegistry","DOMRectList","DOMStringMap","DOMTokenList","DataTransfer",
+        "DataTransferItem","DataTransferItemList","DeviceOrientationEvent","DocumentTimeline",
+        "DocumentType","ElementInternals","FocusEvent","FormDataEvent","HashChangeEvent",
+        "History","InputEvent","KeyboardEvent","KeyframeEffect","MediaQueryList","MediaStream",
+        "MediaStreamTrack","MimeType","MimeTypeArray","MouseEvent","Navigator",
+        "OfflineAudioContext","PageTransitionEvent","Plugin","PluginArray","PointerEvent",
+        "PopStateEvent","RTCIceCandidate","RTCPeerConnection","RTCSessionDescription",
+        "ServiceWorkerContainer","ShadowRoot","SharedArrayBuffer","SharedWorker",
+        "SpeechRecognition","SpeechSynthesisUtterance","Storage","StorageEvent",
+        "SubmitEvent","TextTrack","TextTrackCue","TextTrackCueList","TextTrackList",
+        "ToggleEvent","TransitionEvent","UIEvent","VTTCue","ValidityState","WheelEvent",
+        "PictureInPictureWindow","RemotePlayback","MediaDevices","Geolocation",
+        "PaymentRequest","PresentationAvailability","PresentationConnection","PresentationConnectionList","PresentationRequest",
+        "CookieStore","cookieStore",
+        "cancelIdleCallback","chrome","clientInformation","customElements",
+        "devicePixelRatio","length","navigation","requestFileSystem","requestIdleCallback",
+        "speechSynthesis","webkitAudioContext","webkitSpeechRecognition",
+        "onabort","onbeforeprint","onblur","oncancel","oncanplay","oncanplaythrough",
+        "onchange","onclick","onclose","oncontextmenu","oncuechange","ondblclick",
+        "ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart",
+        "ondrop","ondurationchange","onemptied","onended","onfocus","onfocusin",
+        "onfocusout","onformdata","ongotpointercapture","oninput","oninvalid",
+        "onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata",
+        "onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave",
+        "onmousemove","onmouseout","onmouseover","onmouseup","onoffline","ononline",
+        "onpagehide","onpageshow","onpaste","onpause","onplay","onplaying",
+        "onpointercancel","onpointerdown","onpointerenter","onpointerleave",
+        "onpointermove","onpointerout","onpointerover","onpointerup","onprogress",
+        "onratechange","onreset","onseeked","onseeking","onselect","onstalled",
+        "onstorage","onsubmit","onsuspend","ontimeupdate","ontoggle","onvolumechange",
+        "onwaiting","onwheel",
+        "onanimationiteration","onanimationend","RTCDtlsTransport","MediaRecorder",
+        "onwebkittransitionend","BatteryManager","ScriptProcessorNode","onwebkitanimationstart",
+        "Sensor","onanimationstart","ondevicemotion","onwebkitanimationiteration",
+        "ontransitionend","onmousewheel","onappinstalled","AudioScheduledSourceNode",
+        "ondeviceorientationabsolute","onwebkitanimationend","onselectionchange","MIDIInput",
+        "AudioWorkletNode","onafterprint","onselectstart","onsearch","MIDIAccess",
+        "ondeviceorientation","ServiceWorker","RTCDTMFSender","onbeforeinstallprompt",
+        "BaseAudioContext","MIDIPort","RTCIceTransport","MediaKeySession","onauxclick",
+        "ApplicationCache"
+    ];
+    for (const name of _windowOnlyProps) {
+        delete globalThis[name];
+    }
+    for (let i = 0; i < 50; i++) {
+        delete globalThis[i];
+    }
+    try { delete globalThis.Deno; } catch(e) {}
 
-    globalThis.self = globalThis;
     let closing = false;
-    for (const name of ['setTimeout', 'setInterval']) {
-        const schedule = globalThis[name];
-        globalThis[name] = (callback, delay, ...args) => schedule(() => {
+    function _wrapTimer(fn) {
+        return (callback, delay, ...args) => fn(() => {
             if (!closing) {
                 if (typeof callback === 'function') callback(...args);
                 else (0, eval)(String(callback));
             }
         }, delay);
     }
+    const _wrappedSetTimeout = _wrapTimer(globalThis.setTimeout);
+    const _wrappedSetInterval = _wrapTimer(globalThis.setInterval);
+    const _wrappedClearTimeout = globalThis.clearTimeout;
+    const _wrappedClearInterval = globalThis.clearInterval;
 
     function EventTarget() {
         this._listeners = new Map();
@@ -342,9 +406,6 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         value: EventTarget, writable: true, configurable: true,
     });
     globalThis.EventTarget = EventTarget;
-    globalThis.addEventListener = EventTarget.prototype.addEventListener;
-    globalThis.removeEventListener = EventTarget.prototype.removeEventListener;
-    globalThis.dispatchEvent = EventTarget.prototype.dispatchEvent;
 
     if (globalThis.MessageEvent) {
         globalThis.MessageEvent.prototype.stopImmediatePropagation = function() {
@@ -370,14 +431,17 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
     Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'constructor', {
         value: DedicatedWorkerGlobalScope, writable: true, configurable: true,
     });
+    Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'TEMPORARY', {
+        value: 0, writable: false, enumerable: true, configurable: false,
+    });
+    Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'PERSISTENT', {
+        value: 1, writable: false, enumerable: true, configurable: false,
+    });
     globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
 
     Object.setPrototypeOf(globalThis, DedicatedWorkerGlobalScope.prototype);
     Object.defineProperty(globalThis, Symbol.toStringTag, {
         value: 'DedicatedWorkerGlobalScope', configurable: true,
-    });
-    Object.defineProperty(globalThis, 'constructor', {
-        value: DedicatedWorkerGlobalScope, writable: true, configurable: true,
     });
 
     function WorkerNavigator() {}
@@ -389,20 +453,40 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
     });
     const workerNav = Object.create(WorkerNavigator.prototype);
     const navProps = [
-        'userAgent', 'platform', 'hardwareConcurrency', 'deviceMemory',
-        'language', 'languages', 'onLine', 'userAgentData', 'storage',
-        'locks', 'mediaCapabilities', 'permissions', 'gpu',
+        'appCodeName', 'appName', 'appVersion', 'platform', 'product', 'userAgent',
+        'language', 'languages', 'onLine', 'hardwareConcurrency', 'deviceMemory',
+        'userAgentData', 'locks', 'storage', 'mediaCapabilities', 'permissions',
+        'gpu', 'connection',
     ];
     for (const prop of navProps) {
-        if (globalThis.navigator && prop in globalThis.navigator) {
-            const val = globalThis.navigator[prop];
+        if (_origNavigator && prop in _origNavigator) {
+            const val = _origNavigator[prop];
             Object.defineProperty(WorkerNavigator.prototype, prop, {
                 configurable: true, enumerable: true, get() { return val; }
+            });
+        } else if (prop === 'appCodeName') {
+            Object.defineProperty(WorkerNavigator.prototype, prop, {
+                configurable: true, enumerable: true, get() { return 'Mozilla'; }
+            });
+        } else if (prop === 'appName') {
+            Object.defineProperty(WorkerNavigator.prototype, prop, {
+                configurable: true, enumerable: true, get() { return 'Netscape'; }
+            });
+        } else if (prop === 'appVersion') {
+            Object.defineProperty(WorkerNavigator.prototype, prop, {
+                configurable: true, enumerable: true, get() {
+                    return _origNavigator && _origNavigator.userAgent
+                        ? _origNavigator.userAgent.replace(/^Mozilla\//, '')
+                        : '5.0';
+                }
+            });
+        } else if (prop === 'product') {
+            Object.defineProperty(WorkerNavigator.prototype, prop, {
+                configurable: true, enumerable: true, get() { return 'Gecko'; }
             });
         }
     }
     globalThis.WorkerNavigator = WorkerNavigator;
-    globalThis.navigator = workerNav;
 
     function WorkerLocation() {}
     Object.defineProperty(WorkerLocation.prototype, Symbol.toStringTag, {
@@ -430,41 +514,56 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         Object.defineProperty(WorkerLocation.prototype, k, { configurable: true, enumerable: true, get() { return String(parsedUrl[k] || ''); } });
     }
     globalThis.WorkerLocation = WorkerLocation;
-    Object.defineProperty(WorkerGlobalScope.prototype, 'location', {
-        get() { return workerLoc; },
-        configurable: true,
-        enumerable: true,
-    });
-    Object.defineProperty(globalThis, 'location', {
-        get() { return workerLoc; },
-        configurable: true,
-        enumerable: true,
-    });
 
-    let _workerOnMessageHandler = null;
-    let _workerOnMessageWrapper = null;
-    const onmessageDescriptor = {
-        configurable: true,
-        enumerable: true,
-        get() {
-            return _workerOnMessageHandler;
-        },
-        set(fn) {
-            _workerOnMessageHandler = (typeof fn === 'function' || (fn && typeof fn.handleEvent === 'function')) ? fn : null;
-            if (!_workerOnMessageWrapper) {
-                _workerOnMessageWrapper = function(event) {
-                    if (typeof _workerOnMessageHandler === 'function') {
-                        _workerOnMessageHandler.call(globalThis, event);
-                    } else if (_workerOnMessageHandler && typeof _workerOnMessageHandler.handleEvent === 'function') {
-                        _workerOnMessageHandler.handleEvent.call(_workerOnMessageHandler, event);
-                    }
-                };
-                globalThis.addEventListener('message', _workerOnMessageWrapper);
-            }
+    function _isTrustworthy(str) {
+        try {
+            const u = new URL(str);
+            if (u.protocol === 'https:' || u.protocol === 'wss:' || u.protocol === 'file:') return true;
+            const h = u.hostname.toLowerCase();
+            if (h === 'localhost' || h.endsWith('.localhost') || h === '127.0.0.1' || h === '::1' || h === '[::1]') return true;
+            if (/^127(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}$/.test(h)) return true;
+            if (u.protocol === 'blob:') return _isTrustworthy(u.origin);
+            return false;
+        } catch (e) {
+            return false;
         }
-    };
-    Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'onmessage', onmessageDescriptor);
-    Object.defineProperty(globalThis, 'onmessage', onmessageDescriptor);
+    }
+
+    const _workerOrigin = (parsedUrl.protocol === 'blob:' || parsedUrl.protocol === 'data:' || !workerLoc.origin || workerLoc.origin === 'null')
+        ? (globalThis.__obscura_creator_origin || workerLoc.origin || 'null')
+        : workerLoc.origin;
+
+    const _workerIsSecure = typeof globalThis.__obscura_is_secure_context === 'boolean'
+        ? globalThis.__obscura_is_secure_context
+        : _isTrustworthy(workerUrl);
+
+    const _workerIsIsolated = Boolean(globalThis.__obscura_cross_origin_isolated);
+
+    function _getWorkerOrigin() { return _workerOrigin; }
+    function _setWorkerOrigin(val) {
+        Object.defineProperty(this, 'origin', { value: val, writable: true, enumerable: true, configurable: true });
+    }
+    function _getWorkerIsSecure() { return _workerIsSecure; }
+    function _getWorkerIsIsolated() { return _workerIsIsolated; }
+
+    Object.defineProperty(WorkerGlobalScope.prototype, 'self', {
+        get() { return globalThis; }, configurable: true, enumerable: true,
+    });
+    Object.defineProperty(WorkerGlobalScope.prototype, 'location', {
+        get() { return workerLoc; }, configurable: true, enumerable: true,
+    });
+    Object.defineProperty(WorkerGlobalScope.prototype, 'navigator', {
+        get() { return workerNav; }, configurable: true, enumerable: true,
+    });
+    Object.defineProperty(WorkerGlobalScope.prototype, 'origin', {
+        get: _getWorkerOrigin, set: _setWorkerOrigin, configurable: true, enumerable: true,
+    });
+    Object.defineProperty(WorkerGlobalScope.prototype, 'isSecureContext', {
+        get: _getWorkerIsSecure, configurable: true, enumerable: true,
+    });
+    Object.defineProperty(WorkerGlobalScope.prototype, 'crossOriginIsolated', {
+        get: _getWorkerIsIsolated, configurable: true, enumerable: true,
+    });
 
     let _workerOnError = null;
     let _workerOnErrorWrapper = null;
@@ -486,8 +585,207 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
             }
         },
     };
-    Object.defineProperty(DedicatedWorkerGlobalScope.prototype, 'onerror', onerrorDescriptor);
-    Object.defineProperty(globalThis, 'onerror', onerrorDescriptor);
+    Object.defineProperty(WorkerGlobalScope.prototype, 'onerror', onerrorDescriptor);
+
+    let _workerOnLanguageChange = null;
+    Object.defineProperty(WorkerGlobalScope.prototype, 'onlanguagechange', {
+        configurable: true,
+        enumerable: true,
+        get() { return _workerOnLanguageChange; },
+        set(val) {
+            _workerOnLanguageChange = typeof val === 'function' || (val && typeof val.handleEvent === 'function') ? val : null;
+        },
+    });
+
+    let _workerOnRejectionHandled = null;
+    Object.defineProperty(WorkerGlobalScope.prototype, 'onrejectionhandled', {
+        configurable: true,
+        enumerable: true,
+        get() { return _workerOnRejectionHandled; },
+        set(val) {
+            _workerOnRejectionHandled = typeof val === 'function' || (val && typeof val.handleEvent === 'function') ? val : null;
+        },
+    });
+
+    let _workerOnUnhandledRejection = null;
+    Object.defineProperty(WorkerGlobalScope.prototype, 'onunhandledrejection', {
+        configurable: true,
+        enumerable: true,
+        get() { return _workerOnUnhandledRejection; },
+        set(val) {
+            _workerOnUnhandledRejection = typeof val === 'function' || (val && typeof val.handleEvent === 'function') ? val : null;
+        },
+    });
+
+    for (const p of ['performance', 'crypto', 'indexedDB', 'caches', 'scheduler']) {
+        if (p in globalThis) {
+            const val = globalThis[p];
+            Object.defineProperty(WorkerGlobalScope.prototype, p, {
+                configurable: true, enumerable: true,
+                get() { return val; },
+                set(v) { Object.defineProperty(this, p, { value: v, writable: true, configurable: true, enumerable: true }); }
+            });
+            delete globalThis[p];
+        }
+    }
+
+    let _workerFonts = null;
+    Object.defineProperty(WorkerGlobalScope.prototype, 'fonts', {
+        configurable: true,
+        enumerable: true,
+        get() {
+            if (!_workerFonts && typeof globalThis.FontFaceSet === 'function') {
+                _workerFonts = new globalThis.FontFaceSet();
+            }
+            return _workerFonts;
+        },
+    });
+    Object.defineProperty(WorkerGlobalScope.prototype, 'trustedTypes', {
+        configurable: true,
+        enumerable: true,
+        get() { return undefined; },
+    });
+
+    WorkerGlobalScope.prototype.importScripts = function(...urls) {
+        for (const rawUrl of urls) {
+            let resolved = String(rawUrl);
+            try { resolved = new URL(resolved, (globalThis.location && globalThis.location.href) || '').href; } catch (e) {}
+            const source = ops.op_worker_load_script(resolved);
+            if (source === null || source === undefined) {
+                throw new DOMException(`Failed to execute 'importScripts': The script at '${resolved}' could not be loaded.`, 'NetworkError');
+            }
+            ops.op_worker_run_script(resolved, source);
+        }
+    };
+
+    WorkerGlobalScope.prototype.setTimeout = _wrappedSetTimeout;
+    WorkerGlobalScope.prototype.setInterval = _wrappedSetInterval;
+    WorkerGlobalScope.prototype.clearTimeout = _wrappedClearTimeout;
+    WorkerGlobalScope.prototype.clearInterval = _wrappedClearInterval;
+    delete globalThis.setTimeout;
+    delete globalThis.setInterval;
+    delete globalThis.clearTimeout;
+    delete globalThis.clearInterval;
+
+    for (const m of ['fetch', 'atob', 'btoa', 'queueMicrotask', 'reportError', 'structuredClone', 'createImageBitmap']) {
+        if (m in globalThis) {
+            WorkerGlobalScope.prototype[m] = globalThis[m];
+            delete globalThis[m];
+        }
+    }
+
+    const _workerConstructors = [
+        "WebSocketStream", "WebSocketError", "RestrictionTarget", "RTCTransformEvent", "RTCRtpScriptTransformer",
+        "RTCDataChannel", "QuotaExceededError", "PushSubscriptionOptions", "PushSubscription", "PushManager",
+        "PeriodicSyncManager", "Origin", "CropTarget", "BackgroundFetchRegistration", "BackgroundFetchRecord",
+        "BackgroundFetchManager", "XMLHttpRequestUpload", "WritableStreamDefaultWriter", "WritableStreamDefaultController",
+        "WebGLVertexArrayObject", "WebGLUniformLocation", "WebGLTransformFeedback", "WebGLTexture", "WebGLSync",
+        "WebGLShaderPrecisionFormat", "WebGLShader", "WebGLSampler", "WebGLRenderbuffer", "WebGLQuery",
+        "WebGLProgram", "WebGLObject", "WebGLFramebuffer", "WebGLContextEvent", "WebGLBuffer",
+        "WebGLActiveInfo", "VideoFrame", "VideoColorSpace", "UserActivation", "TrustedTypePolicyFactory",
+        "TrustedTypePolicy", "TrustedScriptURL", "TrustedScript", "TrustedHTML", "TransformStreamDefaultController",
+        "TextMetrics", "TaskSignal", "TaskPriorityChangeEvent", "TaskController", "SyncManager",
+        "Subscriber", "SourceBufferList", "SourceBuffer", "SecurityPolicyViolationEvent", "ReportingObserver",
+        "ReportBody", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "ReadableStreamBYOBRequest",
+        "ReadableStreamBYOBReader", "ReadableByteStreamController", "RTCEncodedVideoFrame", "RTCEncodedAudioFrame",
+        "Permissions", "PermissionStatus", "PerformanceServerTiming", "PerformanceResourceTiming",
+        "PerformanceObserverEntryList", "PerformanceMeasure", "PerformanceMark", "PerformanceEntry",
+        "Performance", "OffscreenCanvasRenderingContext2D", "Observable", "NavigatorUAData",
+        "MediaSourceHandle", "MediaSource", "MediaCapabilities", "ImageBitmapRenderingContext",
+        "IDBVersionChangeEvent", "IDBTransaction", "IDBRequest", "IDBRecord", "IDBOpenDBRequest",
+        "IDBObjectStore", "IDBIndex", "IDBFactory", "IDBDatabase", "IDBCursorWithValue",
+        "IDBCursor", "FileReaderSync", "EncodedVideoChunk", "EncodedAudioChunk", "DecompressionStream",
+        "DOMStringList", "DOMRectReadOnly", "DOMQuad", "DOMPointReadOnly", "DOMMatrixReadOnly",
+        "CountQueuingStrategy", "CompressionStream", "CloseEvent", "CanvasPattern", "CanvasGradient",
+        "CSSSkewY", "CSSSkewX", "ByteLengthQueuingStrategy", "AudioData",
+        "webkitRequestFileSystemSync", "webkitResolveLocalFileSystemSyncURL", "webkitResolveLocalFileSystemURL",
+        "AudioDecoder", "AudioEncoder", "Cache", "CacheStorage", "CreateMonitor",
+        "FileSystemSyncAccessHandle", "GPU", "GPUAdapter", "GPUAdapterInfo", "GPUBindGroup",
+        "GPUBindGroupLayout", "GPUBuffer", "GPUBufferUsage", "GPUCanvasContext", "GPUColorWrite",
+        "GPUCommandBuffer", "GPUCommandEncoder", "GPUCompilationInfo", "GPUCompilationMessage",
+        "GPUComputePassEncoder", "GPUComputePipeline", "GPUDevice", "GPUDeviceLostInfo",
+        "GPUError", "GPUExternalTexture", "GPUInternalError", "GPUMapMode", "GPUOutOfMemoryError",
+        "GPUPipelineError", "GPUPipelineLayout", "GPUQuerySet", "GPUQueue", "GPURenderBundle",
+        "GPURenderBundleEncoder", "GPURenderPassEncoder", "GPURenderPipeline", "GPUSampler",
+        "GPUShaderModule", "GPUShaderStage", "GPUSupportedFeatures", "GPUSupportedLimits",
+        "GPUTexture", "GPUTextureUsage", "GPUTextureView", "GPUUncapturedErrorEvent", "GPUValidationError",
+        "IdleDetector", "ImageDecoder", "ImageTrack", "ImageTrackList", "NavigationPreloadManager",
+        "ServiceWorkerRegistration", "StorageManager", "VideoDecoder", "VideoEncoder", "WGSLLanguageFeatures",
+        "WebTransport", "WebTransportBidirectionalStream", "WebTransportDatagramDuplexStream", "WebTransportError",
+        "BarcodeDetector", "FileSystemDirectoryHandle", "FileSystemFileHandle", "FileSystemHandle",
+        "FileSystemWritableFileStream", "FileSystemObserver", "HID", "HIDConnectionEvent",
+        "HIDDevice", "HIDInputReportEvent", "Lock", "LockManager", "PressureObserver",
+        "PressureRecord", "Serial", "SerialPort", "StorageBucket", "StorageBucketManager",
+        "USB", "USBAlternateInterface", "USBConfiguration", "USBConnectionEvent", "USBDevice",
+        "USBEndpoint", "USBInTransferResult", "USBInterface", "USBIsochronousInTransferPacket",
+        "USBIsochronousInTransferResult", "USBIsochronousOutTransferPacket", "USBIsochronousOutTransferResult",
+        "USBOutTransferResult"
+    ];
+    for (const name of _workerConstructors) {
+        if (!(name in globalThis)) {
+            const ctor = function() {
+                throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object cannot be constructed.");
+            };
+            Object.defineProperty(ctor, 'name', { value: name, configurable: true });
+            try { Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
+            Object.defineProperty(globalThis, name, { value: ctor, writable: true, configurable: true, enumerable: false });
+        }
+    }
+    if (!('onrtctransform' in globalThis)) {
+        globalThis.onrtctransform = null;
+    }
+
+    let _workerName = '';
+    Object.defineProperty(globalThis, 'name', {
+        configurable: true,
+        enumerable: true,
+        get() { return _workerName; },
+        set(v) { Object.defineProperty(this, 'name', { value: String(v), writable: true, configurable: true, enumerable: true }); }
+    });
+
+    let _workerOnMessageHandler = null;
+    let _workerOnMessageWrapper = null;
+    const onmessageDescriptor = {
+        configurable: true,
+        enumerable: true,
+        get() { return _workerOnMessageHandler; },
+        set(fn) {
+            _workerOnMessageHandler = (typeof fn === 'function' || (fn && typeof fn.handleEvent === 'function')) ? fn : null;
+            if (!_workerOnMessageWrapper) {
+                _workerOnMessageWrapper = function(event) {
+                    if (typeof _workerOnMessageHandler === 'function') {
+                        _workerOnMessageHandler.call(globalThis, event);
+                    } else if (_workerOnMessageHandler && typeof _workerOnMessageHandler.handleEvent === 'function') {
+                        _workerOnMessageHandler.handleEvent.call(_workerOnMessageHandler, event);
+                    }
+                };
+                globalThis.addEventListener('message', _workerOnMessageWrapper);
+            }
+        }
+    };
+    Object.defineProperty(globalThis, 'onmessage', onmessageDescriptor);
+
+    let _workerOnMessageErrorHandler = null;
+    let _workerOnMessageErrorWrapper = null;
+    const onmessageerrorDescriptor = {
+        configurable: true,
+        enumerable: true,
+        get() { return _workerOnMessageErrorHandler; },
+        set(val) {
+            _workerOnMessageErrorHandler = typeof val === 'function' || (val && typeof val.handleEvent === 'function') ? val : null;
+            if (!_workerOnMessageErrorWrapper) {
+                _workerOnMessageErrorWrapper = function(event) {
+                    if (typeof _workerOnMessageErrorHandler === 'function') {
+                        _workerOnMessageErrorHandler.call(globalThis, event);
+                    } else if (_workerOnMessageErrorHandler && typeof _workerOnMessageErrorHandler.handleEvent === 'function') {
+                        _workerOnMessageErrorHandler.handleEvent.call(_workerOnMessageErrorHandler, event);
+                    }
+                };
+                globalThis.addEventListener('messageerror', _workerOnMessageErrorWrapper);
+            }
+        },
+    };
+    Object.defineProperty(globalThis, 'onmessageerror', onmessageerrorDescriptor);
 
     function _serializeWorkerMsg(msg, options) {
         const transfers = options == null ? [] : Array.from(
@@ -500,32 +798,25 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         return {v: ops.op_worker_deserialize(data)};
     }
 
-    DedicatedWorkerGlobalScope.prototype.postMessage = function(msg, options = undefined) {
+    globalThis.postMessage = function(msg, options = undefined) {
         const json = _serializeWorkerMsg(msg, options);
         ops.op_worker_post_to_parent(workerId, json);
     };
-    globalThis.postMessage = DedicatedWorkerGlobalScope.prototype.postMessage;
 
-    DedicatedWorkerGlobalScope.prototype.close = function() {
+    globalThis.close = function() {
         closing = true;
         ops.op_worker_close();
     };
-    globalThis.close = DedicatedWorkerGlobalScope.prototype.close;
 
-    DedicatedWorkerGlobalScope.prototype.importScripts = function(...urls) {
-        for (const rawUrl of urls) {
-            let resolved = String(rawUrl);
-            try { resolved = new URL(resolved, globalThis.location?.href || '').href; } catch (e) {}
-            const source = ops.op_worker_load_script(resolved);
-            if (source === null || source === undefined) {
-                throw new DOMException(`Failed to execute 'importScripts': The script at '${resolved}' could not be loaded.`, 'NetworkError');
-            }
-            (0, eval)(source);
-        }
+    globalThis.cancelAnimationFrame = function(id) {
+        globalThis.clearTimeout(id);
     };
-    globalThis.importScripts = DedicatedWorkerGlobalScope.prototype.importScripts;
+    globalThis.requestAnimationFrame = function(cb) {
+        return globalThis.setTimeout(cb, 16);
+    };
 
-    globalThis.__obscura_worker_receive = function(json) {
+    const _workerReceiveSymbol = Symbol.for('__obscura_worker_receive');
+    globalThis[_workerReceiveSymbol] = function(json) {
         if (closing) return;
         const payload = _deserializeWorkerMsg(json);
         if (!payload) return;
@@ -533,6 +824,12 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         try { Object.defineProperties(event, { target: { value: globalThis }, currentTarget: { value: globalThis } }); } catch (e) {}
         globalThis.dispatchEvent(event);
     };
+
+    for (const k of Object.getOwnPropertyNames(globalThis)) {
+        if (k.startsWith('__obscura_')) {
+            try { delete globalThis[k]; } catch (e) {}
+        }
+    }
 })
 "#;
 
@@ -550,6 +847,7 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
     for name in ["__obscura_ua", "__obscura_platform", "__obscura_ua_platform",
         "__obscura_ua_platform_version", "__obscura_ua_full_version", "__obscura_ua_architecture",
         "__obscura_language", "__obscura_languages", "__obscura_accept_language",
+        "__obscura_webgl_vendor", "__obscura_webgl_renderer",
         "__obscura_hw", "__obscura_mem", "__obscura_network_downlink", "__obscura_network_rtt",
         "__obscura_network_effective_type", "__obscura_network_save_data"] {
         let key = v8::String::new(scope, name).unwrap();
@@ -567,6 +865,21 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         return 0;
     }
     let parent = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow();
+    if let Some(doc_url) = parent.dom.as_ref().and_then(obscura_dom::DomTree::document_url) {
+        if let Ok(parsed) = url::Url::parse(&doc_url) {
+            globals.insert("__obscura_creator_origin".into(), serde_json::Value::String(parsed.origin().ascii_serialization()));
+            let host = parsed.host_str().unwrap_or("");
+            let is_secure = matches!(parsed.scheme(), "https" | "wss" | "file")
+                || host == "localhost"
+                || host.ends_with(".localhost")
+                || host == "127.0.0.1"
+                || host == "::1"
+                || host == "[::1]"
+                || (host.starts_with("127.") && host.split('.').count() == 4);
+            globals.insert("__obscura_is_secure_context".into(), serde_json::Value::Bool(is_secure));
+        }
+    }
+    globals.insert("__obscura_cross_origin_isolated".into(), serde_json::Value::Bool(false));
     let config = WorkerConfig { policy: registry.borrow().policy.clone(), resources: resources.clone(), url: url.into(), globals, blobs,
         identity: parent.device_identity.clone(), cookies: parent.cookie_jar.clone(),
         http: parent.http_client.clone(), callbacks: parent.callbacks.clone(),
@@ -667,7 +980,7 @@ async fn run_worker(id: u32, config: WorkerConfig,
         if control.stopped() { break; }
         let result = match command {
             Some(WorkerCommand::Run(source)) => rt.execute_worker_script(&source),
-            Some(WorkerCommand::Message(json)) => rt.execute_worker_script(&format!("__obscura_worker_receive({});", serde_json::to_string(&json).unwrap())),
+            Some(WorkerCommand::Message(json)) => rt.execute_worker_script(&format!("(globalThis[Symbol.for('__obscura_worker_receive')] || globalThis.__obscura_worker_receive)({});", serde_json::to_string(&json).unwrap())),
             Some(WorkerCommand::Stop) | None => break,
         };
         if let Err(error) = result {
@@ -738,6 +1051,47 @@ pub fn op_worker_terminate(state: &OpState, worker_id: u32) {
 #[string]
 pub fn op_worker_load_script(state: &OpState, #[string] url: &str) -> Option<String> {
     state.try_borrow::<WorkerEndpoint>()?.blobs.get(url).cloned()
+}
+
+#[op2(reentrant)]
+#[string]
+pub fn op_worker_run_script(
+    scope: &mut v8::HandleScope,
+    #[string] url: &str,
+    #[string] source: &str,
+) -> Option<String> {
+    let source_str = v8::String::new(scope, source)?;
+    let name_str = v8::String::new(scope, url)?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        name_str.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let tc = &mut v8::TryCatch::new(scope);
+    let script = v8::Script::compile(tc, source_str, Some(&origin));
+    let Some(script) = script else {
+        if tc.has_caught() {
+            tc.rethrow();
+            return None;
+        }
+        return Some("Worker script compilation failed".into());
+    };
+    if script.run(tc).is_none() {
+        if tc.has_caught() {
+            tc.rethrow();
+            return None;
+        }
+        return Some("Worker script execution failed".into());
+    }
+    None
 }
 
 struct WorkerSerializer<'s> {

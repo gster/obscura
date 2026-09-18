@@ -1,5 +1,17 @@
 "use strict";
 (function () {
+const Deno = globalThis.Deno;
+
+// Events and performance share a realm-relative clock. Capture the wall-clock
+// primitive so page overrides cannot rewrite event timestamps or advance time.
+const _clockDateNow = Date.now.bind(Date);
+let _clockTimeOrigin = _clockDateNow();
+let _clockLastReading = 0;
+function _relativeTimeNow() {
+  const elapsed = _clockDateNow() - _clockTimeOrigin;
+  if (elapsed > _clockLastReading) _clockLastReading = elapsed;
+  return _clockLastReading;
+}
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -55,7 +67,7 @@
     //   Object.getOwnPropertyDescriptor(window, 'Node').enumerable
     // Pre-declaring them non-enumerable here is enough -- per the note above,
     // the later `globalThis.X = X` assignments only update the value.
-    'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
+    'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType', 'HTMLAllCollection',
     'DeviceOrientationEvent',
     'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
@@ -136,6 +148,11 @@ globalThis.dispatchEvent = function(event) {
 
 let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
+const _iframeContextElements = new Set();
+const _iframeContextPaths = new WeakMap();
+const _iframeAncestorCounts = new Map();
+const _pendingIframeLoads = new Set();
+const _pendingIframeLoadRefs = new WeakMap();
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
@@ -160,6 +177,13 @@ const _domJSONParse = JSON.parse;
 const _domJSONStringify = JSON.stringify;
 const _domSetHas = Function.call.bind(Set.prototype.has);
 const _dom = (cmd, a1, a2) => {
+  // Ordinary insertions keep the native fast path. Only a move of an existing
+  // subtree can discard an iframe while leaving it connected afterwards.
+  let movedFrames = null;
+  if (_iframeContextElements.size && (cmd === 'append_child' || cmd === 'insert_before')) {
+    const movedId = cmd === 'append_child' ? a2 : a1;
+    if (_iframeAncestorCounts.has(+movedId)) movedFrames = _iframeContextsWithin(movedId);
+  }
   const result = Deno.core.ops.op_dom(cmd, _domString(a1 ?? ""), _domString(a2 ?? ""), _realmFrameId);
   if (_domSetHas(_DOM_MUTATION_COMMANDS, cmd)) {
     _domMutationEpoch++;
@@ -180,6 +204,15 @@ const _dom = (cmd, a1, a2) => {
   // not make JS believe a move happened.
   if (result === "true" && _domSetHas(_DOM_TREE_MUTATION_COMMANDS, cmd)) {
     _treeMutationEpoch++;
+    if (_iframeContextElements.size && (movedFrames?.length || cmd === 'remove_child'
+        || cmd === 'set_inner_html' || cmd === 'set_inner_html_context'
+        || cmd === 'set_fragment_html_executable')) {
+      for (const frame of _iframeContextElements) {
+        if (movedFrames?.includes(frame) || _dom('is_connected', frame._nid) !== 'true') {
+          _discardIframeContext(frame);
+        }
+      }
+    }
   }
   return result;
 };
@@ -259,7 +292,7 @@ _nativeFns.add(_functionToString);
 [Error, TypeError, ReferenceError, SyntaxError, RangeError, URIError, EvalError].forEach(E => {
   try {
     Object.defineProperty(E.prototype, 'name', {
-      value: E.name, writable: true, enumerable: false, configurable: false,
+      value: E.name, writable: true, enumerable: false, configurable: true,
     });
   } catch(e) {}
 });
@@ -268,11 +301,12 @@ const _stackCache = new WeakMap();
 const _origStackDesc = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
 if (_origStackDesc && _origStackDesc.get) {
   Object.defineProperty(Error.prototype, 'stack', {
-    configurable: false, enumerable: false,
+    configurable: true, enumerable: false,
     get: function() {
       if (!_stackCache.has(this)) _stackCache.set(this, _origStackDesc.get.call(this));
       return _stackCache.get(this);
-    }
+    },
+    set: _origStackDesc.set,
   });
 }
 
@@ -1956,9 +1990,26 @@ const _customElementConstructionStack = [];
 
 function __prepareInsertedScript(script) {
   if (!Deno.core.ops.op_script_try_start(script._nid)) return;
-  const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
-  const isModule = scriptType === 'module';
-  const isImportMap = scriptType === 'importmap';
+  let scriptBlockType = 'text/javascript';
+  const rawType = script.getAttribute('type');
+  const hasType = rawType !== null && rawType !== undefined;
+  const trimmedType = hasType ? rawType.trim().toLowerCase() : '';
+  const rawLang = script.getAttribute('language');
+  const hasLang = rawLang !== null && rawLang !== undefined;
+  const trimmedLang = hasLang ? rawLang.trim().toLowerCase() : '';
+
+  if (hasType && trimmedType !== '') {
+    scriptBlockType = trimmedType;
+  } else if (!hasType && hasLang) {
+    if (trimmedLang === '') {
+      scriptBlockType = 'text/javascript';
+    } else {
+      scriptBlockType = 'text/' + trimmedLang;
+    }
+  }
+
+  const isModule = scriptBlockType === 'module';
+  const isImportMap = scriptBlockType === 'importmap';
   if (isImportMap) {
     const src = script.getAttribute('src');
     let error = '';
@@ -1982,7 +2033,14 @@ function __prepareInsertedScript(script) {
     }
     return;
   }
-  if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
+  const _JS_MIME_TYPES = new Set([
+    'text/javascript', 'application/javascript', 'text/ecmascript',
+    'application/ecmascript', 'text/x-javascript', 'application/x-javascript',
+    'text/x-ecmascript', 'application/x-ecmascript', 'text/jscript', 'text/livescript',
+    'text/javascript1.0', 'text/javascript1.1', 'text/javascript1.2',
+    'text/javascript1.3', 'text/javascript1.4', 'text/javascript1.5',
+  ]);
+  if (!isModule && !_JS_MIME_TYPES.has(scriptBlockType)) {
     return;
   }
   const src = script.getAttribute('src');
@@ -2079,15 +2137,25 @@ function __prepareInsertedSubtree(root) {
   // unstarted.  When an ancestor is later connected, insertion steps visit
   // every script in that subtree in tree order.
   if (!root || !root.isConnected) return;
+  _startConnectedIframeLoads();
+  if (root.nodeType === 1 && root.tagName === 'IFRAME') {
+    const src = root.getAttribute('src');
+    if (src && src !== 'about:blank') root._loadIframeSrc(src);
+  }
   const scripts = [];
   const seen = new Set();
   if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
+    if (script?.localName === 'iframe') {
+      const src = script.getAttribute('src');
+      if (src && src !== 'about:blank') script._loadIframeSrc(src);
+      continue;
+    }
     if (script && !seen.has(script._nid)) {
       scripts.push(script);
       seen.add(script._nid);
@@ -2217,7 +2285,7 @@ class Node {
     }
     if (c instanceof DocumentFragment) {
       const children = Array.from(c.childNodes);
-      for (const child of children) this.appendChild(child);
+      for (const child of children) _nodeAppendChild.call(this, child);
       return c;
     }
     if (c._shadowParent) c._shadowParent.removeChild(c);
@@ -2475,6 +2543,10 @@ class Node {
     return _eventTargetDispatch(this, event);
   }
 }
+// Fragment insertion must not re-enter a page replacement of appendChild.
+const _nodeAppendChild = Node.prototype.appendChild;
+const EventTarget = Node;
+globalThis.EventTarget = Node;
 class CharacterData extends Node {
   get textContent() { return this.data; }
   set textContent(v) { this.data = v == null ? "" : v; }
@@ -4398,18 +4470,15 @@ class Element extends Node {
     this.setAttribute("src", v);
   }
   _resetIframeFrame() {
-    const oldId = this._frameId;
-    if (oldId) {
-      delete globalThis.__obscura_frameElements[oldId];
-      delete globalThis.__obscura_frameWindows[oldId];
-    }
-    this._frameId = 0;
-    this._iframeLoadingUrl = null;
+    _discardIframeContext(this, false);
+    if (!this.isConnected) return;
     this._iframeDoc = new _IframeDocument(
       '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
     this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+    _trackIframeContext(this);
   }
   _loadIframeSrc(url) {
+    if (!this.isConnected) { _queueIframeLoad(this); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -4419,11 +4488,13 @@ class Element extends Node {
     if (this._iframeLoadingUrl === fullUrl) return;
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
+    const generation = this._iframeGeneration;
     const el = this;
     fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
+      if (el._iframeGeneration !== generation || el._iframeLoadingUrl !== fullUrl || !el.isConnected) return;
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
+        if (el._iframeGeneration !== generation || !el.isConnected) return;
         // Hand the document to the host, which gives this frame a realm of its
         // own and runs the scripts that came with it (issue #600). The shim
         // document below stays: it is what the parent reads through
@@ -4452,7 +4523,7 @@ class Element extends Node {
       // directly bypasses listeners registered via addEventListener.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
+      if (el._iframeGeneration !== generation || el._iframeLoadingUrl !== fullUrl || !el.isConnected) return;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
@@ -4461,6 +4532,7 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    if (!this.isConnected) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -4474,11 +4546,13 @@ class Element extends Node {
     if (!this._iframeDoc) {
       this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
       this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+      _trackIframeContext(this);
     }
     return this._iframeDoc;
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (!this.isConnected) return null;
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -4497,6 +4571,32 @@ class Element extends Node {
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
   set method(v) { this.setAttribute("method", v); }
+  get formAction() {
+    const raw = this.getAttribute('formaction');
+    if (raw === null || raw === '') {
+      return _domParse("document_url") || globalThis.location?.href || "about:blank";
+    }
+    try { return new URL(raw, _documentBase() || "about:blank").href; } catch(e) { return raw; }
+  }
+  set formAction(v) { this.setAttribute('formaction', v); }
+  get formaction() { return this.formAction; }
+  set formaction(v) { this.formAction = v; }
+  get formEnctype() { return this.getAttribute("formenctype") || ""; }
+  set formEnctype(v) { this.setAttribute("formenctype", v); }
+  get formMethod() { return this.getAttribute("formmethod") || ""; }
+  set formMethod(v) { this.setAttribute("formmethod", v); }
+  get formNoValidate() { return this.hasAttribute("formnovalidate"); }
+  set formNoValidate(v) { if (v) this.setAttribute("formnovalidate", ""); else this.removeAttribute("formnovalidate"); }
+  get formTarget() { return this.getAttribute("formtarget") || ""; }
+  set formTarget(v) { this.setAttribute("formtarget", v); }
+  get srcset() { return this.getAttribute("srcset") || ""; }
+  set srcset(v) { this.setAttribute("srcset", v); }
+  get data() { return this.getAttribute("data") || ""; }
+  set data(v) { this.setAttribute("data", v); }
+  get outerText() { return this.innerText; }
+  set outerText(v) { this.innerText = v; }
+  get srcdoc() { return this.getAttribute('srcdoc') || ''; }
+  set srcdoc(v) { this.setAttribute('srcdoc', v); }
   get form() {
     const id = _domParse('form_owner',this._nid);
     return id == null ? null : _wrap(id);
@@ -5873,6 +5973,9 @@ class Document extends Node {
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
+  get all() {
+    return this._allCollection || (this._allCollection = _createHTMLAllCollection(this));
+  }
   get cookie() {
     return Deno.core.ops.op_get_cookies();
   }
@@ -5946,6 +6049,11 @@ class Document extends Node {
   hasFocus() { return true; }
   execCommand() { return false; }
 }
+
+class HTMLDocument extends Document {}
+Object.defineProperty(HTMLDocument.prototype, Symbol.toStringTag, { value: 'HTMLDocument', configurable: true });
+_markNative(HTMLDocument);
+globalThis.HTMLDocument = HTMLDocument;
 
 class DocumentFragment extends Node {
   constructor(nid) {
@@ -6613,7 +6721,7 @@ function _wrap(nid) {
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
-  else if (t === 9) n = new Document(nid);
+  else if (t === 9) n = new HTMLDocument(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -6702,6 +6810,78 @@ globalThis.parent = globalThis;
 globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
+
+function _isPotentiallyTrustworthyOrigin(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol === 'https:' || u.protocol === 'wss:' || u.protocol === 'file:') return true;
+    const hostname = u.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname.endsWith('.localhost')
+        || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]') {
+      return true;
+    }
+    if (/^127(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)){3}$/.test(hostname)) {
+      return true;
+    }
+    if (u.protocol === 'blob:') {
+      return u.origin !== 'null' && _isPotentiallyTrustworthyOrigin(u.origin);
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+function _currentOrigin() {
+  const org = globalThis.location?.origin;
+  return (org && org !== '') ? org : 'null';
+}
+
+let _secureContextOverride = null;
+function _isSecureContext() {
+  if (typeof _secureContextOverride === 'boolean') {
+    return _secureContextOverride;
+  }
+  if (!_isPotentiallyTrustworthyOrigin(globalThis.location?.href || 'about:blank')) {
+    return false;
+  }
+  try {
+    if (globalThis.parent && globalThis.parent !== globalThis && !globalThis.parent.isSecureContext) {
+      return false;
+    }
+  } catch (e) {}
+  return true;
+}
+
+function _originGetter() { return _currentOrigin(); }
+function _originSetter(v) {
+  Object.defineProperty(this, 'origin', {
+    value: v,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+function _secureContextGetter() { return _isSecureContext(); }
+let _crossOriginIsolated = false;
+function _crossOriginIsolatedGetter() { return _crossOriginIsolated; }
+
+Object.defineProperty(globalThis, 'origin', {
+  get: _originGetter,
+  set: _originSetter,
+  configurable: true,
+  enumerable: true,
+});
+Object.defineProperty(globalThis, 'isSecureContext', {
+  get: _secureContextGetter,
+  configurable: true,
+  enumerable: true,
+});
+Object.defineProperty(globalThis, 'crossOriginIsolated', {
+  get: _crossOriginIsolatedGetter,
+  configurable: true,
+  enumerable: true,
+});
 
 // HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
 // mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
@@ -6793,6 +6973,24 @@ Object.defineProperty(globalThis, 'constructor', {
   configurable: true,
   enumerable: false,
 });
+if (globalThis.Window && globalThis.Window.prototype) {
+  Object.defineProperty(globalThis.Window.prototype, 'origin', {
+    get: _originGetter,
+    set: _originSetter,
+    configurable: true,
+    enumerable: true,
+  });
+  Object.defineProperty(globalThis.Window.prototype, 'isSecureContext', {
+    get: _secureContextGetter,
+    configurable: true,
+    enumerable: true,
+  });
+  Object.defineProperty(globalThis.Window.prototype, 'crossOriginIsolated', {
+    get: _crossOriginIsolatedGetter,
+    configurable: true,
+    enumerable: true,
+  });
+}
 
 
 // Remove the static _iframeRegistry and replace with dynamic getters.
@@ -6965,55 +7163,249 @@ function _uaBrands() {
   return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
 }
 
+class PermissionStatus extends EventTarget {
+  constructor(state = 'prompt', name = '') {
+    super();
+    this._state = state;
+    this._name = name;
+    this._onchange = null;
+  }
+  get state() { return this._state; }
+  get name() { return this._name; }
+  get onchange() { return this._onchange; }
+  set onchange(fn) { this._onchange = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(PermissionStatus.prototype, Symbol.toStringTag, { value: 'PermissionStatus', configurable: true });
+_markNative(PermissionStatus);
+globalThis.PermissionStatus = PermissionStatus;
+
+class BatteryManager extends EventTarget {
+  constructor(charging = true, level = 1) {
+    super();
+    this._charging = charging;
+    this._chargingTime = Infinity;
+    this._dischargingTime = charging ? Infinity : Math.floor(3600 + _fpRand(250) * 7200);
+    this._level = level;
+    this._onchargingchange = null;
+    this._onchargingtimechange = null;
+    this._ondischargingtimechange = null;
+    this._onlevelchange = null;
+  }
+  get charging() { return this._charging; }
+  get chargingTime() { return this._chargingTime; }
+  get dischargingTime() { return this._dischargingTime; }
+  get level() { return this._level; }
+  get onchargingchange() { return this._onchargingchange; }
+  set onchargingchange(fn) { this._onchargingchange = typeof fn === 'function' ? fn : null; }
+  get onchargingtimechange() { return this._onchargingtimechange; }
+  set onchargingtimechange(fn) { this._onchargingtimechange = typeof fn === 'function' ? fn : null; }
+  get ondischargingtimechange() { return this._ondischargingtimechange; }
+  set ondischargingtimechange(fn) { this._ondischargingtimechange = typeof fn === 'function' ? fn : null; }
+  get onlevelchange() { return this._onlevelchange; }
+  set onlevelchange(fn) { this._onlevelchange = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(BatteryManager.prototype, Symbol.toStringTag, { value: 'BatteryManager', configurable: true });
+_markNative(BatteryManager);
+globalThis.BatteryManager = BatteryManager;
+
+class MediaDevices extends EventTarget {
+  constructor() {
+    super();
+    this._ondevicechange = null;
+  }
+  enumerateDevices() {
+    return Promise.resolve([
+      { deviceId: "", kind: "audioinput", label: "", groupId: "" },
+      { deviceId: "", kind: "videoinput", label: "", groupId: "" },
+      { deviceId: "", kind: "audiooutput", label: "", groupId: "" },
+    ]);
+  }
+  getUserMedia() { return Promise.reject(new DOMException("NotAllowedError")); }
+  getDisplayMedia() { return Promise.reject(new DOMException("NotAllowedError")); }
+  getSupportedConstraints() { return {}; }
+  get ondevicechange() { return this._ondevicechange; }
+  set ondevicechange(fn) { this._ondevicechange = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(MediaDevices.prototype, Symbol.toStringTag, { value: 'MediaDevices', configurable: true });
+_markNative(MediaDevices);
+_markNative(MediaDevices.prototype.enumerateDevices);
+_markNative(MediaDevices.prototype.getUserMedia);
+_markNative(MediaDevices.prototype.getDisplayMedia);
+_markNative(MediaDevices.prototype.getSupportedConstraints);
+globalThis.MediaDevices = MediaDevices;
+
+class Geolocation {
+  getCurrentPosition(success, error) {
+    const coords = {
+      latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1,
+      longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(501) - 0.5) * 0.1,
+      accuracy: 10 + _fpRand(502) * 40,
+      altitude: null,
+      altitudeAccuracy: null,
+      heading: null,
+      speed: null,
+    };
+    const pos = { coords, timestamp: Date.now() };
+    if (typeof success === 'function') success(pos);
+  }
+  watchPosition(success, error) {
+    if (typeof success === 'function') {
+      const coords = {
+        latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(503) - 0.5) * 0.1,
+        longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(504) - 0.5) * 0.1,
+        accuracy: 10 + _fpRand(505) * 40,
+        altitude: null,
+        altitudeAccuracy: null,
+        heading: null,
+        speed: null,
+      };
+      success({ coords, timestamp: Date.now() });
+    }
+    return 0;
+  }
+  clearWatch() {}
+}
+Object.defineProperty(Geolocation.prototype, Symbol.toStringTag, { value: 'Geolocation', configurable: true });
+_markNative(Geolocation);
+_markNative(Geolocation.prototype.getCurrentPosition);
+_markNative(Geolocation.prototype.watchPosition);
+_markNative(Geolocation.prototype.clearWatch);
+globalThis.Geolocation = Geolocation;
+
+class ServiceWorkerContainer extends EventTarget {
+  constructor() {
+    super();
+    this.ready = Promise.resolve();
+    this.controller = null;
+    this._oncontrollerchange = null;
+    this._onmessage = null;
+    this._onmessageerror = null;
+  }
+  register() { return Promise.resolve(new ServiceWorkerRegistration()); }
+  getRegistration() { return Promise.resolve(undefined); }
+  getRegistrations() { return Promise.resolve([]); }
+  startMessages() {}
+  get oncontrollerchange() { return this._oncontrollerchange; }
+  set oncontrollerchange(fn) { this._oncontrollerchange = typeof fn === 'function' ? fn : null; }
+  get onmessage() { return this._onmessage; }
+  set onmessage(fn) { this._onmessage = typeof fn === 'function' ? fn : null; }
+  get onmessageerror() { return this._onmessageerror; }
+  set onmessageerror(fn) { this._onmessageerror = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(ServiceWorkerContainer.prototype, Symbol.toStringTag, { value: 'ServiceWorkerContainer', configurable: true });
+_markNative(ServiceWorkerContainer);
+_markNative(ServiceWorkerContainer.prototype.register);
+_markNative(ServiceWorkerContainer.prototype.getRegistration);
+_markNative(ServiceWorkerContainer.prototype.getRegistrations);
+_markNative(ServiceWorkerContainer.prototype.startMessages);
+globalThis.ServiceWorkerContainer = ServiceWorkerContainer;
+
+class ServiceWorker extends EventTarget {
+  constructor() {
+    super();
+    this.scriptURL = '';
+    this.state = 'parsed';
+    this._onerror = null;
+    this._onstatechange = null;
+  }
+  postMessage() {}
+  get onerror() { return this._onerror; }
+  set onerror(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
+  get onstatechange() { return this._onstatechange; }
+  set onstatechange(fn) { this._onstatechange = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(ServiceWorker.prototype, Symbol.toStringTag, { value: 'ServiceWorker', configurable: true });
+_markNative(ServiceWorker);
+_markNative(ServiceWorker.prototype.postMessage);
+globalThis.ServiceWorker = ServiceWorker;
+
+class ServiceWorkerRegistration extends EventTarget {
+  constructor() {
+    super();
+    this.installing = null;
+    this.waiting = null;
+    this.active = null;
+    this.scope = '';
+    this.updateViaCache = 'imports';
+    this._onupdatefound = null;
+  }
+  update() { return Promise.resolve(); }
+  unregister() { return Promise.resolve(true); }
+  get onupdatefound() { return this._onupdatefound; }
+  set onupdatefound(fn) { this._onupdatefound = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(ServiceWorkerRegistration.prototype, Symbol.toStringTag, { value: 'ServiceWorkerRegistration', configurable: true });
+_markNative(ServiceWorkerRegistration);
+_markNative(ServiceWorkerRegistration.prototype.update);
+_markNative(ServiceWorkerRegistration.prototype.unregister);
+globalThis.ServiceWorkerRegistration = ServiceWorkerRegistration;
+
+class CookieStore extends EventTarget {
+  constructor() {
+    super();
+    this._onchange = null;
+  }
+  get(name) { return Promise.resolve(null); }
+  getAll(name) { return Promise.resolve([]); }
+  set(name, value) { return Promise.resolve(); }
+  delete(name) { return Promise.resolve(); }
+  get onchange() { return this._onchange; }
+  set onchange(fn) { this._onchange = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(CookieStore.prototype, Symbol.toStringTag, { value: 'CookieStore', configurable: true });
+_markNative(CookieStore);
+_markNative(CookieStore.prototype.get);
+_markNative(CookieStore.prototype.getAll);
+_markNative(CookieStore.prototype.set);
+_markNative(CookieStore.prototype.delete);
+globalThis.CookieStore = CookieStore;
+globalThis.cookieStore = new CookieStore();
+
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
-  vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
+  vendor: "Google Inc.", vendorSub: "", product: "Gecko", productSub: "20030107",
   get doNotTrack() { return globalThis.__obscura_do_not_track ?? null; },
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   userAgentData: {
     mobile: false,
     get brands() { return _uaBrands(); },
-    get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
+    get platform() {
+      if (globalThis.__obscura_ua_platform) return globalThis.__obscura_ua_platform;
+      const p = globalThis.__obscura_platform || globalThis.navigator?.platform || "";
+      if (p.includes("Mac")) return "macOS";
+      if (p.includes("Linux") || p.includes("Android")) return "Linux";
+      return "Windows";
+    },
     getHighEntropyValues(hints) {
       var brands = _uaBrands();
+      const plat = globalThis.__obscura_ua_platform || (globalThis.navigator?.platform?.includes("Mac") ? "macOS" : (globalThis.navigator?.platform?.includes("Linux") ? "Linux" : "Windows"));
       return Promise.resolve({
-        architecture: globalThis.__obscura_ua_architecture || "x86",
+        architecture: globalThis.__obscura_ua_architecture || (plat === "macOS" ? "arm" : "x86"),
         bitness: "64",
         brands: brands,
         fullVersionList: brands.map(function(b) { return {brand: b.brand, version: (b.brand === "Chromium" || b.brand === "Google Chrome") ? (globalThis.__obscura_ua_full_version || b.version + ".0.0.0") : b.version + ".0.0.0"}; }),
         mobile: false,
         model: "",
-        platform: globalThis.__obscura_ua_platform || "Windows",
-        platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
+        platform: plat,
+        platformVersion: globalThis.__obscura_ua_platform_version || (plat === "macOS" ? "15.0.0" : "10.0.0"),
         uaFullVersion: globalThis.__obscura_ua_full_version || _chromeMajor() + ".0.0.0",
         wow64: false,
       });
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
-  mediaDevices: {
-    enumerateDevices() {
-      return Promise.resolve([
-        {deviceId:"",kind:"audioinput",label:"",groupId:""},
-        {deviceId:"",kind:"videoinput",label:"",groupId:""},
-        {deviceId:"",kind:"audiooutput",label:"",groupId:""},
-      ]);
-    },
-    getUserMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    getDisplayMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    addEventListener(){}, removeEventListener(){},
-  },
+  serviceWorker: new ServiceWorkerContainer(),
+  mediaDevices: new MediaDevices(),
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: { query(params){
     var n = params && params.name;
     // Match a fresh desktop Chrome profile. Invalid and context-dependent
     // descriptors reject instead of silently turning into "granted".
-    if (n === 'accessibility-events' || n === 'ambient-light-sensor' || n === 'top-level-storage-access') {
+    if (n === 'ambient-light-sensor' || n === 'top-level-storage-access') {
       return Promise.reject(new TypeError(`Invalid permission descriptor: ${n}`));
     }
     if (n === 'push') {
@@ -7021,55 +7413,23 @@ globalThis.navigator = {
     }
     if (['camera','clipboard-read','geolocation','local-fonts','microphone','midi',
          'notifications','persistent-storage','window-management'].includes(n)) {
-      return Promise.resolve({state: 'prompt', onchange: null});
+      return Promise.resolve(new PermissionStatus('prompt', n));
     }
     if (['accelerometer','background-sync','clipboard-write','gyroscope','magnetometer',
          'payment-handler','screen-wake-lock','storage-access'].includes(n)) {
-      return Promise.resolve({state: 'granted', onchange: null});
+      return Promise.resolve(new PermissionStatus('granted', n));
     }
-    return Promise.reject(new TypeError(`Invalid permission descriptor: ${n}`));
+    return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '" + n + "' is not a valid enum value of type PermissionName."));
   } },
   getBattery() {
     const charging = globalThis.__obscura_battery_charging ?? _fp('batteryCharging');
     const level = globalThis.__obscura_battery_level ?? _fp('batteryLevel');
-    return Promise.resolve({ charging, chargingTime: Infinity,
-      dischargingTime: charging ? Infinity : Math.floor(3600 + _fpRand(250) * 7200),
-      level, addEventListener(){} });
+    return Promise.resolve(new BatteryManager(charging, level));
   },
   getGamepads() { return []; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
-  geolocation: {
-    getCurrentPosition(success, error) {
-      const coords = {
-        latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1,
-        longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(501) - 0.5) * 0.1,
-        accuracy: 10 + _fpRand(502) * 40,
-        altitude: null,
-        altitudeAccuracy: null,
-        heading: null,
-        speed: null,
-      };
-      const pos = { coords, timestamp: Date.now() };
-      if (typeof success === 'function') success(pos);
-    },
-    watchPosition(success, error) {
-      if (typeof success === 'function') {
-        const coords = {
-          latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(503) - 0.5) * 0.1,
-          longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(504) - 0.5) * 0.1,
-          accuracy: 10 + _fpRand(505) * 40,
-          altitude: null,
-          altitudeAccuracy: null,
-          heading: null,
-          speed: null,
-        };
-        success({ coords, timestamp: Date.now() });
-      }
-      return 0;
-    },
-    clearWatch() {},
-  },
+  geolocation: new Geolocation(),
   storage: {
     estimate() { return Promise.resolve({ quota: globalThis.__obscura_storage_quota ?? 10738064711, usage: Math.floor(_fpRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
@@ -7108,11 +7468,22 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
+  defGetter('vendor', function() { return "Google Inc."; });
+  defGetter('vendorSub', function() { return ""; });
+  defGetter('product', function() { return "Gecko"; });
+  defGetter('productSub', function() { return "20030107"; });
   defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
   defGetter('languages', function() {
     return Array.isArray(globalThis.__obscura_languages)
       ? globalThis.__obscura_languages.slice()
       : ["en-US", "en"];
+  });
+
+  Navigator.prototype.sendBeacon = _markNative(function sendBeacon() { return true; });
+  Object.defineProperty(Navigator.prototype, 'onLine', {
+    get: _markNative(function onLine() { return true; }),
+    enumerable: true,
+    configurable: true,
   });
 
   // Chrome exposes the same two PDF MIME types through every built-in PDF
@@ -7207,13 +7578,33 @@ globalThis.Notification = class Notification {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
+class ScreenOrientation extends EventTarget {
+  constructor() {
+    super();
+    this._type = 'landscape-primary';
+    this._angle = 0;
+    this._onchange = null;
+  }
+  get type() { return this._type; }
+  get angle() { return this._angle; }
+  get onchange() { return this._onchange; }
+  set onchange(fn) { this._onchange = typeof fn === 'function' ? fn : null; }
+  lock() { return Promise.resolve(); }
+  unlock() {}
+}
+Object.defineProperty(ScreenOrientation.prototype, Symbol.toStringTag, { value: 'ScreenOrientation', configurable: true });
+_markNative(ScreenOrientation);
+_markNative(ScreenOrientation.prototype.lock);
+_markNative(ScreenOrientation.prototype.unlock);
+globalThis.ScreenOrientation = ScreenOrientation;
+
 class Screen {
   constructor(w, h, availW, availH) {
     this._w = w; this._h = h;
     this._availW = availW === undefined ? w : availW;
     this._availH = availH === undefined ? h - 40 : availH;
     this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    this.orientation = new ScreenOrientation();
   }
   get width() { return this._w; }
   get height() { return this._h; }
@@ -7249,7 +7640,33 @@ globalThis.__obscura_set_screen_override = function(w, h, emulated) {
   const fallback = _fp('screen');
   _applyScreenSize(fallback[0], fallback[1], !!emulated);
 };
-globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
+
+class VisualViewport extends EventTarget {
+  constructor(w = 1920, h = 1000) {
+    super();
+    this._w = w;
+    this._h = h;
+    this._onresize = null;
+    this._onscroll = null;
+  }
+  get width() { return this._w ?? (globalThis.innerWidth || 0); }
+  set width(v) { this._w = v; }
+  get height() { return this._h ?? (globalThis.innerHeight || 0); }
+  set height(v) { this._h = v; }
+  get offsetLeft() { return 0; }
+  get offsetTop() { return 0; }
+  get pageLeft() { return globalThis.pageXOffset || 0; }
+  get pageTop() { return globalThis.pageYOffset || 0; }
+  get scale() { return 1; }
+  get onresize() { return this._onresize; }
+  set onresize(fn) { this._onresize = typeof fn === 'function' ? fn : null; }
+  get onscroll() { return this._onscroll; }
+  set onscroll(fn) { this._onscroll = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(VisualViewport.prototype, Symbol.toStringTag, { value: 'VisualViewport', configurable: true });
+_markNative(VisualViewport);
+globalThis.VisualViewport = VisualViewport;
+globalThis.visualViewport = new VisualViewport(1920, 1000);
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
 globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
@@ -10198,7 +10615,7 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=_relativeTimeNow();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return _trustedEvents.has(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
@@ -10254,21 +10671,58 @@ globalThis.MouseEvent = class extends Event {
     this.relatedTarget=relatedTarget===undefined?null:relatedTarget;
   }
 };
-globalThis.KeyboardEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
-  // Legacy DOM Level 3 initializer. Positional signature per the WebKit/Gecko form.
-  initKeyboardEvent(type,canBubble,cancelable,view,key,location,ctrlKey,altKey,shiftKey,metaKey) {
-    if (arguments.length < 1) throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");
-    this.initEvent(type,canBubble,cancelable);
-    this.view=view===undefined?null:view;
-    this.key=key===undefined?"":String(key);
-    this.location=location||0;
-    this.ctrlKey=!!ctrlKey;
-    this.altKey=!!altKey;
-    this.shiftKey=!!shiftKey;
-    this.metaKey=!!metaKey;
+class KeyboardEvent extends Event {
+  constructor(t, o = {}) {
+    super(t, o);
+    this.view = o.view || null;
+    this.detail = o.detail || 0;
+    this._key = o.key || "";
+    this._code = o.code || "";
+    this._location = o.location || 0;
+    this._ctrlKey = !!o.ctrlKey;
+    this._altKey = !!o.altKey;
+    this._shiftKey = !!o.shiftKey;
+    this._metaKey = !!o.metaKey;
+    this._repeat = !!o.repeat;
+    this._charCode = o.charCode || 0;
+    this._keyCode = o.keyCode || 0;
+    this._which = o.which !== undefined ? o.which : (o.keyCode || 0);
   }
-};
+  get key() { return this._key ?? ""; }
+  set key(v) { this._key = String(v); }
+  get code() { return this._code ?? ""; }
+  set code(v) { this._code = String(v); }
+  get location() { return this._location ?? 0; }
+  set location(v) { this._location = Number(v) || 0; }
+  get ctrlKey() { return !!this._ctrlKey; }
+  set ctrlKey(v) { this._ctrlKey = !!v; }
+  get altKey() { return !!this._altKey; }
+  set altKey(v) { this._altKey = !!v; }
+  get shiftKey() { return !!this._shiftKey; }
+  set shiftKey(v) { this._shiftKey = !!v; }
+  get metaKey() { return !!this._metaKey; }
+  set metaKey(v) { this._metaKey = !!v; }
+  get repeat() { return !!this._repeat; }
+  set repeat(v) { this._repeat = !!v; }
+  get charCode() { return this._charCode ?? 0; }
+  set charCode(v) { this._charCode = Number(v) || 0; }
+  get keyCode() { return this._keyCode ?? 0; }
+  set keyCode(v) { this._keyCode = Number(v) || 0; }
+  get which() { return this._which !== undefined ? this._which : (this._keyCode || 0); }
+  set which(v) { this._which = Number(v) || 0; }
+  initKeyboardEvent(type, canBubble, cancelable, view, key, location, ctrlKey, altKey, shiftKey, metaKey) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");
+    this.initEvent(type, canBubble, cancelable);
+    this.view = view === undefined ? null : view;
+    this._key = key === undefined ? "" : String(key);
+    this._location = location || 0;
+    this._ctrlKey = !!ctrlKey;
+    this._altKey = !!altKey;
+    this._shiftKey = !!shiftKey;
+    this._metaKey = !!metaKey;
+  }
+}
+globalThis.KeyboardEvent = KeyboardEvent;
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
 globalThis.PointerEvent = class extends MouseEvent {
@@ -10282,16 +10736,23 @@ globalThis.PointerEvent = class extends MouseEvent {
 };
 globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
-globalThis.UIEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0; }
-  // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
-  initUIEvent(type,canBubble,cancelable,view,detail) {
-    if (arguments.length < 1) throw new TypeError("Failed to execute 'initUIEvent' on 'UIEvent': 1 argument required, but only 0 present.");
-    this.initEvent(type,canBubble,cancelable);
-    this.view=view===undefined?null:view;
-    this.detail=detail||0;
+class UIEvent extends Event {
+  constructor(t, o = {}) {
+    super(t, o);
+    this.view = o.view || null;
+    this.detail = o.detail || 0;
+    this._which = o.which !== undefined ? o.which : (o.detail || 0);
   }
-};
+  get which() { return this._which !== undefined ? this._which : 0; }
+  set which(v) { this._which = Number(v) || 0; }
+  initUIEvent(type, canBubble, cancelable, view, detail) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initUIEvent' on 'UIEvent': 1 argument required, but only 0 present.");
+    this.initEvent(type, canBubble, cancelable);
+    this.view = view === undefined ? null : view;
+    this.detail = detail || 0;
+  }
+}
+globalThis.UIEvent = UIEvent;
 globalThis.InputEvent = class extends UIEvent {
   constructor(type,options={}) {
     super(type,options);this.data=options.data==null?null:_domString(options.data);
@@ -10951,33 +11412,64 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
-globalThis.performance = globalThis.performance || {
-  now: (function() {
-    // Monotonically non-decreasing: return the wall-clock offset, but never a
-    // value below the last one. Equal readings are allowed, and avoiding a
-    // synthetic per-call increment keeps tight loops from advancing the clock
-    // faster than real elapsed time.
-    var _last = -Infinity;
-    return function() {
-      var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
-      if (ms < _last) return _last;
-      _last = ms;
-      return _last;
+class Performance extends EventTarget {
+  constructor() {
+    super();
+    this._timeOrigin = 0;
+    this._timing = { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 };
+    this._navigation = { type: 0, redirectCount: 0 };
+    this._memory = {
+      jsHeapSizeLimit: 4294705152,
+      totalJSHeapSize: 19321856,
+      usedJSHeapSize: 16781520,
     };
-  })(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
-  setResourceTimingBufferSize(){},
-  timeOrigin: 0,
-  timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
-  navigation: { type: 0, redirectCount: 0 },
-  memory: {
-    jsHeapSizeLimit: 4294705152,
-    totalJSHeapSize: 19321856,
-    usedJSHeapSize: 16781520,
-  },
-};
+    this._onresourcetimingbufferfull = null;
+  }
+  now() { return _relativeTimeNow(); }
+  mark() {}
+  measure() {}
+  clearMarks() {}
+  clearMeasures() {}
+  clearResourceTimings() {}
+  getEntries() { return []; }
+  getEntriesByName() { return []; }
+  getEntriesByType() { return []; }
+  setResourceTimingBufferSize() {}
+  get timeOrigin() { return this._timeOrigin || 0; }
+  set timeOrigin(v) { this._timeOrigin = v; }
+  get timing() { return this._timing; }
+  set timing(v) { this._timing = v; }
+  get navigation() { return this._navigation; }
+  set navigation(v) { this._navigation = v; }
+  get memory() { return this._memory; }
+  set memory(v) { this._memory = v; }
+  get eventCounts() { return new Map(); }
+  get onresourcetimingbufferfull() { return this._onresourcetimingbufferfull; }
+  set onresourcetimingbufferfull(fn) { this._onresourcetimingbufferfull = typeof fn === 'function' ? fn : null; }
+  toJSON() {
+    return {
+      timeOrigin: this.timeOrigin,
+      timing: this.timing,
+      navigation: this.navigation,
+    };
+  }
+}
+Object.defineProperty(Performance.prototype, Symbol.toStringTag, { value: 'Performance', configurable: true });
+_markNative(Performance);
+_markNative(Performance.prototype.now);
+_markNative(Performance.prototype.mark);
+_markNative(Performance.prototype.measure);
+_markNative(Performance.prototype.clearMarks);
+_markNative(Performance.prototype.clearMeasures);
+_markNative(Performance.prototype.clearResourceTimings);
+_markNative(Performance.prototype.getEntries);
+_markNative(Performance.prototype.getEntriesByName);
+_markNative(Performance.prototype.getEntriesByType);
+_markNative(Performance.prototype.setResourceTimingBufferSize);
+_markNative(Performance.prototype.toJSON);
+
+globalThis.Performance = Performance;
+globalThis.performance = (globalThis.performance instanceof Performance) ? globalThis.performance : new Performance();
 
 var _commonFonts = [
   'Arial', 'Arial Black', 'Arial Narrow',
@@ -12053,6 +12545,12 @@ for (const [tag, name] of Object.entries({
   PROGRESS: "HTMLProgressElement",
   DETAILS: "HTMLDetailsElement",
   DIALOG: "HTMLDialogElement",
+  SOURCE: "HTMLSourceElement",
+  OBJECT: "HTMLObjectElement",
+  EMBED: "HTMLEmbedElement",
+  PARAM: "HTMLParamElement",
+  OUTPUT: "HTMLOutputElement",
+  FRAMESET: "HTMLFrameSetElement",
 })) {
   const type = { [name]: class extends Element {} }[name];
   Object.defineProperty(type.prototype, Symbol.toStringTag, {value: name, configurable: true});
@@ -12236,6 +12734,11 @@ class SVGComponentTransferFunctionElement extends SVGElement {}
 class SVGFEDisplacementMapElement extends SVGElement {}
 class SVGFEMorphologyElement extends SVGElement {}
 class SVGFETurbulenceElement extends SVGElement {}
+class SVGTextPathElement extends SVGTextContentElement {}
+class SVGPatternElement extends SVGElement {}
+class SVGMPathElement extends SVGElement {}
+class SVGFEImageElement extends SVGElement {}
+class SVGAnimationElement extends SVGElement {}
 class SVGPoint {
   constructor(x = 0, y = 0) { this.x = Number(x) || 0; this.y = Number(y) || 0; }
   matrixTransform(matrix) {
@@ -12343,8 +12846,40 @@ Object.assign(globalThis, {
   SVGClipPathElement, SVGMaskElement, SVGFilterElement, SVGFEBlendElement,
   SVGFECompositeElement, SVGComponentTransferFunctionElement,
   SVGFEDisplacementMapElement, SVGFEMorphologyElement, SVGFETurbulenceElement,
+  SVGTextPathElement, SVGPatternElement, SVGMPathElement, SVGFEImageElement, SVGAnimationElement,
   SVGPoint, SVGRect, SVGLength, SVGTransform, SVGPreserveAspectRatio,
 });
+
+function _svgHref(proto) {
+  if (proto && !Object.getOwnPropertyDescriptor(proto, 'href')) {
+    Object.defineProperty(proto, 'href', {
+      get() {
+        const val = this.getAttribute('href') || this.getAttribute('xlink:href') || '';
+        return { baseVal: val, animVal: val };
+      },
+      set(v) { this.setAttribute('href', String(v)); },
+      configurable: true,
+      enumerable: true,
+    });
+  }
+}
+for (const C of [SVGUseElement, SVGTextPathElement, SVGScriptElement, SVGRadialGradientElement, SVGPatternElement, SVGMPathElement, SVGLinearGradientElement, SVGImageElement, SVGFilterElement, SVGFEImageElement]) {
+  if (C && C.prototype) _svgHref(C.prototype);
+}
+const _elStyleDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'style');
+if (_elStyleDesc && !Object.getOwnPropertyDescriptor(SVGElement.prototype, 'style')) {
+  Object.defineProperty(SVGElement.prototype, 'style', _elStyleDesc);
+}
+for (const ev of ['onbegin', 'onend', 'onrepeat']) {
+  if (!Object.getOwnPropertyDescriptor(SVGAnimationElement.prototype, ev)) {
+    Object.defineProperty(SVGAnimationElement.prototype, ev, {
+      get() { return this['__' + ev] || null; },
+      set(fn) { this['__' + ev] = typeof fn === 'function' ? fn : null; },
+      configurable: true,
+      enumerable: true,
+    });
+  }
+}
 globalThis.__obscura_svg_types = {
   svg: SVGSVGElement, script: SVGScriptElement, g: SVGGElement, path: SVGPathElement,
   rect: SVGRectElement, circle: SVGCircleElement, ellipse: SVGEllipseElement,
@@ -12388,6 +12923,11 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+globalThis.HTMLDocument = HTMLDocument;
+const _docCookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+if (_docCookieDesc && !Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie')) {
+  Object.defineProperty(HTMLDocument.prototype, 'cookie', _docCookieDesc);
+}
 Document.prototype.hasStorageAccess = _markNative(function hasStorageAccess() {
   return Promise.resolve(true);
 });
@@ -12483,6 +13023,119 @@ function _nodeList(els) {
   nl.length = els.length;
   return nl;
 }
+
+// HTMLAllCollection (HTML §15.3.3). Returned by Document.prototype.all.
+function HTMLAllCollection() {
+  throw new TypeError("Illegal constructor");
+}
+HTMLAllCollection.prototype.item = function item(i) {
+  if (arguments.length === 0) return null;
+  i = i >>> 0;
+  const els = typeof this._elements === "function" ? this._elements() : [];
+  return i < els.length ? els[i] : null;
+};
+HTMLAllCollection.prototype.namedItem = function namedItem(name) {
+  if (name === undefined || name === null || name === "") return null;
+  name = String(name);
+  const els = typeof this._elements === "function" ? this._elements() : [];
+  const matches = [];
+  for (let i = 0; i < els.length; i++) {
+    const el = els[i];
+    if (!el) continue;
+    if (el.id === name) {
+      matches.push(el);
+    } else if (_isHTMLEl(el) && typeof el.getAttribute === "function" && el.getAttribute("name") === name) {
+      matches.push(el);
+    }
+  }
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
+  return HTMLCollection._from(matches);
+};
+Object.defineProperty(HTMLAllCollection.prototype, "length", {
+  get() {
+    return typeof this._elements === "function" ? this._elements().length : 0;
+  },
+  configurable: true,
+  enumerable: true,
+});
+HTMLAllCollection.prototype[Symbol.iterator] = function() {
+  const els = typeof this._elements === "function" ? this._elements() : [];
+  return els[Symbol.iterator]();
+};
+Object.defineProperty(HTMLAllCollection.prototype, Symbol.toStringTag, {
+  value: 'HTMLAllCollection',
+  configurable: true,
+});
+_markNative(HTMLAllCollection);
+_markNative(HTMLAllCollection.prototype.item);
+_markNative(HTMLAllCollection.prototype.namedItem);
+
+const _htmlAllCollectionProxy = {
+  get(target, prop, receiver) {
+    if (typeof prop === "string") {
+      if (prop === "length") {
+        return target._elements().length;
+      }
+      if (/^\d+$/.test(prop)) {
+        return target.item(Number(prop)) || undefined;
+      }
+      if (prop in HTMLAllCollection.prototype) {
+        return Reflect.get(target, prop, receiver);
+      }
+      const named = target.namedItem(prop);
+      if (named !== null) return named;
+    }
+    return Reflect.get(target, prop, receiver);
+  },
+  apply(target, thisArg, args) {
+    return Reflect.apply(target, thisArg, args);
+  },
+  has(target, prop) {
+    if (typeof prop === "string") {
+      if (prop === "length") return true;
+      if (/^\d+$/.test(prop)) {
+        return Number(prop) < target._elements().length;
+      }
+      if (prop in HTMLAllCollection.prototype) return true;
+      if (target.namedItem(prop) !== null) return true;
+      return false;
+    }
+    return Reflect.has(target, prop);
+  },
+};
+
+function _createHTMLAllCollection(doc) {
+  function all(nameOrIndex) {
+    if (arguments.length === 0) return null;
+    if (typeof nameOrIndex === "number") {
+      return all.item(nameOrIndex);
+    }
+    const named = all.namedItem(nameOrIndex);
+    if (named !== null) return named;
+    if (typeof nameOrIndex === "string" && /^\d+$/.test(nameOrIndex)) {
+      return all.item(Number(nameOrIndex));
+    }
+    return null;
+  }
+  all._doc = doc;
+  all._elements = function() {
+    if (!this._doc || !this._doc.documentElement) return [];
+    const qsa = this._doc.querySelectorAll("*");
+    const arr = new Array(qsa.length);
+    for (let i = 0; i < qsa.length; i++) arr[i] = qsa[i];
+    return arr;
+  };
+  Object.defineProperty(all, 'length', {
+    get() { return this._elements().length; },
+    configurable: true,
+  });
+  Object.setPrototypeOf(all, HTMLAllCollection.prototype);
+  _markNative(all);
+  return new Proxy(all, _htmlAllCollectionProxy);
+}
+
+globalThis.HTMLAllCollection = HTMLAllCollection;
 
 // Window named access. HTML exposes every element id, plus the name of a
 // small legacy set of HTML elements, as properties of the WindowProxy. V8's
@@ -13087,6 +13740,77 @@ class _IframeDocument {
   close() {}
 }
 
+// Keep iframe teardown synchronous with DOM removal, including removal of an
+// ancestor or a shadow host. Saved references keep their old document; a later
+// insertion creates a different context and cannot accept an old fetch result.
+function _queueIframeLoad(frame) {
+  if (_pendingIframeLoadRefs.has(frame)) return;
+  const ref = new WeakRef(frame);
+  _pendingIframeLoadRefs.set(frame, ref);
+  _pendingIframeLoads.add(ref);
+}
+
+function _startConnectedIframeLoads() {
+  for (const ref of _pendingIframeLoads) {
+    const frame = ref.deref();
+    if (!frame) { _pendingIframeLoads.delete(ref); continue; }
+    if (!frame.isConnected) continue;
+    _pendingIframeLoads.delete(ref);
+    _pendingIframeLoadRefs.delete(frame);
+    const src = frame.getAttribute('src');
+    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+  }
+}
+
+function _trackIframeContext(frame) {
+  if (_iframeContextElements.has(frame)) return;
+  const path = [];
+  let node = frame;
+  while (node) {
+    path.push(node._nid);
+    _iframeAncestorCounts.set(node._nid, (_iframeAncestorCounts.get(node._nid) || 0) + 1);
+    node = node.parentNode || (node instanceof ShadowRoot ? node.host : null);
+  }
+  _iframeContextPaths.set(frame, path);
+  _iframeContextElements.add(frame);
+}
+
+function _iframeContextsWithin(nid) {
+  const result = [];
+  for (const frame of _iframeContextElements) {
+    if (_iframeContextPaths.get(frame)?.includes(+nid)) result.push(frame);
+  }
+  return result;
+}
+
+function _discardIframeContext(frame, removed = true) {
+  for (const nid of _iframeContextPaths.get(frame) || []) {
+    const count = _iframeAncestorCounts.get(nid) - 1;
+    if (count) _iframeAncestorCounts.set(nid, count);
+    else _iframeAncestorCounts.delete(nid);
+  }
+  _iframeContextPaths.delete(frame);
+  _iframeContextElements.delete(frame);
+  const oldId = frame._frameId;
+  if (frame._iframeWin) {
+    if (removed) frame._iframeWin.closed = true;
+    frame._iframeWin._frameId = 0;
+  }
+  if (oldId) {
+    const oldWindow = globalThis.__obscura_frameWindows[oldId];
+    if (removed && oldWindow) { try { oldWindow.closed = true; } catch (_) {} }
+    delete globalThis.__obscura_frameElements[oldId];
+    delete globalThis.__obscura_frameWindows[oldId];
+    delete globalThis.__obscura_frameObjects[oldId];
+  }
+  frame._frameId = 0;
+  frame._iframeGeneration = (frame._iframeGeneration || 0) + 1;
+  frame._iframeLoadingUrl = null;
+  frame._iframeDoc = null;
+  frame._iframeWin = null;
+  if (frame.getAttribute('src')) _queueIframeLoad(frame);
+}
+
 const _iframeRealmGlobalCache = new WeakMap();
 let _iframeRealmGlobalNames = [];
 let _iframeRealmGlobalNameSet = new Set();
@@ -13434,6 +14158,26 @@ class _IframeWindow {
     } catch(e) {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
     }
+
+    // Initial about:blank/srcdoc documents inherit their creator's context,
+    // although their Location still has an opaque URL origin. Capture internal
+    // values: window.origin is replaceable by page code.
+    const inheritsContext = /^about:(?:blank|srcdoc)(?:[?#]|$)/i.test(url);
+    const contextOrigin = inheritsContext ? _currentOrigin() : (this.location.origin || 'null');
+    const secureContext = _isSecureContext()
+      && (inheritsContext || _isPotentiallyTrustworthyOrigin(url));
+    Object.defineProperties(this, {
+      origin: {
+        get() { return contextOrigin; }, set: _originSetter,
+        enumerable: true, configurable: true,
+      },
+      isSecureContext: {
+        get() { return secureContext; }, enumerable: true, configurable: true,
+      },
+      crossOriginIsolated: {
+        get() { return false; }, enumerable: true, configurable: true,
+      },
+    });
 
     const proxy = new Proxy(this, _iframeWindowProxyHandler);
     this.self = proxy;
@@ -14192,8 +14936,61 @@ globalThis.AudioBuffer = class AudioBuffer {
   copyFromChannel(dst, ch, start) { var s=this._chs[ch]||this._chs[0]; start=start||0; for(var i=0;i<dst.length;i++) dst[i]=(s&&s[start+i])||0; }
   copyToChannel(src, ch, start) { var d=this._chs[ch]||this._chs[0]; start=start||0; if(d) for(var i=0;i<src.length;i++) d[start+i]=src[i]; }
 };
-globalThis.AudioContext = class AudioContext {
+
+class BaseAudioContext extends EventTarget {
   constructor() {
+    super();
+    this.sampleRate = 48000;
+    this.state = 'suspended';
+    this.currentTime = 0;
+    this.destination = {
+      maxChannelCount: 2, numberOfInputs: 1, numberOfOutputs: 0,
+      channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers'
+    };
+    this.listener = {};
+    this.onstatechange = null;
+  }
+}
+Object.defineProperty(BaseAudioContext.prototype, Symbol.toStringTag, { value: 'BaseAudioContext', configurable: true });
+_markNative(BaseAudioContext);
+globalThis.BaseAudioContext = BaseAudioContext;
+
+class AudioScheduledSourceNode extends EventTarget {
+  constructor() {
+    super();
+    this.onended = null;
+  }
+}
+Object.defineProperty(AudioScheduledSourceNode.prototype, Symbol.toStringTag, { value: 'AudioScheduledSourceNode', configurable: true });
+_markNative(AudioScheduledSourceNode);
+globalThis.AudioScheduledSourceNode = AudioScheduledSourceNode;
+
+class AudioWorkletNode extends EventTarget {
+  constructor() {
+    super();
+    this.parameters = new Map();
+    this.port = new MessageChannel().port1;
+    this.onprocessorerror = null;
+  }
+}
+Object.defineProperty(AudioWorkletNode.prototype, Symbol.toStringTag, { value: 'AudioWorkletNode', configurable: true });
+_markNative(AudioWorkletNode);
+globalThis.AudioWorkletNode = AudioWorkletNode;
+
+class ScriptProcessorNode extends EventTarget {
+  constructor() {
+    super();
+    this.bufferSize = 4096;
+    this.onaudioprocess = null;
+  }
+}
+Object.defineProperty(ScriptProcessorNode.prototype, Symbol.toStringTag, { value: 'ScriptProcessorNode', configurable: true });
+_markNative(ScriptProcessorNode);
+globalThis.ScriptProcessorNode = ScriptProcessorNode;
+
+globalThis.AudioContext = class AudioContext extends BaseAudioContext {
+  constructor() {
+    super();
     this.sampleRate=48000; this.state='suspended'; this.currentTime=0;
     this.baseLatency=0.005333333333333333; this.outputLatency=0;
     this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,
@@ -14298,18 +15095,240 @@ globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candida
 // the first `get` because their request's `onsuccess` is never called. Fire
 // `onsuccess` asynchronously with `null` so reads complete-but-empty, which
 // most libraries treat as a cache miss and fall back to the network.
+class IDBRequest extends EventTarget {
+  constructor() {
+    super();
+    this.result = undefined;
+    this.error = null;
+    this.source = null;
+    this.transaction = null;
+    this.readyState = 'pending';
+    this._onsuccess = null;
+    this._onerror = null;
+  }
+  get onsuccess() { return this._onsuccess; }
+  set onsuccess(fn) { this._onsuccess = typeof fn === 'function' ? fn : null; }
+  get onerror() { return this._onerror; }
+  set onerror(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(IDBRequest.prototype, Symbol.toStringTag, { value: 'IDBRequest', configurable: true });
+_markNative(IDBRequest);
+globalThis.IDBRequest = IDBRequest;
+
+class IDBOpenDBRequest extends IDBRequest {
+  constructor() {
+    super();
+    this._onblocked = null;
+    this._onupgradeneeded = null;
+  }
+  get onblocked() { return this._onblocked; }
+  set onblocked(fn) { this._onblocked = typeof fn === 'function' ? fn : null; }
+  get onupgradeneeded() { return this._onupgradeneeded; }
+  set onupgradeneeded(fn) { this._onupgradeneeded = typeof fn === 'function' ? fn : null; }
+}
+Object.defineProperty(IDBOpenDBRequest.prototype, Symbol.toStringTag, { value: 'IDBOpenDBRequest', configurable: true });
+_markNative(IDBOpenDBRequest);
+globalThis.IDBOpenDBRequest = IDBOpenDBRequest;
+
+class IDBTransaction extends EventTarget {
+  constructor(storeNames) {
+    super();
+    this.db = null;
+    this.mode = 'readonly';
+    this.error = null;
+    const names = Array.isArray(storeNames) ? storeNames : (storeNames ? [storeNames] : []);
+    this._stores = new Map();
+    for (const n of names) this._stores.set(String(n), new IDBObjectStore(String(n)));
+    this.objectStoreNames = { contains: (n) => this._stores.has(String(n)), length: this._stores.size };
+    this._onabort = null;
+    this._oncomplete = null;
+    this._onerror = null;
+    Promise.resolve().then(() => {
+      if (typeof this._oncomplete === 'function') {
+        try { this._oncomplete({ target: this, type: 'complete' }); } catch (e) {}
+      }
+    });
+  }
+  get onabort() { return this._onabort; }
+  set onabort(fn) { this._onabort = typeof fn === 'function' ? fn : null; }
+  get oncomplete() { return this._oncomplete; }
+  set oncomplete(fn) { this._oncomplete = typeof fn === 'function' ? fn : null; }
+  get onerror() { return this._onerror; }
+  set onerror(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
+  abort() {}
+  commit() {}
+  objectStore(name) {
+    let s = this._stores.get(name);
+    if (!s) { s = new IDBObjectStore(name); this._stores.set(name, s); }
+    s.transaction = this;
+    return s;
+  }
+}
+Object.defineProperty(IDBTransaction.prototype, Symbol.toStringTag, { value: 'IDBTransaction', configurable: true });
+_markNative(IDBTransaction);
+_markNative(IDBTransaction.prototype.abort);
+_markNative(IDBTransaction.prototype.commit);
+_markNative(IDBTransaction.prototype.objectStore);
+globalThis.IDBTransaction = IDBTransaction;
+
+class IDBDatabase extends EventTarget {
+  constructor(name = '', version = 1) {
+    super();
+    this.name = name;
+    this.version = version;
+    this.objectStoreNames = { contains: () => false, length: 0, item: () => null };
+    this._onabort = null;
+    this._onclose = null;
+    this._onerror = null;
+    this._onversionchange = null;
+  }
+  get onabort() { return this._onabort; }
+  set onabort(fn) { this._onabort = typeof fn === 'function' ? fn : null; }
+  get onclose() { return this._onclose; }
+  set onclose(fn) { this._onclose = typeof fn === 'function' ? fn : null; }
+  get onerror() { return this._onerror; }
+  set onerror(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
+  get onversionchange() { return this._onversionchange; }
+  set onversionchange(fn) { this._onversionchange = typeof fn === 'function' ? fn : null; }
+  close() {}
+  createObjectStore(name) { return new IDBObjectStore(name); }
+  deleteObjectStore(name) {}
+  transaction(storeNames, mode) {
+    const tx = new IDBTransaction(storeNames);
+    tx.db = this;
+    tx.mode = mode || 'readonly';
+    return tx;
+  }
+}
+Object.defineProperty(IDBDatabase.prototype, Symbol.toStringTag, { value: 'IDBDatabase', configurable: true });
+_markNative(IDBDatabase);
+_markNative(IDBDatabase.prototype.close);
+_markNative(IDBDatabase.prototype.createObjectStore);
+_markNative(IDBDatabase.prototype.deleteObjectStore);
+_markNative(IDBDatabase.prototype.transaction);
+globalThis.IDBDatabase = IDBDatabase;
+
+class IDBFactory {
+  open(name, version) {
+    const req = new IDBOpenDBRequest();
+    Promise.resolve().then(() => {
+      try {
+        req.result = new IDBDatabase(name, version || 1);
+        req.readyState = 'done';
+        if (typeof req.onsuccess === 'function') req.onsuccess({ target: req, type: 'success' });
+      } catch (e) {
+        req.error = e; req.readyState = 'done';
+        if (typeof req.onerror === 'function') req.onerror({ target: req, type: 'error' });
+      }
+    });
+    return req;
+  }
+  deleteDatabase(name) {
+    const req = new IDBOpenDBRequest();
+    Promise.resolve().then(() => {
+      req.result = undefined;
+      req.readyState = 'done';
+      if (typeof req.onsuccess === 'function') req.onsuccess({ target: req, type: 'success' });
+    });
+    return req;
+  }
+  databases() { return Promise.resolve([]); }
+  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
+}
+Object.defineProperty(IDBFactory.prototype, Symbol.toStringTag, { value: 'IDBFactory', configurable: true });
+_markNative(IDBFactory);
+_markNative(IDBFactory.prototype.open);
+_markNative(IDBFactory.prototype.deleteDatabase);
+_markNative(IDBFactory.prototype.databases);
+_markNative(IDBFactory.prototype.cmp);
+globalThis.IDBFactory = IDBFactory;
+
+class IDBObjectStore {
+  constructor(name = '') {
+    this.name = name;
+    this.keyPath = null;
+    this.autoIncrement = false;
+    this.indexNames = { contains: () => false, length: 0, item: () => null };
+    this.transaction = null;
+    this._data = new Map();
+  }
+  add(val, key) { const k = key ?? Date.now(); this._data.set(k, val); return _idbRequest(() => k); }
+  put(val, key) { const k = key ?? Date.now(); this._data.set(k, val); return _idbRequest(() => k); }
+  get(key) { return _idbRequest(() => this._data.get(key) ?? undefined); }
+  getAll() { return _idbRequest(() => Array.from(this._data.values())); }
+  getAllKeys() { return _idbRequest(() => Array.from(this._data.keys())); }
+  getKey(key) { return _idbRequest(() => (this._data.has(key) ? key : undefined)); }
+  delete(key) { return _idbRequest(() => { this._data.delete(key); return undefined; }); }
+  clear() { return _idbRequest(() => { this._data.clear(); return undefined; }); }
+  count() { return _idbRequest(() => this._data.size); }
+  openCursor() { return _idbRequest(() => null); }
+  openKeyCursor() { return _idbRequest(() => null); }
+  createIndex() { return new IDBIndex(); }
+  index() { return new IDBIndex(); }
+  deleteIndex() {}
+}
+Object.defineProperty(IDBObjectStore.prototype, Symbol.toStringTag, { value: 'IDBObjectStore', configurable: true });
+_markNative(IDBObjectStore);
+globalThis.IDBObjectStore = IDBObjectStore;
+
+class IDBIndex {
+  constructor() {
+    this.name = '';
+    this.objectStore = null;
+    this.keyPath = '';
+    this.multiEntry = false;
+    this.unique = false;
+  }
+  get() { return _idbRequest(() => undefined); }
+  getAll() { return _idbRequest(() => []); }
+  count() { return _idbRequest(() => 0); }
+  openCursor() { return _idbRequest(() => null); }
+  openKeyCursor() { return _idbRequest(() => null); }
+}
+Object.defineProperty(IDBIndex.prototype, Symbol.toStringTag, { value: 'IDBIndex', configurable: true });
+_markNative(IDBIndex);
+globalThis.IDBIndex = IDBIndex;
+
+class IDBCursor {
+  constructor() {
+    this.source = null;
+    this.direction = 'next';
+    this.key = undefined;
+    this.primaryKey = undefined;
+  }
+  advance(count) {}
+  continue(key) {}
+  continuePrimaryKey(key, primaryKey) {}
+  delete() { return _idbRequest(() => undefined); }
+  update(value) { return _idbRequest(() => undefined); }
+}
+Object.defineProperty(IDBCursor.prototype, Symbol.toStringTag, { value: 'IDBCursor', configurable: true });
+_markNative(IDBCursor);
+globalThis.IDBCursor = IDBCursor;
+
+class IDBCursorWithValue extends IDBCursor {
+  constructor() {
+    super();
+    this.value = undefined;
+  }
+}
+Object.defineProperty(IDBCursorWithValue.prototype, Symbol.toStringTag, { value: 'IDBCursorWithValue', configurable: true });
+_markNative(IDBCursorWithValue);
+globalThis.IDBCursorWithValue = IDBCursorWithValue;
+
+class IDBVersionChangeEvent extends Event {
+  constructor(type, opts = {}) {
+    super(type, opts);
+    this.oldVersion = opts.oldVersion || 0;
+    this.newVersion = opts.newVersion !== undefined ? opts.newVersion : null;
+  }
+}
+Object.defineProperty(IDBVersionChangeEvent.prototype, Symbol.toStringTag, { value: 'IDBVersionChangeEvent', configurable: true });
+_markNative(IDBVersionChangeEvent);
+globalThis.IDBVersionChangeEvent = IDBVersionChangeEvent;
+
 function _idbRequest(produceResult) {
-  const req = {
-    result: undefined,
-    error: null,
-    source: null,
-    transaction: null,
-    readyState: 'pending',
-    onsuccess: null,
-    onerror: null,
-    addEventListener(type, fn) { req['on' + type] = fn; },
-    removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
-  };
+  const req = new IDBRequest();
   Promise.resolve().then(() => {
     try {
       req.result = produceResult();
@@ -14327,86 +15346,7 @@ function _idbRequest(produceResult) {
   return req;
 }
 
-function _idbObjectStore(name) {
-  const data = new Map();
-  return {
-    name,
-    keyPath: null,
-    autoIncrement: false,
-    indexNames: { contains() { return false; }, length: 0, item() { return null; } },
-    transaction: null,
-    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
-    getAll() { return _idbRequest(() => Array.from(data.values())); },
-    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
-    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
-    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
-    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
-    count() { return _idbRequest(() => data.size); },
-    openCursor() { return _idbRequest(() => null); },
-    openKeyCursor() { return _idbRequest(() => null); },
-    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
-    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
-    deleteIndex() {},
-  };
-}
-
-function _idbTransaction(storeNames) {
-  const stores = new Map();
-  const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
-  const tx = {
-    db: null,
-    mode: 'readonly',
-    objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
-    onabort: null, oncomplete: null, onerror: null,
-    error: null,
-    objectStore(name) {
-      let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
-      s.transaction = tx;
-      return s;
-    },
-    abort() {},
-    commit() {},
-    addEventListener(type, fn) { tx['on' + type] = fn; },
-    removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
-  };
-  Promise.resolve().then(() => {
-    if (typeof tx.oncomplete === 'function') {
-      try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
-    }
-  });
-  return tx;
-}
-
-function _idbDatabase(name, version) {
-  return {
-    name,
-    version,
-    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
-    deleteObjectStore() {},
-    transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
-      tx.mode = mode || 'readonly';
-      return tx;
-    },
-    close() {},
-    onversionchange: null, onabort: null, onerror: null, onclose: null,
-    addEventListener() {}, removeEventListener() {},
-  };
-}
-
-globalThis.indexedDB = {
-  open(name, version) {
-    return _idbRequest(() => _idbDatabase(name, version || 1));
-  },
-  deleteDatabase(_name) { return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([]); },
-  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
-};
+globalThis.indexedDB = new IDBFactory();
 globalThis.IDBKeyRange = {
   only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
   lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },
@@ -14475,6 +15415,321 @@ navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
 globalThis.opener = null;
+
+class SourceBufferList extends EventTarget {
+  constructor() {
+    super();
+    this.length = 0;
+    this.onaddsourcebuffer = null;
+    this.onremovesourcebuffer = null;
+  }
+}
+class SourceBuffer extends EventTarget {
+  constructor() {
+    super();
+    this.mode = 'segments';
+    this.updating = false;
+    this.buffered = { length: 0, start() { return 0; }, end() { return 0; } };
+    this.timestampOffset = 0;
+    this.appendWindowStart = 0;
+    this.appendWindowEnd = Infinity;
+    this.onupdatestart = null;
+    this.onupdate = null;
+    this.onupdateend = null;
+    this.onerror = null;
+    this.onabort = null;
+  }
+  appendBuffer(data) {}
+  abort() {}
+  remove(start, end) {}
+}
+class MediaSource extends EventTarget {
+  constructor() {
+    super();
+    this.sourceBuffers = new SourceBufferList();
+    this.activeSourceBuffers = new SourceBufferList();
+    this.readyState = 'closed';
+    this.duration = NaN;
+    this.onsourceopen = null;
+    this.onsourceended = null;
+    this.onsourceclose = null;
+  }
+  addSourceBuffer(type) { return new SourceBuffer(); }
+  removeSourceBuffer(buf) {}
+  endOfStream(error) {}
+  static isTypeSupported(type) { return true; }
+}
+class MediaRecorder extends EventTarget {
+  constructor(stream, options) {
+    super();
+    this.state = 'inactive';
+    this.stream = stream;
+    this.mimeType = (options && options.mimeType) || '';
+    this.audioBitsPerSecond = 0;
+    this.videoBitsPerSecond = 0;
+    this.onstart = null;
+    this.onstop = null;
+    this.ondataavailable = null;
+    this.onpause = null;
+    this.onresume = null;
+    this.onerror = null;
+  }
+  start(timeslice) { this.state = 'recording'; }
+  stop() { this.state = 'inactive'; }
+  pause() { this.state = 'paused'; }
+  resume() { this.state = 'recording'; }
+  requestData() {}
+  static isTypeSupported(type) { return true; }
+}
+class PictureInPictureWindow extends EventTarget {
+  constructor() {
+    super();
+    this.width = 0;
+    this.height = 0;
+    this.onresize = null;
+  }
+}
+class RemotePlayback extends EventTarget {
+  constructor() {
+    super();
+    this.state = 'disconnected';
+    this.onconnecting = null;
+    this.onconnect = null;
+    this.ondisconnect = null;
+  }
+  watchAvailability() { return Promise.resolve(0); }
+  cancelWatchAvailability() { return Promise.resolve(); }
+  prompt() { return Promise.resolve(); }
+}
+class RTCDataChannel extends EventTarget {
+  constructor() {
+    super();
+    this.label = '';
+    this.ordered = true;
+    this.maxPacketLifeTime = null;
+    this.maxRetransmits = null;
+    this.protocol = '';
+    this.negotiated = false;
+    this.id = null;
+    this.readyState = 'connecting';
+    this.bufferedAmount = 0;
+    this.bufferedAmountLowThreshold = 0;
+    this.onopen = null;
+    this.onbufferedamountlow = null;
+    this.onerror = null;
+    this.onclose = null;
+    this.onmessage = null;
+  }
+  close() { this.readyState = 'closed'; }
+  send(data) {}
+}
+class RTCDTMFSender extends EventTarget {
+  constructor() {
+    super();
+    this.toneBuffer = '';
+    this.ontonechange = null;
+  }
+  insertDTMF(tones, duration, interToneGap) {}
+}
+class RTCDtlsTransport extends EventTarget {
+  constructor() {
+    super();
+    this.iceTransport = null;
+    this.state = 'new';
+    this.onstatechange = null;
+    this.onerror = null;
+  }
+  getRemoteCertificates() { return []; }
+}
+class RTCIceTransport extends EventTarget {
+  constructor() {
+    super();
+    this.role = 'controlling';
+    this.component = 'rtp';
+    this.state = 'new';
+    this.gatheringState = 'new';
+    this.ongatheringstatechange = null;
+    this.onselectedcandidatepairchange = null;
+    this.onstatechange = null;
+  }
+  getSelectedCandidatePair() { return null; }
+  getLocalCandidates() { return []; }
+  getRemoteCandidates() { return []; }
+}
+class MIDIPort extends EventTarget {
+  constructor() {
+    super();
+    this.id = '';
+    this.manufacturer = '';
+    this.name = '';
+    this.type = 'input';
+    this.version = '';
+    this.state = 'disconnected';
+    this.connection = 'closed';
+    this.onstatechange = null;
+  }
+  open() { return Promise.resolve(this); }
+  close() { return Promise.resolve(this); }
+}
+class MIDIInput extends MIDIPort {
+  constructor() {
+    super();
+    this.onmidimessage = null;
+  }
+}
+class MIDIAccess extends EventTarget {
+  constructor() {
+    super();
+    this.inputs = new Map();
+    this.outputs = new Map();
+    this.onstatechange = null;
+    this.sysexEnabled = false;
+  }
+}
+class BackgroundFetchRegistration extends EventTarget {
+  constructor() {
+    super();
+    this.id = '';
+    this.uploadTotal = 0;
+    this.uploaded = 0;
+    this.downloadTotal = 0;
+    this.downloaded = 0;
+    this.result = '';
+    this.failureReason = '';
+    this.recordsAvailable = false;
+    this.onprogress = null;
+  }
+  abort() { return Promise.resolve(true); }
+  match(request) { return Promise.resolve(undefined); }
+  matchAll() { return Promise.resolve([]); }
+}
+class ApplicationCache extends EventTarget {
+  constructor() {
+    super();
+    this.status = 0;
+    this.oncached = null;
+    this.onchecking = null;
+    this.ondownloading = null;
+    this.onerror = null;
+    this.onnoupdate = null;
+    this.onobsolete = null;
+    this.onprogress = null;
+    this.onupdateready = null;
+  }
+  update() {}
+  abort() {}
+  swapCache() {}
+}
+class MediaKeySession extends EventTarget {
+  constructor() {
+    super();
+    this.sessionId = '';
+    this.expiration = NaN;
+    this.keyStatuses = new Map();
+    this.closed = new Promise(() => {});
+    this.onkeystatuseschange = null;
+    this.onmessage = null;
+  }
+  generateRequest(initDataType, initData) { return Promise.resolve(); }
+  load(sessionId) { return Promise.resolve(false); }
+  update(response) { return Promise.resolve(); }
+  close() { return Promise.resolve(); }
+  remove() { return Promise.resolve(); }
+}
+class PaymentRequest extends EventTarget {
+  constructor(methodData, details, options) {
+    super();
+    this.id = '';
+    this.shippingAddress = null;
+    this.shippingOption = null;
+    this.shippingType = null;
+    this.onshippingaddresschange = null;
+    this.onshippingoptionchange = null;
+  }
+  show() { return Promise.reject(new DOMException('PaymentRequest not supported', 'NotSupportedError')); }
+  abort() { return Promise.resolve(); }
+  canMakePayment() { return Promise.resolve(false); }
+}
+class PresentationAvailability extends EventTarget {
+  constructor() {
+    super();
+    this.value = false;
+    this.onchange = null;
+  }
+}
+class PresentationConnection extends EventTarget {
+  constructor() {
+    super();
+    this.id = '';
+    this.url = '';
+    this.state = 'closed';
+    this.onclose = null;
+    this.onconnect = null;
+    this.onmessage = null;
+    this.onterminate = null;
+  }
+  send(data) {}
+  close() {}
+  terminate() {}
+}
+class PresentationConnectionList extends EventTarget {
+  constructor() {
+    super();
+    this.connections = [];
+    this.onconnectionavailable = null;
+  }
+}
+class PresentationRequest extends EventTarget {
+  constructor(url) {
+    super();
+    this.onconnectionavailable = null;
+  }
+  start() { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); }
+  reconnect(id) { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); }
+  getAvailability() { return Promise.resolve(new PresentationAvailability()); }
+}
+class Sensor extends EventTarget {
+  constructor() {
+    super();
+    this.activated = false;
+    this.hasReading = false;
+    this.timestamp = null;
+    this.onactivate = null;
+    this.onerror = null;
+    this.onreading = null;
+  }
+  start() {}
+  stop() {}
+}
+class USB extends EventTarget {
+  constructor() {
+    super();
+    this.onconnect = null;
+    this.ondisconnect = null;
+  }
+  getDevices() { return Promise.resolve([]); }
+  requestDevice(options) { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); }
+}
+
+for (const ctor of [
+  SourceBufferList, SourceBuffer, MediaSource, MediaRecorder,
+  PictureInPictureWindow, RemotePlayback, RTCDataChannel, RTCDTMFSender,
+  RTCDtlsTransport, RTCIceTransport, MIDIPort, MIDIInput, MIDIAccess,
+  BackgroundFetchRegistration, ApplicationCache, MediaKeySession,
+  PaymentRequest, PresentationAvailability, PresentationConnection,
+  PresentationConnectionList, PresentationRequest, Sensor, USB
+]) {
+  Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: ctor.name, configurable: true });
+  _markNative(ctor);
+  for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(ctor.prototype, key);
+      if (desc && typeof desc.value === "function") _markNative(desc.value);
+    } catch (e) {}
+  }
+  globalThis[ctor.name] = ctor;
+}
+
 
 const _workerMessageHandlerState = new WeakMap();
 function _initializeWorkerMessageHandler(target) {
@@ -15722,7 +16977,17 @@ if (typeof CanvasRenderingContext2D === 'undefined') {
 if (typeof OffscreenCanvas === 'undefined') {
   globalThis.OffscreenCanvas = class OffscreenCanvas {
     constructor(w, h) { this.width = w; this.height = h; }
-    getContext(type) { return globalThis.document?.createElement('canvas')?.getContext(type) || null; }
+    getContext(type, options) {
+      type = String(type);
+      if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+        if (this.width > _MAX_CANVAS_DIMENSION || this.height > _MAX_CANVAS_DIMENSION
+            || this.width * this.height > _MAX_CANVAS_PIXELS) return null;
+        // WebGL owns a software surface and does not require a Document.
+        return HTMLCanvasElement.prototype.getContext.call(this, type, options);
+      }
+      if (this._contextType) return null;
+      return globalThis.document?.createElement('canvas')?.getContext(type, options) || null;
+    }
     convertToBlob() { return Promise.resolve(new Blob([''])); }
     transferToImageBitmap() { return {}; }
   };
@@ -16227,7 +17492,7 @@ globalThis.__obscura_init = function() {
   _installWasmStreamingFallback();
 
   const documentNid = +_dom("document_node_id");
-  globalThis.document = new Document(documentNid);
+  globalThis.document = new HTMLDocument(documentNid);
   // parentNode on <html> reaches the backing document node. Keep that wrapper
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
@@ -16250,7 +17515,7 @@ globalThis.__obscura_init = function() {
   const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
     ? globalThis.__obscura_viewport_h : sh - 80;
   _applyScreenSize(sw, sh, !!globalThis.__obscura_screen_emulated);
-  globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
+  globalThis.visualViewport = new VisualViewport(vw, vh);
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
@@ -16266,6 +17531,8 @@ globalThis.__obscura_init = function() {
   // A navigation start precedes the wall clock, so skew into the past only: an
   // origin ahead of it makes performance.now() and the rAF timestamp negative.
   const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
+  _clockTimeOrigin = t0;
+  _clockLastReading = 0;
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
@@ -17291,21 +18558,88 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // value tracker. Copy only members implemented by this kernel, after input
 // and validation setup has installed their final descriptors.
 for (const [name, members] of Object.entries({
-  HTMLInputElement: 'accept alt autocomplete checked defaultChecked defaultValue disabled files form formAction formEnctype formMethod formNoValidate formTarget height indeterminate max maxLength min minLength multiple name pattern placeholder readOnly required selectionDirection selectionEnd selectionStart size src step type value valueAsDate valueAsNumber width validity validationMessage willValidate checkValidity reportValidity setCustomValidity select setRangeText setSelectionRange stepDown stepUp',
+  HTMLInputElement: 'accept alt autocomplete checked defaultChecked defaultValue disabled files form formAction formaction formEnctype formMethod formNoValidate formTarget height indeterminate max maxLength min minLength multiple name pattern placeholder readOnly required selectionDirection selectionEnd selectionStart size src step type value valueAsDate valueAsNumber width validity validationMessage willValidate checkValidity reportValidity setCustomValidity select setRangeText setSelectionRange stepDown stepUp',
   HTMLTextAreaElement: 'autocomplete defaultValue disabled form maxLength minLength name placeholder readOnly required selectionDirection selectionEnd selectionStart type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity select setRangeText setSelectionRange',
-  HTMLButtonElement: 'disabled form formAction formEnctype formMethod formNoValidate formTarget name type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
+  HTMLButtonElement: 'disabled form formAction formaction formEnctype formMethod formNoValidate formTarget name type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
   HTMLSelectElement: 'autocomplete disabled form length multiple name required selectedIndex size type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
-  HTMLScriptElement: 'src type text async defer crossOrigin integrity referrerPolicy noModule',
+  HTMLScriptElement: 'src type text innerText innerHTML textContent async defer crossOrigin integrity referrerPolicy noModule',
   HTMLIFrameElement: 'src srcdoc name width height contentDocument contentWindow',
   HTMLStyleElement: 'media type disabled sheet',
   HTMLLinkElement: 'href rel media type disabled sheet crossOrigin',
-  HTMLAnchorElement: 'href target download rel hreflang type protocol username password host hostname port pathname search hash origin',
-  HTMLAreaElement: 'href target download rel protocol username password host hostname port pathname search hash origin',
+  HTMLAnchorElement: 'click ping href target download rel hreflang type protocol username password host hostname port pathname search hash origin',
+  HTMLAreaElement: 'click ping href target download rel protocol username password host hostname port pathname search hash origin',
+  HTMLAudioElement: 'src',
+  HTMLVideoElement: 'poster src',
+  HTMLSourceElement: 'src srcset',
+  HTMLObjectElement: 'data',
+  HTMLEmbedElement: 'src',
+  HTMLParamElement: 'value',
+  HTMLOutputElement: 'defaultValue value',
+  HTMLFormElement: 'action submit',
+  HTMLProgressElement: 'value',
 })) {
-  const prototype = globalThis[name].prototype;
+  const prototype = globalThis[name]?.prototype;
+  if (!prototype) continue;
   for (const member of members.split(' ')) {
-    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, member);
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, member) || Object.getOwnPropertyDescriptor(Node.prototype, member);
     if (descriptor && !Object.hasOwn(prototype, member)) Object.defineProperty(prototype, member, descriptor);
+  }
+}
+
+// Install standard prototype event handler accessors for all audited interfaces
+const _auditedEvents = {"window": ["onanimationend", "onanimationiteration", "onanimationstart", "onsearch", "ontransitionend", "onwebkitanimationend", "onwebkitanimationiteration", "onwebkitanimationstart", "onwebkittransitionend", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange", "onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpageshow", "onpopstate", "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload", "onappinstalled", "onbeforeinstallprompt", "ondevicemotion", "ondeviceorientation", "ondeviceorientationabsolute"], "XMLHttpRequest": ["onreadystatechange"], "Document": ["onreadystatechange", "onpointerlockchange", "onpointerlockerror", "onbeforecopy", "onbeforecut", "onbeforepaste", "onsearch", "onvisibilitychange", "oncopy", "oncut", "onpaste", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange", "onfullscreenchange", "onfullscreenerror", "onwebkitfullscreenchange", "onwebkitfullscreenerror", "onfreeze", "onresume"], "Element": ["onbeforecopy", "onbeforecut", "onbeforepaste", "onsearch", "onfullscreenchange", "onfullscreenerror", "onwebkitfullscreenchange", "onwebkitfullscreenerror"], "SVGElement": ["oncopy", "oncut", "onpaste", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange"], "Navigator": ["onLine"], "HTMLElement": ["oncopy", "oncut", "onpaste", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange"], "HTMLMediaElement": ["onencrypted", "onwaitingforkey"], "HTMLVideoElement": ["onenterpictureinpicture", "onleavepictureinpicture"], "RTCPeerConnection": ["onnegotiationneeded", "onicecandidate", "onsignalingstatechange", "oniceconnectionstatechange", "onconnectionstatechange", "onicegatheringstatechange", "ontrack", "ondatachannel", "onaddstream", "onremovestream"], "MediaStream": ["onaddtrack", "onremovetrack", "onactive", "oninactive"], "WebSocket": ["onopen", "onerror", "onclose", "onmessage"], "SourceBufferList": ["onaddsourcebuffer", "onremovesourcebuffer"], "SourceBuffer": ["onupdatestart", "onupdate", "onupdateend", "onerror", "onabort"], "ScriptProcessorNode": ["onaudioprocess"], "ScreenOrientation": ["onchange"], "RTCDataChannel": ["onopen", "onbufferedamountlow", "onerror", "onclose", "onmessage"], "RTCDTMFSender": ["ontonechange"], "AudioScheduledSourceNode": ["onended"], "BaseAudioContext": ["onstatechange"], "OfflineAudioContext": ["oncomplete"], "NetworkInformation": ["onchange"], "MediaStreamTrack": ["onmute", "onunmute", "onended"], "MediaSource": ["onsourceopen", "onsourceended", "onsourceclose"], "MediaRecorder": ["onstart", "onstop", "ondataavailable", "onpause", "onresume", "onerror"], "MIDIPort": ["onstatechange"], "MIDIInput": ["onmidimessage"], "MIDIAccess": ["onstatechange"], "IDBTransaction": ["onabort", "oncomplete", "onerror"], "IDBRequest": ["onsuccess", "onerror"], "IDBOpenDBRequest": ["onblocked", "onupgradeneeded"], "IDBDatabase": ["onabort", "onclose", "onerror", "onversionchange"], "EventSource": ["onopen", "onmessage", "onerror"], "BroadcastChannel": ["onmessage", "onmessageerror"], "BatteryManager": ["onchargingchange", "onchargingtimechange", "ondischargingtimechange", "onlevelchange"], "AudioWorkletNode": ["onprocessorerror"], "XMLHttpRequestEventTarget": ["onloadstart", "onprogress", "onabort", "onerror", "onload", "ontimeout", "onloadend"], "Worker": ["onmessage", "onerror"], "VisualViewport": ["onresize", "onscroll"], "TextTrackCue": ["onenter", "onexit"], "TextTrackList": ["onchange", "onaddtrack", "onremovetrack"], "TextTrack": ["oncuechange"], "SVGAnimationElement": ["onbegin", "onend", "onrepeat"], "Performance": ["onresourcetimingbufferfull"], "MessagePort": ["onmessage", "onmessageerror"], "MediaQueryList": ["onchange"], "HTMLFrameSetElement": ["onblur", "onerror", "onfocus", "onload", "onresize", "onscroll", "onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpageshow", "onpopstate", "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload"], "HTMLBodyElement": ["onblur", "onerror", "onfocus", "onload", "onresize", "onscroll", "onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpageshow", "onpopstate", "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload"], "FileReader": ["onloadstart", "onprogress", "onload", "onabort", "onerror", "onloadend"], "Animation": ["onfinish", "oncancel"], "AbortSignal": ["onabort"], "SharedWorker": ["onerror"], "BackgroundFetchRegistration": ["onprogress"], "Notification": ["onclick", "onshow", "onerror", "onclose"], "PermissionStatus": ["onchange"], "PictureInPictureWindow": ["onresize"], "RTCDtlsTransport": ["onstatechange", "onerror"], "RemotePlayback": ["onconnecting", "onconnect", "ondisconnect"], "SpeechRecognition": ["onaudiostart", "onsoundstart", "onspeechstart", "onspeechend", "onsoundend", "onaudioend", "onresult", "onnomatch", "onerror", "onstart", "onend"], "SpeechSynthesisUtterance": ["onstart", "onend", "onerror", "onpause", "onresume", "onmark", "onboundary"], "ApplicationCache": ["oncached", "onchecking", "ondownloading", "onerror", "onnoupdate", "onobsolete", "onprogress", "onupdateready"], "MediaDevices": ["ondevicechange"], "Geolocation": [""], "MediaKeySession": ["onkeystatuseschange", "onmessage"], "RTCIceTransport": ["ongatheringstatechange", "onselectedcandidatepairchange", "onstatechange"], "ServiceWorker": ["onerror", "onstatechange"], "ServiceWorkerContainer": ["oncontrollerchange", "onmessage"], "ServiceWorkerRegistration": ["onupdatefound"], "PaymentRequest": ["onshippingaddresschange", "onshippingoptionchange"], "PresentationAvailability": ["onchange"], "PresentationConnection": ["onclose", "onconnect", "onmessage", "onterminate"], "PresentationConnectionList": ["onconnectionavailable"], "PresentationRequest": ["onconnectionavailable"], "Sensor": ["onactivate", "onerror", "onreading"], "USB": ["onconnect", "ondisconnect"], "CookieStore": ["onchange"]};
+
+function _installEventAccessors(target, events) {
+  if (!target) return;
+  const xhrDispatchesHandlers = target === XMLHttpRequest.prototype
+    || target === XMLHttpRequestEventTarget.prototype;
+  for (const prop of events) {
+    if (!prop || Object.getOwnPropertyDescriptor(target, prop)) continue;
+    // Preserve inherited behavior such as body's window-reflecting onload.
+    let inherited;
+    for (let proto = Object.getPrototypeOf(target); proto; proto = Object.getPrototypeOf(proto)) {
+      inherited = Object.getOwnPropertyDescriptor(proto, prop);
+      if (inherited) break;
+    }
+    if (inherited && (inherited.get || inherited.set)) {
+      Object.defineProperty(target, prop, { ...inherited, enumerable: true, configurable: true });
+      continue;
+    }
+    const desc = {
+      get() { return this['__' + prop] || null; },
+      set(fn) {
+        // XHR dispatch already invokes the IDL property. Registering it again
+        // fires callbacks twice and can complete application counters early.
+        if (xhrDispatchesHandlers) {
+          this['__' + prop] = typeof fn === 'function' ? fn : null;
+          return;
+        }
+        const old = this['__' + prop];
+        const eventName = prop.startsWith('on') ? prop.slice(2) : prop;
+        if (old && typeof this.removeEventListener === 'function') {
+          try { this.removeEventListener(eventName, old); } catch(e) {}
+        }
+        this['__' + prop] = (typeof fn === 'function' ? fn : null);
+        if (fn && typeof this.addEventListener === 'function') {
+          try { this.addEventListener(eventName, fn); } catch(e) {}
+        }
+      },
+      enumerable: true,
+      configurable: true,
+    };
+    if (typeof _markNative === "function") {
+      _markNative(desc.get);
+      _markNative(desc.set);
+    }
+    Object.defineProperty(target, prop, desc);
+  }
+}
+
+for (const [name, evList] of Object.entries(_auditedEvents)) {
+  const target = (name === 'window') ? globalThis : globalThis[name]?.prototype;
+  if (target) _installEventAccessors(target, evList);
+  if (name === 'window' && globalThis.Window?.prototype) {
+    _installEventAccessors(globalThis.Window.prototype, evList);
   }
 }
 

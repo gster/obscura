@@ -45,6 +45,11 @@ pub struct FrameRealm {
 
 impl Drop for FrameRealm {
     fn drop(&mut self) {
+        // Retained DOM references must not keep this document's queued tasks
+        // executable after its browsing context has been destroyed.
+        let mut state = self.state.borrow_mut();
+        state.document_generation = state.document_generation.wrapping_add(1);
+        drop(state);
         self.realms.borrow_mut().forget(&self.context);
     }
 }
@@ -91,6 +96,7 @@ impl FrameRealm {
         parent.share_resources_with(&mut state);
 
         let state = Rc::new(std::cell::RefCell::new(state));
+        parent.bind_realm_document_state(&context, state.clone());
         let realms = parent.realm_states();
         realms.borrow_mut().register(
             context.clone(),
@@ -1335,6 +1341,26 @@ mod tests {
             frame.evaluate(&mut parent, "globalThis.secret").unwrap(),
             serde_json::json!("do-not-leak"),
         );
+    }
+
+    #[test]
+    fn retained_frame_document_routes_to_its_state_until_v8_collects_it() {
+        let mut parent = page("https://parent.example/", "<title>parent</title>");
+        let frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/child", "<title>child</title>").unwrap();
+        let weak = Rc::downgrade(&frame.state);
+        parent.evaluate("(globalThis.savedDoc = __obscura_frameObjects[1].document, delete __obscura_frameObjects[1])").unwrap();
+        drop(frame);
+        parent.runtime().v8_isolate().low_memory_notification();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(parent.evaluate("[savedDoc.title, document.title]").unwrap(), serde_json::json!(["child", "parent"]));
+        assert_eq!(parent.evaluate("(savedDoc.title = 'old document', [savedDoc.title, document.title])").unwrap(), serde_json::json!(["old document", "parent"]));
+        parent.evaluate("delete globalThis.savedDoc").unwrap();
+        for _ in 0..4 { parent.runtime().v8_isolate().low_memory_notification(); }
+        assert!(weak.upgrade().is_none(), "the retired document outlived all JavaScript references");
+        let state = parent.runtime().op_state();
+        assert!(crate::ops::frame_state(&state.borrow(), 1).is_none());
+        assert!(crate::ops::frame_state(&state.borrow(), 999).is_none());
     }
 
     #[test]

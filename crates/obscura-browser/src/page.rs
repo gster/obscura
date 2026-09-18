@@ -6443,6 +6443,44 @@ mod tests {
     /// The sweep still does its job: an iframe removed from the document has
     /// its realm and every reference the page realm holds to it released.
     #[tokio::test(flavor = "current_thread")]
+    async fn reinserting_a_loaded_iframe_reloads_and_releases_the_previous_realm() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("reinsert-loaded-frame");
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        page.settle(1_000).await;
+        assert_eq!(page.frames.len(), 1);
+        let old_id = page.frames[0].frame_id();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(r#"(() => {
+            globalThis.savedFrame = document.querySelector('iframe');
+            globalThis.savedWindow = savedFrame.contentWindow;
+            globalThis.savedDocument = savedFrame.contentDocument;
+            savedDocument.title = "retained child";
+            document.title = "owner page";
+            savedFrame.remove();
+            const hidden = savedFrame.contentWindow === null && savedFrame.contentDocument === null;
+            document.body.appendChild(savedFrame);
+            return {hidden, fresh: savedFrame.contentWindow !== savedWindow,
+                closed: savedWindow.closed, retained: savedWindow.document === savedDocument};
+        })()"#).unwrap(), serde_json::json!({
+            "hidden": true, "fresh": true, "closed": true, "retained": true,
+        }));
+        page.settle(1_000).await;
+        assert_eq!(page.frames.len(), 1);
+        assert_ne!(page.frames[0].frame_id(), old_id);
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[savedFrame.contentWindow.__ran, savedFrame.contentDocument !== savedDocument]"
+        ).unwrap(), serde_json::json!(["YES", true]));
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[savedDocument.title, document.title, savedFrame.contentDocument.title]"
+        ).unwrap(), serde_json::json!(["retained child", "owner page", ""]));
+        assert_eq!(page.js.as_mut().unwrap().evaluate(r#"(() => {
+            savedDocument.title = 'retired edit';
+            return [savedDocument.title, document.title, savedFrame.contentDocument.title];
+        })()"#).unwrap(), serde_json::json!(["retired edit", "owner page", ""]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn removing_an_iframe_releases_its_realm() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let base = spawn_shadow_frame_server().await;

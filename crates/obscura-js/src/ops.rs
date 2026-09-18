@@ -806,6 +806,7 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 #[derive(Default)]
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
+    retired_documents: HashMap<u32, std::rc::Weak<RefCell<ObscuraState>>>,
 }
 
 impl RealmStates {
@@ -815,11 +816,24 @@ impl RealmStates {
         frame_id: u32,
         state: SharedState,
     ) {
+        self.retired_documents.retain(|_, state| state.strong_count() > 0);
         self.entries.push((context, frame_id, state));
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
+        self.retired_documents.retain(|_, state| state.strong_count() > 0);
+        for (known, id, state) in &self.entries {
+            if known == context {
+                self.retired_documents.insert(*id, Rc::downgrade(state));
+            }
+        }
         self.entries.retain(|(known, _, _)| known != context);
+    }
+
+    fn by_document_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+        self.by_frame_id(frame_id).or_else(|| {
+            self.retired_documents.get(&frame_id).and_then(std::rc::Weak::upgrade)
+        })
     }
 
     fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
@@ -839,15 +853,14 @@ impl RealmStates {
 /// read the page's document. Each realm's bootstrap closure knows its own frame
 /// id and passes it, which is both correct here and cheaper than asking V8:
 /// a page with no frames resolves on `frame_id == 0` alone.
-pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
-    let page = || op_state.borrow::<SharedState>().clone();
+pub fn frame_state(op_state: &OpState, frame_id: u32) -> Option<SharedState> {
     if frame_id == 0 {
-        return page();
+        return Some(op_state.borrow::<SharedState>().clone());
     }
-    match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
-        Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
-        None => page(),
-    }
+    let registry = op_state.try_borrow::<Rc<RefCell<RealmStates>>>()?;
+    // A retired document can still be held by page JavaScript. Never route an
+    // unknown child id to the parent: even a title read would cross documents.
+    registry.borrow().by_document_frame_id(frame_id)
 }
 
 /// The state of the realm running right now, or the page's when the caller is
@@ -1503,7 +1516,7 @@ fn op_dom(
     #[string] arg2: String,
     frame_id: u32,
 ) -> String {
-    let shared = frame_state(state, frame_id);
+    let Some(shared) = frame_state(state, frame_id) else { return "null".into(); };
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
@@ -6881,6 +6894,7 @@ pub fn build_extension() -> Extension {
         crate::worker::op_worker_post_to_parent(),
         crate::worker::op_worker_terminate(),
         crate::worker::op_worker_load_script(),
+        crate::worker::op_worker_run_script(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.

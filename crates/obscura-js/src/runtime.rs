@@ -20,9 +20,11 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    build_extension, invalidate_input_render, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
+    build_extension, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
     StoredNetworkResponseBody,
 };
+#[cfg(feature = "render")]
+use crate::ops::invalidate_input_render;
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll, input_focusable,
@@ -1035,14 +1037,37 @@ impl ObscuraJsRuntime {
     }
 
     pub(crate) fn execute_worker_script(&mut self, source: &str) -> Result<(), String> {
+        let url = self.state.borrow().url.clone();
+        self.execute_worker_script_with_name(&url, source)
+    }
+
+    pub(crate) fn execute_worker_script_with_name(&mut self, name: &str, source: &str) -> Result<(), String> {
         use deno_core::v8;
         let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
         let result = (|| {
             let mut runtime = self.runtime();
             let scope = &mut runtime.handle_scope();
             let scope = &mut v8::TryCatch::new(scope);
-            let source = v8::String::new(scope, source).ok_or("Worker source allocation failed")?;
-            let result = v8::Script::compile(scope, source, None).and_then(|script| script.run(scope));
+            let source_val = v8::String::new(scope, source).ok_or("Worker source allocation failed")?;
+            let origin = if !name.is_empty() {
+                let name_val = v8::String::new(scope, name).ok_or("Worker source name allocation failed")?;
+                Some(v8::ScriptOrigin::new(
+                    scope,
+                    name_val.into(),
+                    0,
+                    0,
+                    false,
+                    0,
+                    None,
+                    false,
+                    false,
+                    false,
+                    None,
+                ))
+            } else {
+                None
+            };
+            let result = v8::Script::compile(scope, source_val, origin.as_ref()).and_then(|script| script.run(scope));
             if result.is_some() { Ok(()) } else {
                 Err(crate::worker::extract_exception_message(scope).unwrap_or_else(|| "Worker execution terminated".into()))
             }
@@ -1103,6 +1128,19 @@ impl ObscuraJsRuntime {
             deno_core::v8::Global::new(scope, context)
         };
         Some(context)
+    }
+
+    /// Saved frame DOM wrappers keep their realm alive in V8. Let that context
+    /// own its document state, while the retired-id registry holds only a Weak.
+    pub(crate) fn bind_realm_document_state(
+        &mut self,
+        context: &deno_core::v8::Global<deno_core::v8::Context>,
+        state: crate::ops::SharedState,
+    ) {
+        let mut entered = self.runtime();
+        let scope = &mut deno_core::v8::HandleScope::new(entered.v8_isolate());
+        let context = deno_core::v8::Local::new(scope, context);
+        context.set_slot(state);
     }
 
     /// Takes the ops object bootstrap handed out, and removes the handoff from
@@ -6891,6 +6929,141 @@ mod tests {
     }
 
     #[test]
+    fn iframe_context_is_discarded_on_removal_and_recreated_on_insertion() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"
+(function(){
+const host=document.createElement('div');document.body.appendChild(host);
+const frame=document.createElement('iframe');const fragment=document.createDocumentFragment();fragment.appendChild(frame);
+const before=[frame.contentWindow===null,frame.contentDocument===null];host.appendChild(fragment);
+const first=frame.contentWindow,doc=frame.contentDocument;first.marker=7;
+frame.remove();const removed=[frame.contentWindow===null,frame.contentDocument===null,first.closed,first.marker===7,first.document===doc];
+host.appendChild(frame);const second=frame.contentWindow;const reinsert=[second!==first,frame.contentDocument!==doc,second.marker===undefined,second.closed===false];
+const other=document.createElement('div');document.body.appendChild(other);other.appendChild(frame);const moved=frame.contentWindow!==second;
+const third=frame.contentWindow;other.textContent='cleared';const cleared=[frame.contentWindow===null,frame.contentDocument===null,third.closed];
+return {before,removed,reinsert,moved,cleared};
+})();"#).unwrap(), serde_json::json!({
+            "before": [true, true], "removed": [true, true, true, true, true],
+            "reinsert": [true, true, true, true], "moved": true, "cleared": [true, true, true],
+        }));
+    }
+
+    #[test]
+    fn iframe_context_cleanup_covers_ancestors_shadow_roots_and_rejected_moves() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const host = document.createElement('div');
+            const shadow = host.attachShadow({mode: 'closed'});
+            const frame = document.createElement('iframe');
+            shadow.appendChild(frame);
+            const disconnected = frame.contentWindow === null && frame.contentDocument === null;
+            document.body.appendChild(host);
+            const first = frame.contentWindow;
+            try { host.appendChild(document.body); } catch (_) {}
+            const rejected = frame.contentWindow === first && host.isConnected;
+            host.remove();
+            const removed = frame.contentWindow === null && first.closed;
+            document.body.appendChild(host);
+            const fresh = frame.contentWindow !== first;
+            const holder = document.createElement('div');
+            holder.innerHTML = '<iframe></iframe>';
+            document.body.appendChild(holder);
+            const other = holder.firstChild;
+            const old = other.contentWindow;
+            holder.innerHTML = '';
+            return {disconnected, rejected, removed, fresh,
+                cleared: other.contentDocument === null && other.contentWindow === null && old.closed};
+        })()"#).unwrap(), serde_json::json!({
+            "disconnected": true, "rejected": true, "removed": true, "fresh": true, "cleared": true,
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_load_waits_for_connection_and_discards_previous_generation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://example.com/page");
+        rt.execute_script("iframe-generations", r#"
+            globalThis.requests = [];
+            globalThis.fetch = url => new Promise(resolve => requests.push({url, resolve}));
+            globalThis.frame = document.createElement('iframe');
+            frame.src = '/child';
+            globalThis.disconnectedRequests = requests.length;
+            document.body.appendChild(frame);
+            frame.remove();
+            document.body.appendChild(frame);
+            requests[0].resolve({ok: true, text: async () => '<p>old</p>'});
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[disconnectedRequests, requests.length]").unwrap(), serde_json::json!([0, 2]));
+        assert!(rt.take_pending_frames().is_empty(), "a stale response created a realm");
+        rt.execute_script("current-iframe-response", "requests[1].resolve({ok: true, text: async () => '<p>new</p>'})").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_frames().len(), 1);
+    }
+
+    #[test]
+    fn fragment_append_does_not_reenter_overridden_append_child() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const host = document.createElement('div');
+            document.body.appendChild(host);
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(document.createElement('span'));
+            fragment.appendChild(document.createElement('i'));
+            const original = Node.prototype.appendChild;
+            const calls = [];
+            Node.prototype.appendChild = function(child) {
+                calls.push(child.nodeType);
+                return original.call(this, child);
+            };
+            let returned;
+            try { returned = host.appendChild(fragment) === fragment; }
+            finally { Node.prototype.appendChild = original; }
+            host.appendChild = function() { throw new Error('unexpected own override'); };
+            const second = document.createDocumentFragment();
+            second.appendChild(document.createElement('b'));
+            original.call(host, second);
+            return {calls, returned, tags: Array.from(host.childNodes, n => n.tagName),
+                empty: fragment.childNodes.length === 0 && second.childNodes.length === 0};
+        })()"#).unwrap(), serde_json::json!({
+            "calls": [11], "returned": true, "tags": ["SPAN", "I", "B"], "empty": true,
+        }));
+    }
+
+    #[test]
+    fn blank_iframe_inherits_context_flags_without_reading_replaceable_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        for (url, origin, secure) in [
+            ("https://example.com/page", "https://example.com", true),
+            ("http://example.com/page", "http://example.com", false),
+            ("http://127.0.0.1:18791/page", "http://127.0.0.1:18791", true),
+        ] {
+            rt.set_url(url);
+            assert_eq!(rt.evaluate(r#"(() => {
+                window.origin = 'https://spoofed.invalid';
+                const iframe = document.createElement('iframe');
+                document.body.appendChild(iframe);
+                const child = iframe.contentWindow;
+                const result = {
+                    origin: child.origin, secure: child.isSecureContext,
+                    isolated: child.crossOriginIsolated, locationOrigin: child.location.origin,
+                    present: ['origin', 'isSecureContext', 'crossOriginIsolated'].map(k => k in child),
+                };
+                child.origin = 'replacement';
+                result.replaceable = child.origin === 'replacement';
+                child.isSecureContext = !result.secure;
+                result.readonly = child.isSecureContext === result.secure;
+                iframe.remove();
+                return result;
+            })()"#).unwrap(), serde_json::json!({
+                "origin": origin, "secure": secure, "isolated": false,
+                "locationOrigin": "null", "present": [true, true, true],
+                "replaceable": true, "readonly": true,
+            }));
+        }
+    }
+
+    #[test]
     fn iframe_content_window_exposes_realm_globals() {
         let mut rt = setup_runtime("<html><body></body></html>");
 
@@ -7572,6 +7745,246 @@ mod tests {
         rt.run_event_loop_bounded(500).await.unwrap();
         assert_eq!(rt.evaluate("__closedWorkerReplies").unwrap(), serde_json::json!(["current-task"]));
         rt.execute_script("cleanup", "worker.terminate(); URL.revokeObjectURL(url);").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_timestamps_use_an_internal_relative_clock_in_window_and_worker() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("event-clock", r#"
+            function probeEventClock() {
+                const clock = performance.now.bind(performance);
+                const before = clock();
+                const normal = new Event('probe').timeStamp;
+                const after = clock();
+                const dateNow = Date.now, performanceNow = performance.now;
+                let overridden;
+                try {
+                    Date.now = () => -1;
+                    performance.now = () => -2;
+                    overridden = new MessageEvent('message').timeStamp;
+                } finally {
+                    Date.now = dateNow;
+                    performance.now = performanceNow;
+                }
+                return {
+                    relative: normal >= before && normal <= after,
+                    isolated: overridden >= after && overridden <= clock()
+                };
+            }
+            globalThis.__eventPage = probeEventClock();
+            globalThis.__eventWorker = null;
+            const url = URL.createObjectURL(new Blob([
+                probeEventClock.toString() + '; postMessage(probeEventClock());'
+            ], {type: 'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = e => {
+                __eventWorker = e.data;
+                worker.terminate(); URL.revokeObjectURL(url);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        let expected = serde_json::json!({"relative": true, "isolated": true});
+        assert_eq!(rt.evaluate("__eventPage").unwrap(), expected);
+        assert_eq!(rt.evaluate("__eventWorker").unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offscreen_webgl_owns_its_context_in_window_and_worker() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_webgl_identity("Test Vendor", "Test Renderer");
+        rt.execute_script("offscreen-context", r#"
+            function probeOffscreen() {
+                const canvas = new OffscreenCanvas(2, 3);
+                const gl = canvas.getContext('webgl', {alpha: false});
+                if (!gl) return {context: false};
+                gl.clearColor(1, 0, 0, 1);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                const pixel = new Uint8Array(4);
+                gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+                const result = {
+                    context: true, owner: gl.canvas === canvas,
+                    same: canvas.getContext('webgl') === gl,
+                    exclusive: canvas.getContext('2d') === null,
+                    size: [gl.drawingBufferWidth, gl.drawingBufferHeight],
+                    alpha: gl.getContextAttributes().alpha, pixel: Array.from(pixel),
+                    renderer: gl.getParameter(gl.getExtension('WEBGL_debug_renderer_info').UNMASKED_RENDERER_WEBGL)
+                };
+                return result;
+            }
+            globalThis.__offscreenPage = probeOffscreen();
+            globalThis.__offscreenWorker = null;
+            const url = URL.createObjectURL(new Blob([
+                probeOffscreen.toString() + '; postMessage(probeOffscreen());'
+            ], {type: 'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = e => { __offscreenWorker = e.data; worker.terminate(); };
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        let expected = serde_json::json!({
+            "context": true, "owner": true, "same": true, "exclusive": true,
+            "size": [2, 3], "alpha": false, "pixel": [255, 0, 0, 255], "renderer": "Test Renderer"
+        });
+        assert_eq!(rt.evaluate("__offscreenPage").unwrap(), expected);
+        assert_eq!(rt.evaluate("__offscreenWorker").unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn global_context_flags_in_window_and_worker() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://example.com/secure/page");
+        rt.execute_script("context-flags", r#"
+            function probeFlags() {
+                const desc = Object.getOwnPropertyDescriptor(globalThis, 'origin');
+                const canReplace = typeof desc?.set === 'function';
+                return {
+                    origin: globalThis.origin,
+                    isSecure: globalThis.isSecureContext,
+                    isolated: globalThis.crossOriginIsolated,
+                    hasOrigin: 'origin' in globalThis,
+                    hasSecure: 'isSecureContext' in globalThis,
+                    hasIsolated: 'crossOriginIsolated' in globalThis,
+                    originReplaceable: canReplace
+                };
+            }
+            globalThis.__pageFlags = probeFlags();
+            globalThis.__workerFlags = null;
+            globalThis.__workerError = null;
+            const url = URL.createObjectURL(new Blob([
+                probeFlags.toString() + '; postMessage(probeFlags());'
+            ], {type: 'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onerror = e => { __workerError = e.message || String(e); };
+            worker.onmessage = e => {
+                __workerFlags = e.data;
+                worker.terminate(); URL.revokeObjectURL(url);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        let expected_page = serde_json::json!({
+            "origin": "https://example.com",
+            "isSecure": true,
+            "isolated": false,
+            "hasOrigin": true,
+            "hasSecure": true,
+            "hasIsolated": true,
+            "originReplaceable": true
+        });
+        let expected_worker = serde_json::json!({
+            "origin": "https://example.com",
+            "isSecure": true,
+            "isolated": false,
+            "hasOrigin": true,
+            "hasSecure": true,
+            "hasIsolated": true,
+            "originReplaceable": false
+        });
+        assert_eq!(rt.evaluate("__pageFlags").unwrap(), expected_page);
+        assert_eq!(rt.evaluate("__workerFlags").unwrap(), expected_worker);
+
+        // Verify insecure HTTP origin has isSecureContext: false
+        let mut rt_insecure = setup_runtime("<html><body></body></html>");
+        rt_insecure.set_url("http://example.com/insecure/page");
+        let secure: bool = serde_json::from_value(rt_insecure.evaluate("isSecureContext").unwrap()).unwrap();
+        assert!(!secure);
+
+        // Verify loopback HTTP origin has isSecureContext: true
+        let mut rt_loopback = setup_runtime("<html><body></body></html>");
+        rt_loopback.set_url("http://127.0.0.1:18791/test");
+        let secure_loopback: bool = serde_json::from_value(rt_loopback.evaluate("isSecureContext").unwrap()).unwrap();
+        assert!(secure_loopback);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn akamai_sensor_web_platform_compatibility() {
+        let mut rt = setup_runtime("<html><head><title>Test</title></head><body><div id=\"d1\">Hello</div></body></html>");
+        rt.execute_script("sensor-test", r#"
+            // 1. document.all / HTMLAllCollection
+            globalThis.__docAllDefined = void 0 !== document.all;
+            globalThis.__docAllHasLength = typeof document.all.length === "number" && document.all.length >= 3;
+            globalThis.__docAllIndexed = document.all[0] === document.documentElement;
+            globalThis.__docAllCallable = typeof document.all === "function" && document.all("d1")?.id === "d1";
+            globalThis.__hasHTMLAllCollection = typeof HTMLAllCollection === "function";
+
+            // 2. navigator.vendorSub
+            globalThis.__vendorSub = navigator.vendorSub;
+            globalThis.__vendor = navigator.vendor;
+
+            // 3. permissions.query nap computation
+            const napNames = [
+                'geolocation','notifications','push','midi','camera','microphone',
+                'speaker','device-info','background-sync','bluetooth','persistent-storage',
+                'ambient-light-sensor','accelerometer','gyroscope','magnetometer',
+                'clipboard','accessibility-events','clipboard-read','clipboard-write','payment-handler'
+            ];
+            globalThis.__napResult = null;
+            const napTokens = [];
+            const queries = napNames.map((name, idx) => {
+                return navigator.permissions.query({name})
+                    .then(res => {
+                        switch (res.state) {
+                            case 'prompt': napTokens[idx] = 1; break;
+                            case 'granted': napTokens[idx] = 2; break;
+                            case 'denied': napTokens[idx] = 0; break;
+                            default: napTokens[idx] = 5;
+                        }
+                    })
+                    .catch(err => {
+                        napTokens[idx] = -1 !== (err.message || '').indexOf('is not a valid enum value of type PermissionName') ? 4 : 3;
+                    });
+            });
+            Promise.all(queries).then(() => {
+                globalThis.__napResult = napTokens.join('');
+            });
+
+            // 4. script language compatibility (jsv)
+            const s15 = document.createElement('script');
+            s15.setAttribute('language', 'JavaScript1.5');
+            s15.text = 'globalThis.__jsv15 = true;';
+            document.head.appendChild(s15);
+
+            const s16 = document.createElement('script');
+            s16.setAttribute('language', 'JavaScript1.6');
+            s16.text = 'globalThis.__jsv16 = true;';
+            document.head.appendChild(s16);
+
+            // 5. Worker checks
+            globalThis.__workerVendorSub = null;
+            globalThis.__workerHasHTMLAllCollection = null;
+            const workerUrl = URL.createObjectURL(new Blob([`
+                postMessage({
+                    vendorSub: navigator.vendorSub,
+                    vendor: navigator.vendor,
+                    hasHTMLAllCollection: 'HTMLAllCollection' in globalThis
+                });
+            `], { type: 'application/javascript' }));
+            const w = new Worker(workerUrl);
+            w.onmessage = e => {
+                globalThis.__workerVendorSub = e.data.vendorSub;
+                globalThis.__workerVendor = e.data.vendor;
+                globalThis.__workerHasHTMLAllCollection = e.data.hasHTMLAllCollection;
+                w.terminate();
+                URL.revokeObjectURL(workerUrl);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+
+        assert_eq!(rt.evaluate("__docAllDefined").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__docAllHasLength").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__docAllIndexed").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__docAllCallable").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("__hasHTMLAllCollection").unwrap(), serde_json::json!(true));
+
+        assert_eq!(rt.evaluate("__vendorSub").unwrap(), serde_json::json!(""));
+        assert_eq!(rt.evaluate("__vendor").unwrap(), serde_json::json!("Google Inc."));
+
+        assert_eq!(rt.evaluate("__napResult").unwrap(), serde_json::json!("11311144241322244122"));
+
+        assert_eq!(rt.evaluate("__jsv15").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("typeof __jsv16 === 'undefined'").unwrap(), serde_json::json!(true));
+
+        assert_eq!(rt.evaluate("__workerVendorSub").unwrap(), serde_json::Value::Null);
+        assert_eq!(rt.evaluate("__workerVendor").unwrap(), serde_json::Value::Null);
+        assert_eq!(rt.evaluate("__workerHasHTMLAllCollection").unwrap(), serde_json::json!(false));
     }
 
     #[tokio::test(flavor = "current_thread")]
