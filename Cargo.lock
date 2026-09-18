@@ -2405,8 +2405,6 @@ dependencies = [
 [[package]]
 name = "primp-rustls"
 version = "0.23.43"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84e95ec28daaa3a1a39c49aff97adddd14e7bcfc454ee5ee9342981ddf3a177c"
 dependencies = [
  "aws-lc-rs",
  "brotli 9.0.0",

@@ -26,6 +26,7 @@ sha2 = "0.10"
 
 [patch.crates-io]
 primp = { path = "../vendor/primp" }
+primp-rustls = { path = "../vendor/primp-rustls" }
 taffy = { path = "../vendor/taffy" }
 cosmic-text = { path = "../vendor/cosmic-text" }
 
