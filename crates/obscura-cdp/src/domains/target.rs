@@ -4,6 +4,44 @@ use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
+fn validate_create_browser_context(params: &Value) -> Result<(), String> {
+    if params.is_null() {
+        return Ok(());
+    }
+    let object = params
+        .as_object()
+        .ok_or("Target.createBrowserContext params must be an object")?;
+    if object.keys().any(|name| name != "disposeOnDetach") {
+        return Err(
+            "Target.createBrowserContext supports only optional disposeOnDetach=true".to_string(),
+        );
+    }
+    if params
+        .get("disposeOnDetach")
+        .is_some_and(|value| value.as_bool() != Some(true))
+    {
+        return Err(
+            "Target.createBrowserContext supports only optional disposeOnDetach=true".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn browser_context_id<'a>(method: &str, params: &'a Value) -> Result<&'a str, String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| format!("Target.{method} params must be an object"))?;
+    if object.len() != 1 || !object.contains_key("browserContextId") {
+        return Err(format!(
+            "Target.{method} supports only string browserContextId"
+        ));
+    }
+    params
+        .get("browserContextId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Target.{method} requires string browserContextId"))
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -275,14 +313,12 @@ pub async fn handle(
             Ok(json!({ "browserContextIds": ids }))
         }
         "createBrowserContext" => {
+            validate_create_browser_context(params)?;
             let id = ctx.create_browser_context();
             Ok(json!({ "browserContextId": id }))
         }
         "disposeBrowserContext" => {
-            let context_id = params
-                .get("browserContextId")
-                .and_then(|v| v.as_str())
-                .ok_or("browserContextId required")?;
+            let context_id = browser_context_id("disposeBrowserContext", params)?;
             let sessions: Vec<(String, String)> = ctx
                 .sessions
                 .iter()
@@ -374,6 +410,61 @@ mod tests {
             .await
             .expect("context listing should succeed");
         assert_eq!(listed["browserContextIds"], json!([context_id]));
+    }
+
+    #[tokio::test]
+    async fn playwright_browser_context_shapes_are_explicit() {
+        let mut ctx = CdpContext::new();
+        for params in [Value::Null, json!({})] {
+            let created = handle("createBrowserContext", &params, &mut ctx, &None)
+                .await
+                .expect("omitted and empty optional params should be equivalent");
+            handle(
+                "disposeBrowserContext",
+                &json!({"browserContextId": created["browserContextId"]}),
+                &mut ctx,
+                &None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let created = handle(
+            "createBrowserContext",
+            &json!({"disposeOnDetach": true}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("the observed Playwright context shape should be accepted");
+        let context_id = created["browserContextId"].as_str().unwrap();
+
+        for params in [
+            json!({"disposeOnDetach": false}),
+            json!({"proxyServer": "http://example.test"}),
+            json!({"disposeOnDetach": true, "invented": true}),
+        ] {
+            handle("createBrowserContext", &params, &mut ctx, &None)
+                .await
+                .expect_err("unqualified context options must fail");
+        }
+
+        handle(
+            "disposeBrowserContext",
+            &json!({"browserContextId": context_id}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("the observed Playwright disposal shape should be accepted");
+        handle(
+            "disposeBrowserContext",
+            &json!({"browserContextId": context_id, "invented": true}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("extra disposal options must fail");
     }
 
     #[tokio::test]

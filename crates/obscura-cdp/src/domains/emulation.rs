@@ -4,6 +4,44 @@ use crate::dispatch::CdpContext;
 
 const MAX_DEVICE_METRIC_DIMENSION: i64 = 10_000_000;
 
+fn validate_device_metrics_shape(params: &Value) -> Result<(), String> {
+    let object = params
+        .as_object()
+        .ok_or("Emulation.setDeviceMetricsOverride params must be an object")?;
+    let allowed = [
+        "width",
+        "height",
+        "deviceScaleFactor",
+        "mobile",
+        "screenWidth",
+        "screenHeight",
+        "screenOrientation",
+    ];
+    if let Some(name) = object
+        .keys()
+        .find(|name| !allowed.contains(&name.as_str()))
+    {
+        return Err(format!(
+            "Emulation.setDeviceMetricsOverride does not support parameter {name}"
+        ));
+    }
+    if let Some(orientation) = params.get("screenOrientation") {
+        let orientation = orientation.as_object().ok_or(
+            "Emulation.setDeviceMetricsOverride screenOrientation must be an object",
+        )?;
+        if orientation.len() != 2
+            || orientation.get("type").and_then(Value::as_str) != Some("landscapePrimary")
+            || orientation.get("angle").and_then(Value::as_i64) != Some(0)
+        {
+            return Err(
+                "Emulation.setDeviceMetricsOverride supports only landscapePrimary angle 0"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn metric_dimension(params: &Value, name: &str) -> Result<u32, String> {
     let value = params
         .get(name)
@@ -121,6 +159,7 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "setDeviceMetricsOverride" => {
+            validate_device_metrics_shape(params)?;
             let width = metric_dimension(params, "width")?;
             let height = metric_dimension(params, "height")?;
             let device_scale_factor = params
@@ -220,7 +259,8 @@ mod tests {
                 "deviceScaleFactor": 2,
                 "mobile": false,
                 "screenWidth": 1440,
-                "screenHeight": 900
+                "screenHeight": 900,
+                "screenOrientation": {"type": "landscapePrimary", "angle": 0}
             }),
             &mut ctx,
             &session_id,
@@ -241,6 +281,24 @@ mod tests {
             ),
             json!([1024, 768, 1024, 768, 1440, 900, 1440, 900, 2])
         );
+    }
+
+    #[tokio::test]
+    async fn device_metrics_override_rejects_unqualified_options() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("viewport-options-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        for params in [
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1, "mobile": false, "scale": 2}),
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1, "mobile": false, "screenOrientation": {"type": "portraitPrimary", "angle": 0}}),
+            json!({"width": 800, "height": 600, "deviceScaleFactor": 1, "mobile": false, "screenOrientation": {"type": "landscapePrimary", "angle": 0, "invented": true}}),
+        ] {
+            handle("setDeviceMetricsOverride", &params, &mut ctx, &session_id)
+                .await
+                .expect_err("unqualified device metrics options must fail");
+        }
     }
 
     #[tokio::test]

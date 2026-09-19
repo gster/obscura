@@ -228,6 +228,115 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         if event.get("trusted") is not expected_trusted:
                             raise AssertionError(f"locator event trust differs from Chrome: {locator!r}")
 
+                    context_result: dict[str, Any] = {
+                        "initialContextCount": len(browser.contexts),
+                    }
+                    result["contextIsolation"] = context_result
+                    page.evaluate(
+                        """(() => {
+                          localStorage.setItem('__obscuraContextOwner', 'default');
+                          globalThis.__obscuraDefaultContextSentinel = 73;
+                        })()"""
+                    )
+                    isolated_context = None
+                    isolated_page = None
+                    try:
+                        isolated_context = browser.new_context()
+                        context_result["createdContextCount"] = len(browser.contexts)
+                        isolated_page = isolated_context.new_page()
+                        isolated_response = isolated_page.goto(
+                            f"{fixture_origin}/fixture?token=isolated-context-value",
+                            wait_until="load",
+                        )
+                        if isolated_response is None:
+                            raise AssertionError("isolated Page.goto returned no document response")
+                        context_result["documentResponse"] = {
+                            "url": isolated_response.url,
+                            "status": isolated_response.status,
+                            "statusText": isolated_response.status_text,
+                            "headers": isolated_response.all_headers(),
+                            "body": isolated_response.body().decode(
+                                "utf-8", errors="surrogateescape"
+                            ),
+                        }
+                        context_result["isolatedBefore"] = isolated_page.evaluate(
+                            """({
+                              storage: localStorage.getItem('__obscuraContextOwner'),
+                              defaultSentinel: globalThis.__obscuraDefaultContextSentinel,
+                              viewport: [innerWidth, innerHeight, visualViewport.width, visualViewport.height],
+                              screen: [screen.width, screen.height, screen.availWidth, screen.availHeight],
+                              devicePixelRatio
+                            })"""
+                        )
+                        isolated_page.evaluate(
+                            """(() => {
+                              localStorage.setItem('__obscuraContextOwner', 'isolated');
+                              globalThis.__obscuraIsolatedContextSentinel = 91;
+                            })()"""
+                        )
+                        context_result["defaultWhileOpen"] = page.evaluate(
+                            """({
+                              storage: localStorage.getItem('__obscuraContextOwner'),
+                              defaultSentinel: globalThis.__obscuraDefaultContextSentinel,
+                              isolatedSentinel: globalThis.__obscuraIsolatedContextSentinel
+                            })"""
+                        )
+                        context_result["isolatedWhileOpen"] = isolated_page.evaluate(
+                            """({
+                              storage: localStorage.getItem('__obscuraContextOwner'),
+                              defaultSentinel: globalThis.__obscuraDefaultContextSentinel,
+                              isolatedSentinel: globalThis.__obscuraIsolatedContextSentinel
+                            })"""
+                        )
+                        isolated_context.close()
+                        isolated_context = None
+                        context_result["closedContextCount"] = len(browser.contexts)
+                        context_result["isolatedPageClosed"] = isolated_page.is_closed()
+                        context_result["defaultAfterClose"] = page.evaluate(
+                            """({
+                              storage: localStorage.getItem('__obscuraContextOwner'),
+                              defaultSentinel: globalThis.__obscuraDefaultContextSentinel,
+                              title: document.title
+                            })"""
+                        )
+                    finally:
+                        if isolated_context is not None:
+                            isolated_context.close()
+
+                    expected_context = {
+                        "initialContextCount": 1,
+                        "createdContextCount": 2,
+                        "isolatedBefore": {
+                            "storage": None,
+                            "defaultSentinel": None,
+                            "viewport": [1280, 720, 1280, 720],
+                            "screen": [1280, 720, 1280, 720],
+                            "devicePixelRatio": 1,
+                        },
+                        "defaultWhileOpen": {
+                            "storage": "default",
+                            "defaultSentinel": 73,
+                            "isolatedSentinel": None,
+                        },
+                        "isolatedWhileOpen": {
+                            "storage": "isolated",
+                            "defaultSentinel": None,
+                            "isolatedSentinel": 91,
+                        },
+                        "closedContextCount": 1,
+                        "isolatedPageClosed": True,
+                        "defaultAfterClose": {
+                            "storage": "default",
+                            "defaultSentinel": 73,
+                            "title": "OB-026 CDP fixture",
+                        },
+                    }
+                    for name, expected in expected_context.items():
+                        if context_result.get(name) != expected:
+                            raise AssertionError(
+                                f"browser context {name} differs from Chrome: {context_result!r}"
+                            )
+
                     session = context.new_cdp_session(page)
                     document = trace.send(
                         session,

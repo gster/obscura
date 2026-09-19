@@ -38,10 +38,13 @@ CDP_IMPLEMENTATION_STATES = {"implemented", "compatibility-ack", "fixed-value", 
 CDP_VERIFICATION_STATES = {"verified", "partial", "not-run"}
 PLAYWRIGHT_SMOKE_METHODS = {
     "Browser.getVersion",
+    "Browser.getWindowForTarget",
+    "Browser.setWindowBounds",
     "Browser.setDownloadBehavior",
     "DOM.getContentQuads",
     "DOM.getDocument",
     "DOM.scrollIntoViewIfNeeded",
+    "Emulation.setDeviceMetricsOverride",
     "Emulation.setEmulatedMedia",
     "Emulation.setFocusEmulationEnabled",
     "Input.dispatchMouseEvent",
@@ -63,7 +66,9 @@ PLAYWRIGHT_SMOKE_METHODS = {
     "Runtime.runIfWaitingForDebugger",
     "Target.attachToBrowserTarget",
     "Target.attachToTarget",
+    "Target.createBrowserContext",
     "Target.createTarget",
+    "Target.disposeBrowserContext",
     "Target.getTargetInfo",
     "Target.setAutoAttach",
 }

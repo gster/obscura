@@ -32,6 +32,30 @@
       "evidence": "Rust parameter test and official Playwright initialization. Persona-derived values remain OB-015."
     },
     {
+      "method": "Browser.getWindowForTarget",
+      "capability": "LIMITED",
+      "implementation": "fixed-value",
+      "verification": "verified",
+      "params": "Omitted params or an optional string targetId, as used by the official client.",
+      "result": "Fixed headless windowId 1 and 1280 by 720 normal bounds.",
+      "events": "None.",
+      "scope": "Current headless browser target.",
+      "errors": "Unknown fields and a nonstring targetId fail.",
+      "evidence": "Official Playwright 1.60 Browser.new_context page initialization and Rust parameter coverage."
+    },
+    {
+      "method": "Browser.setWindowBounds",
+      "capability": "LIMITED",
+      "implementation": "compatibility-ack",
+      "verification": "verified",
+      "params": "Only windowId=1 with positive integer width and height bounds, the observed Playwright headless initialization shape.",
+      "result": "Empty object. The engine has no OS window; the following Emulation.setDeviceMetricsOverride applies the content viewport.",
+      "events": "None.",
+      "scope": "Official headless new-page initialization only; arbitrary window management is not qualified.",
+      "errors": "Other window ids, zero dimensions, extra bounds fields and unknown top-level fields fail.",
+      "evidence": "Official Playwright 1.60 Browser.new_context path, resulting 1280 by 720 page metrics, and exact Rust parameter tests."
+    },
+    {
       "method": "Browser.setDownloadBehavior",
       "capability": "LIMITED",
       "implementation": "compatibility-ack",
@@ -54,6 +78,30 @@
       "scope": "Browser connection or attached browser session.",
       "errors": "Missing, extra, nonboolean, or different values fail.",
       "evidence": "Exact Rust parameter tests and the complete Playwright 1.60 protocol initializer trace; lifecycle closure remains OB-028."
+    },
+    {
+      "method": "Target.createBrowserContext",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "verified",
+      "params": "Omitted params, an empty object or exactly disposeOnDetach=true; proxy and other context options are rejected.",
+      "result": "A new browserContextId backed by an independent Obscura browser context.",
+      "events": "Subsequent targets identify the new browser context.",
+      "scope": "Browser connection and pages explicitly created in the returned context.",
+      "errors": "Unsupported options and malformed disposeOnDetach values fail.",
+      "evidence": "Official Playwright 1.60 Browser.new_context smoke plus Rust cookie/context isolation and parameter tests. Disconnect disposal remains outside this slice."
+    },
+    {
+      "method": "Target.disposeBrowserContext",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "verified",
+      "params": "Exactly one string browserContextId.",
+      "result": "Empty object after removing the named context and its pages.",
+      "events": "Target.detachedFromTarget and Target.targetDestroyed for disposed pages.",
+      "scope": "The named nondefault browser context; sibling default-context pages remain live.",
+      "errors": "Unknown contexts, missing ids, nonstring ids and extra fields fail.",
+      "evidence": "Official Playwright 1.60 context close with retained post-close default-page evaluation plus Rust disposal tests."
     },
     {
       "method": "Target.attachToTarget",
@@ -198,6 +246,18 @@
       "scope": "Page session response store.",
       "errors": "Unknown or evicted request ids fail.",
       "evidence": "Rust body tests and full-body official CDP fixture."
+    },
+    {
+      "method": "Emulation.setDeviceMetricsOverride",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "verified",
+      "params": "Width, height, deviceScaleFactor and mobile, with optional screenWidth, screenHeight and the default landscapePrimary angle 0 orientation.",
+      "result": "Empty object after applying viewport, screen and device scale metrics to the page.",
+      "events": "No independent event contract is qualified.",
+      "scope": "Attached page session.",
+      "errors": "Malformed dimensions, unsupported orientation values and unqualified fields fail.",
+      "evidence": "Official Playwright 1.60 new-context page reports the expected viewport, screen and devicePixelRatio; Rust effect and rejection tests."
     },
     {
       "method": "Emulation.setFocusEmulationEnabled",
@@ -550,7 +610,7 @@
   ],
   "coverage": {
     "kind": "observed-official-client-slice",
-    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic smoke and full pw:protocol log",
+    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic locator and browser-context smoke with full pw:protocol log",
     "unlisted": "not-qualified",
     "completion": "OB-027 remains open until the scoped automation profile is expanded and reconciled against the migration surface."
   }

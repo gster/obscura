@@ -31,6 +31,35 @@ fn window_id(method: &str, params: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_window_bounds(params: &Value) -> Result<(), String> {
+    let method = "setWindowBounds";
+    only_fields(method, params, &["windowId", "bounds"])?;
+    window_id(method, params)?;
+    if params.get("windowId").and_then(Value::as_i64) != Some(1) {
+        return Err("Browser.setWindowBounds supports only windowId 1".to_string());
+    }
+    let bounds = params
+        .get("bounds")
+        .and_then(Value::as_object)
+        .ok_or("Browser.setWindowBounds requires bounds object")?;
+    if bounds.len() != 2
+        || bounds.get("width").and_then(Value::as_u64).is_none()
+        || bounds.get("height").and_then(Value::as_u64).is_none()
+    {
+        return Err(
+            "Browser.setWindowBounds supports only positive integer bounds.width and bounds.height"
+                .to_string(),
+        );
+    }
+    if bounds["width"].as_u64() == Some(0) || bounds["height"].as_u64() == Some(0) {
+        return Err(
+            "Browser.setWindowBounds supports only positive integer bounds.width and bounds.height"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_download_behavior(params: &Value) -> Result<(), String> {
     let method = "setDownloadBehavior";
     only_fields(
@@ -90,6 +119,10 @@ pub async fn handle(method: &str, params: &Value) -> Result<Value, String> {
                 }
             }))
         }
+        "setWindowBounds" => {
+            validate_window_bounds(params)?;
+            Ok(json!({}))
+        }
         "setDownloadBehavior" => {
             validate_download_behavior(params)?;
             Ok(json!({}))
@@ -125,11 +158,31 @@ mod tests {
 
     #[tokio::test]
     async fn unimplemented_browser_mutations_error_instead_of_acknowledging() {
-        for method in ["setWindowBounds", "grantPermissions", "resetPermissions"] {
+        for method in ["grantPermissions", "resetPermissions"] {
             let error = handle(method, &json!({}))
                 .await
                 .expect_err("unimplemented Browser mutation must fail");
             assert!(error.contains("Unknown Browser method"), "{method}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn playwright_headless_window_bounds_shape_is_explicit() {
+        handle(
+            "setWindowBounds",
+            &json!({"windowId": 1, "bounds": {"width": 1282, "height": 800}}),
+        )
+        .await
+        .expect("the observed Playwright headless bounds should be accepted");
+
+        for params in [
+            json!({"windowId": 2, "bounds": {"width": 1282, "height": 800}}),
+            json!({"windowId": 1, "bounds": {"width": 0, "height": 800}}),
+            json!({"windowId": 1, "bounds": {"width": 1282, "height": 800, "left": 0}}),
+        ] {
+            handle("setWindowBounds", &params)
+                .await
+                .expect_err("unqualified window bounds must fail");
         }
     }
 
