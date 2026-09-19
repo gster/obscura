@@ -3276,11 +3276,24 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "remove_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
+            let node_id = NodeId::new(nid);
+            // Removing `id` must clear the id_index too, matching set_attribute /
+            // remove_attribute_ns; otherwise getElementById keeps returning the
+            // still-attached element (#1013).
+            let old_id = if arg2 == "id" {
+                dom.with_node(node_id, |n| n.get_attribute("id").map(str::to_owned))
+                    .flatten()
+            } else {
+                None
+            };
+            dom.with_node_mut(node_id, |n| {
                 if let NodeData::Element { attrs, .. } = &mut n.data {
                     attrs.retain(|a| !a.qualified_name_eq(&arg2));
                 }
             });
+            if arg2 == "id" {
+                dom.update_id_index(node_id, old_id.as_deref(), None);
+            }
             "true".into()
         }
         // Namespace-aware attribute ops. arg2 packs the pieces with a NUL:
