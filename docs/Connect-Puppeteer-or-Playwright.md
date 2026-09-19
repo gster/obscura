@@ -62,7 +62,7 @@ Specify the client wait condition explicitly. Both client navigation APIs defaul
 
 ## Compatibility boundary
 
-The handlers cover navigation, evaluation, DOM/input, networking, cookies and render output, but method presence does not certify every parameter or event contract. Current utility-world IDs do not create independent globals, and several domains acknowledge all methods without implementing them. Use the fixed-client results and backlog in [SUMMARY](SUMMARY.md) and [TODO](TODO.md).
+The handlers cover navigation, evaluation, DOM/input, networking, cookies and render output, but method presence does not certify every parameter or event contract. Current utility-world IDs do not create independent globals. The first observed Playwright 1.60 method slice is recorded in [`automation-cdp-profile.json`](../tools/unblocked/automation-cdp-profile.json); unlisted methods and unvalidated parameter shapes are not qualified. Use the fixed-client results and backlog in [SUMMARY](SUMMARY.md) and [TODO](TODO.md).
 
 The following capture example uses Puppeteer APIs; Playwright equivalents are in its separate guide.
 

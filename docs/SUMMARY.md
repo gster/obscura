@@ -1,6 +1,6 @@
 # 项目现状与文档核验摘要
 
-核验日期：2026-09-19。引擎行为核验基线：`e67e67b11eb265f097942055962622e43fcb9a16`。随后提交 `741f40a97ce2a0672be4c85b24aa4bef85faccae` 增加开发侧基线资产、固定工具链和 CI benchmark pin；没有修改引擎行为代码。
+核验日期：2026-09-19。引擎行为核验基线：`e67e67b11eb265f097942055962622e43fcb9a16`。随后提交 `741f40a97ce2a0672be4c85b24aa4bef85faccae` 增加开发侧基线资产、固定工具链和 CI benchmark pin；`9be460d` 交付首批 Automation CDP Profile、精确 initializer 契约和必需官方客户端 smoke。
 
 ## 根本目标与当前阶段
 
@@ -8,7 +8,7 @@
 
 CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径。反追踪不能用 `DNT=1`、清空 Cookie 或几个伪装字段代替；分别验收 RPA 正确性/效率、网络与行为一致性、跨站/会话/身份空间关联抵抗、完整进程链性能及兼容性成本。受控报价实验在使用方进行，内核提供隔离、配置和完整原始证据。开发工具不做脱敏或删字段，日志的保管、清理和对外流转由执行方负责。
 
-**当前处于迁移前的基线阶段。** 已有 Rust/V8/DOM/渲染、CDP 和 Worker 能力；CLI/MCP、自有 Python SDK/NDJSON runtime 仍存在。`tools/unblocked/` 已包含机器可读的基线、官方 Playwright Python 1.60.0 范围、独立锁和校验器，以及 macOS 首批三路 CDP 记录/差分证据；Linux 资格与采集开关副作用验证尚未完成。统一 persona 编译器和 AutomationProfile 仍未建立。最新范围：删除自有 Python SDK/配套私有 runtime；保留 MCP 和有用 CLI，不强制新增宿主产物；统一 persona、强制 stealth、全出口 primp 与 Chrome 差异修补为重点。Southwest shopping 不再 403 且返回有效结果是重要业务门槛。不要把规划中的删除、认证和独立发布写成已经完成。
+**当前处于迁移前的基线阶段。** 已有 Rust/V8/DOM/渲染、CDP 和 Worker 能力；CLI/MCP、自有 Python SDK/NDJSON runtime 仍存在。`tools/unblocked/` 已包含机器可读的基线、官方 Playwright Python 1.60.0 范围、独立锁和校验器、macOS 首批三路 CDP 记录/差分证据，以及首批实际观测的 Automation CDP Profile 和必需 smoke；Linux 资格、采集开关副作用和完整 profile 仍未完成。统一 persona 编译器仍未建立。最新范围：删除自有 Python SDK/配套私有 runtime；保留 MCP 和有用 CLI，不强制新增宿主产物；统一 persona、强制 stealth、全出口 primp 与 Chrome 差异修补为重点。Southwest shopping 不再 403 且返回有效结果是重要业务门槛。不要把规划中的删除、认证和独立发布写成已经完成。
 
 目标与阶段：[New_ACH](New_ACH.md)。唯一执行队列：[TODO](TODO.md)。
 
@@ -55,11 +55,25 @@ OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run
 
 这不是性能报告；构建、测试及各探针时序不用于宣称加速。root nextest 和 runtime nextest 是两个 workspace 的结果，不能相加成为一个统一资格分数。
 
+### OB-027 首批 profile 后续验证
+
+`9be460d` 基于未修改的 Playwright Python 1.60.0 `connect_over_cdp` 路径运行。raw `pw:protocol` 日志中 25 个实际发送方法全部进入 profile；HTTP body/headers、完整 `DOM.getDocument` 响应、显式 CDP 命令/响应/错误均原样保留。profile 明确是 observed slice，未列方法和未验证参数均为 not-qualified，OB-027 未关闭。
+
+| 检查 | 结果 | 边界 |
+| --- | --- | --- |
+| obscura-cdp release nextest，render | **221 passed，3 skipped，0 failed** | 覆盖首批契约和真实 WebSocket 非法 `Browser.close` 回归 |
+| 根 release nextest，render | **1782 passed，4 skipped，0 failed** | 不替代 Linux、stealth、WPT 或完整客户端资格 |
+| 指定 release CLI build，render | **通过** | 精确 AGENTS.md build 命令；不宣称 stealth |
+| Playwright 1.60.0 required smoke | **通过，25/25 observed methods 已登记** | 单个本地合成页面；不是完整 API 或参数矩阵 |
+| 固定 benchmark obstacle course | **33/33** | `--runs 1 --warmup 0`；包括 `observer-intersection` |
+
+本轮完整 raw protocol 日志和 smoke JSON 位于执行方临时目录，不进入 Git；开发工具不做脱敏或删字段，测试后由执行方处理日志。
+
 ## 当前缺口：源码与实验交叉核验
 
 | 项目 | 证据 | 处置 |
 | --- | --- | --- |
-| CDP 假成功 | `dispatch.rs` 的 Log/Debugger 等整域 no-op；不存在的 `Log.auditMethodDoesNotExist` 实测返回 `{}` | OB-027：精确方法/参数契约，不保留整域兜底 |
+| CDP 假成功 | `9be460d` 已移除首批路径的 server fast path 与整域 no-op；不存在的 `Log.auditMethodDoesNotExist` 现在报错，精确 initializer 越界参数也报错；其余方法/参数未取得资格 | OB-027：扩展 observed profile 并逐项完成参数、事件和作用域契约，不从首批切片外推 |
 | utility world 没有真实隔离 | Page.createIsolatedWorld 登记 ID；Runtime 注释明确仍使用页面 global；实测新 world 可读主世界 `auditMainOnly=73` | OB-029：真实 realm/wrapper/句柄边界 |
 | 观察会执行 getter | Runtime.getProperties 的 `Object.keys` 后读取 `obj[k]`；实测 getter 计数 0→1，返回被读取值 7 | OB-030：描述符检查和对象生命周期 |
 | Beacon 空成功 | bootstrap 两处 sendBeacon 直接 true；同源本地 POST 接收数为 0 | OB-039：真实排队/发送、body、配额和生命周期 |
@@ -91,8 +105,8 @@ shopping 不再 403 且有有效航班/报价结果现已列为 OB-046 的重要
 
 ## 下一步顺序
 
-1. G0：OB-001/025 固定双平台与正式客户端，OB-026 建可重复 trace/fixture。当前 smoke 仅是起点。
-2. 先完成 OB-026 的可重复 trace/fixture，再修清楚的语义与隔离缺口：OB-027/029/030、OB-011、OB-041。OB-037 obstacle 门禁已恢复。
+1. G0：OB-001/025 固定双平台与正式客户端，OB-026 继续补齐可重复 trace/fixture。OB-027 首批 profile 和 smoke 已进入门禁，但仍只是实际观测切片。
+2. 扩展 OB-027，并修清楚的语义与隔离缺口：OB-028/029/030、OB-011、OB-041。OB-037 obstacle 门禁已恢复。
 3. 迁出独有能力并优先清理 Python SDK/私有 runtime；保留 MCP 和有用 CLI。统一 primp/强制 stealth，强化统一 persona，持续修补 Chrome 差异。
 4. 按目标分别验收 Chrome 一致性、反关联/防标记、Southwest shopping 业务结果、完整进程链性能与发布资格。没有实际证据的组合保持未认证。
 

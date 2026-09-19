@@ -26,7 +26,7 @@ managed page session 通常为 `{targetId}-session`；显式 flattened attach �
 
 ## 调用与渲染
 
-CDP handler → Page → 网络/DOM/JS；JS 通过 ops 进入原生能力。网络事件、拦截和导航生命周期由多层共同处理，不能仅从 handler 名称断言协议语义完整。若干域目前整域返回 `{}`，见 TODO OB-027。
+CDP handler → Page → 网络/DOM/JS；JS 通过 ops 进入原生能力。网络事件、拦截和导航生命周期由多层共同处理，不能仅从 handler 名称断言协议语义完整。首批官方客户端方法已发布 observed profile 并移除相应整域占位成功；未列方法和未验证参数仍不具备资格，见 TODO OB-027。
 
 render 消费共享 DOM/样式状态，以 Taffy 和原生浏览器布局逻辑、文本 shaping 和 CPU 绘制生成几何与图像。Page 负责资源和捕获，CDP 提供截图、screencast 与 raster PDF。图像输出存在不等于 Chromium 保真度认证。
 

@@ -42,12 +42,12 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 ### OB-027 · P0 · 发布 Automation CDP Profile 并清理占位成功
 
-状态：未关闭。
+状态：未关闭。`9be460d` 已发布 Playwright Python 1.60.0 首批实际观测方法切片、必需 smoke、profile 校验器和精确 initializer allowlist；尚未覆盖迁移范围内的全部方法、参数组合、事件与生命周期。
 
 依赖：OB-026。入口：crates/obscura-cdp/src/dispatch.rs、domains/、types.rs。
-现状：本次 raw CDP 中不存在的 `Log.auditMethodDoesNotExist` 返回成功 `{}`。
+现状：首批 raw protocol 中的 25 个发送方法均已进入 `tools/unblocked/automation-cdp-profile.json`；不存在的 `Log.auditMethodDoesNotExist` 及已限定 initializer 的越界参数会明确失败。未列方法和未逐项验证的非法参数仍标为 not-qualified，不能从本切片外推。
 动作：逐方法标记 SUPPORTED / LIMITED / VERIFIED_NOOP / UNSUPPORTED，实施/验证状态另存；覆盖参数组合、返回、事件、作用域、错误。审计整域空成功和 Browser 域占位行为。
-完成：未知方法、非法参数明确失败；no-op 仅是有依据的精确允许项；版本号/空对象/初始化成功不能充当资格证据。首个正式 Python smoke 进入必需测试。
+完成：最终迁移范围内的未知方法、非法参数明确失败；no-op 仅是有依据的精确允许项；版本号/空对象/初始化成功不能充当资格证据。正式 Python smoke 保持必需测试，profile 与实际 raw protocol 方法集合持续对账。
 
 ### OB-028 · P0 · Target、session 与页面生命周期闭环
 
