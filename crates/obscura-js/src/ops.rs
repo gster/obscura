@@ -15,7 +15,7 @@ use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 use obscura_net::RequestCredentials;
 use obscura_net::StealthHttpClient;
 use obscura_net::{
-    RequestMode, CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response, ResourceRequest, ReferrerPolicy,
+    RequestMode, CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, ResourceRequest, ReferrerPolicy,
 };
 use tokio::sync::Mutex;
 
@@ -98,6 +98,8 @@ pub struct JsNetworkEvent {
     pub method: String,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
+    pub raw_headers: Option<obscura_net::HeaderCapture>,
+    pub request_raw_headers: Option<obscura_net::HeaderCapture>,
     pub body_size: usize,
     pub timestamp: f64,
 }
@@ -1310,6 +1312,8 @@ pub struct RenderResourceResponse {
     pub url: String,
     pub status: u16,
     pub headers: std::collections::HashMap<String, String>,
+    pub raw_headers: Option<obscura_net::HeaderCapture>,
+    pub request_raw_headers: Option<obscura_net::HeaderCapture>,
     pub body: Arc<[u8]>,
 }
 
@@ -3920,25 +3924,6 @@ async fn op_fetch_url(
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
     custom_headers.retain(|key, _| !key.eq_ignore_ascii_case("referer") && !key.eq_ignore_ascii_case("origin") && !key.to_ascii_lowercase().starts_with("sec-"));
 
-    // Passive request observation (non-blocking). Fires for every request that
-    // reaches the network (Fulfill/Fail from the interception channel short-
-    // circuit earlier). on_request/on_response previously fired only for
-    // navigation; this wires them for JS fetch()/XHR too.
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_request_callbacks().await {
-            if let Ok(parsed) = url::Url::parse(&url) {
-                let info = RequestInfo {
-                    body: body.clone(),
-                    url: parsed,
-                    method: method.clone(),
-                    headers: custom_headers.clone(),
-                    resource_type,
-                };
-                cbs.fire_request(&info).await;
-            }
-        }
-    }
-
     let unsafe_header_names = if is_cross_origin && mode == "cors" {
         cors_unsafe_request_header_names(&custom_headers)
     } else {
@@ -4045,26 +4030,6 @@ async fn op_fetch_url(
     ).await
 }
 
-/// Assemble a `Response` for the on_response interception callbacks from the
-/// parts op_fetch_url already holds. Navigation gets a Response straight from
-/// the http client, but the JS fetch path builds the pieces itself.
-fn fetch_response(
-    url: &str,
-    status: u16,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-    redirected_from: Vec<url::Url>,
-) -> Response {
-    Response {
-        url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
-        status,
-        headers,
-        body,
-        redirected_from,
-        request_referrer: None,
-    }
-}
-
 /// Scripted fetch()/XHR over primp: mirrors op_fetch_url's redirect, SSRF,
 /// and CORS semantics but sends every hop through the primp stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
@@ -4097,7 +4062,7 @@ async fn stealth_fetch_all(
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
 
-    let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
+    let mut response = loop {
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
             Err(_) => {
@@ -4130,7 +4095,7 @@ async fn stealth_fetch_all(
         if let Some(value) = &referrer { req_headers.insert("referer".into(), value.to_string()); }
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let r = tokio::time::timeout(fetch_timeout(), stealth
-            .send_single_with_limit(
+            .send_single_observed(
                 &current_method,
                 &parsed_current,
                 &req_headers,
@@ -4139,20 +4104,24 @@ async fn stealth_fetch_all(
                 credentials_allowed,
                 fetch_max_body_bytes(),
                 fetch_timeout(),
+                // Preserve one request callback per logical fetch. The response
+                // callback carries the final hop's independently captured headers.
+                callbacks.as_deref().filter(|_| redirects_followed == 0)
+                    .map(|callbacks| (callbacks, resource_type)),
             ))
             .await
             .map_err(|_| deno_error::JsErrorBox::generic("fetch timed out"))?
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
         if !(300..400).contains(&r.status) {
-            break (r.status, r.headers, r.body);
+            break r;
         }
         let Some(location) = r.headers.get("location").cloned() else {
-            break (r.status, r.headers, r.body);
+            break r;
         };
         let next_url = match parsed_current.join(&location) {
             Ok(u) => u,
-            Err(_) => break (r.status, r.headers, r.body),
+            Err(_) => break r,
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
@@ -4185,6 +4154,10 @@ async fn stealth_fetch_all(
         current_url = next_url.to_string();
     };
 
+    response.redirected_from = redirected_from;
+    let status = response.status;
+    let resp_headers = &response.headers;
+    let resp_bytes = &response.body;
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
@@ -4221,21 +4194,15 @@ async fn stealth_fetch_all(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(
-                current_url.as_str(),
-                status,
-                resp_headers.clone(),
-                resp_bytes.clone(),
-                redirected_from,
-            );
             let info = RequestInfo {
+                raw_headers: response.request_raw_headers.clone(),
                 body: current_body.clone(),
-                url: resp.url.clone(),
+                url: response.url.clone(),
                 method: current_method.clone(),
-                headers: custom_headers.clone(),
+                headers: response.request_raw_headers.as_ref().map(|h| h.text_headers()).unwrap_or_default(),
                 resource_type,
             };
-            cbs.fire_response(&info, &resp).await;
+            cbs.fire_response(&info, &response).await;
         }
     }
 
@@ -4269,6 +4236,8 @@ async fn stealth_fetch_all(
             method: current_method.clone(),
             status,
             response_headers: resp_headers.clone(),
+            raw_headers: response.raw_headers.clone(),
+            request_raw_headers: response.request_raw_headers.clone(),
             body_size: resp_bytes.len(),
             timestamp,
         });

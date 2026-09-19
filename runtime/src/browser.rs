@@ -1261,6 +1261,8 @@ mod tests {
                 headers: HashMap::new(),
                 body: b"fixture".to_vec(),
                 redirected_from: vec![],
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: None,
             })
         }
@@ -1347,6 +1349,8 @@ mod tests {
                 headers: HashMap::from([("content-type".into(), "text/html".into())]),
                 body: self.0.as_bytes().to_vec(),
                 redirected_from: vec![],
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: None,
             })
         }
@@ -4049,6 +4053,8 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
                 } else {
                     vec![]
                 },
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: None,
             })
         }
@@ -4135,6 +4141,8 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
                 headers: HashMap::from([("content-type".into(), "text/html".into())]),
                 body: b"<!doctype html><script>window.initial=history.state</script>".to_vec(),
                 redirected_from: vec![],
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: None,
             })
         }

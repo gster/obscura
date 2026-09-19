@@ -18,7 +18,7 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 | 检查 | 本次结果 | 边界 |
 | --- | --- | --- |
-| 根 release nextest，render | **1842 passed，4 skipped，0 failed** | OB-012 standalone runtime/primp 与 Page transport 绑定切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
+| 根 release nextest，render | **1844 passed，4 skipped，0 failed** | OB-012 raw transport header 切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
 | 独立 runtime release nextest，locked | **185 passed，0 skipped** | runtime 普通依赖已无条件包含 primp；不能替代全部网络/线级测试 |
 | 指定 release CLI build，render | **通过** | 默认产品构建无条件包含 primp |
 | 指定 release CLI build，no-default-features | **通过** | 无渲染产物仍包含 primp；不能借 feature 组合关闭该能力 |
@@ -29,6 +29,7 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 | 当前 CI pin 的完整 obstacle course | **33/33** | Obscura release render 二进制，`--runs 1 --warmup 0` |
 | deterministic render fixtures | Obscura **66/66** 捕获且行为断言无失败；双方 132 张图均可解码、900×1000、非纯色 | 系统 Chrome 153 有 4 条固化字体/表单几何参考断言失败，故 harness 总退出 1；完整记录该环境差异，不把它计成全绿 |
 | representative top/bottom captures | top、bottom 均退出 0，各 **15/15** 双引擎捕获；有效 fidelity 分别 10/15、11/15 | 1440×1000、默认 3 秒 settle、固定动画时刻；Remix 双方内容为空，另有捕获边界状态不稳项被排除，不从像素距离单独推断正确性 |
+| 官方 Playwright Python **1.60.0** automation smoke | **通过**，协议日志覆盖 profile 要求的 **37/37** 方法 | 未修改官方客户端通过 `connect_over_cdp` 执行；验证 `rawHeaders` 加法字段不破坏解析，不代表完整 API/多平台认证 |
 | 较早的官方 Playwright Python **1.58.0** async/CDP 证据 | 连接、建页、导航、title、label fill、role click、DOM 结果、evaluate、关闭均成功 | 历史单页证据；当前必需门槛已固定为 1.60.0，见下文；没有完整 API/多平台认证 |
 | raw WebSocket/CDP 和 CLI 本地夹具 | 复现下节 6 项行为 | 使用本次 render 二进制；不涉及真实网站或凭据 |
 
@@ -38,16 +39,18 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 OB-044 本轮删除 CLI/serve 的 `--stealth`、`--user-agent`、`OBSCURA_STEALTH`、scrape worker 转发和嵌入 API 开关；CDP、MCP、CLI、Page 与独立 runtime 的产品路径默认使用 primp。Cargo `stealth` feature 只保留为空兼容别名，不能改变行为；发布矩阵不再生成有无 stealth 的组合。强制路径同时保留子资源缓存合并，将 JS fetch/XHR 的完整响应体和网络事件写入 CDP/MCP 观察面，并以原字节或明确 Base64 保存二进制响应。persona 在 BrowserContext 初始化时同时确定 primp 传输配置与 JavaScript 身份，并在 context 生命周期内保持不变；运行中的 CDP User-Agent 覆盖明确不支持。全出口盘点、完整 persona 编译器和 Docker 干净构建仍由 OB-012/015/016/042 跟进，OB-044 保持未关闭。
 
-OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓存改为只消费已注入字节；robots.txt 改走 persona-owned primp，并验证其与导航使用同一 persona User-Agent；每个 Page 的 primp 与其 detached Worker 共享 transport in-flight 计数，兄弟 Page 保持隔离，`networkidle` 合并观察互斥的预发送/CDP 拦截与 primp 传输阶段；native policy `RequestInterceptor` 保留完整二进制请求体。页面和独立 `ObscuraJsRuntime` 的 fetch/XHR、CORS OPTIONS、module、图片、字体与样式请求均只经 primp 获取；独立 runtime 在初始化时固定默认 Windows Chrome145 persona，frame/Worker 继承身份、Cookie 和策略。context baseline、Page override 与 request-specific headers 分层合并且兄弟 Page 隔离；无效代理 fail closed，PEM/DER CA、scripted 逐跳 timeout 与 body cap 保持。运行时挂接 Page 时会明确接管 transport，保留 Page persona、私网策略、Cookie 和回调。第二切片将 `ObscuraHttpClient` 收敛为 policy/context 类型，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖、根与独立 runtime 锁文件中的对应 package，以及 `wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。仍有 Abort/CORS 细节、最终线上请求头观察、重复与非 UTF-8 头、完整响应体保存、CDP Fetch、Beacon、下载及线级校准缺口，因此 OB-012 只记录为部分完成。删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。所有采集与日志保留 Cookie、Authorization、重复头、原始字节和完整 body，不做脱敏或字段裁剪。
+OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓存改为只消费已注入字节；robots.txt 改走 persona-owned primp，并验证其与导航使用同一 persona User-Agent；每个 Page 的 primp 与其 detached Worker 共享 transport in-flight 计数，兄弟 Page 保持隔离，`networkidle` 合并观察互斥的预发送/CDP 拦截与 primp 传输阶段；native policy `RequestInterceptor` 保留完整二进制请求体。页面和独立 `ObscuraJsRuntime` 的 fetch/XHR、CORS OPTIONS、module、图片、字体与样式请求均只经 primp 获取；独立 runtime 在初始化时固定默认 Windows Chrome145 persona，frame/Worker 继承身份、Cookie 和策略。context baseline、Page override 与 request-specific headers 分层合并且兄弟 Page 隔离；无效代理 fail closed，PEM/DER CA、scripted 逐跳 timeout 与 body cap 保持。运行时挂接 Page 时会明确接管 transport，保留 Page persona、私网策略、Cookie 和回调。第二切片将 `ObscuraHttpClient` 收敛为 policy/context 类型，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖、根与独立 runtime 锁文件中的对应 package，以及 `wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。
+
+本轮 raw header 切片将 `HeaderCapture`/`RawHeader` 从 primp 边界贯穿 `Response`、`RequestInfo`、JS/render/Page 到 CDP 观察面。`rawHeaders` 是 Obscura 加法扩展，格式为 `captureStage=transportRequest|transportResponse`、`encoding=base64`、`fields=[{nameBase64,valueBase64}]`；重复值、非 UTF-8、Cookie、Authorization、Set-Cookie 的原始 bytes 均不脱敏、不裁剪，兼容性的 map 只是派生视图。本轮不宣称已经取得 wire capture。仍有 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、Worker→Page/CDP、preflight/失败链、公开 HashMap 输入限制、完整响应 body 持久化，以及 Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、下载和线级校准缺口，因此 OB-012 只记录为部分完成。删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。所有采集与日志保留 Cookie、Authorization、重复头、原始字节和完整 body，不做脱敏或字段裁剪。
 
 本次未运行：Linux 原生验证、完整官方客户端矩阵、WPT、24h 长稳、受控性能/TLS/H2 测量、Docker 构建、Southwest/ZG 现场流程和报价对照。没有新的生产发布或部署结论。
 
 ### 构建与证据定位
 
-本次 render CLI SHA-256：`59a7b9475a0c999be7633a7287ed45e3441cb363ca50c9f6212f30db72fd3fd7`（118847536 bytes）。
+本次 render CLI SHA-256：`6cc8c9cd9a9ebc962901cb0e0faf7389e9c4e91a3ae04c3c4f7daced595765a6`（118922656 bytes）。
 
-- 根 Cargo.lock SHA-256：`1ffacb8f98f4a678217401fc9ca834d87eb3007603388995b7d573762ab2deb9`。
-- runtime/Cargo.lock SHA-256：`3ee83ffa2ab80fc7b7b0989d00d29afbf7a6afacc04e51bf9130cfcf2f582041`。
+- 根 Cargo.lock SHA-256：`813ac17dfae3d60a779ee6d892d9989bbb92c7f18b3bc4f16bb569868f280343`。
+- runtime/Cargo.lock SHA-256：`279f5b950dbb6d03500cf231fc5554e704f762804e81fc7fbccacde4a720ccf7`。
 - benchmark revision：`2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`（`gster/obscura-benchmark`），与当前 CI pin 一致；旧失败归因使用 `6ebac8293d7477f59e837768bfd4e74173f04f1c`。
 - 本机原始日志、合成探针和 JSON：`/tmp/obscura-doc-audit-20260919/`；临时文件不入 Git，也不保证跨设备或长期存在。仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
 

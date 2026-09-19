@@ -933,7 +933,7 @@ pub fn emit_navigation_events(
         let rid = &nav_request_ids[idx];
         ctx.pending_events.push(CdpEvent {
             method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
     }
@@ -978,7 +978,7 @@ pub fn emit_navigation_events(
                     "request": {
                         "url": net_event.url,
                         "method": net_event.method,
-                        "headers": net_event.headers,
+                        "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers,
                     },
                     "frameId": frame_id,
                     "resourceType": net_event.resource_type,
@@ -994,13 +994,13 @@ pub fn emit_navigation_events(
         if Some(i) != nav_idx {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
                 session_id: es.clone(),
             });
         }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "rawHeaders": net_event.raw_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
             session_id: es.clone(),
         });
         ctx.pending_events.push(CdpEvent {
@@ -1099,6 +1099,7 @@ pub(crate) fn emit_runtime_network_events(
                     "url": network_event.url,
                     "method": network_event.method,
                     "headers": network_event.headers,
+                    "rawHeaders": network_event.request_raw_headers,
                 },
                 "timestamp": network_event.timestamp,
                 "wallTime": network_event.timestamp,
@@ -1120,6 +1121,7 @@ pub(crate) fn emit_runtime_network_events(
                     "status": network_event.status,
                     "statusText": "",
                     "headers": &*network_event.response_headers,
+                    "rawHeaders": network_event.raw_headers,
                     "mimeType": network_event.response_headers
                         .get("content-type")
                         .cloned()
@@ -1802,6 +1804,117 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_headers_survive_proxy_redirect_callbacks_page_and_cdp_events() {
+        use base64::Engine;
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in [(200, "<html></html>"), (302, ""), (200, "ok")] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                stream.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n", body.len()).as_bytes()).unwrap();
+                if status == 302 { stream.write_all(b"Location: /data\r\n").unwrap(); }
+                stream.write_all(b"Set-Cookie: first=Raw+/=123; Path=/\r\nSet-Cookie: second=Keep; Path=/\r\nX-Repeated: one\r\nX-Repeated: two\r\nX-Bytes: \x80\xff\r\n\r\n").unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+                requests.push(bytes);
+            }
+            requests
+        });
+        let mut ctx = CdpContext::new();
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("raw-headers".into(), Some(proxy)));
+        ctx.default_context.http_client.set_extra_headers([
+            ("Authorization".into(), "Bearer Raw+/=123".into()),
+            ("Cookie".into(), "explicit=Raw+/=123".into()),
+        ].into_iter().collect()).await;
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = requests.clone();
+        let response_sink = responses.clone();
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.on_request(Arc::new(move |request| request_sink.lock().unwrap().push(request.clone())));
+        page.on_response(Arc::new(move |request, response| response_sink.lock().unwrap().push((request.clone(), response.clone()))));
+        page.navigate("http://raw-headers.test/").await.unwrap();
+        let navigation: Vec<_> = page.network_events.drain(..).collect();
+        let result = page.evaluate_for_cdp("fetch('/redirect').then(r => r.text())", true, true).await;
+        assert!(!result.thrown, "{result:?}");
+        assert_eq!(result.value, Some(json!("ok")));
+        page.sync_js_network_events();
+        let scripted: Vec<_> = page.network_events.drain(..).collect();
+        assert_eq!(navigation.len(), 1);
+        assert_eq!(scripted.len(), 1);
+        for (event, (request, response)) in navigation.iter().chain(scripted.iter()).zip(responses.lock().unwrap().iter()) {
+            assert_eq!(event.raw_headers, response.raw_headers);
+            assert_eq!(event.request_raw_headers, request.raw_headers);
+            assert_eq!(event.request_raw_headers, response.request_raw_headers);
+            assert!(!event.response_headers.contains_key("x-bytes"));
+        }
+        for request in requests.lock().unwrap().iter() {
+            assert_eq!(request.headers.get("authorization").map(String::as_str), Some("Bearer Raw+/=123"));
+            assert!(request.headers.contains_key("user-agent"));
+            assert!(request.headers.contains_key("cookie"));
+            assert_eq!(request.raw_headers.as_ref().unwrap().capture_stage, "transportRequest");
+        }
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(responses.lock().unwrap().len(), 2);
+        let observed_responses = responses.lock().unwrap();
+        assert_eq!(observed_responses[1].0.url.path(), "/data");
+        assert_eq!(observed_responses[1].1.redirected_from.len(), 1);
+        drop(observed_responses);
+        let observed = requests.lock().unwrap();
+        assert_eq!(observed[1].url.path(), "/redirect", "request callback remains once per logical fetch");
+        let scripted_cookies: Vec<_> = observed[1].raw_headers.as_ref().unwrap().fields.iter()
+            .filter(|field| field.name == b"cookie").map(|field| field.value.as_slice()).collect();
+        assert_eq!(scripted_cookies.len(), 2, "jar and explicit Cookie fields must remain distinct");
+        assert!(scripted_cookies.contains(&b"explicit=Raw+/=123".as_slice()));
+        assert!(scripted_cookies.iter().any(|value| value.windows(b"first=Raw+/=123".len()).any(|part| part == b"first=Raw+/=123")));
+        drop(observed);
+        ctx.fetch_intercept.enabled = true;
+        emit_navigation_events(&mut ctx, &session, "frame-raw", "loader-raw", "http://raw-headers.test/", &page_id, &navigation, WaitUntil::Load, false);
+        emit_runtime_network_events(&mut ctx, &session, "frame-raw", "http://raw-headers.test/", &page_id, &scripted);
+        let values = |capture: &Value, name: &[u8]| -> Vec<Vec<u8>> {
+            assert_eq!(capture["encoding"], "base64");
+            capture["fields"].as_array().unwrap().iter().filter_map(|field| {
+                let base64 = base64::engine::general_purpose::STANDARD;
+                (base64.decode(field["nameBase64"].as_str().unwrap()).unwrap() == name)
+                    .then(|| base64.decode(field["valueBase64"].as_str().unwrap()).unwrap())
+            }).collect()
+        };
+        let mut response_count = 0;
+        for event in &ctx.pending_events {
+            if event.method == "Network.responseReceived" {
+                let raw = &event.params["response"]["rawHeaders"];
+                assert_eq!(raw["captureStage"], "transportResponse");
+                assert_eq!(values(raw, b"x-repeated"), [b"one".to_vec(), b"two".to_vec()]);
+                assert_eq!(values(raw, b"x-bytes"), [b"\x80\xff".to_vec()]);
+                assert_eq!(values(raw, b"set-cookie"), [b"first=Raw+/=123; Path=/".to_vec(), b"second=Keep; Path=/".to_vec()]);
+                response_count += 1;
+            } else if event.method == "Network.requestWillBeSent" || event.method == "Fetch.requestPaused" {
+                let raw = &event.params["request"]["rawHeaders"];
+                assert_eq!(raw["captureStage"], "transportRequest");
+                assert_eq!(values(raw, b"authorization"), [b"Bearer Raw+/=123".to_vec()]);
+            }
+        }
+        assert_eq!(response_count, 2);
+        for request in server.join().unwrap() {
+            assert!(request.windows(b"authorization: Bearer Raw+/=123\r\n".len())
+                .any(|part| part == b"authorization: Bearer Raw+/=123\r\n"));
+        }
+    }
+
     // #920: a history navigation that fails to load must not move the recorded
     // currentIndex — the page never actually went anywhere, so a later
     // getNavigationHistory must still report where it really is.
@@ -1935,6 +2048,8 @@ mod tests {
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
+            raw_headers: None,
+            request_raw_headers: None,
             request_id: "fetch-7".into(),
             url: "https://example.test/data.json".into(),
             method: "GET".into(),

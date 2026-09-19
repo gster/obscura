@@ -1,6 +1,6 @@
 # 当前传输实现与统一目标
 
-2026-09-20 复核。产品 Page、CDP、MCP、Worker、JS fetch/XHR 和独立 runtime/module loader 路径统一使用 persona-owned primp；renderer 默认 cache 已不再自行联网，robots.txt 也进入同一 primp。第二切片已将 `ObscuraHttpClient` 收敛为 policy/context，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖和 `obscura-net::wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径也统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。OB-012 仍不能关闭，因为重复/非 UTF-8 请求头、完整响应持久化、Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、download 和线级校准仍未完成。这里的删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。旧比较中的 upstream commit、Python 探针和现场请求只代表迁移前历史，不是本次传输测量。
+2026-09-20 复核。产品 Page、CDP、MCP、Worker、JS fetch/XHR 和独立 runtime/module loader 路径统一使用 persona-owned primp；renderer 默认 cache 已不再自行联网，robots.txt 也进入同一 primp。第二切片已将 `ObscuraHttpClient` 收敛为 policy/context，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖和 `obscura-net::wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径也统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。OB-012 仍不能关闭，因为 raw header 观察仍未取得 wire capture，且 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、Worker→Page/CDP、preflight/失败链、公开 HashMap 输入限制、完整响应 body 持久化、Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、download 和线级校准仍未完成。这里的删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。旧比较中的 upstream commit、Python 探针和现场请求只代表迁移前历史，不是本次传输测量。
 
 ## 当前源码事实
 
@@ -10,9 +10,12 @@
 - `retry::never()` 关闭外层重试，不代表 vendor 内所有协议级恢复都被禁用。请求写出状态未知时不得在引擎增加盲目重放。
 - 独立 runtime 初始化时固定默认 Windows Chrome145 persona；frame/Worker 继承身份、策略和 Cookie，Worker 采用 detached primp 独立池。context baseline、Page override 和 request-specific headers 分层合并，兄弟 Page 互不污染。
 - module、图片、字体、样式和 CORS OPTIONS 不再从独立 runtime 回退到其他项目自有 HTTP backend。无效代理 fail closed；PEM/DER CA、scripted 请求逐跳 timeout 和 body cap 保持生效。
+- `HeaderCapture`/`RawHeader` 从 primp 边界贯穿 `Response`、`RequestInfo`、JS/render/Page 到 CDP；`rawHeaders` 采用 `captureStage=transportRequest|transportResponse`、`encoding=base64`、`fields=[{nameBase64,valueBase64}]`。重复值、非 UTF-8、Cookie、Authorization、Set-Cookie 原始 bytes 不脱敏、不裁剪，兼容 map 是派生视图。
 - [vendor/primp-rustls](../vendor/primp-rustls/) 带本地 Chrome 扩展顺序修改；它不是未跟踪的临时目录，也不等于上游未修改依赖。
 
 ## 验证边界
+
+本轮 raw header 结果不宣称 wire capture；仍待处理 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、Worker→Page/CDP、preflight/失败链、公开 HashMap 输入限制、完整响应 body 持久化，以及 Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、download 和线级校准。
 
 本次没有重跑 TLS/H2 抓包、Chrome 线级对照或网站验收。历史 ALPS/trust-anchor/头顺序差异需要在固定构建上重新采集才能声明当前数值。JA3/JA4、版本名、单次导航成功不证明所有资源类别的传输等价；具体 method/body、redirect、credentials、预检、代理和连接复用分别验收。
 

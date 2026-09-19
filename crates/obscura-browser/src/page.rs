@@ -178,6 +178,8 @@ pub struct NetworkEvent {
     pub status: u16,
     pub headers: std::collections::HashMap<String, String>,
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
+    pub raw_headers: Option<obscura_net::HeaderCapture>,
+    pub request_raw_headers: Option<obscura_net::HeaderCapture>,
     pub body_size: usize,
     pub timestamp: f64,
 }
@@ -1985,6 +1987,8 @@ impl Page {
                     "Stylesheet",
                     response.status,
                     &response.headers,
+                    response.raw_headers.as_ref(),
+                    response.request_raw_headers.as_ref(),
                     &response.body,
                     false,
                 );
@@ -2357,6 +2361,8 @@ impl Page {
                             headers,
                             body,
                             redirected_from: Vec::new(),
+                            raw_headers: None,
+                            request_raw_headers: None,
                             request_referrer: None,
                         };
                         return (idx, Some((url, resp)));
@@ -2581,6 +2587,8 @@ impl Page {
                             "Script",
                             resp.status,
                             &resp.headers,
+                            resp.raw_headers.as_ref(),
+                            resp.request_raw_headers.as_ref(),
                             &resp.body,
                             false,
                         );
@@ -3390,6 +3398,8 @@ impl Page {
                 headers,
                 body: body_bytes,
                 redirected_from: Vec::new(),
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: None,
             })
         } else if url.scheme() == "blob" {
@@ -3406,6 +3416,8 @@ impl Page {
                 headers,
                 body: body_bytes,
                 redirected_from: Vec::new(),
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: None,
             })
         } else if method == "POST" {
@@ -3428,6 +3440,8 @@ impl Page {
             "Document",
             response.status,
             &response.headers,
+            response.raw_headers.as_ref(),
+            response.request_raw_headers.as_ref(),
             &response.body,
             main_is_binary,
         );
@@ -3870,6 +3884,8 @@ impl Page {
                 if event.is_font { "Font" } else { "Image" },
                 event.response.status,
                 &event.response.headers,
+                event.response.raw_headers.as_ref(),
+                event.response.request_raw_headers.as_ref(),
                 event.response.body.as_ref(),
                 true,
             );
@@ -4192,8 +4208,10 @@ impl Page {
                 method: ev.method,
                 resource_type: "Fetch".to_string(),
                 status: ev.status,
-                headers: std::collections::HashMap::new(),
+                headers: ev.request_raw_headers.as_ref().map(|h| h.text_headers()).unwrap_or_default(),
                 response_headers: Arc::new(ev.response_headers),
+                raw_headers: ev.raw_headers,
+                request_raw_headers: ev.request_raw_headers,
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
             });
@@ -4442,6 +4460,8 @@ impl Page {
             resource_type,
             status,
             response_headers,
+            None,
+            None,
             body_size,
         );
     }
@@ -4453,6 +4473,8 @@ impl Page {
         resource_type: &str,
         status: u16,
         response_headers: &std::collections::HashMap<String, String>,
+        raw_headers: Option<&obscura_net::HeaderCapture>,
+        request_raw_headers: Option<&obscura_net::HeaderCapture>,
         body: &[u8],
         base64_encoded: bool,
     ) {
@@ -4462,6 +4484,8 @@ impl Page {
             resource_type,
             status,
             response_headers,
+            raw_headers,
+            request_raw_headers,
             body.len(),
         );
         self.store_response_body(request_id, body, base64_encoded);
@@ -4474,6 +4498,8 @@ impl Page {
         resource_type: &str,
         status: u16,
         response_headers: &std::collections::HashMap<String, String>,
+        raw_headers: Option<&obscura_net::HeaderCapture>,
+        request_raw_headers: Option<&obscura_net::HeaderCapture>,
         body_size: usize,
     ) -> String {
         self.network_event_counter += 1;
@@ -4488,7 +4514,9 @@ impl Page {
             method: method.to_string(),
             resource_type: resource_type.to_string(),
             status,
-            headers: std::collections::HashMap::new(),
+            headers: request_raw_headers.map(|h| h.text_headers()).unwrap_or_default(),
+            raw_headers: raw_headers.cloned(),
+            request_raw_headers: request_raw_headers.cloned(),
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
@@ -4719,8 +4747,12 @@ impl Page {
     }
 
     /// Register a passive callback fired for every JS `fetch()`/XHR (and
-    /// navigation) request this page makes, once the method/headers/body are
-    /// known and before it is sent. Non-blocking; use `enable_interception` to
+    /// navigation) request this page makes. Fires once per logical request,
+    /// before its first hop, after persona/cookie/default headers are prepared.
+    /// A cache hit reuses the original transport capture and therefore has no
+    /// new send boundary. `raw_headers` records that transport boundary, not
+    /// HTTP wire framing.
+    /// Non-blocking; use `enable_interception` to
     /// mutate or block. Returns a stable id; pass it to `off_request` to
     /// detach (issue #408). Scoped to this page: it never sees sibling pages'
     /// requests and dies with the page.
@@ -4729,7 +4761,9 @@ impl Page {
     }
 
     /// Register a passive callback fired with every JS `fetch()`/XHR (and
-    /// navigation) response this page receives, including its body.
+    /// navigation) response this page receives, including its body. Redirects
+    /// produce one response callback for the final hop, whose request and
+    /// response headers are available as raw transport captures.
     /// Non-blocking. The main path for crawlers that need to capture API
     /// response payloads. Returns a stable id for `off_response`. Page-scoped
     /// like `on_request`.

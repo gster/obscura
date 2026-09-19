@@ -222,6 +222,8 @@ async fn fulfilled_response_cannot_supply_navigation_referrer() {
                 body: Vec::new(),
                 redirected_from: Vec::new(),
                 headers: HashMap::from([("referer".into(), "https://forged.invalid/".into())]),
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: Some(Url::parse("https://forged.invalid/").unwrap()),
             })
         }
@@ -267,6 +269,8 @@ async fn fulfilled_file_response_has_no_navigation_referrer() {
                 headers: HashMap::new(),
                 body: Vec::new(),
                 redirected_from: Vec::new(),
+                raw_headers: None,
+                request_raw_headers: None,
                 request_referrer: Some(Url::parse("https://forged.invalid/").unwrap()),
             })
         }

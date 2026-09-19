@@ -1,4 +1,6 @@
 pub mod client;
+pub mod headers;
+pub use headers::{HeaderCapture, RawHeader};
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;

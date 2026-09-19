@@ -547,10 +547,11 @@ impl StealthHttpClient {
     ) {
         let Some(callbacks) = callbacks else { return; };
         let request_info = RequestInfo {
+            raw_headers: response.request_raw_headers.clone(),
             body: Vec::new(),
             url: url.clone(),
             method: http::Method::GET.to_string(),
-            headers: self.request_headers().await,
+            headers: response.request_raw_headers.as_ref().map(|h| h.text_headers()).unwrap_or_default(),
             resource_type: request.resource_type,
         };
         callbacks.fire_request(&request_info).await;
@@ -573,7 +574,7 @@ impl StealthHttpClient {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
-            if let Some(mut response) = self.intercept(&mut RequestInfo {body: Vec::new(), url: url.clone(), method: "GET".into(), headers: HashMap::new(), resource_type: request.resource_type}, None).await? {
+            if let Some(mut response) = self.intercept(&mut RequestInfo {raw_headers: None, body: Vec::new(), url: url.clone(), method: "GET".into(), headers: HashMap::new(), resource_type: request.resource_type}, None).await? {
                 response.request_referrer = None;
                 return Ok(response);
             }
@@ -599,12 +600,15 @@ impl StealthHttpClient {
                         headers: HashMap::new(),
                         body: Vec::new(),
                         redirected_from: Vec::new(),
+                        raw_headers: None,
+                        request_raw_headers: None,
                         request_referrer: None,
                     });
                 }
             }
 
             let mut request_info = RequestInfo {
+                raw_headers: None,
                 body: Vec::new(),
                 url: current_url.clone(), method: method.to_string(),
                 headers: self.request_headers().await, resource_type: request.resource_type,
@@ -656,6 +660,9 @@ impl StealthHttpClient {
                 header(&mut headers, "content-type", "application/x-www-form-urlencoded")?;
             }
 
+            let (transport, prepared) = self.client.request(method.clone(), &current_url, headers, &request_body, std::time::Duration::from_secs(30))?;
+            request_info.raw_headers = Some(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
+            request_info.headers = request_info.raw_headers.as_ref().unwrap().text_headers();
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
                     request_info.body = request_body.clone();
@@ -665,7 +672,7 @@ impl StealthHttpClient {
                 request_callback_fired = true;
             }
 
-            let resp = self.client.send(method.clone(), &current_url, headers, &request_body).await?;
+            let resp = self.client.send_prepared(transport, prepared).await?;
 
             let status = resp.status();
             validate_stealth_cors_response(
@@ -683,14 +690,9 @@ impl StealthHttpClient {
                 }
             }
 
-            let mut response_headers: HashMap<String, String> = HashMap::new();
-            for (k, v) in resp.headers().iter() {
-                crate::client::merge_response_header(
-                    &mut response_headers,
-                    k.as_str().to_lowercase(),
-                    v.to_str().unwrap_or("").to_string(),
-                );
-            }
+            let raw_headers = crate::HeaderCapture::from_headers("transportResponse", resp.headers());
+            let request_raw_headers = resp.request_headers.clone();
+            let response_headers = raw_headers.text_headers();
 
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get("location") {
@@ -731,6 +733,8 @@ impl StealthHttpClient {
                 headers: response_headers,
                 body,
                 redirected_from: redirects,
+                raw_headers: Some(raw_headers),
+                request_raw_headers: Some(request_raw_headers),
                 request_referrer: request.referrer,
             };
             if let Some(callbacks) = callbacks {
@@ -771,6 +775,15 @@ impl StealthHttpClient {
         max_response_bytes: usize,
         timeout: std::time::Duration,
     ) -> Result<Response, ObscuraNetError> {
+        self.send_single_observed(method, url, headers, body, send_cookies, store_cookies, max_response_bytes, timeout, None).await
+    }
+
+    pub async fn send_single_observed(
+        &self, method: &str, url: &Url, headers: &HashMap<String, String>, body: &[u8],
+        send_cookies: bool, store_cookies: bool, max_response_bytes: usize,
+        timeout: std::time::Duration,
+        observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
+    ) -> Result<Response, ObscuraNetError> {
         let in_flight = InFlightGuard::new(&self.in_flight);
         if let Some(host) = url.host_str() {
             if self.block_trackers() && crate::blocklist::is_blocked(host) {
@@ -781,6 +794,8 @@ impl StealthHttpClient {
                     headers: HashMap::new(),
                     body: Vec::new(),
                     redirected_from: Vec::new(),
+                    raw_headers: None,
+                    request_raw_headers: None,
                     request_referrer: None,
                 });
             }
@@ -788,7 +803,7 @@ impl StealthHttpClient {
 
         let mut request_headers = self.request_headers().await;
         overlay_headers(&mut request_headers, headers);
-        let mut info = RequestInfo {body: Vec::new(), url: url.clone(), method: method.to_string(), headers: request_headers, resource_type: crate::client::ResourceType::Fetch};
+        let mut info = RequestInfo {raw_headers: None, body: Vec::new(), url: url.clone(), method: method.to_string(), headers: request_headers, resource_type: crate::client::ResourceType::Fetch};
         if let Some(response) = self.intercept(&mut info, Some(body)).await? { return Ok(response); }
 
         let req_method = method
@@ -808,8 +823,18 @@ impl StealthHttpClient {
         let request_referrer = info.headers.iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
             .and_then(|(_, value)| Url::parse(value).ok());
+        let (transport, prepared) = self.client.request(req_method, url, headers, body, timeout)?;
+        if let Some((callbacks, resource_type)) = observation {
+            if callbacks.has_request_callbacks().await {
+                info.raw_headers = Some(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
+                info.headers = info.raw_headers.as_ref().unwrap().text_headers();
+                info.resource_type = resource_type;
+                info.body = body.to_vec();
+                callbacks.fire_request(&info).await;
+            }
+        }
         drop(info);
-        let resp = self.client.send_with_timeout(req_method, url, headers, body, timeout).await?;
+        let resp = self.client.send_prepared(transport, prepared).await?;
 
         let status = resp.status();
         if store_cookies {
@@ -819,11 +844,9 @@ impl StealthHttpClient {
                 }
             }
         }
-        let mut response_headers = HashMap::new();
-        for (name, value) in resp.headers() {
-            crate::client::merge_response_header(&mut response_headers,
-                name.as_str().to_lowercase(), value.to_str().unwrap_or("").to_owned());
-        }
+        let raw_headers = crate::HeaderCapture::from_headers("transportResponse", resp.headers());
+        let request_raw_headers = resp.request_headers.clone();
+        let response_headers = raw_headers.text_headers();
         let resp_body = read_stealth_body_limited(resp, url, max_response_bytes).await?;
         drop(in_flight);
 
@@ -833,6 +856,8 @@ impl StealthHttpClient {
             headers: response_headers,
             body: resp_body,
             redirected_from: Vec::new(),
+            raw_headers: Some(raw_headers),
+            request_raw_headers: Some(request_raw_headers),
             request_referrer,
         })
     }
@@ -1063,6 +1088,7 @@ mod tests {
         let client = StealthHttpClient::with_policy(Arc::new(CookieJar::new()), None, policy);
         let payload = b"raw\0\x80\xff";
         let mut info = crate::client::RequestInfo {
+            raw_headers: None,
             url: Url::parse("https://example.com/body").unwrap(),
             method: "POST".into(),
             headers: std::collections::HashMap::new(),

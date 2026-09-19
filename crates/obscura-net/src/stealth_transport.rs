@@ -120,16 +120,24 @@ impl Client {
         Ok(client)
     }
 
+    #[cfg(test)]
     pub async fn send(&self, method: http::Method, url: &Url, headers: HeaderMap, body: &[u8]) -> Result<Response, ObscuraNetError> {
         self.send_with_timeout(method, url, headers, body, Duration::from_secs(30)).await
     }
 
+    #[cfg(test)]
     pub async fn send_with_timeout(&self, method: http::Method, url: &Url, headers: HeaderMap, body: &[u8], timeout: Duration) -> Result<Response, ObscuraNetError> {
         let (client, request) = self.request(method, url, headers, body, timeout)?;
-        client.execute(request).await.map(Response).map_err(|error| network_error(url, error))
+        self.send_prepared(client, request).await
     }
 
-    fn request(&self, method: http::Method, url: &Url, headers: HeaderMap, body: &[u8], timeout: Duration) -> Result<(&primp::Client, primp::Request), ObscuraNetError> {
+    pub(super) async fn send_prepared(&self, client: &primp::Client, request: primp::Request) -> Result<Response, ObscuraNetError> {
+        let request_headers = crate::HeaderCapture::from_headers("transportRequest", request.headers());
+        let url = request.url().clone();
+        client.execute(request).await.map(|response| Response { response, request_headers }).map_err(|error| network_error(&url, error))
+    }
+
+    pub(super) fn request(&self, method: http::Method, url: &Url, headers: HeaderMap, body: &[u8], timeout: Duration) -> Result<(&primp::Client, primp::Request), ObscuraNetError> {
         let client = self.client.get_or_init(|| self.build()).as_ref()
             .map_err(|error| network_error(url, error))?;
         let defaults = &self.defaults;
@@ -170,14 +178,17 @@ pub(super) fn header(headers: &mut HeaderMap, name: &str, value: &str) -> Result
     Ok(())
 }
 
-pub(super) struct Response(primp::Response);
+pub(super) struct Response {
+    response: primp::Response,
+    pub request_headers: crate::HeaderCapture,
+}
 
 impl Response {
-    pub fn status(&self) -> http::StatusCode { self.0.status() }
-    pub fn headers(&self) -> &HeaderMap { self.0.headers() }
-    pub fn content_length(&self) -> Option<u64> { self.0.content_length() }
+    pub fn status(&self) -> http::StatusCode { self.response.status() }
+    pub fn headers(&self) -> &HeaderMap { self.response.headers() }
+    pub fn content_length(&self) -> Option<u64> { self.response.content_length() }
     pub fn bytes_stream(self) -> BoxStream<'static, Result<bytes::Bytes, ObscuraNetError>> {
-        self.0.bytes_stream().map(|v| v.map_err(|e| ObscuraNetError::Network(e.to_string()))).boxed()
+        self.response.bytes_stream().map(|v| v.map_err(|e| ObscuraNetError::Network(e.to_string()))).boxed()
     }
 }
 
@@ -185,6 +196,55 @@ impl Response {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn raw_headers_preserve_repeated_and_non_utf8_transport_fields() {
+        for proxied in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nSet-Cookie: first=Raw+/=; Path=/\r\nSet-Cookie: second=Keep; Path=/\r\nX-Repeated: first\r\nX-Repeated: second\r\nX-Bytes: \x80\xff\r\n\r\n").unwrap();
+                bytes
+            });
+            let proxy = proxied.then(|| format!("http://{address}"));
+            let client = Client::new(StealthProfile::default(), proxy.as_deref(), true, None, None);
+            let url = Url::parse(&if proxied { "http://headers.test/".into() } else { format!("http://{address}/") }).unwrap();
+            let mut headers = HeaderMap::new();
+            for value in [b"first".as_slice(), b"\x80\xff".as_slice()] {
+                headers.append("x-repeated", HeaderValue::from_bytes(value).unwrap());
+            }
+            headers.append("authorization", HeaderValue::from_static("Bearer Raw+/=123"));
+            headers.append("cookie", HeaderValue::from_static("session=Raw+/=123"));
+            let response = client.send(http::Method::GET, &url, headers, &[]).await.unwrap();
+            let request = &response.request_headers;
+            assert_eq!(request.capture_stage, "transportRequest");
+            let values = |capture: &crate::HeaderCapture, name: &[u8]| capture.fields.iter()
+                .filter(|field| field.name == name).map(|field| field.value.clone()).collect::<Vec<_>>();
+            assert_eq!(values(request, b"x-repeated"), [b"first".to_vec(), b"\x80\xff".to_vec()]);
+            assert!(!request.text_headers().contains_key("x-repeated"), "a partial text projection must not hide an invalid duplicate");
+            assert_eq!(values(request, b"authorization"), [b"Bearer Raw+/=123".to_vec()]);
+            assert_eq!(values(request, b"cookie"), [b"session=Raw+/=123".to_vec()]);
+            assert_eq!(values(request, b"user-agent"), [StealthProfile::default().user_agent().as_bytes().to_vec()]);
+            let raw = crate::HeaderCapture::from_headers("transportResponse", response.headers());
+            assert_eq!(values(&raw, b"set-cookie"), [b"first=Raw+/=; Path=/".to_vec(), b"second=Keep; Path=/".to_vec()]);
+            assert_eq!(values(&raw, b"x-repeated"), [b"first".to_vec(), b"second".to_vec()]);
+            assert_eq!(values(&raw, b"x-bytes"), [b"\x80\xff".to_vec()]);
+            assert!(!raw.text_headers().contains_key("x-bytes"));
+            let wire = server.join().unwrap();
+            for value in [b"x-repeated: first\r\n".as_slice(), b"x-repeated: \x80\xff\r\n".as_slice(), b"authorization: Bearer Raw+/=123\r\n".as_slice(), b"cookie: session=Raw+/=123\r\n".as_slice()] {
+                assert!(wire.windows(value.len()).any(|part| part == value), "missing field: {value:?}");
+            }
+        }
+    }
 
     #[test]
     fn scripted_request_timeout_overrides_default_for_preflight_and_redirect_hops() {

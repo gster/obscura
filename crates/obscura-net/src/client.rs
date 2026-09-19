@@ -35,10 +35,16 @@ pub struct Response {
     pub url: Url,
     pub status: u16,
     pub headers: HashMap<String, String>,
+    /// Authoritative transport field values; `headers` is only a text projection.
+    /// None denotes a synthetic response without a transport capture.
+    pub raw_headers: Option<crate::HeaderCapture>,
     pub body: Vec<u8>,
     pub redirected_from: Vec<Url>,
     /// Computed referrer of the final request, independent of response headers.
     pub request_referrer: Option<Url>,
+    /// Request handed to primp after persona/default/cookie headers were applied.
+    /// This excludes fields injected later by HTTP framing or a proxy.
+    pub request_raw_headers: Option<crate::HeaderCapture>,
 }
 
 impl Response {
@@ -77,8 +83,8 @@ impl Response {
 /// earlier lines. Per RFC 9110 §5.3 duplicate field lines of the same name may
 /// be combined into one comma-separated value without changing semantics.
 /// `Set-Cookie` is the exception (RFC 6265 forbids folding it): it is captured
-/// individually by the cookie jar via `get_all`, so the map keeps it only as a
-/// presence signal and last-wins there is fine.
+/// individually by the cookie jar and the authoritative raw capture. This
+/// compatibility map retains the last Set-Cookie value only.
 pub(crate) fn merge_response_header(map: &mut HashMap<String, String>, name: String, value: String) {
     if name == "set-cookie" {
         map.insert(name, value);
@@ -99,6 +105,9 @@ pub struct RequestInfo {
     pub url: Url,
     pub method: String,
     pub headers: HashMap<String, String>,
+    /// Passive callbacks receive the prepared transport headers. Interceptors
+    /// run before preparation, so their intent-only view has no capture.
+    pub raw_headers: Option<crate::HeaderCapture>,
     pub resource_type: ResourceType,
 }
 
@@ -835,6 +844,8 @@ pub(crate) async fn fetch_file_url(
         headers,
         body,
         redirected_from: Vec::new(),
+        raw_headers: None,
+        request_raw_headers: None,
         request_referrer: None,
     })
 }

@@ -12,6 +12,7 @@ default = []
 stealth = []
 
 [dependencies]
+base64 = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }

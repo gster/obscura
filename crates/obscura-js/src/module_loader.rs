@@ -386,6 +386,8 @@ mod tests {
                 obscura_net::interceptor::InterceptAction::Fulfill(obscura_net::Response {
                     status: 200, url: request.url.clone(), headers: Default::default(),
                     body: b"export default 'intercepted';".to_vec(),
+                    raw_headers: None,
+                    request_raw_headers: None,
                     redirected_from: Vec::new(), request_referrer: None,
                 })
             })

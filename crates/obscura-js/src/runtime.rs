@@ -4532,6 +4532,8 @@ impl ObscuraJsRuntime {
                             url: response.url.to_string(),
                             status: response.status,
                             headers: response.headers,
+                            raw_headers: response.raw_headers,
+                            request_raw_headers: response.request_raw_headers,
                             body: std::sync::Arc::from(response.body),
                         }),
                     }
@@ -7173,6 +7175,8 @@ mod tests {
                 profile: None,
                 is_font: false,
                 response: Some(crate::ops::RenderResourceResponse {
+                    raw_headers: None,
+                    request_raw_headers: None,
                     url: url.clone(),
                     status: 200,
                     headers: Default::default(),
