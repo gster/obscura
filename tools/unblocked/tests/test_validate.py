@@ -35,6 +35,19 @@ class ManifestValidationTests(unittest.TestCase):
             manifest.flush()
             return self.run_validator(command, manifest.name)
 
+    def protocol_log(self, methods: list[str], extra_lines: list[str] | None = None):
+        lines = list(extra_lines or [])
+        lines.extend(
+            f'2026-09-19T00:00:00Z pw:protocol SEND ► {json.dumps({"id": index, "method": method, "params": {"raw": "complete-value"}})}'
+            for index, method in enumerate(methods, 1)
+        )
+        return tempfile.NamedTemporaryFile(
+            mode="w+",
+            suffix=".log",
+            encoding="utf-8",
+            delete=False,
+        ), "\n".join(lines) + "\n"
+
     def test_committed_baseline_is_complete_and_reproducible(self) -> None:
         result = self.run_validator(
             "baseline",
@@ -149,6 +162,64 @@ class ManifestValidationTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("unlisted automation methods must remain not-qualified", result.stderr)
+
+    def test_protocol_log_methods_are_reconciled_without_changing_raw_payloads(self) -> None:
+        profile = json.loads(
+            (TOOL_ROOT / "automation-cdp-profile.json").read_text(encoding="utf-8")
+        )
+        methods = [method["method"] for method in profile["methods"]]
+        log, text = self.protocol_log(methods, ["unrelated complete log line"])
+        try:
+            log.write(text)
+            log.close()
+            result = self.run_validator(
+                "protocol-log",
+                str(TOOL_ROOT / "automation-cdp-profile.json"),
+                log.name,
+            )
+            self.assertEqual(Path(log.name).read_text(encoding="utf-8"), text)
+        finally:
+            Path(log.name).unlink(missing_ok=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("protocol log matches automation profile", result.stdout)
+
+    def test_protocol_log_rejects_a_truncated_smoke_inventory(self) -> None:
+        log, text = self.protocol_log(["Browser.getVersion"])
+        try:
+            log.write(text)
+            log.close()
+            result = self.run_validator(
+                "protocol-log",
+                str(TOOL_ROOT / "automation-cdp-profile.json"),
+                log.name,
+            )
+        finally:
+            Path(log.name).unlink(missing_ok=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("protocol log is missing required smoke methods", result.stderr)
+
+    def test_protocol_log_rejects_an_unprofiled_method(self) -> None:
+        profile = json.loads(
+            (TOOL_ROOT / "automation-cdp-profile.json").read_text(encoding="utf-8")
+        )
+        methods = [method["method"] for method in profile["methods"]]
+        methods.append("Page.newUnqualifiedMethod")
+        log, text = self.protocol_log(methods)
+        try:
+            log.write(text)
+            log.close()
+            result = self.run_validator(
+                "protocol-log",
+                str(TOOL_ROOT / "automation-cdp-profile.json"),
+                log.name,
+            )
+        finally:
+            Path(log.name).unlink(missing_ok=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("protocol log contains unprofiled methods", result.stderr)
 
 
 if __name__ == "__main__":

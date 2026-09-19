@@ -166,9 +166,23 @@ jobs:
         env:
           DEBUG: pw:protocol
         run: |
+          smoke_root="$RUNNER_TEMP/obscura-cdp-smoke"
+          mkdir -p "$smoke_root"
+          set +e
           uv run --project tools/unblocked --frozen --python 3.12 \
             python tools/unblocked/automation_smoke.py \
-              --obscura-bin target/release/obscura
+              --obscura-bin target/release/obscura \
+              --output "$smoke_root/smoke.json" \
+              > "$smoke_root/stdout.json" \
+              2> "$smoke_root/playwright-protocol.log"
+          smoke_status=$?
+          set -e
+          cat "$smoke_root/stdout.json"
+          cat "$smoke_root/playwright-protocol.log" >&2
+          test "$smoke_status" -eq 0
+          python3 tools/unblocked/validate.py protocol-log \
+            tools/unblocked/automation-cdp-profile.json \
+            "$smoke_root/playwright-protocol.log"
 
       - name: Test render configuration
         run: cargo nextest run --release --features render --no-fail-fast

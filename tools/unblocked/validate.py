@@ -36,6 +36,33 @@ CLIENT_EXECUTION_PATHS = {"cdp", "driver", "host"}
 CDP_CAPABILITY_STATUSES = {"SUPPORTED", "LIMITED", "VERIFIED_NOOP", "UNSUPPORTED"}
 CDP_IMPLEMENTATION_STATES = {"implemented", "compatibility-ack", "fixed-value", "rejected"}
 CDP_VERIFICATION_STATES = {"verified", "partial", "not-run"}
+PLAYWRIGHT_SMOKE_METHODS = {
+    "Browser.getVersion",
+    "Browser.setDownloadBehavior",
+    "DOM.getDocument",
+    "Emulation.setEmulatedMedia",
+    "Emulation.setFocusEmulationEnabled",
+    "Log.auditMethodDoesNotExist",
+    "Log.enable",
+    "Network.enable",
+    "Network.getResponseBody",
+    "Page.addScriptToEvaluateOnNewDocument",
+    "Page.createIsolatedWorld",
+    "Page.enable",
+    "Page.getFrameTree",
+    "Page.navigate",
+    "Page.setLifecycleEventsEnabled",
+    "Runtime.callFunctionOn",
+    "Runtime.enable",
+    "Runtime.evaluate",
+    "Runtime.releaseObject",
+    "Runtime.runIfWaitingForDebugger",
+    "Target.attachToBrowserTarget",
+    "Target.attachToTarget",
+    "Target.createTarget",
+    "Target.getTargetInfo",
+    "Target.setAutoAttach",
+}
 
 
 def require(condition: bool, message: str) -> None:
@@ -279,34 +306,10 @@ def validate_automation_profile(path: Path) -> None:
         {"LIMITED", "VERIFIED_NOOP", "UNSUPPORTED"} <= statuses,
         "automation profile must distinguish limited, verified no-op, and unsupported methods",
     )
-    required = {
-        "Browser.getVersion",
-        "Browser.setDownloadBehavior",
-        "DOM.getDocument",
-        "Emulation.setEmulatedMedia",
-        "Emulation.setFocusEmulationEnabled",
-        "Log.auditMethodDoesNotExist",
-        "Log.enable",
-        "Network.enable",
-        "Network.getResponseBody",
-        "Page.addScriptToEvaluateOnNewDocument",
-        "Page.createIsolatedWorld",
-        "Page.enable",
-        "Page.getFrameTree",
-        "Page.navigate",
-        "Page.setLifecycleEventsEnabled",
-        "Runtime.callFunctionOn",
-        "Runtime.enable",
-        "Runtime.evaluate",
-        "Runtime.releaseObject",
-        "Runtime.runIfWaitingForDebugger",
-        "Target.attachToBrowserTarget",
-        "Target.attachToTarget",
-        "Target.createTarget",
-        "Target.getTargetInfo",
-        "Target.setAutoAttach",
-    }
-    require(required <= names, "automation profile is missing official smoke methods")
+    require(
+        PLAYWRIGHT_SMOKE_METHODS <= names,
+        "automation profile is missing official smoke methods",
+    )
 
     negative = value.get("negative_contract")
     require(isinstance(negative, dict), "automation profile needs negative_contract")
@@ -328,6 +331,45 @@ def validate_automation_profile(path: Path) -> None:
     )
 
 
+def validate_protocol_log(profile_path: Path, log_path: Path) -> int:
+    validate_automation_profile(profile_path)
+    profile = load_json(profile_path)
+    profiled = {method["method"] for method in profile["methods"]}
+    observed = set()
+    marker = "pw:protocol SEND"
+    for line_number, line in enumerate(log_path.read_text(encoding="utf-8").splitlines(), 1):
+        if marker not in line:
+            continue
+        payload_start = line.find("{", line.find(marker) + len(marker))
+        require(payload_start >= 0, f"protocol log line {line_number} has no JSON payload")
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(line[payload_start:])
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"protocol log line {line_number} has invalid JSON: {error.msg}"
+            ) from error
+        require(isinstance(payload, dict), f"protocol log line {line_number} payload must be an object")
+        method = payload.get("method")
+        require(
+            isinstance(method, str) and re.fullmatch(r"[A-Za-z]+\.[A-Za-z]+", method) is not None,
+            f"protocol log line {line_number} needs a qualified method",
+        )
+        observed.add(method)
+
+    require(bool(observed), "protocol log contains no Playwright SEND entries")
+    missing_from_log = sorted(PLAYWRIGHT_SMOKE_METHODS - observed)
+    require(
+        not missing_from_log,
+        "protocol log is missing required smoke methods: " + ", ".join(missing_from_log),
+    )
+    unprofiled = sorted(observed - profiled)
+    require(
+        not unprofiled,
+        "protocol log contains unprofiled methods: " + ", ".join(unprofiled),
+    )
+    return len(observed)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -337,6 +379,9 @@ def main() -> None:
     client.add_argument("path", type=Path)
     profile = subparsers.add_parser("profile")
     profile.add_argument("path", type=Path)
+    protocol_log = subparsers.add_parser("protocol-log")
+    protocol_log.add_argument("profile", type=Path)
+    protocol_log.add_argument("log", type=Path)
     args = parser.parse_args()
 
     try:
@@ -346,9 +391,12 @@ def main() -> None:
         elif args.command == "client":
             validate_client_scope(args.path)
             message = "OB-025 client scope is valid"
-        else:
+        elif args.command == "profile":
             validate_automation_profile(args.path)
             message = "OB-027 automation profile is valid"
+        else:
+            count = validate_protocol_log(args.profile, args.log)
+            message = f"OB-027 protocol log matches automation profile ({count} methods)"
     except (OSError, json.JSONDecodeError, ValueError) as error:
         parser.exit(1, f"error: {error}\n")
     print(message)
