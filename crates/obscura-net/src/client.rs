@@ -35,8 +35,9 @@ pub struct Response {
     pub url: Url,
     pub status: u16,
     pub headers: HashMap<String, String>,
-    /// Authoritative transport field values; `headers` is only a text projection.
-    /// None denotes a synthetic response without a transport capture.
+    /// Authoritative field values; `headers` is only a text projection.
+    /// `capture_stage` distinguishes transport observations from CDP-supplied
+    /// synthetic fields. None means no authoritative field capture is available.
     pub raw_headers: Option<crate::HeaderCapture>,
     pub body: Vec<u8>,
     pub redirected_from: Vec<Url>,

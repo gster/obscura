@@ -1323,6 +1323,53 @@ pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<St
     )
 }
 
+fn parse_fulfill_headers(params: &serde_json::Value) -> Result<obscura_net::HeaderCapture, String> {
+    use base64::Engine as _;
+    let mut fields = Vec::new();
+    if let Some(binary) = params.get("binaryResponseHeaders") {
+        if params.get("responseHeaders").is_some() {
+            return Err("supply responseHeaders or binaryResponseHeaders, not both".into());
+        }
+        let encoded = binary.as_str().ok_or("binaryResponseHeaders must be a base64 string")?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+            .map_err(|_| "binaryResponseHeaders must be valid base64")?;
+        for field in bytes.split(|byte| *byte == 0).filter(|field| !field.is_empty()) {
+            let colon = field.iter().position(|byte| *byte == b':')
+                .filter(|index| *index > 0).ok_or("binaryResponseHeaders fields require name: value")?;
+            let value = &field[colon + 1..];
+            fields.push(obscura_net::RawHeader {
+                name: field[..colon].to_vec(),
+                value: value.strip_prefix(b" ").unwrap_or(value).to_vec(),
+            });
+        }
+    } else if let Some(headers) = params.get("responseHeaders") {
+        for header in headers.as_array().ok_or("responseHeaders must be an array")? {
+            let name = header.get("name").and_then(|v| v.as_str()).ok_or("responseHeaders require a string name")?;
+            let value = header.get("value").and_then(|v| v.as_str()).ok_or("responseHeaders require a string value")?;
+            fields.push(obscura_net::RawHeader { name: name.as_bytes().to_vec(), value: value.as_bytes().to_vec() });
+        }
+    }
+    Ok(obscura_net::HeaderCapture { capture_stage: "cdpFulfillResponse", encoding: "base64", fields })
+}
+
+pub(crate) fn parse_fulfill_resolution(params: &serde_json::Value) -> Result<obscura_js::ops::InterceptResolution, String> {
+    use base64::Engine as _;
+    let raw_headers = parse_fulfill_headers(params)?;
+    let body_base64 = match params.get("body") {
+        Some(body) => body.as_str().ok_or("body must be a base64 string")?,
+        None => "",
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(body_base64)
+        .map_err(|_| "body must be valid base64")?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let mut text_projection = raw_headers.clone();
+    for field in &mut text_projection.fields { field.name.make_ascii_lowercase(); }
+    Ok(obscura_js::ops::InterceptResolution::FulfillWithHeaders {
+        status: params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16,
+        headers: text_projection.text_headers(), raw_headers, body, body_base64: body_base64.to_string(),
+    })
+}
+
 fn handle_fetch_resolution(
     text: &str,
     _ctx: &mut CdpContext,
@@ -1349,6 +1396,18 @@ fn handle_fetch_resolution(
             return false;
         }
 
+        // Validate synthetic fields before consuming the pause so malformed
+        // input can be corrected without stranding the in-flight fetch.
+        let fulfilled_response = if method == "Fetch.fulfillRequest" && intercepted_paused.contains_key(request_id) {
+            match parse_fulfill_resolution(&req.params) {
+                Ok(response) => Some(response),
+                Err(message) => {
+                    let response = CdpResponse::error(req.id, -32602, message, req.session_id);
+                    if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+                    return true;
+                }
+            }
+        } else { None };
         if let Some(resolver) = intercepted_paused.remove(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let resolution = match method {
@@ -1362,22 +1421,7 @@ fn handle_fetch_resolution(
                     headers: parse_cdp_headers(&req.params),
                     body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 },
-                "Fetch.fulfillRequest" => {
-                    let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-                    let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    // `body` is a lossy text view; `body_base64` carries the CDP
-                    // body (already base64) through unchanged so op_fetch_url can
-                    // hand JS the exact bytes for a binary fulfill (#912).
-                    let body = decode_base64(raw_body);
-                    let body_base64 = raw_body.to_string();
-                    let headers = req.params.get("responseHeaders")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
-                        .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }
-                }
+                "Fetch.fulfillRequest" => fulfilled_response.expect("validated fulfill response"),
                 "Fetch.failRequest" => {
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
                     obscura_js::ops::InterceptResolution::Fail { reason }
@@ -1697,33 +1741,6 @@ async fn process_cdp_message(
             }
         }
     }
-}
-
-pub(crate) fn decode_base64(input: &str) -> String {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = input.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let b = [
-            chunk.first().copied().unwrap_or(0),
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-            chunk.get(3).copied().unwrap_or(0),
-        ];
-        out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
-        if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
-    }
-    String::from_utf8_lossy(&out).to_string()
 }
 
 fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String)> {
@@ -2067,6 +2084,70 @@ mod tests {
     #[test]
     fn parse_cdp_headers_absent_is_none() {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
+    }
+
+    #[test]
+    fn fulfilled_headers_preserve_duplicates_binary_values_and_capture_source() {
+        use base64::Engine as _;
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let binary = b"Set-Cookie: session=first-secret\0sEt-CoOkIe: session=second-secret\0X-Bytes: \xff\xfe\0";
+        for params in [
+            json!({"responseHeaders":[{"name":"Set-Cookie","value":"session=first-secret"},{"name":"sEt-CoOkIe","value":"session=second-secret"},{"name":"X-Unicode","value":"原文"}]}),
+            json!({"binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(binary)}),
+        ] {
+            let (resolver, mut resolved) = tokio::sync::oneshot::channel();
+            let mut paused = HashMap::from([("fulfilled".to_string(), resolver)]);
+            let mut params = params;
+            params["requestId"] = json!("fulfilled"); params["body"] = json!("AP8="); params["responseCode"] = json!(201);
+            let command = json!({"id":1,"method":"Fetch.fulfillRequest","params":params}).to_string();
+            assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+            let obscura_js::ops::InterceptResolution::FulfillWithHeaders { raw_headers, headers, body_base64, status, .. } = resolved.try_recv().unwrap() else { panic!("missing captured fulfill") };
+            assert_eq!(status, 201);
+            assert_eq!(body_base64, "AP8=");
+            assert_eq!(raw_headers.capture_stage, "cdpFulfillResponse");
+            assert_eq!(raw_headers.fields.len(), 3);
+            assert_eq!(raw_headers.fields[0].name, b"Set-Cookie");
+            assert_eq!(raw_headers.fields[1].name, b"sEt-CoOkIe");
+            assert_eq!(raw_headers.fields[0].value, b"session=first-secret");
+            assert_eq!(raw_headers.fields[1].value, b"session=second-secret");
+            assert_eq!(headers["set-cookie"], "session=second-secret");
+            if params.get("binaryResponseHeaders").is_some() {
+                assert_eq!(raw_headers.fields[2].value, [0xff, 0xfe]);
+                assert!(!headers.contains_key("x-bytes"));
+            } else {
+                assert_eq!(raw_headers.fields[2].value, "原文".as_bytes());
+            }
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert!(reply.get("error").is_none());
+            assert!(paused.is_empty());
+        }
+    }
+
+    #[test]
+    fn fulfilled_invalid_headers_keep_request_paused_for_retry() {
+        use base64::Engine as _;
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolver, mut resolved) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("fulfilled".to_string(), resolver)]);
+        for params in [json!({"binaryResponseHeaders":"%"}), json!({"body":"%"}), json!({"body":7}),
+            json!({"binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(b"missing colon")}),
+            json!({"responseHeaders":{},"binaryResponseHeaders":""}),
+            json!({"responseHeaders":[{"name":"missing-value"}]}),
+        ] {
+            let mut params = params; params["requestId"] = json!("fulfilled");
+            let command = json!({"id":1,"method":"Fetch.fulfillRequest","params":params}).to_string();
+            assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], -32602);
+            assert!(paused.contains_key("fulfilled"));
+            assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        }
+        let command = json!({"id":2,"method":"Fetch.fulfillRequest","params":{"requestId":"fulfilled","body":""}}).to_string();
+        assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+        let obscura_js::ops::InterceptResolution::FulfillWithHeaders { body, body_base64, .. } = resolved.try_recv().unwrap() else { panic!("missing captured fulfill") };
+        assert!(body.is_empty()); assert!(body_base64.is_empty());
     }
 
     #[test]

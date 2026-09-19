@@ -2114,13 +2114,17 @@ impl ObscuraJsRuntime {
         self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).take(request_id)
     }
 
-    /// Install the owner store before starting scripts or workers.
+    /// Install the owner store and Page-lifetime capture/interception ID
+    /// allocator before starting scripts or workers.
     pub fn set_network_response_body_store(&self,
         store: std::sync::Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
         counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) {
         let mut state = self.state.borrow_mut();
         state.network_response_bodies = store;
+        // Pause IDs can alias retained bodies, so they must stay unique across
+        // owner runtime rebuilds just like completed-response IDs.
+        state.intercept_counter = counter.clone();
         state.network_response_body_counter = counter;
     }
 
@@ -6809,6 +6813,65 @@ mod tests {
         let id = rt.take_js_network_events().pop().unwrap().request_id;
         assert_eq!(rt.get_network_response_body(&id).unwrap().body, "ok");
         assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fulfilled_nested_worker_body_uses_owner_store() {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
+        let mut rt = setup_runtime("<html></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.execute_script("nested-worker-fulfill", r#"
+            globalThis.__fulfilledWorkerBody = null;
+            const childSource = `fetch('http://example.com/binary').then(r=>r.arrayBuffer()).then(b=> {
+                const bytes = new Uint8Array(b); postMessage([bytes.length, bytes[0], bytes[bytes.length-1]]);
+            });`;
+            const parentSource = `const child = new Worker(URL.createObjectURL(new Blob([${JSON.stringify(childSource)}])));
+                child.onmessage = e => { postMessage(e.data); child.terminate(); };`;
+            const worker = new Worker(URL.createObjectURL(new Blob([parentSource])));
+            worker.onmessage = e => { __fulfilledWorkerBody = e.data; worker.terminate(); };
+        "#).unwrap();
+        let respond = async {
+            let request = rx.recv().await.unwrap();
+            let id = request.request_id.clone();
+            request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                status: 200,
+                headers: HashMap::from([("Set-Cookie".into(), "secret=complete".into())]),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+                body_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }).unwrap();
+            id
+        };
+        let (result, pause_id) = tokio::join!(rt.run_event_loop_bounded(3000), respond);
+        result.unwrap();
+        assert_eq!(rt.evaluate("__fulfilledWorkerBody").unwrap(), serde_json::json!([bytes.len(), 0, 16]));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.body_size, bytes.len());
+        assert_eq!(event.response_headers["Set-Cookie"], "secret=complete");
+        assert!(event.raw_headers.is_none());
+        assert!(event.request_raw_headers.is_none());
+        let (body, _) = rt.get_network_response_body_result(&event.request_id).unwrap().unwrap();
+        assert_eq!(body.with_bytes(|body| body.to_vec()).unwrap(), bytes);
+        let (alias, _) = rt.get_network_response_body_result(&pause_id).unwrap().unwrap();
+        assert_eq!(alias.with_bytes(|body| body.to_vec()).unwrap(), bytes);
+        rt.take_network_response_body_result(&pause_id).unwrap().unwrap();
+        assert!(matches!(rt.get_network_response_body_result(&event.request_id),
+            Some(Err(obscura_net::response_body::ResponseBodyError::Consumed))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cors_rejected_transport_response_has_no_success_capture() {
+        let (proxy, server) = standalone_proxy(vec![(String::new(), b"not-exposed".to_vec())]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp("async () => { try { await fetch('http://cross.test/denied'); return 'unexpected'; } catch(e) { return e.name; } }", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("TypeError")));
+        assert!(rt.take_js_network_events().is_empty());
+        assert!(rt.get_network_response_body_result("fetch-1").is_none());
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

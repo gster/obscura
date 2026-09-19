@@ -1,5 +1,6 @@
-//! Lossless field values at the transport boundary. HTTP parsing normalizes
-//! names and groups repeated names; this is not a capture of wire casing/order.
+//! Lossless field values with an explicit source in `capture_stage`. Transport
+//! parsing normalizes names and groups repeated names; synthetic CDP captures
+//! preserve supplied names and ordering. Neither claims HTTP wire framing.
 use base64::Engine;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -26,8 +27,8 @@ impl Serialize for RawHeader {
 pub struct HeaderCapture {
     pub capture_stage: &'static str,
     pub encoding: &'static str,
-    /// Transport iteration order, preserving every value for repeated names.
-    /// HTTP wire casing, cross-name order and framing are not represented.
+    /// Source iteration order, preserving every value for repeated names.
+    /// Transport captures do not represent wire casing, cross-name order or framing.
     pub fields: Vec<RawHeader>,
 }
 

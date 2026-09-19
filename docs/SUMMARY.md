@@ -45,16 +45,18 @@ OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓�
 
 上述 Page-only 记录随后扩展为 JS fetch/XHR、module loader 和 Worker 的 owning Page 共享 `ResponseBodyStore`：成功 transport 响应超过 2 MiB 进入 spool，invalid UTF-8 保留原字节，Worker 观察队列只传 metadata、不复制 body；module 仅记录最终 URL 的成功 2xx 响应，resource type 为 `Script`。该扩展聚焦 release nextest 为 27/27，根 release nextest 为 1870/1870，4 skipped。`Fetch.getResponseBody` 现已读取统一 raw store，重复 get 不消费正文并与 `Network.getResponseBody` 使用同一编码；`takeResponseBodyAsStream` 之后 get 明确返回 consumed。session 严格隔离，带 session 的请求或未知 session 不会跨 Page 查找；无 session 时多 Page 同 ID 按顺序选取首个仍可读的 body。live request-stage 请求的 get/take 返回 `response_body_not_ready` 并保留 resolver。这是 completed-capture requestId 扩展，不是标准 response-stage interception；whole-body get 会 materialize spool，磁盘 IO 故障注入尚未单测。该 Fetch 切片聚焦 release nextest 为 16/16。仍有 transport 先完整 materialize `Vec`、JS 100 MiB 与 module 32 MiB 默认硬帽、JS/module/Worker 的 redirect 中间响应、preflight/失败链、Fulfill/CORS early return、metadata 4096 上限、独立 Worker target、`importScripts`、公开 HashMap 输入限制、其他完整响应体出口；低层 `ObscuraState` 字段也有源码兼容变化。OB-012 保持未关闭。
 
+当前 synthetic `Fetch.fulfillRequest` capture 已接入 owning Page 的共享 raw store：JS fetch/XHR、Worker Fulfill 会产生成功 Network 事件，超过 2 MiB、invalid UTF-8 和 binary body 均保留完整原字节。pause 的 `intercept-N` alias 到完成 capture 的 `fetch-N`；`Network.getResponseBody`、`Fetch.getResponseBody` 与 stream 共用 consumed/budget 状态，Page 生命周期内跨导航不会复用 ID。CDP `responseHeaders` 的重复值、大小写、顺序及 `binaryResponseHeaders` 的非 UTF-8 原字节均保留，raw capture 使用 `captureStage=cdpFulfillResponse`，明确表示 synthetic response 而非 transport/wire capture。非法 body/header base64 在解除 pause 前拒绝且可重试。既有 Fulfill CORS、opaque、302 语义保持；Fail 与 transport CORS 拒绝不产生成功事件。聚焦 release nextest 为 9/9；最终根 release nextest 为 1876/1876，4 skipped，独立 runtime 为 185/185，三种发布构建均成功，障碍课为 33/33，官方 Playwright smoke 与 37-method 协议画像校验通过。尚无 preflight/redirect failure 完整生命周期、active multi-Page pause ID 隔离、Continue 非 UTF-8 postData、真正 response-stage interception、IO 注入；新增 public enum variant 会影响 exhaustive match 的源码兼容性。OB-012 保持未关闭。
+
 本次未运行：Linux 原生验证、完整官方客户端矩阵、WPT、24h 长稳、受控性能/TLS/H2 测量、Docker 构建、Southwest/ZG 现场流程和报价对照。没有新的生产发布或部署结论。
 
 ### 构建与证据定位
 
-本次 render CLI SHA-256：`afe68bc174abbd3e58225c50db49cff5cf90dcc806886bf1f6bbdd410d7efd7c`（118918144 bytes）。
+本次 render CLI SHA-256：`8de422416c94b684f3d3752c4b10b86495b427f1fb08e187885fee22551c754c`（118901344 bytes）。
 
 - 根 Cargo.lock SHA-256：`813ac17dfae3d60a779ee6d892d9989bbb92c7f18b3bc4f16bb569868f280343`。
 - runtime/Cargo.lock SHA-256：`279f5b950dbb6d03500cf231fc5554e704f762804e81fc7fbccacde4a720ccf7`。
 - benchmark revision：`2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`（`gster/obscura-benchmark`），与当前 CI pin 一致；旧失败归因使用 `6ebac8293d7477f59e837768bfd4e74173f04f1c`。
-- 本机最终门禁日志：`/tmp/ob012-fetch-get-body-root-nextest.log`、`/tmp/ob012-fetch-get-body-runtime-nextest.log`、`/tmp/ob012-fetch-get-body-build-minimal.log`、`/tmp/ob012-fetch-get-body-build-stealth.log`、`/tmp/ob012-fetch-get-body-build-render.log`、`/tmp/ob012-fetch-get-body-obstacle.log`、`/tmp/ob012-fetch-get-body-playwright-validate.log`；官方 Playwright smoke 与完整协议日志位于 `/var/folders/r8/vzjpyytd6yx0wwcwtl1wd81w0000gp/T/tmp.Y0PCaAEoCO/`。这些临时文件不入 Git，也不保证跨设备或长期存在；仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
+- 本机最终门禁日志：`/tmp/ob012-fulfill-root-nextest.log`、`/tmp/ob012-fulfill-runtime-nextest.log`、`/tmp/ob012-fulfill-build-minimal.log`、`/tmp/ob012-fulfill-build-stealth.log`、`/tmp/ob012-fulfill-build-render.log`、`/tmp/ob012-fulfill-obstacle.log`、`/tmp/ob012-fulfill-playwright-validate.log`；官方 Playwright smoke 与完整协议日志位于 `/var/folders/r8/vzjpyytd6yx0wwcwtl1wd81w0000gp/T/tmp.3m5cz34egi/`。这些临时文件不入 Git，也不保证跨设备或长期存在；仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
 
 ```bash
 # 仓库根

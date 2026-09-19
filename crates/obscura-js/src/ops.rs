@@ -51,6 +51,15 @@ pub enum InterceptResolution {
         /// of any non-UTF-8 payload (image, font, protobuf). See #912.
         body_base64: String,
     },
+    /// CDP-supplied response fields, preserving repeats and original bytes.
+    /// This is a synthetic capture, not headers observed at the transport.
+    FulfillWithHeaders {
+        status: u16,
+        headers: HashMap<String, String>,
+        raw_headers: obscura_net::HeaderCapture,
+        body: String,
+        body_base64: String,
+    },
     Fail {
         reason: String,
     },
@@ -3860,14 +3869,49 @@ async fn op_fetch_url(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            match resolve_rx.await {
+            let resolution = resolve_rx.await;
+            let raw_headers = match &resolution {
+                Ok(InterceptResolution::FulfillWithHeaders { raw_headers, .. }) => Some(raw_headers.clone()),
+                _ => None,
+            };
+            match resolution {
                 Ok(InterceptResolution::Fulfill {
                     status,
                     headers: h,
                     body: b,
                     body_base64: bb,
+                } | InterceptResolution::FulfillWithHeaders {
+                    status,
+                    headers: h,
+                    body: b,
+                    body_base64: bb,
+                    ..
                 }) => {
-                    return Ok(intercept_fulfill_response(status, h, &b, &bb, &url).to_string());
+                    let mut result = intercept_fulfill_response(status, h.clone(), &b, &bb, &url);
+                    // Fulfill is synthetic and keeps its existing JS/CORS/redirect
+                    // semantics. Capture exactly the bytes handed to JS, without
+                    // inventing a transport header capture or response-stage pause.
+                    // Internal text producers omit base64; CDP's empty body has
+                    // both an empty text view and empty base64.
+                    let bytes = if bb.is_empty() { Ok(b.into_bytes()) } else { BASE64.decode(&bb) };
+                    if let (Ok(response_url), Ok(bytes)) = (url::Url::parse(&url), bytes) {
+                        let response = obscura_net::Response {
+                            url: response_url, status, headers: h, body: bytes,
+                            raw_headers, request_raw_headers: None,
+                            redirected_from: Vec::new(), request_referrer: None,
+                        };
+                        let shared = state.borrow().borrow::<SharedState>().clone();
+                        let response_request_id = shared.borrow_mut()
+                            .record_network_response(&response, &method, resource_type);
+                        // The client already knows the request-stage pause ID.
+                        // Once fulfilled, both IDs resolve to the same retained
+                        // bytes and share stream consumption and budget errors.
+                        let _ = shared.borrow().network_response_bodies.lock()
+                            .unwrap_or_else(|e| e.into_inner()).alias(&response_request_id, &request_id);
+                        result["requestId"] = serde_json::Value::String(response_request_id);
+                        crate::worker::flush_observations(&state.borrow());
+                    }
+                    return Ok(result.to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({

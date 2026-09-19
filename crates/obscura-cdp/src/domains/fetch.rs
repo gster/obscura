@@ -25,6 +25,12 @@ pub enum FetchResolution {
         headers: Vec<(String, String)>,
         body: String,
     },
+    FulfillWithHeaders {
+        status: u16,
+        raw_headers: obscura_net::HeaderCapture,
+        body: String,
+        body_base64: String,
+    },
     Fail {
         reason: String,
     },
@@ -140,34 +146,12 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
-            let status = params
-                .get("responseCode")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(200) as u16;
-            let headers: HashMap<String, String> = params
-                .get("responseHeaders")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|h| {
-                            let name = h.get("name")?.as_str()?.to_string();
-                            let value = h.get("value")?.as_str()?.to_string();
-                            Some((name, value))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            // The CDP fulfillRequest body is base64-encoded; decode it — parity
-            // with server.rs handle_fetch_resolution (#919). (Binary-safe body
-            // transport across the JS boundary remains tracked in #912.)
-            let body =
-                crate::server::decode_base64(params.get("body").and_then(|v| v.as_str()).unwrap_or(""));
+            let obscura_js::ops::InterceptResolution::FulfillWithHeaders { status, raw_headers, body, body_base64, .. } =
+                crate::server::parse_fulfill_resolution(params)? else { unreachable!("fulfill parser returns captured response") };
 
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
-                let _ = paused.resolver.send(FetchResolution::Fulfill {
-                    status,
-                    headers: headers.into_iter().collect(),
-                    body,
+                let _ = paused.resolver.send(FetchResolution::FulfillWithHeaders {
+                    status, raw_headers, body, body_base64,
                 });
             }
             Ok(json!({}))
@@ -251,6 +235,170 @@ mod tests {
             },
         );
         rx
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fulfilled_js_bodies_reach_network_and_fetch_without_transport_capture() {
+        use base64::Engine as _;
+        use obscura_js::ops::InterceptResolution;
+        let large: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
+        let invalid = vec![0xff, 0xe9, 0];
+        let bodies = vec![large.clone(), invalid.clone(), Vec::new(), b"internal-text".to_vec(), b"redirect-body".to_vec()];
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html></html>").await.unwrap();
+        page.network_events.clear();
+        let mut requests = page.enable_interception();
+        let mut pause_ids = Vec::new();
+        let respond = async {
+            for (index, bytes) in bodies.iter().enumerate() {
+                let request = requests.recv().await.unwrap();
+                pause_ids.push(request.request_id.clone());
+                assert_eq!(request.method, if index == 0 { "POST" } else { "GET" });
+                let legacy = InterceptResolution::Fulfill {
+                    status: if index == 4 { 302 } else { 201 },
+                    headers: HashMap::from([
+                        ("Content-Type".into(), "application/octet-stream".into()),
+                        ("Set-Cookie".into(), "session=complete-secret; HttpOnly".into()),
+                        ("X-Complete".into(), "unaltered".into()),
+                        ("Location".into(), "https://unused.test/redirect".into()),
+                    ]),
+                    body: String::from_utf8_lossy(bytes).into_owned(),
+                    body_base64: if index == 3 { String::new() } else { base64::engine::general_purpose::STANDARD.encode(bytes) },
+                };
+                let resolution = if index == 0 {
+                    let InterceptResolution::Fulfill { status, body_base64, .. } = legacy else { unreachable!() };
+                    let fields = b"Set-Cookie: first=secret\0Set-Cookie: second=secret\0X-Bytes: \xff\xfe\0Content-Type: application/octet-stream\0X-Complete: unaltered\0";
+                    crate::server::parse_fulfill_resolution(&json!({"responseCode": status, "body": body_base64,
+                        "binaryResponseHeaders": base64::engine::general_purpose::STANDARD.encode(fields)})).unwrap()
+                } else { legacy };
+                request.resolver.send(resolution).unwrap();
+            }
+            requests.recv().await.unwrap().resolver.send(InterceptResolution::Fail { reason: "Failed".into() }).unwrap();
+        };
+        let evaluate = page.evaluate_for_cdp(r#"(async () => {
+            const first = await fetch('https://synthetic.test/large', {method:'POST'});
+            const binary = new Uint8Array(await first.arrayBuffer());
+            const xhr = await new Promise((resolve, reject) => {
+                const x = new XMLHttpRequest(); x.open('GET', 'https://synthetic.test/invalid');
+                x.responseType = 'arraybuffer'; x.onload = () => resolve(Array.from(new Uint8Array(x.response)));
+                x.onerror = reject; x.send();
+            });
+            const empty = await (await fetch('https://synthetic.test/empty')).text();
+            const text = await (await fetch('https://synthetic.test/text')).text();
+            const redirect = await fetch('https://synthetic.test/redirect');
+            let failed; try { await fetch('https://synthetic.test/fail'); } catch(e) { failed = e.name; }
+            return [binary.length, binary[0], binary[binary.length-1], xhr, empty, text, redirect.status, failed];
+        })()"#, true, true);
+        let (result, ()) = tokio::join!(evaluate, respond);
+        assert!(!result.thrown, "{result:?}");
+        assert_eq!(result.value, Some(json!([large.len(), 0, 16, invalid, "", "internal-text", 302, "AbortError"])));
+        page.sync_js_network_events();
+        let events: Vec<_> = page.network_events.drain(..).collect();
+        assert_eq!(events.len(), bodies.len(), "Fail must not emit successful response observations");
+        for (index, (event, bytes)) in events.iter().zip(&bodies).enumerate() {
+            assert_eq!(event.status, if index == 4 { 302 } else { 201 });
+            assert_eq!(event.method, if index == 0 { "POST" } else { "GET" });
+            assert_eq!(event.resource_type, "Fetch");
+            assert_eq!(event.body_size, bytes.len());
+            assert!(event.url.starts_with("https://synthetic.test/"));
+            if index == 0 {
+                let capture = event.raw_headers.as_ref().unwrap();
+                assert_eq!(capture.capture_stage, "cdpFulfillResponse");
+                assert_eq!(capture.fields.len(), 5);
+                assert_eq!(capture.fields[0].value, b"first=secret");
+                assert_eq!(capture.fields[1].value, b"second=secret");
+                assert_eq!(capture.fields[2].value, [0xff, 0xfe]);
+            } else { assert!(event.raw_headers.is_none()); }
+            assert!(event.request_raw_headers.is_none());
+            if index == 0 {
+                assert_eq!(event.response_headers["set-cookie"], "second=secret");
+                assert_eq!(event.response_headers["x-complete"], "unaltered");
+                assert!(!event.response_headers.contains_key("x-bytes"));
+            } else {
+                assert_eq!(event.response_headers["Set-Cookie"], "session=complete-secret; HttpOnly");
+                assert_eq!(event.response_headers["X-Complete"], "unaltered");
+            }
+            let body = super::super::network::handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
+            let fetched = handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
+            assert_eq!(fetched, body);
+            for _ in 0..2 {
+                let alias = handle("getResponseBody", &json!({"requestId": pause_ids[index]}), &mut ctx, &session).await.unwrap();
+                assert_eq!(alias, body);
+            }
+            let actual = if body["base64Encoded"] == true {
+                base64::engine::general_purpose::STANDARD.decode(body["body"].as_str().unwrap()).unwrap()
+            } else { body["body"].as_str().unwrap().as_bytes().to_vec() };
+            assert_eq!(&actual, bytes);
+        }
+        let stream = handle("takeResponseBodyAsStream", &json!({"requestId": pause_ids[0]}), &mut ctx, &session).await.unwrap();
+        for id in [&pause_ids[0], &events[0].request_id] {
+            let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_already_consumed"), "{error}");
+            let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_already_consumed"), "{error}");
+        }
+        super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx).await.unwrap();
+        let other_id = ctx.create_page();
+        let other_session = Some(format!("{other_id}-session"));
+        ctx.sessions.insert(other_session.clone().unwrap(), other_id.clone());
+        let other = ctx.get_page_mut(&other_id).unwrap();
+        other.navigate("data:text/html,<html></html>").await.unwrap();
+        let mut other_requests = other.enable_interception();
+        let respond = async {
+            let request = other_requests.recv().await.unwrap();
+            let id = request.request_id.clone();
+            request.resolver.send(InterceptResolution::Fulfill { status: 200, headers: HashMap::new(), body: "other-page".into(), body_base64: String::new() }).unwrap();
+            id
+        };
+        let (other_result, other_pause_id) = tokio::join!(other.evaluate_for_cdp("fetch('https://synthetic.test/other').then(r=>r.text())", true, true), respond);
+        assert_eq!(other_result.value, Some(json!("other-page")));
+        assert_eq!(other_pause_id, pause_ids[0], "fixture exercises identical IDs in separate Page stores");
+        let body = handle("getResponseBody", &json!({"requestId": other_pause_id}), &mut ctx, &other_session).await.unwrap();
+        assert_eq!(body["body"], "other-page");
+        assert!(handle("getResponseBody", &json!({"requestId": other_pause_id}), &mut ctx, &session).await.unwrap_err().contains("response_body_already_consumed"));
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html>rebuilt</html>").await.unwrap();
+        page.network_events.clear();
+        let respond = async {
+            let request = requests.recv().await.unwrap();
+            let id = request.request_id.clone();
+            request.resolver.send(InterceptResolution::Fulfill { status: 200, headers: HashMap::new(), body: "after-navigation".into(), body_base64: String::new() }).unwrap();
+            id
+        };
+        let (result, rebuilt_pause_id) = tokio::join!(page.evaluate_for_cdp("fetch('https://synthetic.test/rebuilt').then(r=>r.text())", true, true), respond);
+        assert_eq!(result.value, Some(json!("after-navigation")));
+        assert_ne!(rebuilt_pause_id, pause_ids[0], "pause IDs must not collide with retained aliases after navigation");
+        let body = handle("getResponseBody", &json!({"requestId": rebuilt_pause_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(body["body"], "after-navigation");
+        assert!(handle("getResponseBody", &json!({"requestId": pause_ids[0]}), &mut ctx, &session).await.unwrap_err().contains("response_body_already_consumed"));
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.set_response_body_limits(obscura_net::response_body::ResponseBodyLimits {
+            memory_threshold: 0, total_bytes: 4, entries: 1,
+        });
+        let respond = async {
+            let request = requests.recv().await.unwrap();
+            let id = request.request_id.clone();
+            request.resolver.send(InterceptResolution::Fulfill {
+                status: 200, headers: HashMap::new(), body: "uncaptured".into(), body_base64: String::new(),
+            }).unwrap();
+            id
+        };
+        let (result, budget_pause_id) = tokio::join!(page.evaluate_for_cdp("fetch('https://synthetic.test/budget').then(r=>r.text())", true, true), respond);
+        assert_eq!(result.value, Some(json!("uncaptured")));
+        page.sync_js_network_events();
+        let id = page.network_events.pop().unwrap().request_id;
+        let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_budget_exhausted"), "{error}");
+        let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_budget_exhausted"), "{error}");
+        for method in ["getResponseBody", "takeResponseBodyAsStream"] {
+            let error = handle(method, &json!({"requestId": budget_pause_id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_budget_exhausted"), "{error}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -523,6 +671,28 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fulfilled_domain_retains_binary_headers_and_retryable_parse_errors() {
+        use base64::Engine as _;
+        let mut ctx = CdpContext::new();
+        let rx = pause(&mut ctx, "binary-headers");
+        for params in [json!({"requestId":"binary-headers","binaryResponseHeaders":"%"}), json!({"requestId":"binary-headers","body":"%"})] {
+            let result = handle("fulfillRequest", &params, &mut ctx, &None).await;
+            assert!(result.is_err());
+            assert!(ctx.fetch_intercept.paused.contains_key("binary-headers"));
+        }
+        let headers = b"Set-Cookie: a=full\0Set-Cookie: b=full\0X-Bytes: \xff\0";
+        handle("fulfillRequest", &json!({"requestId":"binary-headers","body":"AP8=",
+            "binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(headers)}), &mut ctx, &None).await.unwrap();
+        let FetchResolution::FulfillWithHeaders { raw_headers, body_base64, .. } = rx.await.unwrap() else { panic!("missing raw fulfill") };
+        assert_eq!(body_base64, "AP8=");
+        assert_eq!(raw_headers.capture_stage, "cdpFulfillResponse");
+        assert_eq!(raw_headers.fields.len(), 3);
+        assert_eq!(raw_headers.fields[0].value, b"a=full");
+        assert_eq!(raw_headers.fields[1].value, b"b=full");
+        assert_eq!(raw_headers.fields[2].value, [0xff]);
+    }
+
     // Parity with server.rs: the fulfillRequest body is base64-encoded per CDP
     // and must be decoded, not passed through as raw base64 text. See #919/#912.
     #[tokio::test]
@@ -539,8 +709,10 @@ mod tests {
         .expect("fulfillRequest should succeed");
 
         match rx.await.expect("resolver should fire") {
-            FetchResolution::Fulfill { body, .. } => {
+            FetchResolution::FulfillWithHeaders { body, body_base64, raw_headers, .. } => {
                 assert_eq!(body, "Hello", "fulfill body must be base64-decoded");
+                assert_eq!(body_base64, "SGVsbG8=");
+                assert_eq!(raw_headers.capture_stage, "cdpFulfillResponse");
             }
             _ => panic!("expected FetchResolution::Fulfill"),
         }
