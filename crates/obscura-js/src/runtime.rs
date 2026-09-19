@@ -5626,12 +5626,23 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
-    fn has_pending_network_requests(&self) -> bool {
+    /// Requests owned by this page across the mutually exclusive pre-send and
+    /// primp transport phases. Workers share both counters with their page;
+    /// sibling pages do not.
+    pub fn active_network_requests(&self) -> u32 {
         let state = self.state.borrow();
-        state
+        let pre_send = state
             .page_in_flight
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let transport = state
+            .stealth_client
+            .as_ref()
+            .map_or(0, |client| client.active_requests());
+        pre_send.saturating_add(transport)
+    }
+
+    fn has_pending_network_requests(&self) -> bool {
+        self.active_network_requests() > 0
     }
 
     fn next_pending_timeout_delay_ms(&mut self) -> Option<f64> {
@@ -6623,14 +6634,22 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
-    fn page_transport_keeps_render_resources_cache_only_across_document_resets() {
+    fn render_resources_remain_cache_only_across_document_resets() {
         let standalone = ObscuraJsRuntime::new();
         assert!(
-            standalone.render_resource_sync_loading_enabled(),
-            "standalone render runtimes keep the compatibility loader"
+            !standalone.render_resource_sync_loading_enabled(),
+            "standalone render runtimes must not open an implicit HTTP path"
         );
         standalone.set_dom(parse_html("<html><body></body></html>"));
-        assert!(standalone.render_resource_sync_loading_enabled());
+        assert!(
+            !standalone.render_resource_sync_loading_enabled(),
+            "document reset must keep the default renderer cache-only"
+        );
+        assert!(standalone.take_dom().is_some());
+        assert!(
+            !standalone.render_resource_sync_loading_enabled(),
+            "taking a document must not restore an implicit HTTP loader"
+        );
 
         let rt = ObscuraJsRuntime::new();
         rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
@@ -11785,6 +11804,81 @@ return {before,removed,reinsert,moved,cleared};
             started.elapsed() < std::time::Duration::from_millis(400),
             "an unrelated page request on the shared client must not pin settle"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_activity_hands_off_interception_to_primp_until_body_completion() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buf = [0; 1024];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").unwrap();
+            headers_tx.send(()).unwrap();
+            body_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            stream.write_all(b"ok").unwrap();
+        });
+
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url(&format!("http://{address}/page"));
+        let policy = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        ));
+        rt.set_http_client(policy.clone());
+        let primp = std::sync::Arc::new(obscura_net::StealthHttpClient::with_policy(
+            policy.cookie_jar.clone(), None, policy.clone(),
+        ));
+        rt.set_stealth_client(primp.clone());
+        let pre_send = rt.state.borrow().page_in_flight.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.run_page_init();
+        rt.execute_script("counted-fetch", "globalThis.__countedBody = ''; fetch('/data').then(r => r.text()).then(body => __countedBody = body);").unwrap();
+
+        let paused = tokio::select! {
+            request = rx.recv() => request.expect("fetch must pause for CDP interception"),
+            result = rt.run_event_loop_bounded(2_000) => panic!("interception was not reached: {result:?}"),
+        };
+        assert_eq!(pre_send.load(Ordering::Relaxed), 1);
+        assert_eq!(primp.active_requests(), 0);
+        assert_eq!(rt.active_network_requests(), 1);
+        paused.resolver.send(crate::ops::InterceptResolution::Continue {
+            url: None, method: None, headers: None, body: None,
+        }).unwrap();
+
+        tokio::select! {
+            received = headers_rx => received.unwrap(),
+            result = rt.run_event_loop_bounded(2_000) => panic!("wire request was not reached: {result:?}"),
+        }
+        assert_eq!(pre_send.load(Ordering::Relaxed), 0);
+        assert_eq!(primp.active_requests(), 1);
+        assert_eq!(rt.active_network_requests(), 1, "one fetch must not consume two networkidle2 slots");
+        // A separate pre-send request adds to transport activity, while the
+        // browser-context policy counter belongs to neither page phase.
+        pre_send.store(1, Ordering::Relaxed);
+        policy.in_flight.store(5, Ordering::Relaxed);
+        assert_eq!(rt.active_network_requests(), 2);
+        pre_send.store(0, Ordering::Relaxed);
+        policy.in_flight.store(0, Ordering::Relaxed);
+
+        body_tx.send(()).unwrap();
+        rt.run_event_loop_bounded(2_000).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(rt.evaluate("__countedBody").unwrap(), serde_json::json!("ok"));
+        assert_eq!(rt.active_network_requests(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

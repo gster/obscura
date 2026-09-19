@@ -3324,7 +3324,7 @@ impl Page {
                     robots_url.set_query(None);
                     robots_url.set_fragment(None);
                     let body = match self
-                        .http_client
+                        .stealth_client
                         .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
                         .await
                     {
@@ -3599,7 +3599,11 @@ impl Page {
             let mut idle_since: Option<tokio::time::Instant> = None;
 
             loop {
-                let active = self.http_client.active_requests();
+                let active = self
+                    .js
+                    .as_ref()
+                    .map(|js| js.active_network_requests())
+                    .unwrap_or_else(|| self.stealth_client.active_requests());
                 let now = tokio::time::Instant::now();
 
                 if active <= threshold {
@@ -4856,6 +4860,30 @@ mod tests {
         assert_eq!(
             page.stealth_client.transport_params().profile,
             obscura_net::StealthProfile::default(),
+        );
+    }
+
+    #[test]
+    fn pages_in_one_context_keep_network_idle_accounting_isolated() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "page-idle-isolation".into(),
+            None,
+            false,
+        ));
+        let first = super::Page::new("page-a".into(), context.clone());
+        let second = super::Page::new("page-b".into(), context);
+        let worker = first.stealth_client.detached();
+
+        assert!(
+            !std::sync::Arc::ptr_eq(
+                &first.stealth_client.in_flight,
+                &second.stealth_client.in_flight,
+            ),
+            "a sibling page request must not delay this page's networkidle"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first.stealth_client.in_flight, &worker.in_flight),
+            "a page must include its detached Worker requests in networkidle"
         );
     }
 

@@ -1344,12 +1344,11 @@ pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
 }
 
 /// Build the renderer resource cache for this runtime. A runtime owned by a
-/// page must never let layout or paint open their own synchronous HTTP
-/// requests: the compatibility loader bypasses the page's proxy, cookies,
-/// interception and URL blocking, and it pins V8 for the full network
-/// latency of every unknown asset (retries included). Such runtimes start
-/// cache-only and are fed through the page transport; standalone render
-/// runtimes without a transport keep the compatibility loader.
+/// page must never let layout or paint invoke a caller-supplied synchronous
+/// loader: that loader is outside the page's proxy, cookies, interception and
+/// URL-blocking policy. Page runtimes start cache-only and are fed through the
+/// page transport. The renderer's default cache is also cache-only and never
+/// opens a network connection.
 #[cfg(feature = "render")]
 pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::RenderResourceCache {
     let mut cache = obscura_render::RenderResourceCache::default();
@@ -3825,7 +3824,7 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, mut referrer, mut referrer_policy) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, stealth_client, mut referrer, mut referrer_policy) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -3875,6 +3874,7 @@ async fn op_fetch_url(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            gs.stealth_client.clone(),
             gs.dom.as_ref().and_then(DomTree::document_url).and_then(|url| url::Url::parse(&url).ok()),
             gs.referrer_policy,
         )
@@ -3906,7 +3906,7 @@ async fn op_fetch_url(
         }
     }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _page_in_flight = PageInFlightGuard(page_in_flight);
+    let mut page_in_flight_guard = Some(PageInFlightGuard(page_in_flight));
 
     // Slots the interception channel can override via Continue so a consumer
     // can rewrite url/method/headers/body before the request goes out.
@@ -4065,13 +4065,11 @@ async fn op_fetch_url(
         let preflight_request = preflight_request.build()
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
         let stealth_preflight = {
-            let stealth = {
-                let st = state.borrow();
-                let gs = st.borrow::<SharedState>().clone();
-                let client = gs.borrow().stealth_client.clone();
-                client
-            };
-            if let Some(stealth) = stealth {
+            if let Some(stealth) = stealth_client.clone() {
+                // Handoff from pre-send/CDP interception accounting to the
+                // primp transport counter. The two stages must not overlap or
+                // networkidle2 would count one request twice.
+                drop(page_in_flight_guard.take());
                 let headers = preflight_request.headers().iter()
                     .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
                     .collect();
@@ -4162,26 +4160,23 @@ async fn op_fetch_url(
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
     {
-        let stealth = {
-            let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
-            let client = gs.borrow().stealth_client.clone();
-            client
-        };
-        if let Some(stealth) = stealth {
+        if let Some(stealth) = stealth_client {
+            // No preflight took the guard, so hand off immediately before the
+            // first primp request. Redirect hops remain inside primp.
+            drop(page_in_flight_guard.take());
             return stealth_fetch_all(
                 state.clone(),
                 stealth,
-                url.clone(),
+                url,
                 req_method.as_str().to_string(),
-                custom_headers.clone(),
-                body.clone(),
-                page_origin.clone(),
-                mode.clone(),
+                custom_headers,
+                body,
+                page_origin,
+                mode,
                 credentials,
-                destination.clone(),
+                destination,
                 resource_type,
-                callbacks.clone(),
+                callbacks,
                 allow_private_network,
                 referrer, referrer_policy,
             )
@@ -7692,8 +7687,14 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _page_in_flight = PageImageInFlightGuard(page_in_flight);
+    let _page_in_flight = if stealth_client.is_none() {
+        page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(PageImageInFlightGuard(page_in_flight))
+    } else {
+        // primp counts native interception through complete response body;
+        // the plain-client fallback still needs this runtime-owned counter.
+        None
+    };
 
     let parsed_url = url::Url::parse(&selected_url).ok();
     let response = if blocked || parsed_url.is_none() {

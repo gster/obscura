@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 struct RobotsServer {
     address: String,
-    paths: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl RobotsServer {
@@ -17,13 +17,13 @@ impl RobotsServer {
             .set_nonblocking(true)
             .expect("set fixture nonblocking");
         let address = listener.local_addr().expect("fixture address").to_string();
-        let paths = Arc::new(Mutex::new(Vec::new()));
-        let server_paths = Arc::clone(&paths);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
         thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(15);
             while Instant::now() < deadline {
                 match listener.accept() {
-                    Ok((stream, _)) => serve(stream, &server_paths),
+                    Ok((stream, _)) => serve(stream, &server_requests),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -31,7 +31,7 @@ impl RobotsServer {
                 }
             }
         });
-        Self { address, paths }
+        Self { address, requests }
     }
 
     fn url(&self, path: &str) -> String {
@@ -39,26 +39,52 @@ impl RobotsServer {
     }
 
     fn paths(&self) -> Vec<String> {
-        self.paths.lock().expect("fixture paths").clone()
+        self.requests()
+            .iter()
+            .map(|request| {
+                std::str::from_utf8(request)
+                    .expect("fixture request headers are valid HTTP text")
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn requests(&self) -> Vec<Vec<u8>> {
+        self.requests.lock().expect("fixture requests").clone()
     }
 }
 
-fn serve(mut stream: TcpStream, paths: &Arc<Mutex<Vec<String>>>) {
+fn serve(mut stream: TcpStream, requests: &Arc<Mutex<Vec<Vec<u8>>>>) {
     stream
         .set_nonblocking(false)
         .expect("set fixture connection blocking");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set fixture read timeout");
-    let mut request = [0_u8; 4096];
-    let count = stream.read(&mut request).expect("read fixture request");
-    let first_line = String::from_utf8_lossy(&request[..count])
+    let mut raw_request = Vec::new();
+    while !raw_request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let mut chunk = [0_u8; 1024];
+        let count = stream.read(&mut chunk).expect("read fixture request");
+        assert!(count > 0, "fixture connection closed before complete headers");
+        raw_request.extend_from_slice(&chunk[..count]);
+        assert!(raw_request.len() <= 64 * 1024, "fixture request headers exceed 64 KiB");
+    }
+    let request_text = std::str::from_utf8(&raw_request)
+        .expect("fixture request headers are valid HTTP text");
+    let first_line = request_text
         .lines()
         .next()
         .unwrap_or_default()
         .to_string();
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
-    paths.lock().expect("fixture paths").push(path.to_string());
+    requests
+        .lock()
+        .expect("fixture requests")
+        .push(raw_request);
     let (content_type, body) = if path == "/robots.txt" {
         ("text/plain", "User-agent: *\nDisallow: /private\n")
     } else {
@@ -164,4 +190,24 @@ fn obey_robots_fetches_an_allowed_target_after_loading_policy() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(server.paths(), vec!["/robots.txt", "/public/page"]);
+    let requests = server.requests();
+    let user_agents: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            std::str::from_utf8(request)
+                .expect("fixture request headers are valid HTTP text")
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("user-agent")
+                        .then(|| value.trim().to_string())
+                })
+                .expect("complete raw request contains User-Agent")
+        })
+        .collect();
+    assert_eq!(user_agents.len(), 2);
+    assert_eq!(
+        user_agents[0], user_agents[1],
+        "robots.txt and navigation must use the same persona-owned User-Agent"
+    );
 }

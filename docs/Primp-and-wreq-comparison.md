@@ -1,6 +1,6 @@
 # 当前传输实现与统一目标
 
-2026-09-19 整理。产品页面、CDP、MCP、Worker 和 JS fetch/XHR 路径统一使用 primp。`ObscuraHttpClient` 保留 Cookie、缓存、拦截和安全策略等兼容职责，不再作为产品 HTTP(S) 出口；`obscura-net::wreq_client` 仅为 `stealth_client` 的兼容 re-export。旧比较中的 upstream commit、Python 探针和现场请求只代表迁移前历史，不是本次传输测量。
+2026-09-20 复核。产品 Page、CDP、MCP、Worker 和有 Page 所有者的 JS fetch/XHR 路径使用 primp；renderer 默认 cache 已不再自行联网，robots.txt 也进入同一 primp。`ObscuraHttpClient` 仍保留可执行 reqwest 后端，standalone runtime/module loader 仍可到达该路径，`obscura-net::wreq_client` 兼容 re-export 也尚未删除，因此 OB-012 不能关闭。旧比较中的 upstream commit、Python 探针和现场请求只代表迁移前历史，不是本次传输测量。
 
 ## 当前源码事实
 

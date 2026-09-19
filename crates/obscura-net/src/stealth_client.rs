@@ -249,7 +249,6 @@ impl StealthHttpClient {
 
     fn with_options(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>, policy: Option<Arc<crate::client::ObscuraHttpClient>>, allow_private_network: bool, profile: StealthProfile) -> Self {
         let client = transport::Client::new(profile, proxy_url, allow_private_network, None, None);
-
         StealthHttpClient {
             client,
             allow_private_network,
@@ -305,11 +304,23 @@ impl StealthHttpClient {
         self.policy.as_ref().map_or(true, |p| p.block_trackers)
     }
 
-    async fn intercept(&self, info: &mut RequestInfo) -> Result<Option<Response>, ObscuraNetError> {
+    async fn intercept(
+        &self,
+        info: &mut RequestInfo,
+        body: Option<&[u8]>,
+    ) -> Result<Option<Response>, ObscuraNetError> {
         validate_url(&info.url, self.allow_private_network)?;
         if let Some(policy) = &self.policy {
-            if let Some(interceptor) = policy.interceptor.read().await.as_ref() {
-                match interceptor.intercept(info).await {
+            let interceptor = policy.interceptor.read().await.clone();
+            if let Some(interceptor) = interceptor {
+                if let Some(body) = body {
+                    info.body.extend_from_slice(body);
+                }
+                let action = interceptor.intercept(info).await;
+                // Request bodies can be large. The interceptor has already
+                // observed every byte, so do not retain the copy across I/O.
+                info.body = Vec::new();
+                match action {
                     crate::interceptor::InterceptAction::Continue => {}
                     crate::interceptor::InterceptAction::Block => return Err(ObscuraNetError::Blocked(info.url.to_string())),
                     crate::interceptor::InterceptAction::Fulfill(response) => return Ok(Some(response)),
@@ -496,11 +507,12 @@ impl StealthHttpClient {
         &self, url: &Url, mut request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>, mut method: http::Method, initial_body: &[u8],
     ) -> Result<Response, ObscuraNetError> {
+        let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut request_body = initial_body.to_vec();
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
-            if let Some(mut response) = self.intercept(&mut RequestInfo {body: Vec::new(), url: url.clone(), method: "GET".into(), headers: HashMap::new(), resource_type: request.resource_type}).await? {
+            if let Some(mut response) = self.intercept(&mut RequestInfo {body: Vec::new(), url: url.clone(), method: "GET".into(), headers: HashMap::new(), resource_type: request.resource_type}, None).await? {
                 response.request_referrer = None;
                 return Ok(response);
             }
@@ -532,11 +544,11 @@ impl StealthHttpClient {
             }
 
             let mut request_info = RequestInfo {
-                body: request_body.clone(),
+                body: Vec::new(),
                 url: current_url.clone(), method: method.to_string(),
                 headers: self.extra_headers.read().await.clone(), resource_type: request.resource_type,
             };
-            if let Some(mut response) = self.intercept(&mut request_info).await? {
+            if let Some(mut response) = self.intercept(&mut request_info, Some(&request_body)).await? {
                 response.request_referrer = request.referrer_policy.referrer(request.referrer.as_ref(), &current_url);
                 return Ok(response);
             }
@@ -585,12 +597,13 @@ impl StealthHttpClient {
 
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
+                    request_info.body = request_body.clone();
                     callbacks.fire_request(&request_info).await;
+                    request_info.body = Vec::new();
                 }
                 request_callback_fired = true;
             }
 
-            let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = self.client.send(method.clone(), &current_url, headers, &request_body).await?;
 
             let status = resp.status();
@@ -650,7 +663,6 @@ impl StealthHttpClient {
 
             let body = read_stealth_body_limited(resp, &current_url, request.max_response_bytes)
                 .await?;
-            drop(in_flight);
 
             let response = Response {
                 url: current_url,
@@ -661,7 +673,9 @@ impl StealthHttpClient {
                 request_referrer: request.referrer,
             };
             if let Some(callbacks) = callbacks {
+                request_info.body = request_body.clone();
                 callbacks.fire_response(&request_info, &response).await;
+                request_info.body = Vec::new();
             }
             return Ok(response);
         }
@@ -681,6 +695,7 @@ impl StealthHttpClient {
         send_cookies: bool,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        let in_flight = InFlightGuard::new(&self.in_flight);
         if let Some(host) = url.host_str() {
             if self.block_trackers() && crate::blocklist::is_blocked(host) {
                 tracing::debug!("Blocked tracker: {}", url);
@@ -696,7 +711,7 @@ impl StealthHttpClient {
         }
 
         let mut info = RequestInfo {body: Vec::new(), url: url.clone(), method: method.to_string(), headers: headers.clone(), resource_type: crate::client::ResourceType::Fetch};
-        if let Some(response) = self.intercept(&mut info).await? { return Ok(response); }
+        if let Some(response) = self.intercept(&mut info, Some(body)).await? { return Ok(response); }
 
         let req_method = method
             .parse::<http::Method>()
@@ -715,7 +730,10 @@ impl StealthHttpClient {
         for (k, v) in info.headers.iter() {
             header(&mut headers, k, v)?;
         }
-        let in_flight = InFlightGuard::new(&self.in_flight);
+        let request_referrer = info.headers.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .and_then(|(_, value)| Url::parse(value).ok());
+        drop(info);
         let resp = self.client.send(req_method, url, headers, body).await?;
 
         let status = resp.status();
@@ -740,8 +758,7 @@ impl StealthHttpClient {
             headers: response_headers,
             body: resp_body,
             redirected_from: Vec::new(),
-            request_referrer: info.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("referer"))
-                .and_then(|(_, value)| Url::parse(value).ok()),
+            request_referrer,
         })
     }
 
@@ -797,6 +814,153 @@ mod tests {
 
         // the sibling has its own transport, not a clone of the same one
         assert_ne!(original.transport_params().profile, super::StealthProfile::WindowsChrome145);
+    }
+
+    #[test]
+    fn pages_keep_separate_in_flight_counters_while_detached_workers_share() {
+        use std::sync::Arc as StdArc;
+        let policy = StdArc::new(crate::client::ObscuraHttpClient::new());
+        let first = super::StealthHttpClient::with_policy_profile_persona(
+            StdArc::new(crate::cookies::CookieJar::new()),
+            None,
+            policy.clone(),
+            super::StealthProfile::MacChrome153,
+            "en-US,en;q=0.9",
+            None,
+        );
+        let second = super::StealthHttpClient::with_policy_profile_persona(
+            first.cookie_jar.clone(),
+            None,
+            policy.clone(),
+            super::StealthProfile::MacChrome153,
+            "en-US,en;q=0.9",
+            None,
+        );
+        let worker = first.detached();
+
+        assert!(!StdArc::ptr_eq(&policy.in_flight, &first.in_flight));
+        assert!(!StdArc::ptr_eq(&first.in_flight, &second.in_flight));
+        assert!(StdArc::ptr_eq(&first.in_flight, &worker.in_flight));
+        first
+            .in_flight
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(first.active_requests(), 3);
+        assert_eq!(worker.active_requests(), 3);
+        assert_eq!(second.active_requests(), 0);
+        assert_eq!(policy.active_requests(), 0);
+    }
+
+    struct CaptureBody(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[async_trait::async_trait]
+    impl crate::interceptor::RequestInterceptor for CaptureBody {
+        async fn intercept(
+            &self,
+            request: &crate::client::RequestInfo,
+        ) -> crate::interceptor::InterceptAction {
+            *self.0.lock().unwrap() = request.body.clone();
+            crate::interceptor::InterceptAction::Block
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_request_interceptor_observes_the_complete_body() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let policy = std::sync::Arc::new(crate::client::ObscuraHttpClient::new());
+        *policy.interceptor.write().await = Some(std::sync::Arc::new(CaptureBody(captured.clone())));
+        let client = super::StealthHttpClient::with_policy(
+            std::sync::Arc::new(crate::cookies::CookieJar::new()),
+            None,
+            policy,
+        );
+        let payload = b"complete raw request body\0\x80\xff";
+
+        client
+            .send_single(
+                "POST",
+                &url::Url::parse("https://example.com/collect").unwrap(),
+                &std::collections::HashMap::new(),
+                payload,
+                false,
+                false,
+            )
+            .await
+            .expect_err("capture interceptor blocks before network I/O");
+
+        assert_eq!(captured.lock().unwrap().as_slice(), payload);
+    }
+
+    struct PausedInterceptor {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::interceptor::RequestInterceptor for PausedInterceptor {
+        async fn intercept(
+            &self,
+            _request: &crate::client::RequestInfo,
+        ) -> crate::interceptor::InterceptAction {
+            self.entered.notify_one();
+            self.release.notified().await;
+            crate::interceptor::InterceptAction::Block
+        }
+    }
+
+    #[tokio::test]
+    async fn native_interception_is_counted_until_completion_or_cancellation() {
+        for scripted in [false, true] {
+            for cancel in [false, true] {
+                let interceptor = Arc::new(PausedInterceptor {
+                    entered: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                });
+                let policy = Arc::new(crate::client::ObscuraHttpClient::new());
+                *policy.interceptor.write().await = Some(interceptor.clone());
+                let client = StealthHttpClient::with_policy(Arc::new(CookieJar::new()), None, policy);
+                let url = Url::parse("https://example.com/paused").unwrap();
+                let mut request = Box::pin(async {
+                    if scripted {
+                        client.send_single("POST", &url, &std::collections::HashMap::new(), b"raw\0\x80\xff", false, false).await
+                    } else {
+                        client.fetch(&url).await
+                    }
+                });
+                tokio::select! {
+                    _ = interceptor.entered.notified() => {}
+                    result = &mut request => panic!("request completed before release: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("interceptor was not reached"),
+                }
+                assert_eq!(client.active_requests(), 1, "native interception must keep networkidle pending");
+                if cancel {
+                    drop(request);
+                } else {
+                    interceptor.release.notify_one();
+                    assert!(matches!(request.await, Err(crate::client::ObscuraNetError::Blocked(_))));
+                }
+                assert_eq!(client.active_requests(), 0, "completed or cancelled requests must release their guard");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interceptor_body_copy_is_released_after_observation() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let policy = Arc::new(crate::client::ObscuraHttpClient::new());
+        *policy.interceptor.write().await = Some(Arc::new(CaptureBody(captured.clone())));
+        let client = StealthHttpClient::with_policy(Arc::new(CookieJar::new()), None, policy);
+        let payload = b"raw\0\x80\xff";
+        let mut info = crate::client::RequestInfo {
+            url: Url::parse("https://example.com/body").unwrap(),
+            method: "POST".into(),
+            headers: std::collections::HashMap::new(),
+            resource_type: crate::client::ResourceType::Fetch,
+            body: Vec::new(),
+        };
+        assert!(client.intercept(&mut info, Some(payload)).await.is_err());
+        assert_eq!(captured.lock().unwrap().as_slice(), payload);
+        assert!(info.body.is_empty());
+        assert_eq!(info.body.capacity(), 0, "the temporary observation copy must release its allocation");
     }
 
     #[tokio::test]

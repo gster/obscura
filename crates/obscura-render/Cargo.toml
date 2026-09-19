@@ -11,7 +11,7 @@ default = []
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
 
 [dependencies]
 taffy = { workspace = true }
@@ -27,7 +27,6 @@ cosmic-text = { version = "=0.14.2", default-features = false, features = ["std"
 # shaping and rasterization.
 swash = { version = "=0.2.0", default-features = false, features = ["std", "scale", "render"], optional = true }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"], optional = true }
-ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
 base64 = { workspace = true, optional = true }
 # SVG rasterization for <img src="*.svg">, inline <svg>, and background-image
 # SVGs, all extremely common for logos/icons. Pure Rust, CPU, no system deps,

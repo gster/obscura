@@ -35,14 +35,10 @@ const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// intrinsic geometry before that cascade instead of always laying out twice.
 const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
 const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
-/// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
-/// either wildcard permits a content-negotiating server to choose AVIF,
-/// JPEG-XL, or another format that this build cannot rasterize.
-const IMAGE_ACCEPT: &str = "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon";
-
-/// Synchronous byte loader used by [`RenderResourceCache`]. The default
-/// implementation uses Obscura's pooled image agent; tests and embedding
-/// callers can provide a local loader without changing preparation or paint.
+/// Synchronous byte loader used by [`RenderResourceCache`]. Embedding callers
+/// may provide a local or already-policy-checked loader without changing
+/// preparation or paint. The default cache never opens a network connection;
+/// browser-owned callers seed it with bytes fetched through the page transport.
 pub trait RenderResourceLoader {
     fn load(&mut self, url: &str) -> Option<Vec<u8>>;
 }
@@ -69,11 +65,11 @@ where
     }
 }
 
-struct HttpResourceLoader;
+struct NoNetworkResourceLoader;
 
-impl RenderResourceLoader for HttpResourceLoader {
-    fn load(&mut self, url: &str) -> Option<Vec<u8>> {
-        http_get_bytes(url)
+impl RenderResourceLoader for NoNetworkResourceLoader {
+    fn load(&mut self, _url: &str) -> Option<Vec<u8>> {
+        None
     }
 }
 
@@ -157,11 +153,13 @@ pub struct RenderResourceCache {
 
 impl Default for RenderResourceCache {
     fn default() -> Self {
-        Self::with_loader_and_limits(
-            HttpResourceLoader,
+        let mut cache = Self::with_loader_and_limits(
+            NoNetworkResourceLoader,
             DEFAULT_RESOURCE_CACHE_ENTRIES,
             DEFAULT_RESOURCE_CACHE_BYTES,
-        )
+        );
+        cache.sync_loading_enabled = false;
+        cache
     }
 }
 
@@ -197,17 +195,17 @@ impl RenderResourceCache {
         }
     }
 
-    /// Temporarily control the compatibility loader used by synchronous
-    /// layout and paint. Capture callers disable it so a screenshot observes
-    /// only bytes already prepared by the page transport. Unknown URLs remain
-    /// unknown and can still be fetched by a later navigation/settle warmup.
+    /// Temporarily control an explicitly supplied synchronous loader. The
+    /// default cache keeps this disabled so layout and paint observe only data
+    /// URLs and bytes already prepared by the owning page transport. Unknown
+    /// URLs remain eligible for a later navigation/settle warmup.
     pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
     }
 
-    /// Whether layout and paint may still open synchronous compatibility
-    /// requests. Page-owned caches disable this permanently and are fed by
-    /// the page transport instead.
+    /// Whether layout and paint may invoke an explicitly supplied loader.
+    /// Page-owned and default caches keep this disabled and are fed by the
+    /// page transport instead.
     pub fn sync_loading_enabled(&self) -> bool {
         self.sync_loading_enabled
     }
@@ -2596,10 +2594,9 @@ pub fn paint_dom_scrolled_at_animation_time_with_surface_color(
 /// As [`paint_dom_scrolled_at_animation_time_with_surface_color`], but painting
 /// against a caller-owned resource cache instead of a fresh one.
 ///
-/// The default-cache version starts empty, so every image is fetched again on
-/// every call. A caller that already holds a warm cache for this document — a
-/// page repeating a capture, for instance — can pass it here and pay the
-/// network cost once rather than per frame.
+/// The default-cache version starts empty and does not perform network I/O. A
+/// caller that already holds a cache seeded by its policy-aware transport can
+/// pass it here so repeated captures reuse the same response bytes.
 pub fn paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -7940,69 +7937,6 @@ fn split_css_top_level(value: &str, separator: char) -> Vec<&str> {
     out
 }
 
-/// Fetch `url` with a descriptive User-Agent and a bounded timeout, retrying on
-/// rate-limit / transient errors with backoff. Real pages pull dozens of images
-/// from one CDN in a burst (a Wikipedia article references ~60); hosts like
-/// Wikimedia answer a rapid burst with HTTP 429 after ~10 requests. Without a
-/// retry the rate-limited images (e.g. an infobox photo montage fetched late in
-/// the burst) came back blank, and the failure was cached permanently. The
-/// backoff both recovers them and paces the burst back under the limit.
-fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
-    let mut backoff = std::time::Duration::from_millis(200);
-    for attempt in 0..3 {
-        // Advertise only formats that this build can decode. Content-negotiating
-        // CDNs otherwise commonly choose AVIF and leave the image blank.
-        let res = image_agent().get(url).set("Accept", IMAGE_ACCEPT).call();
-        match res {
-            Ok(resp) => {
-                let mut buf = Vec::new();
-                use std::io::Read;
-                return resp.into_reader().read_to_end(&mut buf).ok().map(|_| buf);
-            }
-            // 429 (rate limit) and 5xx are transient: a short backoff clears a
-            // brief blip. A sustained limit (Wikimedia 429s a 60-image burst
-            // from a datacenter IP hard, with `Retry-After: 1`) is NOT worth
-            // waiting out here: honoring the hint stalls the whole render for
-            // minutes, so fast-fail to the grey placeholder instead. Real
-            // fidelity for that case needs an HTTP/2 image client (multiplexing
-            // like Chrome), not blocking retries.
-            Err(ureq::Error::Status(code, _))
-                if matches!(code, 429 | 500 | 502 | 503 | 504) && attempt < 2 =>
-            {
-                std::thread::sleep(backoff);
-                backoff *= 2;
-            }
-            Err(ureq::Error::Transport(_)) if attempt < 2 => {
-                std::thread::sleep(backoff);
-                backoff *= 2;
-            }
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
-/// One shared HTTP agent for all image fetches in the process, with a browser
-/// User-Agent and keep-alive connection pooling. A CDN's bot rate-limiter keys
-/// on connection churn as much as on rate: a fresh TLS handshake per image (the
-/// old per-call `ureq::get`) reads as a burst and gets 429'd, whereas reusing
-/// one pooled connection to the same host (as a browser does) both avoids most
-/// throttling and is much faster on an image-heavy page.
-fn image_agent() -> &'static ureq::Agent {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(10))
-            // Present the same normal browser identity the engine uses for the
-            // document. A bot-identifying UA got image requests filtered by CDNs
-            // that gate on User-Agent (Akamai/Cloudflare image endpoints on
-            // cnbc, techcrunch, arstechnica), so the images Chrome loads came
-            // back blank; a real browser UA loads the same bytes Chrome does.
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            .build()
-    })
-}
-
 /// Decode a percent-escaped data: URI payload (`%23` -> `#`, etc). Bytes that
 /// are not part of a `%XX` escape pass through unchanged, which is exactly
 /// right for the inline-SVG case: only the characters that would otherwise be
@@ -12296,6 +12230,28 @@ mod tests {
     }
 
     #[test]
+    fn default_resource_cache_never_opens_an_implicit_network_path() {
+        let mut cache = RenderResourceCache::default();
+        let url = "https://example.test/complete/path/image.png?variant=raw#fragment";
+
+        assert!(!cache.sync_loading_enabled());
+        assert!(cache.get_or_load(url, false).is_none());
+        assert_eq!(
+            cache.take_sync_misses(),
+            vec![(
+                "https://example.test/complete/path/image.png?variant=raw".to_string(),
+                None,
+                false,
+            )],
+            "the complete resolved URL is reported for the owning primp transport"
+        );
+        assert!(
+            !cache.has_live_outcome(url),
+            "an unfetched URL must not become a negative-cached network result"
+        );
+    }
+
+    #[test]
     fn cache_only_misses_are_reported_with_their_request_identity() {
         let mut cache = RenderResourceCache::with_loader(|_url: &str| Some(vec![1, 2, 3]));
         let font = "https://example.test/font?id=late";
@@ -12412,34 +12368,6 @@ mod tests {
             (255, 255, 255, 255),
             "failed credentialed image must not paint bytes from another profile"
         );
-    }
-
-    #[test]
-    fn image_accept_advertises_exactly_decodable_mime_types() {
-        assert!(!IMAGE_ACCEPT.contains('*'));
-        assert!(!IMAGE_ACCEPT.to_ascii_lowercase().contains("avif"));
-        for mime in IMAGE_ACCEPT.split(',') {
-            assert!(
-                crate::source_type_supported(mime),
-                "advertised MIME type must be decodable: {mime}"
-            );
-        }
-        for required in [
-            "image/webp",
-            "image/apng",
-            "image/svg+xml",
-            "image/png",
-            "image/jpeg",
-            "image/gif",
-            "image/bmp",
-            "image/x-icon",
-            "image/vnd.microsoft.icon",
-        ] {
-            assert!(
-                IMAGE_ACCEPT.split(',').any(|mime| mime == required),
-                "missing supported MIME type {required}"
-            );
-        }
     }
 
     #[test]
