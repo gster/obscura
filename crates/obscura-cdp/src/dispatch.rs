@@ -850,7 +850,8 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),
         Err(msg) => {
             tracing::warn!("CDP error for {}: {}", req.method, msg);
-            CdpResponse::error(req.id, -32601, msg, req.session_id.clone())
+            let code = if req.method == "Fetch.continueRequest" { -32602 } else { -32601 };
+            CdpResponse::error(req.id, code, msg, req.session_id.clone())
         }
     }
 }

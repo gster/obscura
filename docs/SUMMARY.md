@@ -12,9 +12,9 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 目标与阶段：[New_ACH](New_ACH.md)。唯一执行队列：[TODO](TODO.md)。
 
-## 本次实际执行的验证
+## 此前切片的验证
 
-环境：macOS arm64，Rust/Cargo 1.98.1，cargo-nextest 0.9.145。下表为 OB-044 后续的 OB-012 本轮运行，不继承 handoff 的通过数字。
+环境：macOS arm64，Rust/Cargo 1.98.1，cargo-nextest 0.9.145。下表保留 OB-044 后续、Continue postData 修复之前的验证记录。Continue 切片的实际重跑结果见下文专段；未重跑的渲染、客户端和线级证据不算作本轮结果。
 
 | 检查 | 本次结果 | 边界 |
 | --- | --- | --- |
@@ -45,13 +45,17 @@ OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓�
 
 上述 Page-only 记录随后扩展为 JS fetch/XHR、module loader 和 Worker 的 owning Page 共享 `ResponseBodyStore`：成功 transport 响应超过 2 MiB 进入 spool，invalid UTF-8 保留原字节，Worker 观察队列只传 metadata、不复制 body；module 仅记录最终 URL 的成功 2xx 响应，resource type 为 `Script`。该扩展聚焦 release nextest 为 27/27，根 release nextest 为 1870/1870，4 skipped。`Fetch.getResponseBody` 现已读取统一 raw store，重复 get 不消费正文并与 `Network.getResponseBody` 使用同一编码；`takeResponseBodyAsStream` 之后 get 明确返回 consumed。session 严格隔离，带 session 的请求或未知 session 不会跨 Page 查找；无 session 时多 Page 同 ID 按顺序选取首个仍可读的 body。live request-stage 请求的 get/take 返回 `response_body_not_ready` 并保留 resolver。这是 completed-capture requestId 扩展，不是标准 response-stage interception；whole-body get 会 materialize spool，磁盘 IO 故障注入尚未单测。该 Fetch 切片聚焦 release nextest 为 16/16。仍有 transport 先完整 materialize `Vec`、JS 100 MiB 与 module 32 MiB 默认硬帽、JS/module/Worker 的 redirect 中间响应、preflight/失败链、Fulfill/CORS early return、metadata 4096 上限、独立 Worker target、`importScripts`、公开 HashMap 输入限制、其他完整响应体出口；低层 `ObscuraState` 字段也有源码兼容变化。OB-012 保持未关闭。
 
-当前 synthetic `Fetch.fulfillRequest` capture 已接入 owning Page 的共享 raw store：JS fetch/XHR、Worker Fulfill 会产生成功 Network 事件，超过 2 MiB、invalid UTF-8 和 binary body 均保留完整原字节。pause 的 `intercept-N` alias 到完成 capture 的 `fetch-N`；`Network.getResponseBody`、`Fetch.getResponseBody` 与 stream 共用 consumed/budget 状态，Page 生命周期内跨导航不会复用 ID。CDP `responseHeaders` 的重复值、大小写、顺序及 `binaryResponseHeaders` 的非 UTF-8 原字节均保留，raw capture 使用 `captureStage=cdpFulfillResponse`，明确表示 synthetic response 而非 transport/wire capture。非法 body/header base64 在解除 pause 前拒绝且可重试。既有 Fulfill CORS、opaque、302 语义保持；Fail 与 transport CORS 拒绝不产生成功事件。聚焦 release nextest 为 9/9；最终根 release nextest 为 1876/1876，4 skipped，独立 runtime 为 185/185，三种发布构建均成功，障碍课为 33/33，官方 Playwright smoke 与 37-method 协议画像校验通过。尚无 preflight/redirect failure 完整生命周期、active multi-Page pause ID 隔离、Continue 非 UTF-8 postData、真正 response-stage interception、IO 注入；新增 public enum variant 会影响 exhaustive match 的源码兼容性。OB-012 保持未关闭。
+当前 synthetic `Fetch.fulfillRequest` capture 已接入 owning Page 的共享 raw store：JS fetch/XHR、Worker Fulfill 会产生成功 Network 事件，超过 2 MiB、invalid UTF-8 和 binary body 均保留完整原字节。pause 的 `intercept-N` alias 到完成 capture 的 `fetch-N`；`Network.getResponseBody`、`Fetch.getResponseBody` 与 stream 共用 consumed/budget 状态，Page 生命周期内跨导航不会复用 ID。CDP `responseHeaders` 的重复值、大小写、顺序及 `binaryResponseHeaders` 的非 UTF-8 原字节均保留，raw capture 使用 `captureStage=cdpFulfillResponse`，明确表示 synthetic response 而非 transport/wire capture。非法 body/header base64 在解除 pause 前拒绝且可重试。既有 Fulfill CORS、opaque、302 语义保持；Fail 与 transport CORS 拒绝不产生成功事件。聚焦 release nextest 为 9/9；最终根 release nextest 为 1876/1876，4 skipped，独立 runtime 为 185/185，三种发布构建均成功，障碍课为 33/33，官方 Playwright smoke 与 37-method 协议画像校验通过。尚无 preflight/redirect failure 完整生命周期、active multi-Page pause ID 隔离、真正 response-stage interception、IO 注入；新增 public enum variant 会影响 exhaustive match 的源码兼容性。OB-012 保持未关闭。
+
+本轮 `Fetch.continueRequest.postData` 切片：主 server handler 和 `domains/fetch` 共用严格 standard-base64 解析；非法 base64、非字符串及 null 返回 `-32602`，校验完成前不取走 pause，连续错误后仍可重试。省略 `postData` 保留原 body，空字符串明确清空；`InterceptResolution::Continue.body` 与 `FetchResolution::Continue.post_data` 使用 `Option<Vec<u8>>`，直到 primp 发送均保留任意原字节，不经过文本或 lossy UTF-8，也不脱敏、不裁剪。URL、method、headers 覆盖及 SSRF、redirect、CORS、credentials 的后续处理保持原路径。新增回归覆盖两个入口和真实 HTTP fixture 下的页面 JS fetch / Worker：NUL、0xff、全部 256 种字节、空 body、未覆盖原 body、重复错误后重试，以及 URL/method/Authorization/Cookie。本轮 render/no-render focused release nextest 各为 3/3；最终根 release nextest 为 1879/1879，4 skipped；独立 runtime release nextest 为 185/185；no-default-features、render,stealth、render 三种 exact CLI release build 均成功；CI 固定 benchmark 版本的障碍课为 33/33；官方 Playwright Python 1.60.0 smoke 通过，完整协议日志通过 37-method profile 校验。公开 Continue 字段从 `Option<String>` 改为 `Option<Vec<u8>>`，嵌入调用者提供文本覆盖时需显式 `into_bytes()`。该切片不扩展 active multi-Page pause ID 隔离、response-stage interception、preflight/redirect failure 生命周期、request header HashMap 表达能力或 wire/TLS 校准；OB-012 保持未关闭。
+
+Continue 切片基于 `6883189e03dcc9832837477c0e1902606ade0c76`。最终 render CLI SHA-256：`4714190ac81d6a3194acd073429749c1f0f821e424f0650646b09157de32384f`（118948192 bytes）。本机验证日志为 `/tmp/ob012-continue-focused-final.log`、`/tmp/ob012-continue-no-render-focused.log`、`/tmp/ob012-continue-root-final.log`、`/tmp/ob012-continue-runtime.log`、`/tmp/ob012-continue-build-{minimal,stealth,render}.log`、`/tmp/ob012-continue-obstacle.log`、`/tmp/ob012-continue-playwright-validate.log`；完整 smoke JSON 与原始协议日志位于 `/tmp/ob012-continue-smoke-6inj3S/`。这些临时证据不入 Git、不保证长期保存；本轮未重跑渲染 top/bottom 现场对照、TLS/H2 wire capture 或真实网站验收。
 
 本次未运行：Linux 原生验证、完整官方客户端矩阵、WPT、24h 长稳、受控性能/TLS/H2 测量、Docker 构建、Southwest/ZG 现场流程和报价对照。没有新的生产发布或部署结论。
 
 ### 构建与证据定位
 
-本次 render CLI SHA-256：`8de422416c94b684f3d3752c4b10b86495b427f1fb08e187885fee22551c754c`（118901344 bytes）。
+此前 Fulfill 切片 render CLI SHA-256：`8de422416c94b684f3d3752c4b10b86495b427f1fb08e187885fee22551c754c`（118901344 bytes）。
 
 - 根 Cargo.lock SHA-256：`813ac17dfae3d60a779ee6d892d9989bbb92c7f18b3bc4f16bb569868f280343`。
 - runtime/Cargo.lock SHA-256：`279f5b950dbb6d03500cf231fc5554e704f762804e81fc7fbccacde4a720ccf7`。

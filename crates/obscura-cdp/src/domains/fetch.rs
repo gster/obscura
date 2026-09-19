@@ -18,7 +18,7 @@ pub enum FetchResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        post_data: Option<String>,
+        post_data: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
@@ -119,6 +119,7 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
+            let post_data = crate::server::parse_continue_post_data(params)?;
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
                     url: params
@@ -132,10 +133,7 @@ pub async fn handle(
                     // Honor client header overrides (route.continue({ headers }))
                     // — parity with server.rs handle_fetch_resolution (#919).
                     headers: crate::server::parse_cdp_headers(params),
-                    post_data: params
-                        .get("postData")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    post_data,
                 });
             }
             Ok(json!({}))
@@ -668,6 +666,34 @@ mod tests {
                 assert_eq!(headers, Some(expected), "continue must forward header overrides");
             }
             _ => panic!("expected FetchResolution::Continue"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn continue_post_data_domain_preserves_bytes_and_retryable_errors() {
+        let mut ctx = CdpContext::new();
+        for (value, expected) in [(Some(json!("AP8A/w==")), Some(vec![0, 255, 0, 255])),
+            (Some(json!("")), Some(vec![])), (None, None)] {
+            let mut rx = pause(&mut ctx, "continued");
+            for invalid in [json!("%"), json!("AP8"), json!("AP8=\n"), json!("AP9="), json!(7), json!(null), json!("%") ] {
+                let request = serde_json::from_value(json!({"id":1,"method":"Fetch.continueRequest",
+                    "params":{"requestId":"continued","postData":invalid}})).unwrap();
+                let response = crate::dispatch::dispatch(&request, &mut ctx).await;
+                assert_eq!(response.error.unwrap().code, -32602);
+                assert!(ctx.fetch_intercept.paused.contains_key("continued"));
+                assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            }
+            let mut params = json!({"requestId":"continued","url":"https://example.com/new","method":"PUT",
+                "headers":[{"name":"Authorization","value":"Bearer complete-secret"}]});
+            if let Some(value) = value { params["postData"] = value; }
+            let request = serde_json::from_value(json!({"id":2,"method":"Fetch.continueRequest","params":params})).unwrap();
+            assert!(crate::dispatch::dispatch(&request, &mut ctx).await.error.is_none());
+            let FetchResolution::Continue { post_data, url, method, headers } = rx.try_recv().unwrap() else { panic!("expected continue") };
+            assert_eq!(post_data, expected);
+            assert_eq!(url.as_deref(), Some("https://example.com/new"));
+            assert_eq!(method.as_deref(), Some("PUT"));
+            assert_eq!(headers.unwrap()["Authorization"], "Bearer complete-secret");
+            assert!(ctx.fetch_intercept.paused.is_empty());
         }
     }
 

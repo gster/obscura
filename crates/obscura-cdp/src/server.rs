@@ -1323,6 +1323,17 @@ pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<St
     )
 }
 
+// CDP binary fields use standard base64. Validate before taking the resolver
+// so callers can correct malformed input and retry the same paused request.
+pub(crate) fn parse_continue_post_data(params: &serde_json::Value) -> Result<Option<Vec<u8>>, String> {
+    use base64::Engine as _;
+    params.get("postData").map(|value| {
+        let encoded = value.as_str().ok_or("postData must be a base64 string")?;
+        base64::engine::general_purpose::STANDARD.decode(encoded)
+            .map_err(|_| "postData must be valid base64".to_string())
+    }).transpose()
+}
+
 fn parse_fulfill_headers(params: &serde_json::Value) -> Result<obscura_net::HeaderCapture, String> {
     use base64::Engine as _;
     let mut fields = Vec::new();
@@ -1396,11 +1407,25 @@ fn handle_fetch_resolution(
             return false;
         }
 
-        // Validate synthetic fields before consuming the pause so malformed
-        // input can be corrected without stranding the in-flight fetch.
-        let fulfilled_response = if method == "Fetch.fulfillRequest" && intercepted_paused.contains_key(request_id) {
-            match parse_fulfill_resolution(&req.params) {
-                Ok(response) => Some(response),
+        // Validate fields before consuming the pause so malformed input can
+        // be corrected without stranding the in-flight fetch.
+        let parsed_resolution = if intercepted_paused.contains_key(request_id) {
+            let result = match method {
+                "Fetch.continueRequest" => parse_continue_post_data(&req.params).map(|body| {
+                    obscura_js::ops::InterceptResolution::Continue {
+                        url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        headers: parse_cdp_headers(&req.params),
+                        body,
+                    }
+                }),
+                "Fetch.fulfillRequest" => parse_fulfill_resolution(&req.params),
+                _ => Ok(obscura_js::ops::InterceptResolution::Fail {
+                    reason: req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string(),
+                }),
+            };
+            match result {
+                Ok(resolution) => Some(resolution),
                 Err(message) => {
                     let response = CdpResponse::error(req.id, -32602, message, req.session_id);
                     if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
@@ -1410,25 +1435,7 @@ fn handle_fetch_resolution(
         } else { None };
         if let Some(resolver) = intercepted_paused.remove(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
-            let resolution = match method {
-                "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
-                    // Honor the client's overrides (Playwright route.continue,
-                    // Puppeteer request.continue). op_fetch_url applies each and
-                    // re-validates a rewritten URL through the SSRF gate. Leaving
-                    // these None silently sent the request unmodified (issue #365).
-                    url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    headers: parse_cdp_headers(&req.params),
-                    body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                },
-                "Fetch.fulfillRequest" => fulfilled_response.expect("validated fulfill response"),
-                "Fetch.failRequest" => {
-                    let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
-                    obscura_js::ops::InterceptResolution::Fail { reason }
-                }
-                _ => return false,
-            };
-            let _ = resolver.send(resolution);
+            let _ = resolver.send(parsed_resolution.expect("validated fetch resolution"));
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
@@ -2084,6 +2091,156 @@ mod tests {
     #[test]
     fn parse_cdp_headers_absent_is_none() {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
+    }
+
+    #[test]
+    fn continue_post_data_server_preserves_bytes_and_retryable_errors() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        for (value, expected) in [(Some(json!("AP8A/w==")), Some(vec![0, 255, 0, 255])),
+            (Some(json!("")), Some(vec![])), (None, None)] {
+            let (resolver, mut resolved) = tokio::sync::oneshot::channel();
+            let mut paused = HashMap::from([("continued".to_string(), resolver)]);
+            for invalid in [json!("%"), json!("AP8"), json!("AP8=\n"), json!("AP9="), json!(7), json!(null), json!("%") ] {
+                let command = json!({"id":1,"sessionId":"session","method":"Fetch.continueRequest",
+                    "params":{"requestId":"continued","postData":invalid}}).to_string();
+                assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+                let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32602);
+                assert_eq!(reply["sessionId"], "session");
+                assert!(paused.contains_key("continued"));
+                assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            }
+            let mut params = json!({"requestId":"continued","url":"https://example.com/new","method":"PUT",
+                "headers":[{"name":"Authorization","value":"Bearer complete-secret"}]});
+            if let Some(value) = value { params["postData"] = value; }
+            let command = json!({"id":2,"method":"Fetch.continueRequest","params":params}).to_string();
+            assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+            let obscura_js::ops::InterceptResolution::Continue { body, url, method, headers } = resolved.try_recv().unwrap() else { panic!("expected continue") };
+            assert_eq!(body, expected);
+            assert_eq!(url.as_deref(), Some("https://example.com/new"));
+            assert_eq!(method.as_deref(), Some("PUT"));
+            assert_eq!(headers.unwrap()["Authorization"], "Bearer complete-secret");
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert!(reply.get("error").is_none());
+            assert!(paused.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn continue_post_data_js_and_worker_send_exact_transport_bytes() {
+        use base64::Engine as _;
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        let binary: Vec<u8> = (0..1025).map(|i| (i % 256) as u8).collect();
+        let expected_binary = binary.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut seen = Vec::new();
+            while seen.len() < 7 && std::time::Instant::now() < deadline {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2)); continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut buf = [0; 2048];
+                    let count = socket.read(&mut buf).unwrap();
+                    assert!(count > 0); request.extend_from_slice(&buf[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") { break end + 4; }
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap().to_string();
+                let length = headers.lines().filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap()).unwrap_or(0);
+                while request.len() < header_end + length {
+                    let mut buf = [0; 2048]; let count = socket.read(&mut buf).unwrap();
+                    assert!(count > 0); request.extend_from_slice(&buf[..count]);
+                }
+                let path = headers.split_whitespace().nth(1).unwrap();
+                let body = &request[header_end..header_end + length];
+                if path.ends_with("/binary") {
+                    assert!(headers.starts_with("PUT "));
+                    assert!(headers.to_ascii_lowercase().contains("authorization: bearer complete-secret\r\n"));
+                    assert_eq!(body, expected_binary);
+                } else if path.ends_with("/empty") {
+                    assert!(headers.starts_with("POST ")); assert!(body.is_empty());
+                } else if path.ends_with("/original") {
+                    assert!(headers.starts_with("POST ")); assert_eq!(body, [0, 254, 255, 65]);
+                } else { assert_eq!(path, "http://continue.test/"); assert!(body.is_empty()); }
+                if seen.len() > 0 { assert!(headers.to_ascii_lowercase().contains("cookie: session=complete-secret\r\n")); }
+                seen.push(path.to_string());
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: session=complete-secret; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+            }
+            assert_eq!(seen.len(), 7, "all page/Worker requests must reach transport: {seen:?}");
+            for path in ["binary", "empty", "original"] {
+                assert_eq!(seen.iter().filter(|url| url.ends_with(path)).count(), 2);
+            }
+        });
+        let mut page_ctx = crate::dispatch::CdpContext::new();
+        page_ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("continue-body".into(), Some(proxy)));
+        let page_id = page_ctx.create_page();
+        let page = page_ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("http://continue.test/").await.unwrap();
+        let mut requests = page.enable_interception();
+        let mut resolver_ctx = crate::dispatch::CdpContext::new();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let respond = async {
+            for _ in 0..6 {
+                let request = requests.recv().await.unwrap();
+                let mut params = json!({"requestId":request.request_id});
+                if request.url.ends_with("/rewrite") {
+                    params["url"] = json!("http://continue.test/binary");
+                    params["method"] = json!("PUT");
+                    params["headers"] = json!([{"name":"Authorization","value":"Bearer complete-secret"}]);
+                    params["postData"] = json!(base64::engine::general_purpose::STANDARD.encode(&binary));
+                } else if request.url.ends_with("/empty") { params["postData"] = json!(""); }
+                let mut paused = HashMap::from([(request.request_id.clone(), request.resolver)]);
+                // Retrying invalid data must neither send nor lose the actual JS/Worker request.
+                for _ in 0..2 {
+                    let command = json!({"id":1,"method":"Fetch.continueRequest","params":{
+                        "requestId":request.request_id,"postData":"%"}}).to_string();
+                    assert!(handle_fetch_resolution(&command, &mut resolver_ctx, &reply_tx, &mut paused));
+                    let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+                    assert_eq!(reply["error"]["code"], -32602); assert_eq!(paused.len(), 1);
+                }
+                let command = json!({"id":2,"method":"Fetch.continueRequest","params":params}).to_string();
+                assert!(handle_fetch_resolution(&command, &mut resolver_ctx, &reply_tx, &mut paused));
+                let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+                assert!(reply.get("error").is_none()); assert!(paused.is_empty());
+            }
+        };
+        let result = page.evaluate_for_cdp(r#"(async () => {
+            async function sendBodies() {
+                const results = [];
+                for (const path of ['rewrite', 'empty', 'original']) {
+                    results.push(await (await fetch('http://continue.test/' + path,
+                        {method:'POST', credentials:'include', body:new Uint8Array([0,254,255,65])})).text());
+                }
+                return results;
+            }
+            const parent = await sendBodies();
+            const worker = new Worker(URL.createObjectURL(new Blob([
+                sendBodies.toString() + '; sendBodies().then(postMessage);'
+            ], {type:'application/javascript'})));
+            const child = await new Promise(resolve => { worker.onmessage = e => resolve(e.data); });
+            worker.terminate();
+            return [parent, child];
+        })()"#, true, true);
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(result, respond)
+        }).await.expect("Page/Worker Continue requests must complete within 15 seconds, including transport and interception");
+        assert!(!result.thrown, "{result:?}");
+        assert_eq!(result.value, Some(json!([["ok", "ok", "ok"], ["ok", "ok", "ok"]])));
+        server.join().unwrap();
     }
 
     #[test]
