@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,31 @@ SPEC.loader.exec_module(paired_corpus)
 
 
 class MediaEnvironmentTests(unittest.TestCase):
+    def test_default_persona_must_match_chromium_reference_identity(self):
+        identity = {
+            "userAgent": paired_corpus.CANONICAL_USER_AGENT,
+            "platform": "Win32",
+            "uaPlatform": "Windows",
+        }
+        self.assertTrue(paired_corpus.identity_matches_configured(identity))
+        identity["userAgent"] = identity["userAgent"].replace("145.", "143.")
+        self.assertFalse(paired_corpus.identity_matches_configured(identity))
+
+    def test_obscura_commands_use_context_persona_without_ua_override(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            paired_corpus.subprocess, "run",
+            return_value=mock.Mock(returncode=1, stdout="", stderr="probe failure"),
+        ) as run:
+            paired_corpus.probe_obscura_identity("obscura")
+            paired_corpus.probe_obscura_css_media("obscura")
+            paired_corpus.capture_obscura(
+                "obscura", "https://example.com", Path(directory) / "shot.png",
+                Path(directory) / "capture.log", 900, 1000, 3000,
+            )
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            self.assertNotIn("--user-agent", call.args[0])
+
     def test_canonical_light_default_motion_environment_matches(self):
         self.assertTrue(
             paired_corpus.media_matches_configured(

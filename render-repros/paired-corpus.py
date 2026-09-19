@@ -37,12 +37,11 @@ from check import pair_metrics
 CANONICAL_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/143.0.0.0 Safari/537.36"
+    "Chrome/145.0.0.0 Safari/537.36"
 )
 CANONICAL_PLATFORM = "Win32"
 CANONICAL_UA_PLATFORM = "Windows"
-CANONICAL_UA_PLATFORM_VERSION = "10.0.0"
-CANONICAL_OBSCURA_PROFILE = 0
+CANONICAL_UA_PLATFORM_VERSION = "15.0.0"
 CANONICAL_COLOR_SCHEME = "light"
 # Obscura currently models the default motion preference, not `reduce`.
 CANONICAL_REDUCED_MOTION = "no-preference"
@@ -308,6 +307,14 @@ def diagnostic_text(value):
 
 def media_matches_configured(media):
     return all(media.get(key) is expected for key, expected in EXPECTED_MEDIA_MATCHES.items())
+
+
+def identity_matches_configured(identity):
+    return all(identity.get(key) == expected for key, expected in {
+        "userAgent": CANONICAL_USER_AGENT,
+        "platform": CANONICAL_PLATFORM,
+        "uaPlatform": CANONICAL_UA_PLATFORM,
+    }.items())
 
 
 def parse_scroll_y(value):
@@ -594,10 +601,6 @@ def obscura_environment(width, height, animation_time_ms=None):
         # Match Playwright's 50-second goto allowance. This is the browser
         # engine's millisecond ceiling, distinct from the CLI's seconds unit.
         OBSCURA_NAV_TIMEOUT_MS="50000",
-        # Pin the navigator platform/profile as well as the explicit UA. A
-        # randomized platform changes responsive content and font selection,
-        # making a renderer comparison answer the wrong question.
-        OBSCURA_PROFILE=str(CANONICAL_OBSCURA_PROFILE),
         # Run the paired corpus's read-only state/selector evaluation only after
         # all settle phases and the final scroll reassertion. No event-loop
         # pumping occurs between that evaluation and screenshot paint.
@@ -637,8 +640,6 @@ def probe_obscura_identity(binary):
         binary,
         "fetch",
         "data:text/html,<title>identity-probe</title>",
-        "--user-agent",
-        CANONICAL_USER_AGENT,
         "--eval",
         expression,
         "--timeout",
@@ -658,6 +659,9 @@ def probe_obscura_identity(binary):
             "ok": result.returncode == 0,
             "status": result.returncode,
             "effective": effective,
+            "identity_matches_configured": (
+                identity_matches_configured(effective) if effective else False
+            ),
             "media_matches_configured": (
                 media_matches_configured(effective.get("media", {}))
                 if effective
@@ -687,8 +691,6 @@ def probe_obscura_css_media(binary):
             binary,
             "fetch",
             url,
-            "--user-agent",
-            CANONICAL_USER_AGENT,
             "--screenshot",
             str(screenshot),
             "--timeout",
@@ -750,8 +752,6 @@ def capture_obscura(
         binary,
         "fetch",
         url,
-        "--user-agent",
-        CANONICAL_USER_AGENT,
         "--screenshot",
         str(screenshot),
         "--timeout",
@@ -810,7 +810,7 @@ def capture_obscura(
 def chromium_identity_override(session):
     """Keep request headers and navigator identity aligned with Obscura."""
     match = re.search(r"Chrome/(\d+)", CANONICAL_USER_AGENT)
-    major = int(match.group(1)) if match else 143
+    major = int(match.group(1))
     grease = {
         "brand": (
             "Not"
@@ -2379,7 +2379,7 @@ def main():
             "configured_platform": CANONICAL_PLATFORM,
             "configured_ua_platform": CANONICAL_UA_PLATFORM,
             "configured_ua_platform_version": CANONICAL_UA_PLATFORM_VERSION,
-            "obscura_profile": CANONICAL_OBSCURA_PROFILE,
+            "obscura_identity_source": "immutable default browser-context persona",
         },
         "capture_media": {
             "normalized": True,
@@ -2533,12 +2533,17 @@ def main():
     results_path = out / "results.json"
     write_results(results_path, manifest)
     probes = [
+        ("obscura identity", manifest["obscura_identity_probe"].get("identity_matches_configured")),
         ("obscura JS media", manifest["obscura_identity_probe"].get("media_matches_configured")),
         ("obscura CSS media", manifest["obscura_css_media_probe"].get("ok")),
     ]
     if args.baseline_bin:
         probes.extend(
             [
+                (
+                    "baseline identity",
+                    manifest["baseline_identity_probe"].get("identity_matches_configured"),
+                ),
                 (
                     "baseline JS media",
                     manifest["baseline_identity_probe"].get("media_matches_configured"),
