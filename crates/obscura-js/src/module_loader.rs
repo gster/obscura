@@ -216,6 +216,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // Keeping the guard inside the future makes cancellation/navigation
         // decrement the count through Drop as well as success and failure.
         let activity_guard = is_dyn_import.then(|| activity.begin());
+        let page_state = self.page_state.clone();
         let page_network = match self.page_state.as_ref() {
             Some(weak) => (|| {
                 let state = weak
@@ -270,6 +271,12 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .borrow_mut()
                             .push(found.to_string());
                     }
+                    // Page runtimes expose successful graph fetches through the
+                    // same event/body contract as fetch/XHR. Standalone loaders
+                    // have no owning Page or CDP observation channel.
+                    if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
+                        state.borrow_mut().record_network_response(&resp, "GET", obscura_net::ResourceType::Script);
+                    }
                     let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                     Ok(ModuleSource::new_with_redirect(
                         deno_core::ModuleType::JavaScript,
@@ -298,7 +305,8 @@ mod tests {
         }
     }
 
-    fn proxy(response: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+    fn proxy(response: impl Into<Vec<u8>>) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        let response = response.into();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let thread = std::thread::spawn(move || {
@@ -311,10 +319,39 @@ mod tests {
                 assert!(length > 0);
                 request.extend_from_slice(&buffer[..length]);
             }
-            socket.write_all(response).unwrap();
+            socket.write_all(&response).unwrap();
             request
         });
         (format!("http://{address}"), thread)
+    }
+
+    #[tokio::test]
+    async fn raw_body_store_module_retains_large_undecoded_source_and_success_event() {
+        let mut body = b"export default 7; /*".to_vec();
+        body.extend(vec![b'x'; 2 * 1024 * 1024]);
+        body.extend_from_slice(b"\xff\xe9*/");
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=windows-1252\r\nContent-Length: {}\r\nSet-Cookie: module=secret\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(&body);
+        let (proxy_url, server) = proxy(response);
+        let standalone = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
+        let state = Rc::new(RefCell::new(ObscuraState::new()));
+        state.borrow_mut().stealth_client = standalone.standalone_client.clone();
+        let loader = ObscuraModuleLoader::with_page_state(
+            "http://example.com/", None, &state, state.borrow().import_map.clone());
+        let result = load(&loader, "http://example.com/large.js").await.unwrap();
+        let ModuleSourceCode::String(code) = result.code else { panic!("expected decoded module source") };
+        assert!(code.as_str().ends_with("ÿé*/"));
+        let state = state.borrow();
+        assert_eq!(state.js_network_events.len(), 1);
+        let event = &state.js_network_events[0];
+        assert_eq!(event.resource_type, obscura_net::ResourceType::Script);
+        assert_eq!(event.url, "http://example.com/large.js");
+        assert_eq!(event.body_size, body.len());
+        assert!(event.raw_headers.as_ref().unwrap().fields.iter().any(|field|
+            field.name.eq_ignore_ascii_case(b"set-cookie") && field.value == b"module=secret"));
+        let (stored, _) = state.network_response_bodies.lock().unwrap().get(&event.request_id).unwrap().unwrap();
+        assert_eq!(stored.with_bytes(|bytes| bytes.to_vec()).unwrap(), body);
+        assert!(!server.join().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1924,6 +1924,8 @@ mod tests {
         let proxy = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
+            let text_body = vec![b'w'; 2 * 1024 * 1024 + 31];
+            let binary_body: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             while requests.len() < 5 {
                 assert!(std::time::Instant::now() < deadline, "missing worker requests");
@@ -1955,15 +1957,15 @@ mod tests {
                             child.onmessage = event => { child.terminate(); resolve(event.data); };
                         });
                         Promise.all([
-                            fetch('text', {method: 'POST', body: 'sent'}).then(r => r.text()),
+                            fetch('text', {method: 'POST', body: 'sent'}).then(r => r.text()).then(text => text.length),
                             nested
                         ]).then(postMessage);
                     "#),
                     "/workers/nested.js" => (200, br#"
-                        fetch('binary').then(r => r.arrayBuffer()).then(bytes => postMessage(Array.from(new Uint8Array(bytes))));
+                        fetch('binary').then(r => r.arrayBuffer()).then(bytes => { const b = new Uint8Array(bytes); postMessage([b.length, b[0], b[b.length-1]]); });
                     "#),
-                    "/workers/text" => (201, b"worker-text"),
-                    "/workers/binary" => (200, &[0, 128, 255, 16]),
+                    "/workers/text" => (201, &text_body),
+                    "/workers/binary" => (200, &binary_body),
                     _ => panic!("unexpected request: {path}"),
                 };
                 stream.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -1998,7 +2000,7 @@ mod tests {
             worker.onerror = reject;
         })"#, true, true).await;
         assert!(!result.thrown, "{result:?}");
-        assert_eq!(result.value, Some(json!(["worker-text", [0, 128, 255, 16]])));
+        assert_eq!(result.value, Some(json!([2 * 1024 * 1024 + 31, [2 * 1024 * 1024 + 17, 0, 16]])));
         page.sync_js_network_events();
         let events: Vec<_> = page.network_events.drain(..).collect();
         assert_eq!(events.len(), 4, "both workers must report to their owning page");
@@ -2054,10 +2056,11 @@ mod tests {
         }
         let binary = events.iter().find(|event| event.url.ends_with("/binary")).unwrap();
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": binary.request_id}), &mut ctx, &session).await.unwrap();
-        assert_eq!(body, json!({"body": "AID/EA==", "base64Encoded": true}));
+        let binary_bytes: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
+        assert_eq!(body, json!({"body": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &binary_bytes), "base64Encoded": true}));
         let text = events.iter().find(|event| event.url.ends_with("/text")).unwrap();
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": text.request_id}), &mut ctx, &session).await.unwrap();
-        assert_eq!(body, json!({"body": "worker-text", "base64Encoded": false}));
+        assert_eq!(body, json!({"body": "w".repeat(2 * 1024 * 1024 + 31), "base64Encoded": false}));
         // Navigation-time Fetch observations use the same completed capture.
         // A live pre-transport pause cannot have transport headers yet.
         ctx.pending_events.clear();

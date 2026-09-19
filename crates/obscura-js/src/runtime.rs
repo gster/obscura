@@ -2094,24 +2094,38 @@ impl ObscuraJsRuntime {
             }));
     }
 
+    /// Legacy whole-body API. Protocol users should use the raw result API so
+    /// budget, I/O and consumed-body errors remain distinguishable.
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
-        self.state
-            .borrow()
-            .network_response_bodies
-            .get(request_id)
-            .cloned()
+        let (body, _) = self.get_network_response_body_result(request_id)?.ok()?;
+        body.with_bytes(crate::ops::stored_network_response_body).ok()
+    }
+
+    pub fn get_network_response_body_result(&self, request_id: &str) -> Option<Result<(obscura_net::response_body::ResponseBody, bool), obscura_net::response_body::ResponseBodyError>> {
+        self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
     }
 
     pub fn take_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        self.take_network_response_body_result(request_id)?.ok()?
+            .with_bytes(crate::ops::stored_network_response_body).ok()
+    }
+
+    pub fn take_network_response_body_result(&self, request_id: &str) -> Option<Result<obscura_net::response_body::ResponseBody, obscura_net::response_body::ResponseBodyError>> {
+        self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).take(request_id)
+    }
+
+    /// Install the owner store before starting scripts or workers.
+    pub fn set_network_response_body_store(&self,
+        store: std::sync::Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
         let mut state = self.state.borrow_mut();
-        state.network_response_body_order.retain(|id| id != request_id);
-        state.network_response_bodies.remove(request_id)
+        state.network_response_bodies = store;
+        state.network_response_body_counter = counter;
     }
 
     pub fn clear_network_response_bodies(&self) {
-        let mut state = self.state.borrow_mut();
-        state.network_response_bodies.clear();
-        state.network_response_body_order.clear();
+        self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Wire up the interception channel without enabling interception.
@@ -6734,6 +6748,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn raw_body_store_fetch_xhr_large_text_binary_and_stream_survive_runtime_drop() {
+        let text = vec![b'x'; 2 * 1024 * 1024 + 31];
+        let binary: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
+        let invalid = vec![0xff, 0xe9, 0];
+        let (proxy, server) = standalone_proxy(vec![
+            ("Content-Type: text/plain\r\n".into(), text.clone()),
+            ("Content-Type: application/octet-stream\r\n".into(), binary.clone()),
+            ("Content-Type: text/plain\r\n".into(), invalid.clone()),
+        ]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const text = await (await fetch('/text')).text();
+            const binary = await new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest(); xhr.open('GET', '/binary'); xhr.responseType = 'arraybuffer';
+                xhr.onload = () => resolve(new Uint8Array(xhr.response)); xhr.onerror = reject; xhr.send();
+            });
+            const invalid = new Uint8Array(await (await fetch('/invalid')).arrayBuffer());
+            return [text.length, text[0], text[text.length - 1], binary.length,
+                binary[0], binary[binary.length - 1], Array.from(invalid)];
+        }"#, None, &[], true, true).await.unwrap();
+        assert!(!result.thrown, "{result:?}");
+        assert_eq!(result.value.unwrap(), serde_json::json!([text.len(), "x", "x", binary.len(), 0, 16, invalid]));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 3);
+        for (event, expected) in events.iter().zip([&text, &binary, &invalid]) {
+            let (body, _) = rt.get_network_response_body_result(&event.request_id).unwrap().unwrap();
+            assert_eq!(body.with_bytes(|bytes| bytes.to_vec()).unwrap(), *expected);
+        }
+        let binary_id = &events[1].request_id;
+        rt.state.borrow().network_response_bodies.lock().unwrap().alias(binary_id, "stream-alias").unwrap();
+        let stream = rt.take_network_response_body_result("stream-alias").unwrap().unwrap();
+        assert!(matches!(rt.get_network_response_body_result(binary_id),
+            Some(Err(obscura_net::response_body::ResponseBodyError::Consumed))));
+        rt.clear_network_response_bodies();
+        assert!(rt.get_network_response_body_result(binary_id).is_none());
+        drop(rt);
+        assert_eq!(stream.read(2 * 1024 * 1024 - 3, 64).unwrap(), binary[2 * 1024 * 1024 - 3..]);
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_body_store_budget_error_keeps_fetch_semantics_and_clear_recovers() {
+        let (proxy, server) = standalone_proxy(vec![(String::new(), b"large".to_vec()), (String::new(), b"ok".to_vec())]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        *rt.state.borrow().network_response_bodies.lock().unwrap() =
+            obscura_net::response_body::ResponseBodyStore::new(obscura_net::response_body::ResponseBodyLimits {
+                memory_threshold: 0, total_bytes: 4, entries: 1,
+            });
+        let first = rt.call_function_on_for_cdp("async () => (await fetch('/over-budget')).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(first.value.unwrap(), serde_json::json!("large"));
+        let id = rt.take_js_network_events().pop().unwrap().request_id;
+        assert!(matches!(rt.get_network_response_body_result(&id),
+            Some(Err(obscura_net::response_body::ResponseBodyError::BudgetExceeded { .. }))));
+        assert!(matches!(rt.take_network_response_body_result(&id),
+            Some(Err(obscura_net::response_body::ResponseBodyError::BudgetExceeded { .. }))));
+        rt.clear_network_response_bodies();
+        let second = rt.call_function_on_for_cdp("async () => (await fetch('/after-clear')).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(second.value.unwrap(), serde_json::json!("ok"));
+        let id = rt.take_js_network_events().pop().unwrap().request_id;
+        assert_eq!(rt.get_network_response_body(&id).unwrap().body, "ok");
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_body_store_nested_worker_large_body_uses_owner_store() {
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
+        let (proxy, server) = standalone_proxy(vec![(String::new(), bytes.clone())]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        // Bind the parent transport before workers inherit it.
+        rt.state.borrow_mut().ensure_persona_transport();
+        rt.execute_script("nested-worker-body", r#"
+            globalThis.__largeWorkerBody = null;
+            const childSource = `fetch('http://standalone.test/binary').then(r=>r.arrayBuffer()).then(b=> {
+                const bytes = new Uint8Array(b); postMessage([bytes.length, bytes[0], bytes[bytes.length-1]]);
+            });`;
+            const parentSource = `const child = new Worker(URL.createObjectURL(new Blob([${JSON.stringify(childSource)}])));
+                child.onmessage = e => { postMessage(e.data); child.terminate(); };`;
+            const worker = new Worker(URL.createObjectURL(new Blob([parentSource])));
+            worker.onmessage = e => { __largeWorkerBody = e.data; worker.terminate(); };
+        "#).unwrap();
+        rt.run_event_loop_bounded(3000).await.unwrap();
+        assert_eq!(rt.evaluate("__largeWorkerBody").unwrap(), serde_json::json!([bytes.len(), 0, 16]));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        let (body, _) = rt.get_network_response_body_result(&events[0].request_id).unwrap().unwrap();
+        assert_eq!(body.with_bytes(|bytes| bytes.to_vec()).unwrap(), bytes);
+        assert_eq!(events[0].resource_type, obscura_net::ResourceType::Fetch);
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn standalone_fetch_xhr_preflight_share_persona_proxy_cookies_and_binary_bodies() {
         let cors = "Access-Control-Allow-Origin: http://standalone.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: x-proof\r\n";
         let binary = vec![0, 128, 255, 16];
@@ -6768,7 +6873,7 @@ mod tests {
         assert_eq!(events.len(), 3);
         for event in events {
             assert_eq!(event.body_size, 4);
-            let body = rt.state.borrow().network_response_bodies[&event.request_id].clone();
+            let body = rt.get_network_response_body(&event.request_id).unwrap();
             assert_eq!(body.body, "AID/EA==");
             assert!(body.base64_encoded);
         }

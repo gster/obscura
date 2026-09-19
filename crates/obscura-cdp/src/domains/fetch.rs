@@ -241,6 +241,100 @@ mod tests {
         rx
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_body_store_js_module_cdp_reads_stream_drop_and_budget_errors() {
+        use base64::Engine as _;
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        let text = vec![b'x'; 2 * 1024 * 1024 + 31];
+        let binary: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
+        let mut module = b"export default 7; /*".to_vec();
+        module.extend(vec![b'x'; 2 * 1024 * 1024]);
+        module.extend_from_slice(b"\xff*/");
+        let responses = vec![
+            ("/", "text/html", b"<html></html>".to_vec()),
+            ("/text", "text/plain", text.clone()),
+            ("/binary", "application/octet-stream", binary.clone()),
+            ("/module.js", "text/javascript", module.clone()),
+            ("/budget", "text/plain", b"denied".to_vec()),
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (path, content_type, body) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0); request.extend_from_slice(&buffer[..count]);
+                }
+                assert!(String::from_utf8_lossy(&request).starts_with(&format!("GET http://body.test{path} HTTP/1.1\r\n")));
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+                socket.write_all(&body).unwrap();
+            }
+        });
+        let mut ctx = CdpContext::new();
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("raw-body".into(), Some(proxy)));
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("http://body.test/").await.unwrap();
+        page.network_events.clear();
+        let result = page.evaluate_for_cdp(r#"(async () => {
+            const text = await (await fetch('/text')).text();
+            const binary = await new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest(); xhr.open('GET', '/binary'); xhr.responseType = 'arraybuffer';
+                xhr.onload = () => resolve(xhr.response.byteLength); xhr.onerror = reject; xhr.send();
+            });
+            const module = await import('/module.js');
+            return [text.length, binary, module.default];
+        })()"#, true, true).await;
+        assert!(!result.thrown, "{result:?}");
+        assert_eq!(result.value, Some(json!([text.len(), binary.len(), 7])));
+        page.sync_js_network_events();
+        let events: Vec<_> = page.network_events.drain(..).collect();
+        assert_eq!(events.len(), 3);
+        for (event, bytes) in events.iter().zip([&text, &binary, &module]) {
+            assert_eq!(event.body_size, bytes.len());
+            let value = super::super::network::handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
+            let actual = if value["base64Encoded"] == true {
+                base64::engine::general_purpose::STANDARD.decode(value["body"].as_str().unwrap()).unwrap()
+            } else { value["body"].as_str().unwrap().as_bytes().to_vec() };
+            assert_eq!(&actual, bytes);
+        }
+        assert_eq!(events[2].resource_type, "Script");
+        let request_id = &events[1].request_id;
+        ctx.get_page_mut(&page_id).unwrap().alias_response_body(request_id, "js-alias");
+        let result = handle("takeResponseBodyAsStream", &json!({"requestId": "js-alias"}), &mut ctx, &session).await.unwrap();
+        let stream = result["stream"].as_str().unwrap();
+        let error = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_already_consumed"), "{error}");
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.set_response_body_limits(obscura_net::response_body::ResponseBodyLimits { memory_threshold: 0, total_bytes: 4, entries: 1 });
+        let result = page.evaluate_for_cdp("fetch('/budget').then(r => r.text())", true, true).await;
+        assert_eq!(result.value, Some(json!("denied")));
+        page.sync_js_network_events();
+        let rejected = page.network_events.last().unwrap().request_id.clone();
+        let error = super::super::network::handle("getResponseBody", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_budget_exhausted"), "{error}");
+        let error = handle("takeResponseBodyAsStream", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_budget_exhausted"), "{error}");
+        ctx.get_page_mut(&page_id).unwrap().clear_response_bodies();
+        ctx.remove_page(&page_id);
+        let mut received = Vec::new();
+        loop {
+            let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx).await.unwrap();
+            received.extend(base64::engine::general_purpose::STANDARD.decode(result["data"].as_str().unwrap()).unwrap());
+            if result["eof"] == true { break; }
+        }
+        assert_eq!(received, binary);
+        super::super::io::handle("close", &json!({"handle": stream}), &mut ctx).await.unwrap();
+        server.join().unwrap();
+    }
+
     #[tokio::test]
     async fn response_body_stream_spool_is_once_and_survives_page_drop() {
         use base64::Engine as _;

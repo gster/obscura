@@ -119,14 +119,13 @@ impl Size for WorkerEvent {
         match self {
             Self::Script(value) => value.len(),
             Self::Observations(value) => {
-                let network: usize = value.network.iter().map(|(event, body)| {
+                let network: usize = value.network.iter().map(|event| {
                     std::mem::size_of_val(event) + event.request_id.len() + event.url.len() + event.method.len()
                         + event.response_headers.iter().map(|(k,v)| k.len() + v.len()).sum::<usize>()
                         + event.raw_headers.iter().chain(event.request_raw_headers.iter())
                             .map(|capture| capture.fields.iter().map(|field|
                                 std::mem::size_of_val(field) + field.name.len() + field.value.len()
                             ).sum::<usize>()).sum::<usize>()
-                        + body.as_ref().map_or(0, |body| body.body.len())
                 }).sum();
                 let runtime: usize = value.runtime.iter().map(|event| match event {
                     crate::ops::RuntimeEvent::Console(event) => event.kind.len() + event.args.iter().map(|arg| arg.to_string().len()).sum::<usize>(),
@@ -141,7 +140,8 @@ impl Size for WorkerEvent {
 
 #[derive(Default)]
 struct WorkerObservations {
-    network: Vec<(crate::ops::JsNetworkEvent, Option<crate::ops::StoredNetworkResponseBody>)>,
+    // Bodies stay in the shared bounded raw store; only metadata traverses queues.
+    network: Vec<crate::ops::JsNetworkEvent>,
     urls: Vec<String>,
     console: Vec<String>,
     runtime: Vec<crate::ops::RuntimeEvent>,
@@ -150,13 +150,8 @@ struct WorkerObservations {
 pub(crate) fn flush_observations(state: &OpState) {
     let Some(endpoint) = state.try_borrow::<WorkerEndpoint>() else { return; };
     let mut worker = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow_mut();
-    let events = std::mem::take(&mut worker.js_network_events);
     let mut observations = WorkerObservations::default();
-    for event in events {
-        let body = worker.network_response_bodies.remove(&event.request_id);
-        observations.network.push((event, body));
-    }
-    worker.network_response_body_order.clear();
+    observations.network = std::mem::take(&mut worker.js_network_events);
     observations.urls = std::mem::take(&mut worker.fetched_urls);
     observations.console = worker.pending_console_messages.drain(..).collect();
     observations.runtime = worker.pending_runtime_events.drain(..).collect();
@@ -177,18 +172,7 @@ pub(crate) fn flush_observations(state: &OpState) {
 
 impl WorkerObservations {
     fn deliver(self, parent: &mut crate::ops::ObscuraState) {
-        for (event, body) in self.network {
-            if let Some(body) = body {
-                parent.network_response_body_order.push_back(event.request_id.clone());
-                parent.network_response_bodies.insert(event.request_id.clone(), body);
-            }
-            parent.js_network_events.push(event);
-        }
-        while parent.network_response_body_order.len() > crate::ops::response_body_entry_limit() {
-            if let Some(id) = parent.network_response_body_order.pop_front() {
-                parent.network_response_bodies.remove(&id);
-            }
-        }
+        parent.js_network_events.extend(self.network);
         let excess = parent.js_network_events.len().saturating_sub(4096);
         parent.js_network_events.drain(..excess);
         parent.fetched_urls.extend(self.urls);
@@ -218,6 +202,7 @@ struct WorkerConfig {
     intercept_enabled: bool,
     intercept_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     response_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    response_bodies: std::sync::Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     console_enabled: bool,
     runtime_events_enabled: bool,
@@ -904,6 +889,7 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         blocked_urls: parent.blocked_urls.clone(), referrer_policy: parent.referrer_policy,
         intercept_tx: parent.intercept_tx.clone(), intercept_enabled: parent.intercept_enabled,
         intercept_counter: parent.intercept_counter.clone(), response_counter: parent.network_response_body_counter.clone(),
+        response_bodies: parent.network_response_bodies.clone(),
         in_flight: parent.page_in_flight.clone(), console_enabled: parent.console_messages_enabled,
         runtime_events_enabled: parent.runtime_events_enabled,
     };
@@ -952,6 +938,7 @@ async fn run_worker(id: u32, config: WorkerConfig,
         state.intercept_enabled = config.intercept_enabled;
         state.intercept_counter = config.intercept_counter;
         state.network_response_body_counter = config.response_counter;
+        state.network_response_bodies = config.response_bodies;
         state.page_in_flight = config.in_flight;
         state.console_messages_enabled = config.console_enabled;
         state.runtime_events_enabled = config.runtime_events_enabled;
@@ -1194,16 +1181,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_body_store_and_handle_are_thread_safe() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<obscura_net::response_body::ResponseBody>();
+        send_sync::<obscura_net::response_body::ResponseBodyStore>();
+    }
+
+    #[test]
     fn worker_observation_queue_accounts_for_raw_header_fields() {
         let mut event = crate::ops::JsNetworkEvent {
             request_id: "fetch-1".into(), url: "http://example.test/".into(), method: "GET".into(),
             resource_type: obscura_net::ResourceType::Fetch, status: 200,
             response_headers: HashMap::new(), raw_headers: None, request_raw_headers: None,
-            body_size: 0, timestamp: 0.0,
+            body_size: 256 * 1024 * 1024, timestamp: 0.0,
         };
         let size_without_headers = WorkerEvent::Observations(WorkerObservations {
-            network: vec![(event.clone(), None)], ..Default::default()
+            network: vec![event.clone()], ..Default::default()
         }).queued_bytes();
+        assert!(size_without_headers < 1024, "spooled bodies must not exhaust the metadata queue");
         event.request_raw_headers = Some(obscura_net::HeaderCapture {
             capture_stage: "transportRequest", encoding: "base64",
             fields: vec![
@@ -1216,7 +1211,7 @@ mod tests {
             fields: vec![obscura_net::RawHeader { name: b"x-bytes".to_vec(), value: b"\x80\xff".to_vec() }],
         });
         let size_with_headers = WorkerEvent::Observations(WorkerObservations {
-            network: vec![(event, None)], ..Default::default()
+            network: vec![event], ..Default::default()
         }).queued_bytes();
         assert_eq!(size_with_headers - size_without_headers,
             3 * std::mem::size_of::<obscura_net::RawHeader>() + 6 + 10 + 6 + 11 + 7 + 2);

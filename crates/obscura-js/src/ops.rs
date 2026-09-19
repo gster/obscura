@@ -71,7 +71,7 @@ pub struct StoredNetworkResponseBody {
     pub base64_encoded: bool,
 }
 
-fn stored_network_response_body(bytes: &[u8]) -> StoredNetworkResponseBody {
+pub(crate) fn stored_network_response_body(bytes: &[u8]) -> StoredNetworkResponseBody {
     match std::str::from_utf8(bytes) {
         Ok(body) => StoredNetworkResponseBody {
             body: body.to_owned(),
@@ -307,8 +307,7 @@ pub struct ObscuraState {
     pub pending_console_messages: VecDeque<String>,
     pub console_messages_enabled: bool,
     pub runtime_exception_counter: u64,
-    pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
-    pub network_response_body_order: VecDeque<String>,
+    pub network_response_bodies: Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
     pub network_response_body_counter: Arc<std::sync::atomic::AtomicU64>,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
@@ -504,6 +503,41 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
+    /// The successful-response event contract shared by fetch/XHR and modules.
+    /// Redirect hops and failed requests are not synthesized here.
+    pub(crate) fn record_network_response(&mut self, response: &obscura_net::Response,
+        method: &str, resource_type: obscura_net::ResourceType,
+    ) -> String {
+        let id = self.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let request_id = format!("fetch-{id}");
+        // Retention failures are sticky and returned by the CDP result APIs;
+        // they must not change the page's fetch/XHR response semantics.
+        let _ = self.network_response_bodies.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(request_id.clone(), &response.body, false);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        self.js_network_events.push(JsNetworkEvent {
+            request_id: request_id.clone(),
+            url: response.url.to_string(),
+            method: method.to_string(),
+            resource_type,
+            status: response.status,
+            response_headers: response.headers.clone(),
+            raw_headers: response.raw_headers.clone(),
+            request_raw_headers: response.request_raw_headers.clone(),
+            body_size: response.body.len(),
+            timestamp,
+        });
+        const MAX_JS_NETWORK_EVENTS: usize = 4096;
+        if self.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+            let overflow = self.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+            self.js_network_events.drain(0..overflow);
+        }
+        request_id
+    }
+
     /// Bind the fixed standalone persona once, unless the owning page already
     /// installed its transport. Never derive identity from mutable JS values.
     pub(crate) fn ensure_persona_transport(&mut self) -> Arc<StealthHttpClient> {
@@ -555,8 +589,7 @@ impl ObscuraState {
             pending_console_messages: VecDeque::new(),
             console_messages_enabled: false,
             runtime_exception_counter: 0,
-            network_response_bodies: HashMap::new(),
-            network_response_body_order: VecDeque::new(),
+            network_response_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             network_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
@@ -748,25 +781,10 @@ fn propagate_script_start_state(
     started.borrow_mut().extend(additions);
 }
 
-pub(crate) fn response_body_entry_limit() -> usize {
-    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128)
-}
-
-fn response_body_byte_limit() -> usize {
-    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2 * 1024 * 1024)
-}
-
 /// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
 /// `op_fetch_url` reads the whole body, then makes a UTF-8 copy and a base64
 /// copy of it, so an unbounded body OOMs the process. This bounds the initial
-/// read; it is far larger than `response_body_byte_limit()` (which only decides
-/// whether a body is *cached*) because real page fetches can be large.
+/// read; raw response retention separately spools large bodies to disk.
 /// Configurable via `OBSCURA_FETCH_MAX_BODY_BYTES`.
 fn fetch_max_body_bytes() -> usize {
     std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
@@ -4214,44 +4232,7 @@ async fn stealth_fetch_all(
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
-        let id = gs.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let request_id = format!("fetch-{id}");
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                stored_network_response_body(&resp_bytes),
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: current_url.clone(),
-            method: current_method.clone(),
-            resource_type,
-            status,
-            response_headers: resp_headers.clone(),
-            raw_headers: response.raw_headers.clone(),
-            request_raw_headers: response.request_raw_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
+        gs.record_network_response(&response, &current_method, resource_type)
     };
 
     crate::worker::flush_observations(&state.borrow());
