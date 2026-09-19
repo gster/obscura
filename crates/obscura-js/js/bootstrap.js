@@ -4168,7 +4168,9 @@ class Element extends Node {
           return opts[i].getAttribute('value') !== null ? opts[i].getAttribute('value') : opts[i].textContent;
         }
       }
-      if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
+      if (opts.length && !this.hasAttribute('multiple')) {
+        return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
+      }
       return '';
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
@@ -13004,6 +13006,7 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
 }
 // EventTarget was previously re-aliased to Node here; the real interface is
 // declared above and Node extends it.
+const _htmlCollectionLiveSources = new WeakMap();
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;
@@ -13031,24 +13034,69 @@ globalThis.HTMLCollection = class HTMLCollection extends Array {
     if (arr) for (let i = 0; i < arr.length; i++) { if (arr[i]) c[c.length] = arr[i]; }
     return new Proxy(c, _htmlCollectionProxy);
   }
+  static _live(source) {
+    const c = new HTMLCollection();
+    _htmlCollectionLiveSources.set(c, source);
+    return new Proxy(c, _htmlCollectionProxy);
+  }
 };
 _markNative(HTMLCollection.prototype.item);
 _markNative(HTMLCollection.prototype.namedItem);
-// Shared (allocated once) Proxy traps for HTMLCollection named access. Indices,
-// length, and inherited methods resolve normally via Reflect; only an unknown
-// non-numeric string key falls back to namedItem(), so item/namedItem and the
-// Array methods are never shadowed and id="namedItem" cannot recurse.
+// Shared (allocated once) Proxy traps for HTMLCollection named access. Snapshot
+// collections resolve through their stored Array entries. Live collections
+// query length, indices, and iteration on demand. Unknown non-numeric keys fall
+// back to namedItem(), so methods are never shadowed and id="namedItem" cannot
+// recurse.
 const _htmlCollectionProxy = {
   get(t, k, r) {
+    const source = _htmlCollectionLiveSources.get(t);
+    if (source) {
+      if (k === 'length') return source().length;
+      if (typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) return source()[Number(k)];
+      if (k === Symbol.iterator) return function () { return source()[Symbol.iterator](); };
+    }
     const v = Reflect.get(t, k, r);
     if (v !== undefined || typeof k !== "string") return v;
-    return t.namedItem ? (t.namedItem(k) || undefined) : undefined;
+    return t.namedItem ? (t.namedItem.call(r, k) || undefined) : undefined;
   },
   has(t, k) {
     if (Reflect.has(t, k)) return true;
-    return typeof k === "string" && !!(t.namedItem && t.namedItem(k));
+    const source = _htmlCollectionLiveSources.get(t);
+    if (source && typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k)) {
+      return Number(k) < source().length;
+    }
+    if (typeof k !== "string" || !t.namedItem) return false;
+    if (!source) return !!t.namedItem(k);
+    const items = source();
+    for (let i = 0; i < items.length; i++) {
+      const element = items[i];
+      if (element && (element.id === k
+          || (_isHTMLEl(element) && element.getAttribute('name') === k))) return true;
+    }
+    return false;
   },
 };
+const _selectedOptionsCollections = new WeakMap();
+Object.defineProperties(globalThis.HTMLSelectElement.prototype, {
+  multiple: {
+    get() { return this.hasAttribute('multiple'); },
+    set(value) { if (value) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); },
+    enumerable: true,
+    configurable: true,
+  },
+  selectedOptions: {
+    get() {
+      let collection = _selectedOptionsCollections.get(this);
+      if (!collection) {
+        collection = HTMLCollection._live(() => Array.from(this.options).filter(option => option.selected));
+        _selectedOptionsCollections.set(this, collection);
+      }
+      return collection;
+    },
+    enumerable: true,
+    configurable: true,
+  },
+});
 // True for elements in the HTML namespace (the only ones whose name attribute
 // contributes to an HTMLCollection's supported property names).
 function _isHTMLEl(el) {
@@ -19155,7 +19203,7 @@ for (const [name, members] of Object.entries({
   HTMLInputElement: 'accept alt autocomplete checked defaultChecked defaultValue disabled files form formAction formaction formEnctype formMethod formNoValidate formTarget height indeterminate max maxLength min minLength multiple name pattern placeholder readOnly required selectionDirection selectionEnd selectionStart size src step type value valueAsDate valueAsNumber width validity validationMessage willValidate checkValidity reportValidity setCustomValidity select setRangeText setSelectionRange stepDown stepUp',
   HTMLTextAreaElement: 'autocomplete defaultValue disabled form maxLength minLength name placeholder readOnly required selectionDirection selectionEnd selectionStart type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity select setRangeText setSelectionRange',
   HTMLButtonElement: 'disabled form formAction formaction formEnctype formMethod formNoValidate formTarget name type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
-  HTMLSelectElement: 'autocomplete disabled form length multiple name required selectedIndex size type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
+  HTMLSelectElement: 'autocomplete disabled form length multiple name options required selectedIndex selectedOptions size type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
   HTMLOptionElement: 'disabled label selected text value',
   HTMLScriptElement: 'src type text innerText innerHTML textContent async defer crossOrigin integrity referrerPolicy noModule',
   HTMLIFrameElement: 'src srcdoc name width height contentDocument contentWindow',

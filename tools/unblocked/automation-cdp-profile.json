@@ -509,7 +509,7 @@
       "events": "Console and exception events on implemented paths.",
       "scope": "Selected page execution context or remote object.",
       "errors": "Unknown execution contexts fail; malformed option types outside the covered paths are not uniformly rejected.",
-      "evidence": "Official Python smoke page evaluation plus label fill, role click, and select_option locator paths; complete protocol trace; and Rust rejection/result tests."
+      "evidence": "Official Python smoke page evaluation plus label fill, role click, and single/multiple select_option locator paths; complete protocol trace; and Rust rejection/result tests."
     },
     {
       "method": "Runtime.releaseObject",

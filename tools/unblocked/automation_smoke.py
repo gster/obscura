@@ -93,6 +93,7 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                           globalThis.__obscuraLocatorEvents = [];
                           const input = document.querySelector('#name');
                           const select = document.querySelector('#city');
+                          const multiSelect = document.querySelector('#destinations');
                           const button = document.querySelector('#submit');
                           for (const type of ['focus', 'input', 'change']) {
                             input.addEventListener(type, event => {
@@ -102,11 +103,14 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                               });
                             });
                           }
-                          for (const type of ['input', 'change']) {
-                            select.addEventListener(type, event => {
+                          for (const [target, control] of [
+                            ['select', select], ['multi-select', multiSelect]
+                          ]) {
+                            for (const type of ['input', 'change']) control.addEventListener(type, event => {
                               __obscuraLocatorEvents.push({
-                                target: 'select', type, trusted: event.isTrusted,
-                                value: select.value
+                                target, type, trusted: event.isTrusted,
+                                value: control.value,
+                                selected: Array.from(control.selectedOptions, option => option.value)
                               });
                             });
                           }
@@ -120,9 +124,13 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         })()"""
                     )
                     result["selectedOptions"] = None
+                    result["selectedMultipleOptions"] = None
                     try:
                         page.get_by_label("Name").fill("official-playwright")
                         result["selectedOptions"] = page.get_by_label("City").select_option("pek")
+                        result["selectedMultipleOptions"] = page.get_by_label(
+                            "Destinations"
+                        ).select_option(["sha", "can"])
                         page.get_by_role("button", name="Submit").click()
                     finally:
                         try:
@@ -130,6 +138,10 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                                 """({
                                   input: document.querySelector('#name').value,
                                   city: document.querySelector('#city').value,
+                                  destinations: Array.from(
+                                    document.querySelector('#destinations').selectedOptions,
+                                    option => option.value
+                                  ),
                                   result: document.querySelector('#result').textContent,
                                   activeElement: document.activeElement && document.activeElement.id,
                                   events: globalThis.__obscuraLocatorEvents
@@ -148,6 +160,11 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         raise AssertionError(f"locator fill did not update the input: {locator!r}")
                     if result["selectedOptions"] != ["pek"] or locator["city"] != "pek":
                         raise AssertionError(f"locator select did not choose Beijing: {locator!r}")
+                    if (
+                        result["selectedMultipleOptions"] != ["sha", "can"]
+                        or locator["destinations"] != ["sha", "can"]
+                    ):
+                        raise AssertionError(f"locator multi-select did not choose both cities: {locator!r}")
                     if locator["result"] != "official-playwright":
                         raise AssertionError(f"locator click did not update the output: {locator!r}")
                     observed_events = [
@@ -158,6 +175,8 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         ("input", "input"),
                         ("select", "input"),
                         ("select", "change"),
+                        ("multi-select", "input"),
+                        ("multi-select", "change"),
                         ("button", "mousedown"),
                         ("button", "mouseup"),
                         ("button", "click"),
@@ -165,8 +184,47 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                     positions = [observed_events.index(event) for event in required_events]
                     if positions != sorted(positions):
                         raise AssertionError(f"locator events are out of order: {locator!r}")
+                    select_events = [
+                        event
+                        for event in locator["events"]
+                        if event["target"] in {"select", "multi-select"}
+                    ]
+                    expected_select_events = [
+                        {
+                            "target": "select",
+                            "type": "input",
+                            "trusted": False,
+                            "value": "pek",
+                            "selected": ["pek"],
+                        },
+                        {
+                            "target": "select",
+                            "type": "change",
+                            "trusted": False,
+                            "value": "pek",
+                            "selected": ["pek"],
+                        },
+                        {
+                            "target": "multi-select",
+                            "type": "input",
+                            "trusted": False,
+                            "value": "sha",
+                            "selected": ["sha", "can"],
+                        },
+                        {
+                            "target": "multi-select",
+                            "type": "change",
+                            "trusted": False,
+                            "value": "sha",
+                            "selected": ["sha", "can"],
+                        },
+                    ]
+                    if select_events != expected_select_events:
+                        raise AssertionError(
+                            f"locator select events differ from Chrome: {select_events!r}"
+                        )
                     for event in locator["events"]:
-                        expected_trusted = event["target"] != "select"
+                        expected_trusted = event["target"] not in {"select", "multi-select"}
                         if event.get("trusted") is not expected_trusted:
                             raise AssertionError(f"locator event trust differs from Chrome: {locator!r}")
 

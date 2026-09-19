@@ -18156,6 +18156,83 @@ return {before,removed,reinsert,moved,cleared};
         assert_eq!(value["unrelatedElementHasLabel"], false);
     }
 
+    #[test]
+    fn multiple_select_exposes_selected_options_and_keeps_each_selection() {
+        let mut rt = setup_runtime(
+            "<html><body><select id='cities' multiple><option value='sha'>Shanghai</option><option value='pek' selected>Beijing</option><option value='can'>Guangzhou</option></select></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const select = document.getElementById('cities');
+                    const selectedOptions = select.selectedOptions;
+                    const snapshot = () => ({
+                        length: selectedOptions.length,
+                        item0: selectedOptions.item(0)?.value ?? null,
+                        item2: selectedOptions.item(2)?.value ?? null,
+                        values: Array.from(selectedOptions, option => option.value),
+                    });
+                    const initial = {
+                        multiple: select.multiple,
+                        value: select.value,
+                        selected: snapshot(),
+                    };
+                    select.value = undefined;
+                    const clearedValue = select.value;
+                    const cleared = snapshot();
+                    select.options[0].selected = true;
+                    select.options[2].selected = true;
+                    const selected = snapshot();
+                    const hongKong = document.createElement('option');
+                    hongKong.value = 'hkg';
+                    hongKong.text = 'Hong Kong';
+                    hongKong.selected = true;
+                    select.appendChild(hongKong);
+                    const appended = snapshot();
+                    select.removeChild(hongKong);
+                    const removed = snapshot();
+                    return JSON.stringify({
+                        initial,
+                        clearedValue,
+                        cleared,
+                        value: select.value,
+                        selected,
+                        appended,
+                        removed,
+                        states: Array.from(select.options, option => option.selected),
+                        descriptorOwner: Object.hasOwn(HTMLSelectElement.prototype, 'multiple'),
+                        selectedOptionsBrand: selectedOptions instanceof HTMLCollection,
+                        selectedOptionsDescriptorOwner: Object.hasOwn(HTMLSelectElement.prototype, 'selectedOptions'),
+                        selectedOptionsIdentity: selectedOptions === select.selectedOptions,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["initial"]["multiple"], true);
+        assert_eq!(value["initial"]["value"], "pek");
+        assert_eq!(value["initial"]["selected"], serde_json::json!({
+            "length": 1, "item0": "pek", "item2": null, "values": ["pek"]
+        }));
+        assert_eq!(value["clearedValue"], "");
+        assert_eq!(value["cleared"], serde_json::json!({
+            "length": 0, "item0": null, "item2": null, "values": []
+        }));
+        assert_eq!(value["value"], "sha");
+        assert_eq!(value["selected"], serde_json::json!({
+            "length": 2, "item0": "sha", "item2": null, "values": ["sha", "can"]
+        }));
+        assert_eq!(value["appended"], serde_json::json!({
+            "length": 3, "item0": "sha", "item2": "hkg", "values": ["sha", "can", "hkg"]
+        }));
+        assert_eq!(value["removed"], value["selected"]);
+        assert_eq!(value["states"], serde_json::json!([true, false, true]));
+        assert_eq!(value["descriptorOwner"], true);
+        assert_eq!(value["selectedOptionsBrand"], true);
+        assert_eq!(value["selectedOptionsDescriptorOwner"], true);
+        assert_eq!(value["selectedOptionsIdentity"], true);
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]
