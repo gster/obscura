@@ -38,7 +38,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 依赖：OB-001、OB-025。入口：已建立的 tools/unblocked/；与 OB-008 共用开发依赖和结果清单。
 动作：同一合成页面分别跑参考 Chrome 正常启动、Chrome CDP、Obscura CDP；记录方法、参数、事件、session/context、错误与时序。
-完成：记录器能保留因果与相对顺序、规范化随机 ID；失败应能稳定复现并定位首个分歧，全通过则保留通过证据，不人为制造失败；凭据和正文脱敏，采集开关不改变验收结果。
+完成：记录器能保留因果与相对顺序、规范化随机 ID；失败应能稳定复现并定位首个分歧，全通过则保留通过证据，不人为制造失败；内部原始 trace 保留完整请求数据，输出目录由执行方在测试后妥善处理且不进入仓库或产品包；采集开关不改变验收结果。
 
 ### OB-027 · P0 · 发布 Automation CDP Profile 并清理占位成功
 
@@ -339,7 +339,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 状态：未关闭。依赖：OB-012、OB-016、OB-020、OB-023、OB-032。入口：开发侧受控服务端、persona/隔离 fixture、使用方授权的采购验收。
 完成：分别给出 RPA 效率、Chrome 行为/指纹差异、服务端跨身份空间标记/重新关联结果和兼容性代价。受控检查网络头/TLS/H2、存储/缓存/连接残留、时序与多 realm 一致性；不以 DNT、字段数或单个 JA4 分数代替。
-报价对照须固定产品、时点/库存、渠道、币种、网络等条件，身份变量单独控制；内核提供隔离和脱敏证据，采购业务逻辑不进入内核。未做受控报价实验不能声称已消除价格歧视。
+报价对照须固定产品、时点/库存、渠道、币种、网络等条件，身份变量单独控制；内核提供隔离和完整原始证据，采购业务逻辑不进入内核。开发工具不做脱敏或字段裁剪，日志由执行方保管和处理。未做受控报价实验不能声称已消除价格歧视。
 
 ### OB-044 · P0 · stealth 成为不可关闭的底层能力
 
@@ -353,7 +353,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 ### OB-046 · P0 · Southwest shopping 不再 403 的业务验收
 
-状态：未关闭。依赖：OB-012、OB-016、OB-032、OB-044/045；按复现纳入 Cookie、Worker/frame、Beacon、IndexedDB 等对应修复。入口：[Southwest 验收说明](Southwest-handoff.md)、使用方授权查询、开发侧脱敏采集。
+状态：未关闭。依赖：OB-012、OB-016、OB-032、OB-044/045；按复现纳入 Cookie、Worker/frame、Beacon、IndexedDB 等对应修复。入口：[Southwest 验收说明](Southwest-handoff.md)、使用方授权查询、开发侧完整采集。
 完成：同版本/同 OS 对照与同等查询、出口、时段条件下，Chrome 成功，Obscura 自建会话的 shopping 不再 403，响应不是挑战页/软错误且返回有效航班/报价，使用方能消费结果。覆盖新会话与复用会话；执行前固定查询集、轮数、间隔和持续观察窗口，逐轮保留结果，不能凭偶发 200 关闭。
 证据：engine/persona/client/网络条件、查询摘要、状态及错误码、业务结果校验、受控 Chrome 对照、失败/重试全记录；不借用 Chrome Cookie/token，不用模拟/缓存替代真实结果，不执行购票付款。403 重现则保持未关闭并缩减通用差异 fixture。
 此项是项目的重要业务门槛；通过证明该受测流程达到预期，不能单独推导全站/所有身份均无法标记或已消除价格歧视。通用一致性、隐私及性能门禁同时保留。
@@ -370,7 +370,7 @@ Before / after result, exact commands:
 Related regression results and skipped/not-run reasons:
 Resource and security impact:
 Capability/profile/documentation changes:
-Evidence location (sanitized; no credentials or raw session data):
+Evidence location and access/retention handling (raw credentials and session data permitted):
 ```
 
 源码、当次实验与历史结论的边界统一见 [SUMMARY](SUMMARY.md)。最终完成定义是支持清单内的能力可重现通过，而不是实现了多少方法、删了多少行代码或某个网站偶然成功。

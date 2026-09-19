@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "task": "OB-026",
+  "repositoryBaseRevision": "193d19222a00d8009be6ee5db9b4f4e083a86251",
+  "fixtureSha256": "e8e6db859ea7173049889338b8c732e451dab517afbd570cdfb8ca7af4c33934",
+  "platform": {
+    "os": "macOS",
+    "architecture": "arm64",
+    "darwinRelease": "25.6.0"
+  },
+  "client": {
+    "playwrightPython": "1.60.0",
+    "chromium": "148.0.7778.96",
+    "chromiumRevision": "1223"
+  },
+  "obscura": {
+    "engineSourceRevision": "e67e67b11eb265f097942055962622e43fcb9a16",
+    "binarySha256": "ee1c0893bf31a0cf85e41399a8c71535cdf775d0c0b5a6a79abdc32b6df35c2d",
+    "build": "release, render"
+  },
+  "command": "uv run --project tools/unblocked --frozen --python 3.12 python tools/unblocked/cdp_fixture.py --output $RUN_ROOT --obscura-bin target/release/obscura",
+  "collection": {
+    "chromium-launch": "passed",
+    "chromium-cdp": "passed",
+    "obscura-cdp": "passed"
+  },
+  "comparisonStatus": "different",
+  "comparisons": [
+    {
+      "left": "chromium-launch",
+      "right": "chromium-cdp",
+      "equal": false,
+      "firstDivergence": {
+        "entry": 10,
+        "path": "entries[9].params.request.headers.Accept-Language",
+        "left": "<missing>",
+        "right": "en-US,en;q=0.9"
+      }
+    },
+    {
+      "left": "chromium-launch",
+      "right": "obscura-cdp",
+      "equal": false,
+      "firstDivergence": {
+        "entry": 4,
+        "path": "entries[3].params.context.auxData.isDefault",
+        "left": false,
+        "right": true
+      }
+    }
+  ],
+  "repeatability": {
+    "runs": 2,
+    "sameFirstDivergence": true
+  },
+  "result": "difference",
+  "rawTraces": "Full data retained in a disposable output directory; not committed"
+}

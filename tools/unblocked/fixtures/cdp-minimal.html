@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>OB-026 CDP fixture</title>
+  </head>
+  <body>
+    <label for="name">Name</label>
+    <input id="name" value="fixture">
+    <button id="submit" type="button">Submit</button>
+    <output id="result">idle</output>
+    <script>
+      document.querySelector('#submit').addEventListener('click', () => {
+        document.querySelector('#result').textContent = document.querySelector('#name').value;
+      });
+      queueMicrotask(() => {
+        document.documentElement.dataset.ready = 'yes';
+      });
+    </script>
+  </body>
+</html>
