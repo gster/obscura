@@ -14623,29 +14623,19 @@ const _WEBGL_EXTENSIONS = [
   'WEBGL_lose_context', 'WEBGL_multi_draw', 'WEBGL_polygon_mode',
 ];
 
-// A WebGL2 context does NOT report the WebGL1 list. Extensions that became core
-// in WebGL2 (instanced arrays, standard derivatives, depth texture, ...) are
-// gone, and WebGL2-only ones appear. Returning one list for both contexts is a
-// divergence a probe sees immediately: no real browser reports the same
-// supported-extension set for a WebGL1 and a WebGL2 context on one machine.
-const _WEBGL2_EXTENSIONS = [
-  'EXT_clip_control', 'EXT_color_buffer_float', 'EXT_color_buffer_half_float',
-  'EXT_conservative_depth', 'EXT_depth_clamp', 'EXT_disjoint_timer_query_webgl2',
-  'EXT_float_blend', 'EXT_polygon_offset_clamp', 'EXT_render_snorm',
-  'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc',
-  'EXT_texture_filter_anisotropic', 'EXT_texture_mirror_clamp_to_edge',
-  'EXT_texture_norm16', 'KHR_parallel_shader_compile',
-  'NV_shader_noperspective_interpolation', 'OES_draw_buffers_indexed',
-  'OES_sample_variables', 'OES_shader_multisample_interpolation',
-  'OES_texture_float_linear', 'WEBGL_blend_func_extended',
-  'WEBGL_clip_cull_distance', 'WEBGL_compressed_texture_astc',
-  'WEBGL_compressed_texture_etc', 'WEBGL_compressed_texture_etc1',
-  'WEBGL_compressed_texture_pvrtc', 'WEBGL_compressed_texture_s3tc',
-  'WEBGL_compressed_texture_s3tc_srgb', 'WEBGL_debug_renderer_info',
-  'WEBGL_debug_shaders', 'WEBGL_lose_context', 'WEBGL_multi_draw',
-  'WEBGL_polygon_mode', 'WEBGL_provoking_vertex', 'WEBGL_render_shared_exponent',
-  'WEBGL_stencil_texturing',
-];
+// WebGL2 keeps the extensions this software context already exposes, except
+// for WebGL1 extensions whose behavior became part of the WebGL2 core. Do not
+// copy a host GPU's extra extension list here: extension availability belongs
+// to the configured renderer, not the machine used to run a probe.
+const _WEBGL2_CORE_EXTENSIONS = new Set([
+  'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_frag_depth',
+  'EXT_shader_texture_lod', 'OES_element_index_uint',
+  'OES_standard_derivatives', 'OES_texture_float', 'OES_texture_half_float',
+  'OES_vertex_array_object', 'WEBGL_depth_texture', 'WEBGL_draw_buffers',
+]);
+const _WEBGL2_EXTENSIONS = _WEBGL_EXTENSIONS.filter(
+  name => !_WEBGL2_CORE_EXTENSIONS.has(name),
+);
 
 class _SoftwareWebGLContext {
   constructor(canvas, attributes, webgl2) {
@@ -17558,59 +17548,8 @@ if (typeof ImageData === 'undefined') {
   };
 }
 
-// `CanvasRenderingContext2D` is the interface a page sees; `_Canvas2D` is the
-// implementation. Handing the implementation class out as the interface would
-// publish its twelve underscore-prefixed helpers as interface members, which no
-// browser has, and a page can read `getOwnPropertyNames(CanvasRenderingContext2D
-// .prototype)` - so the interface carries the public methods only, and instances
-// are made to satisfy `instanceof` through the class's own hasInstance hook.
-//
-// This used to be an empty stub class, which made a 2D context report
-// `constructor.name === '_Canvas2D'`, fail `instanceof CanvasRenderingContext2D`,
-// and have no methods on the interface prototype at all - three differences a
-// one-line check finds, on the surface the sensor samples most heavily.
 if (typeof CanvasRenderingContext2D === 'undefined') {
-  const _canvas2dProto = _Canvas2D.prototype;
-  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {
-    static [Symbol.hasInstance](value) { return value instanceof _Canvas2D; }
-  };
-  // Symbols are copied too, and not only as a convenience: `Symbol.toStringTag` is
-  // what makes `Object.prototype.toString.call(ctx)` answer
-  // "[object CanvasRenderingContext2D]". Instances inherit from the implementation
-  // prototype, so a tag defined only on the interface prototype would leave every
-  // real context reporting "[object Object]".
-  for (const prop of [
-    ...Object.getOwnPropertyNames(_canvas2dProto),
-    ...Object.getOwnPropertySymbols(_canvas2dProto),
-  ]) {
-    if (prop === 'constructor') continue;
-    if (typeof prop === 'string' && prop.charAt(0) === '_') continue;
-    Object.defineProperty(
-      globalThis.CanvasRenderingContext2D.prototype,
-      prop,
-      Object.getOwnPropertyDescriptor(_canvas2dProto, prop),
-    );
-  }
-  // Instances come from the implementation, so its constructor property has to
-  // name the interface rather than the implementation.
-  Object.defineProperty(_canvas2dProto, 'constructor', {
-    value: globalThis.CanvasRenderingContext2D,
-    writable: true,
-    enumerable: false,
-    configurable: true,
-  });
-  // And so does its toStringTag: `Object.prototype.toString.call(ctx)` walks the
-  // instance's own chain, which reaches _Canvas2D.prototype and never the interface
-  // prototype. Without this a real context answers "[object Object]" whenever the
-  // tag is set on the interface alone.
-  if (!Object.getOwnPropertySymbols(_canvas2dProto).includes(Symbol.toStringTag)) {
-    Object.defineProperty(_canvas2dProto, Symbol.toStringTag, {
-      value: 'CanvasRenderingContext2D',
-      writable: false,
-      enumerable: false,
-      configurable: true,
-    });
-  }
+  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
 }
 
 if (typeof OffscreenCanvas === 'undefined') {

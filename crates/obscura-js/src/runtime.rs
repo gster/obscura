@@ -13045,8 +13045,6 @@ return {before,removed,reinsert,moved,cleared};
                         haveBoth: !!gl1 && !!gl2,
                         ext1: gl1.getSupportedExtensions().slice().sort(),
                         ext2: gl2.getSupportedExtensions().slice().sort(),
-                        count1: gl1.getSupportedExtensions().length,
-                        count2: gl2.getSupportedExtensions().length,
                         // WebGL2-only constants: present on webgl2, absent on webgl1.
                         maxDrawBuffersIn1: 'MAX_DRAW_BUFFERS' in gl1,
                         maxDrawBuffersIn2: 'MAX_DRAW_BUFFERS' in gl2,
@@ -13054,14 +13052,9 @@ return {before,removed,reinsert,moved,cleared};
                         // Extensions that became core in WebGL2 must be gone there.
                         instanced1: gl1.getSupportedExtensions().indexOf('ANGLE_instanced_arrays') !== -1,
                         instanced2: gl2.getSupportedExtensions().indexOf('ANGLE_instanced_arrays') !== -1,
-                        // A WebGL2-only extension must not be advertised by webgl1.
-                        // Measured against this machine's Chrome: these are
-                        // WebGL2-only, whereas WEBGL_multi_draw is in both lists
-                        // and so would prove nothing either way.
-                        colorBufferFloat1: gl1.getSupportedExtensions().indexOf('EXT_color_buffer_float') !== -1,
-                        colorBufferFloat2: gl2.getSupportedExtensions().indexOf('EXT_color_buffer_float') !== -1,
-                        drawBuffersIndexed1: gl1.getSupportedExtensions().indexOf('OES_draw_buffers_indexed') !== -1,
-                        drawBuffersIndexed2: gl2.getSupportedExtensions().indexOf('OES_draw_buffers_indexed') !== -1,
+                        // Shared optional extensions remain available in both.
+                        anisotropic1: gl1.getSupportedExtensions().indexOf('EXT_texture_filter_anisotropic') !== -1,
+                        anisotropic2: gl2.getSupportedExtensions().indexOf('EXT_texture_filter_anisotropic') !== -1,
                         // Everything advertised must be obtainable, in both
                         // families. A name listed by getSupportedExtensions()
                         // that getExtension() answers null for is a
@@ -13081,6 +13074,10 @@ return {before,removed,reinsert,moved,cleared};
                             const f = gl1.getShaderPrecisionFormat(gl1.VERTEX_SHADER, gl1.HIGH_FLOAT);
                             return f ? [f.rangeMin, f.rangeMax, f.precision] : null;
                         })(),
+                        prototypeOwnsMethod: Object.hasOwn(WebGLRenderingContext.prototype, 'getParameter'),
+                        directPrototype: Object.getPrototypeOf(gl1) === WebGLRenderingContext.prototype,
+                        nativeMethod: Function.prototype.toString.call(WebGLRenderingContext.prototype.getParameter)
+                          .indexOf('[native code]') !== -1,
                     };
                     resolve(out);
                 })
@@ -13097,21 +13094,12 @@ return {before,removed,reinsert,moved,cleared};
             out.get("ext2"),
             "a WebGL2 context must not report the WebGL1 extension list",
         );
-        // The families differ in size, as Chrome's do, rather than by one or two.
-        let count1 = out.get("count1").and_then(|v| v.as_u64()).unwrap_or(0);
-        let count2 = out.get("count2").and_then(|v| v.as_u64()).unwrap_or(0);
-        assert!(count1 > count2, "WebGL1 lists more extensions than WebGL2: {count1} vs {count2}");
-
         assert_eq!(out.get("instanced1"), Some(&serde_json::json!(true)),
             "ANGLE_instanced_arrays is an extension in WebGL1");
         assert_eq!(out.get("instanced2"), Some(&serde_json::json!(false)),
             "ANGLE_instanced_arrays is core in WebGL2 and must not be advertised");
-        assert_eq!(out.get("colorBufferFloat1"), Some(&serde_json::json!(false)),
-            "EXT_color_buffer_float is WebGL2-only on this machine's Chrome");
-        assert_eq!(out.get("colorBufferFloat2"), Some(&serde_json::json!(true)));
-        assert_eq!(out.get("drawBuffersIndexed1"), Some(&serde_json::json!(false)),
-            "OES_draw_buffers_indexed is WebGL2-only on this machine's Chrome");
-        assert_eq!(out.get("drawBuffersIndexed2"), Some(&serde_json::json!(true)));
+        assert_eq!(out.get("anisotropic1"), Some(&serde_json::json!(true)));
+        assert_eq!(out.get("anisotropic2"), Some(&serde_json::json!(true)));
 
         assert_eq!(out.get("maxDrawBuffersIn1"), Some(&serde_json::json!(false)),
             "a WebGL2-only constant must not exist on a WebGL1 context");
@@ -13130,6 +13118,9 @@ return {before,removed,reinsert,moved,cleared};
         );
         assert_eq!(out.get("intPrec1"), Some(&serde_json::json!([31, 30, 0])));
         assert_eq!(out.get("floatPrec1"), Some(&serde_json::json!([127, 127, 23])));
+        assert_eq!(out.get("prototypeOwnsMethod"), Some(&serde_json::json!(true)));
+        assert_eq!(out.get("directPrototype"), Some(&serde_json::json!(true)));
+        assert_eq!(out.get("nativeMethod"), Some(&serde_json::json!(true)));
     }
 
     /// A version upgrade must hand the handler a real transaction.
