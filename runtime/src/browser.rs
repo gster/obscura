@@ -4760,8 +4760,8 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn document_fragment_redirect_inheritance_matches_plain_and_stealth_http() {
-        for stealth in [false, true] {
+    async fn document_fragment_redirect_inheritance_matches_persona_transports() {
+        for profile in [obscura_net::StealthProfile::WindowsChrome145, obscura_net::StealthProfile::MacChrome153] {
             for (location, expected) in [
                 ("/final", Some("one")),
                 ("/final#two", Some("two")),
@@ -4803,14 +4803,10 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
                 client.block_trackers = false;
                 let url = Url::parse(&(base.clone() + "/start#one")).unwrap();
                 let client = Arc::new(client);
-                let response = if stealth {
-                    StealthHttpClient::with_policy(cookies, None, client)
-                        .fetch(&url)
-                        .await
-                        .unwrap()
-                } else {
-                    client.fetch(&url).await.unwrap()
-                };
+                let response = StealthHttpClient::with_policy_profile(cookies, None, client, profile)
+                    .fetch(&url)
+                    .await
+                    .unwrap();
                 assert_eq!(response.url.fragment(), expected);
                 assert_eq!(response.url.path(), "/final");
                 assert_eq!(

@@ -1084,25 +1084,12 @@ async fn fetch_original_response(
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
 
-    // `--dump original` bypasses BrowserContext, so construct the same primp
-    // transport directly. file:// has no network fingerprint and stays on the
-    // file-capable policy client.
-    if url.scheme() != "file" {
-        let client = obscura_net::StealthHttpClient::with_proxy(
-            Arc::new(obscura_net::CookieJar::new()),
-            proxy.as_deref(),
-            false,
-        );
-        return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
-            Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
-        };
-    }
-
-    let client = obscura_net::ObscuraHttpClient::with_options(
+    // `--dump original` uses the standard persona transport, including its
+    // file loader for local URLs.
+    let client = obscura_net::StealthHttpClient::with_proxy(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
+        false,
     );
     match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
         Ok(Ok(resp)) => Ok(resp),

@@ -92,8 +92,8 @@ fn referrer_policy_handles_header_fallbacks_local_trust_and_absent_sources() {
 }
 
 #[tokio::test]
-async fn referrer_policy_redirects_do_not_restore_discarded_source_in_either_transport() {
-    for stealth in [false, true] {
+async fn referrer_policy_redirects_do_not_restore_discarded_source() {
+    for page_headers in [false, true] {
         let mut replies = Vec::new();
         for header in [
             "unsafe-url\r\nReferrer-Policy: invalid, origin, future",
@@ -111,23 +111,19 @@ async fn referrer_policy_redirects_do_not_restore_discarded_source_in_either_tra
             true,
         ));
         let extra = HashMap::from([("Referer".into(), "https://forged.invalid/private".into())]);
-        client.set_extra_headers(extra.clone()).await;
+        let transport = StealthHttpClient::with_policy(client.cookie_jar.clone(), None, client.clone());
+        if page_headers {
+            transport.set_extra_headers(extra).await;
+        } else {
+            client.set_extra_headers(extra).await;
+        }
         let source = Url::parse("https://user:secret@source.example/path?q=1#private").unwrap();
         let mut request = ResourceRequest::subresource(ResourceType::Document, &source);
         request.referrer_policy = ReferrerPolicy::UnsafeUrl;
-        let response = if stealth {
-            let transport =
-                StealthHttpClient::with_policy(Arc::new(CookieJar::new()), None, client.clone());
-            transport.set_extra_headers(extra).await;
-            transport
-                .fetch_resource_with_callbacks(&target, request, None)
-                .await
-        } else {
-            client
-                .fetch_resource_with_callbacks(&target, request, None)
-                .await
-        }
-        .unwrap();
+        let response = transport
+            .fetch_resource_with_callbacks(&target, request, None)
+            .await
+            .unwrap();
         assert_eq!(response.body, b"complete");
         assert_eq!(response.request_referrer, None);
         for expected in [
@@ -141,7 +137,7 @@ async fn referrer_policy_redirects_do_not_restore_discarded_source_in_either_tra
             let referer = raw
                 .lines()
                 .find_map(|line| line.strip_prefix("referer: ").map(str::trim));
-            assert_eq!(referer, expected, "stealth={stealth}");
+            assert_eq!(referer, expected, "page_headers={page_headers}");
             assert!(raw.contains("sec-fetch-site: cross-site\r\n"));
             assert!(!raw.contains("forged.invalid"));
         }
@@ -155,7 +151,7 @@ async fn referrer_policy_partitions_the_resource_cache() {
         ok_response("Cache-Control: max-age=60\r\n", "origin"),
     ])
     .await;
-    let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+    let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
     let source = Url::parse("https://source.example/path").unwrap();
     for (policy, body) in [
         (ReferrerPolicy::NoReferrer, b"no-referrer".as_slice()),
@@ -191,7 +187,7 @@ async fn navigation_post_keeps_request_context_through_redirect() {
     request.referrer = Some(source.clone());
     request.initiator = Some(source);
     request.referrer_policy = ReferrerPolicy::UnsafeUrl;
-    let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+    let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
     let response = client
         .post_form_resource_with_callbacks(&target, "field=value", request, None)
         .await
@@ -245,21 +241,14 @@ async fn fulfilled_response_cannot_supply_navigation_referrer() {
         request.referrer = Some(source.clone());
         request.initiator = Some(source.clone());
         request.referrer_policy = policy;
-        for response in [
-            client
-                .fetch_resource_with_callbacks(&target, request.clone(), None)
-                .await
-                .unwrap(),
-            transport
-                .fetch_resource_with_callbacks(&target, request, None)
-                .await
-                .unwrap(),
-        ] {
-            assert_eq!(
-                response.request_referrer.as_ref().map(Url::as_str),
-                (policy == ReferrerPolicy::Origin).then_some("https://source.example/")
-            );
-        }
+        let response = transport
+            .fetch_resource_with_callbacks(&target, request, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.request_referrer.as_ref().map(Url::as_str),
+            (policy == ReferrerPolicy::Origin).then_some("https://source.example/")
+        );
     }
 }
 

@@ -586,7 +586,7 @@ impl StealthHttpClient {
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
-        // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
+        // Follow up to 20 redirects (Fetch spec): 0..=20 makes
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
             validate_request_mode(&request, &current_url)?;
@@ -1491,3 +1491,7 @@ mod tests {
         assert_eq!(resp.status, 200);
     }
 }
+
+#[cfg(test)]
+#[path = "network_tests.rs"]
+mod network_tests;

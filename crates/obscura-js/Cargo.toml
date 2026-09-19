@@ -18,6 +18,7 @@ render = ["dep:obscura-render", "obscura-render/paint"]
 deno_core = "0.350"
 
 [dependencies]
+http = "1"
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 deno_core = "0.350"
@@ -33,7 +34,6 @@ psl = "2"
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-reqwest = { workspace = true }
 html5ever = { workspace = true }
 deno_error = "0.6"
 base64 = { workspace = true }

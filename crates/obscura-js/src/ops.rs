@@ -3443,7 +3443,7 @@ fn fetch_timeout() -> std::time::Duration {
 /// succeed and the twenty-first must fail:
 /// https://fetch.spec.whatwg.org/#http-redirect-fetch
 ///
-/// The reqwest default of 10 does not apply here. The redirects are
+/// Redirects are
 /// followed by hand in this file, one hop per loop iteration, so that
 /// each hop can be checked against the SSRF rules again.
 const FETCH_REDIRECT_LIMIT: usize = 20;
@@ -3542,7 +3542,7 @@ fn cors_response_allows(
     }
 }
 
-fn is_cors_safelisted_method(method: &reqwest::Method) -> bool {
+fn is_cors_safelisted_method(method: &http::Method) -> bool {
     matches!(method.as_str(), "GET" | "HEAD" | "POST")
 }
 
@@ -3665,7 +3665,7 @@ fn cors_unsafe_request_header_names(headers: &HashMap<String, String>) -> Vec<St
 }
 
 fn parse_cors_header_list<'a>(
-    headers: &'a reqwest::header::HeaderMap,
+    headers: &'a http::header::HeaderMap,
     name: &'static str,
 ) -> Option<Vec<&'a str>> {
     let mut items = Vec::new();
@@ -3682,7 +3682,7 @@ fn parse_cors_header_list<'a>(
     Some(items)
 }
 
-fn preflight_allows_method(method: &reqwest::Method, allowed: &[&str], credentialed: bool) -> bool {
+fn preflight_allows_method(method: &http::Method, allowed: &[&str], credentialed: bool) -> bool {
     is_cors_safelisted_method(method)
         || allowed.iter().any(|allowed| {
             *allowed == method.as_str() || (*allowed == "*" && !credentialed)
@@ -3914,7 +3914,7 @@ async fn op_fetch_url(
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
     let credentials = FetchCredentials::parse(&credentials);
 
-    let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
+    let req_method: http::Method = method.parse().unwrap_or(http::Method::GET);
 
     let mut custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
@@ -3969,11 +3969,11 @@ async fn op_fetch_url(
             .await.map_err(|_| deno_error::JsErrorBox::generic("CORS preflight timed out"))?
             .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
         let preflight_status = response.status;
-        let mut preflight_headers = reqwest::header::HeaderMap::new();
+        let mut preflight_headers = http::header::HeaderMap::new();
         for (name, value) in response.headers {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            let name = http::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
-            let value = reqwest::header::HeaderValue::from_str(&value)
+            let value = http::header::HeaderValue::from_str(&value)
                 .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
             preflight_headers.append(name, value);
         }
@@ -4440,27 +4440,27 @@ mod tests {
     #[test]
     fn cors_preflight_permissions_follow_credentials_and_authorization_rules() {
         assert!(preflight_allows_method(
-            &reqwest::Method::POST,
+            &http::Method::POST,
             &[],
             true
         ));
         assert!(preflight_allows_method(
-            &reqwest::Method::DELETE,
+            &http::Method::DELETE,
             &["DELETE"],
             true
         ));
         assert!(!preflight_allows_method(
-            &reqwest::Method::DELETE,
+            &http::Method::DELETE,
             &["delete"],
             false
         ));
         assert!(preflight_allows_method(
-            &reqwest::Method::DELETE,
+            &http::Method::DELETE,
             &["*"],
             false
         ));
         assert!(!preflight_allows_method(
-            &reqwest::Method::DELETE,
+            &http::Method::DELETE,
             &["*"],
             true
         ));
@@ -4481,7 +4481,7 @@ mod tests {
 
     #[test]
     fn cors_preflight_rejects_malformed_permission_lists() {
-        let mut headers = reqwest::header::HeaderMap::new();
+        let mut headers = http::header::HeaderMap::new();
         headers.append(
             "access-control-allow-methods",
             "GET, DELETE".parse().unwrap(),

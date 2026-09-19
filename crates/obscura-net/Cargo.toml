@@ -12,7 +12,6 @@ default = []
 stealth = []
 
 [dependencies]
-reqwest = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
@@ -31,8 +30,6 @@ http = "1"
 socket2 = "0.6"
 # TLS fixtures for the configured-roots tests: rcgen mints a throwaway CA + leaf,
 # tokio-rustls serves one HTTPS response with them. Pinned to the ring
-# provider so the test binary has a single rustls CryptoProvider (reqwest's
-# rustls also uses ring; adding aws-lc-rs would make provider auto-selection
-# panic).
+# provider so TLS fixtures use an explicit, consistent CryptoProvider.
 rcgen = "0.13"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

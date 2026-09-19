@@ -5,8 +5,6 @@ pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
 pub mod stealth_client;
-// Preserve the public module path for existing Rust callers.
-pub use stealth_client as wreq_client;
 
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,

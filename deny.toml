@@ -17,7 +17,7 @@ ignore = [
 
 [bans]
 # Duplicate transitive versions are build-time bloat, not a security issue, and
-# are largely outside our control (deno_core / v8 / reqwest trees). Surface them
+# are largely outside our control (deno_core / v8 / rendering trees). Surface them
 # without failing the build.
 multiple-versions = "warn"
 wildcards = "allow"

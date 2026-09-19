@@ -38,16 +38,16 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 OB-044 本轮删除 CLI/serve 的 `--stealth`、`--user-agent`、`OBSCURA_STEALTH`、scrape worker 转发和嵌入 API 开关；CDP、MCP、CLI、Page 与独立 runtime 的产品路径默认使用 primp。Cargo `stealth` feature 只保留为空兼容别名，不能改变行为；发布矩阵不再生成有无 stealth 的组合。强制路径同时保留子资源缓存合并，将 JS fetch/XHR 的完整响应体和网络事件写入 CDP/MCP 观察面，并以原字节或明确 Base64 保存二进制响应。persona 在 BrowserContext 初始化时同时确定 primp 传输配置与 JavaScript 身份，并在 context 生命周期内保持不变；运行中的 CDP User-Agent 覆盖明确不支持。全出口盘点、完整 persona 编译器和 Docker 干净构建仍由 OB-012/015/016/042 跟进，OB-044 保持未关闭。
 
-OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓存改为只消费已注入字节；robots.txt 改走 persona-owned primp，并验证其与导航使用同一 persona User-Agent；每个 Page 的 primp 与其 detached Worker 共享 transport in-flight 计数，兄弟 Page 保持隔离，`networkidle` 合并观察互斥的预发送/CDP 拦截与 primp 传输阶段；native policy `RequestInterceptor` 保留完整二进制请求体。页面和独立 `ObscuraJsRuntime` 的 fetch/XHR、CORS OPTIONS、module、图片、字体与样式请求均只经 primp 获取；独立 runtime 在初始化时固定默认 Windows Chrome145 persona，frame/Worker 继承身份、Cookie 和策略。context baseline、Page override 与 request-specific headers 分层合并且兄弟 Page 隔离；无效代理 fail closed，PEM/DER CA、scripted 逐跳 timeout 与 body cap 保持。运行时挂接 Page 时会明确接管 transport，保留 Page persona、私网策略、Cookie 和回调。公开 `ObscuraHttpClient` 的 reqwest 后端和 `wreq_client` 别名，以及 Abort/CORS 细节、最终线上请求头观察、重复与非 UTF-8 头、完整响应体保存、CDP Fetch、Beacon 和下载仍有缺口，因此 OB-012 只记录为部分完成。所有采集与日志保留 Cookie、Authorization、重复头、原始字节和完整 body，不做脱敏或字段裁剪。
+OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓存改为只消费已注入字节；robots.txt 改走 persona-owned primp，并验证其与导航使用同一 persona User-Agent；每个 Page 的 primp 与其 detached Worker 共享 transport in-flight 计数，兄弟 Page 保持隔离，`networkidle` 合并观察互斥的预发送/CDP 拦截与 primp 传输阶段；native policy `RequestInterceptor` 保留完整二进制请求体。页面和独立 `ObscuraJsRuntime` 的 fetch/XHR、CORS OPTIONS、module、图片、字体与样式请求均只经 primp 获取；独立 runtime 在初始化时固定默认 Windows Chrome145 persona，frame/Worker 继承身份、Cookie 和策略。context baseline、Page override 与 request-specific headers 分层合并且兄弟 Page 隔离；无效代理 fail closed，PEM/DER CA、scripted 逐跳 timeout 与 body cap 保持。运行时挂接 Page 时会明确接管 transport，保留 Page persona、私网策略、Cookie 和回调。第二切片将 `ObscuraHttpClient` 收敛为 policy/context 类型，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖、根与独立 runtime 锁文件中的对应 package，以及 `wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。仍有 Abort/CORS 细节、最终线上请求头观察、重复与非 UTF-8 头、完整响应体保存、CDP Fetch、Beacon、下载及线级校准缺口，因此 OB-012 只记录为部分完成。删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。所有采集与日志保留 Cookie、Authorization、重复头、原始字节和完整 body，不做脱敏或字段裁剪。
 
 本次未运行：Linux 原生验证、完整官方客户端矩阵、WPT、24h 长稳、受控性能/TLS/H2 测量、Docker 构建、Southwest/ZG 现场流程和报价对照。没有新的生产发布或部署结论。
 
 ### 构建与证据定位
 
-本次 render CLI SHA-256：`6180aa62f55fd1f6ac92af3df1ef83393d90a429e114f6c59fc3b83813243df4`（121849248 bytes）。
+本次 render CLI SHA-256：`59a7b9475a0c999be7633a7287ed45e3441cb363ca50c9f6212f30db72fd3fd7`（118847536 bytes）。
 
-- 根 Cargo.lock SHA-256：`3a8256dacf51bd2ac0f6491f97360d845094a34b77ce2669b54244de075057fb`。
-- runtime/Cargo.lock SHA-256：`bb4ee97177ebcb698cf1b9dc082aa889d9bbf9ed4ba55620c4e61713c893ebc0`。
+- 根 Cargo.lock SHA-256：`1ffacb8f98f4a678217401fc9ca834d87eb3007603388995b7d573762ab2deb9`。
+- runtime/Cargo.lock SHA-256：`3ee83ffa2ab80fc7b7b0989d00d29afbf7a6afacc04e51bf9130cfcf2f582041`。
 - benchmark revision：`2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`（`gster/obscura-benchmark`），与当前 CI pin 一致；旧失败归因使用 `6ebac8293d7477f59e837768bfd4e74173f04f1c`。
 - 本机原始日志、合成探针和 JSON：`/tmp/obscura-doc-audit-20260919/`；临时文件不入 Git，也不保证跨设备或长期存在。仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
 
@@ -105,7 +105,7 @@ raw CDP 复验次序：创建并 attach target → Page.navigate 本地页面 �
 
 Cookie 键已区分 domain/name/path，已有 host-only、HttpOnly 写保护和过期导入回归；应修剩余语义，不从旧快照重新实现已有保护。iframe/fragment、Text 更新、表单传输、预检和原生输入已有修复，现有回归位于 browser/page、JS runtime/bootstrap、net 与独立 runtime tests；迁移时保留这些能力。保留成果与回归，不据此夸大完整标准资格。
 
-页面所有的产品传输及独立 runtime/module loader 当前强制使用 persona-owned primp；公开 `ObscuraHttpClient` 的 reqwest 后端与 `wreq_client` 兼容别名仍是待删除迁移项。V8 依赖通常取预构建 archive；`V8_FROM_SOURCE` 才走源码构建，本项目还会执行 bootstrap snapshot 生成。旧“首次必编译 V8、固定五分钟”不是准确的构建契约。
+页面所有的产品传输及独立 runtime/module loader 当前强制使用 persona-owned primp；`ObscuraHttpClient` 已收敛为 policy/context，项目自有直接 reqwest 客户端/backend 与 `wreq_client` 兼容别名已删除，CLI `original` 文件和 HTTP 辅助路径也统一走 `StealthHttpClient`。这只描述项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。V8 依赖通常取预构建 archive；`V8_FROM_SOURCE` 才走源码构建，本项目还会执行 bootstrap snapshot 生成。旧“首次必编译 V8、固定五分钟”不是准确的构建契约。
 
 ## Southwest 与历史记录的结论
 
