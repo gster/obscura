@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import importlib.metadata
 import json
+import struct
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +36,87 @@ def expect_protocol_error(
             raise AssertionError(f"{method} failed with the wrong error: {message}") from error
         return message
     raise AssertionError(f"{method} returned placeholder success")
+
+
+def inspect_png(data: bytes) -> dict[str, Any]:
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise AssertionError("Page.screenshot did not return a PNG")
+    offset = 8
+    header = None
+    compressed = bytearray()
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        kind = data[offset + 4 : offset + 8]
+        payload = data[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+        if kind == b"IHDR":
+            header = struct.unpack(">IIBBBBB", payload)
+        elif kind == b"IDAT":
+            compressed.extend(payload)
+        elif kind == b"IEND":
+            break
+    if header is None:
+        raise AssertionError("Page.screenshot PNG has no IHDR")
+    width, height, bit_depth, color_type, compression, filtering, interlace = header
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type)
+    if (
+        bit_depth != 8
+        or channels is None
+        or compression != 0
+        or filtering != 0
+        or interlace != 0
+    ):
+        raise AssertionError(f"unsupported screenshot PNG header: {header!r}")
+
+    encoded = zlib.decompress(compressed)
+    stride = width * channels
+    rows: list[bytes] = []
+    position = 0
+    previous = bytes(stride)
+    for _ in range(height):
+        filter_type = encoded[position]
+        position += 1
+        row = bytearray(encoded[position : position + stride])
+        position += stride
+        for index in range(stride):
+            left = row[index - channels] if index >= channels else 0
+            above = previous[index]
+            upper_left = previous[index - channels] if index >= channels else 0
+            if filter_type == 1:
+                row[index] = (row[index] + left) & 0xFF
+            elif filter_type == 2:
+                row[index] = (row[index] + above) & 0xFF
+            elif filter_type == 3:
+                row[index] = (row[index] + ((left + above) // 2)) & 0xFF
+            elif filter_type == 4:
+                estimate = left + above - upper_left
+                distances = (
+                    abs(estimate - left),
+                    abs(estimate - above),
+                    abs(estimate - upper_left),
+                )
+                predictor = (left, above, upper_left)[distances.index(min(distances))]
+                row[index] = (row[index] + predictor) & 0xFF
+            elif filter_type != 0:
+                raise AssertionError(f"unsupported screenshot PNG filter: {filter_type}")
+        previous = bytes(row)
+        rows.append(previous)
+    pixels = b"".join(rows)
+    unique_pixels = {
+        pixels[index : index + channels]
+        for index in range(0, len(pixels), channels)
+    }
+    return {
+        "data": base64.b64encode(data).decode("ascii"),
+        "byteLength": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "pixelSha256": hashlib.sha256(pixels).hexdigest(),
+        "width": width,
+        "height": height,
+        "bitDepth": bit_depth,
+        "colorType": color_type,
+        "uniquePixelCount": len(unique_pixels),
+    }
 
 
 def run(obscura_bin: Path) -> dict[str, Any]:
@@ -227,6 +312,14 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         expected_trusted = event["target"] not in {"select", "multi-select"}
                         if event.get("trusted") is not expected_trusted:
                             raise AssertionError(f"locator event trust differs from Chrome: {locator!r}")
+
+                    page.set_viewport_size({"width": 320, "height": 240})
+                    screenshot = inspect_png(page.screenshot(type="png"))
+                    result["screenshot"] = screenshot
+                    if screenshot["width"] != 320 or screenshot["height"] != 240:
+                        raise AssertionError(f"unexpected screenshot dimensions: {screenshot!r}")
+                    if screenshot["uniquePixelCount"] < 2:
+                        raise AssertionError(f"screenshot is blank: {screenshot!r}")
 
                     context_result: dict[str, Any] = {
                         "initialContextCount": len(browser.contexts),

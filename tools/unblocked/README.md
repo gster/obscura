@@ -96,13 +96,16 @@ python3 tools/unblocked/validate.py protocol-log \
 
 The smoke navigates the fixed local fixture, fills a labelled input, selects
 labelled single and multiple options, and clicks a role locator through the
-official client. It creates a second browser context, navigates its page,
+official client. It fixes the first page viewport at 320 by 240, captures an
+official `Page.screenshot()` PNG, decodes its pixels to prove the image is
+nonblank, and retains the complete PNG as base64 plus its hashes and metadata.
+It creates a second browser context, navigates its page,
 checks same-origin localStorage and global-object isolation, verifies the
 default viewport/screen metrics, closes that context, and confirms that the
 default page remains live. It also reads the DOM through CDP and proves that an
 unknown method and invalid initializer parameters fail. Its optional JSON
-output retains both complete document responses, locator and context return
-values and event records, the complete DOM response, and every explicit CDP
+output retains both complete document responses, the full screenshot, locator
+and context return values and event records, the complete DOM response, and every explicit CDP
 command, response, and error it collects. `DEBUG=pw:protocol` emits the
 official client's complete raw driver protocol stream without normalization or
 field deletion. The `protocol-log` validator reads that untouched file and

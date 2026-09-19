@@ -140,6 +140,30 @@
       "evidence": "Official Python smoke and CDP fixture. Full navigation parity is not claimed."
     },
     {
+      "method": "Page.getLayoutMetrics",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "verified",
+      "params": "Omitted params or an empty object only.",
+      "result": "Live layoutViewport, visualViewport and contentSize in CSS pixels, including the CDP css aliases used by Playwright.",
+      "events": "None.",
+      "scope": "Attached page and its current viewport.",
+      "errors": "Any supplied parameter fails instead of being ignored.",
+      "evidence": "Official Playwright 1.60 fixed 320 by 240 Page.screenshot path plus exact Rust result and parameter tests."
+    },
+    {
+      "method": "Page.captureScreenshot",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "verified",
+      "params": "The observed PNG clip shape x=0, y=0, width=320, height=240, scale=1 with captureBeyondViewport=false; omitted and empty params are accepted. Supported fields are validated and unknown fields fail.",
+      "result": "Complete base64 PNG data. The smoke decodes pixels and records the full PNG, byte length, encoded and decoded-pixel hashes, dimensions, color metadata and unique-pixel count.",
+      "events": "None.",
+      "scope": "Attached page current rendered viewport and the implemented capture subset.",
+      "errors": "Unknown fields, malformed clips, unsupported formats and invalid option types fail. The full format and option matrix is not qualified.",
+      "evidence": "Official Playwright 1.60 fixed-viewport screenshot path with complete raw protocol response and retained PNG; nonblank decoded-pixel assertion; Rust capture, viewport and strict-parameter tests."
+    },
+    {
       "method": "Runtime.enable",
       "capability": "LIMITED",
       "implementation": "implemented",
@@ -610,7 +634,7 @@
   ],
   "coverage": {
     "kind": "observed-official-client-slice",
-    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic locator and browser-context smoke with full pw:protocol log",
+    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic locator, fixed-viewport screenshot and browser-context smoke with full pw:protocol log",
     "unlisted": "not-qualified",
     "completion": "OB-027 remains open until the scoped automation profile is expanded and reconciled against the migration surface."
   }

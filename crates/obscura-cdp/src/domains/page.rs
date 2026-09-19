@@ -176,7 +176,11 @@ struct ScreenshotOptions {
 }
 
 #[cfg(feature = "render")]
-fn screenshot_bool(params: &Value, name: &str, default: bool) -> Result<bool, String> {
+fn screenshot_bool(
+    params: &serde_json::Map<String, Value>,
+    name: &str,
+    default: bool,
+) -> Result<bool, String> {
     match params.get(name) {
         None => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
@@ -199,8 +203,27 @@ fn screenshot_number(object: &serde_json::Map<String, Value>, name: &str) -> Res
 
 #[cfg(feature = "render")]
 fn parse_screenshot_options(params: &Value) -> Result<ScreenshotOptions, String> {
-    if !params.is_object() {
-        return Err("Invalid parameters: expected an object".to_string());
+    let empty = serde_json::Map::new();
+    let params = match params {
+        Value::Null => &empty,
+        Value::Object(params) => params,
+        _ => return Err("Invalid parameters: expected an object".to_string()),
+    };
+    let allowed = [
+        "format",
+        "quality",
+        "clip",
+        "fromSurface",
+        "captureBeyondViewport",
+        "optimizeForSpeed",
+    ];
+    if let Some(name) = params
+        .keys()
+        .find(|name| !allowed.contains(&name.as_str()))
+    {
+        return Err(format!(
+            "Invalid parameters: unsupported screenshot parameter {name}"
+        ));
     }
 
     let format = match params.get("format") {
@@ -233,6 +256,14 @@ fn parse_screenshot_options(params: &Value) -> Result<ScreenshotOptions, String>
     let clip = match params.get("clip") {
         None => None,
         Some(Value::Object(object)) => {
+            if object.keys().any(|name| {
+                !["x", "y", "width", "height", "scale"].contains(&name.as_str())
+            }) {
+                return Err(
+                    "Invalid parameters: clip supports only x, y, width, height and scale"
+                        .to_string(),
+                );
+            }
             let clip = ScreenshotClip {
                 x: screenshot_number(object, "x")?,
                 y: screenshot_number(object, "y")?,
@@ -1399,6 +1430,11 @@ pub async fn handle(
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
         "getLayoutMetrics" => {
+            if !(params.is_null()
+                || params.as_object().is_some_and(serde_json::Map::is_empty))
+            {
+                return Err("Page.getLayoutMetrics supports only empty params".to_string());
+            }
             // Playwright calls this before every page.screenshot(). Report the
             // same live CSS viewport that responsive page code and paint use.
             let (width, height) = ctx
@@ -1939,9 +1975,22 @@ mod tests {
     #[tokio::test]
     async fn get_layout_metrics_returns_chrome_default_viewport() {
         let mut ctx = CdpContext::new();
+        for params in [Value::Null, json!({})] {
+            handle("getLayoutMetrics", &params, &mut ctx, &None)
+                .await
+                .expect("omitted and empty params should be equivalent");
+        }
         let result = handle("getLayoutMetrics", &json!({}), &mut ctx, &None)
             .await
-            .expect("getLayoutMetrics should succeed without a session");
+            .unwrap();
+        handle(
+            "getLayoutMetrics",
+            &json!({"invented": true}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("getLayoutMetrics must reject ignored parameters");
 
         // CDP spec requires three top-level shapes; Playwright's screenshot
         // path reads contentSize.width/height to size the capture. Without
@@ -1970,6 +2019,21 @@ mod tests {
         assert_eq!(content["width"].as_f64(), Some(1280.0));
         // Without a live page the content height falls back to the viewport.
         assert_eq!(content["height"].as_f64(), Some(720.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screenshot_options_accept_omitted_params_and_reject_unknown_fields() {
+        parse_screenshot_options(&Value::Null)
+            .expect("all Page.captureScreenshot parameters are optional");
+        parse_screenshot_options(&json!({}))
+            .expect("empty Page.captureScreenshot params should remain valid");
+        parse_screenshot_options(&json!({"invented": true}))
+            .expect_err("unknown screenshot options must not be ignored");
+        parse_screenshot_options(&json!({
+            "clip": {"x": 0, "y": 0, "width": 10, "height": 10, "scale": 1, "invented": true}
+        }))
+        .expect_err("unknown clip options must not be ignored");
     }
 
     #[cfg(feature = "render")]
