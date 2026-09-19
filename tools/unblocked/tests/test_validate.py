@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[3]
+TOOL_ROOT = ROOT / "tools" / "unblocked"
+
+
+class ManifestValidationTests(unittest.TestCase):
+    def run_validator(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(TOOL_ROOT / "validate.py"), *arguments],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def validate_mutation(self, command: str, filename: str, mutate) -> subprocess.CompletedProcess[str]:
+        value = json.loads((TOOL_ROOT / filename).read_text(encoding="utf-8"))
+        mutate(value)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            dir=TOOL_ROOT,
+            encoding="utf-8",
+        ) as manifest:
+            json.dump(value, manifest)
+            manifest.flush()
+            return self.run_validator(command, manifest.name)
+
+    def test_committed_baseline_is_complete_and_reproducible(self) -> None:
+        result = self.run_validator(
+            "baseline",
+            str(TOOL_ROOT / "baseline.json"),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OB-001 baseline manifest is valid\n")
+
+    def test_official_client_scope_covers_the_migration_boundary(self) -> None:
+        result = self.run_validator(
+            "client",
+            str(TOOL_ROOT / "client-scope.json"),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OB-025 client scope is valid\n")
+
+    def test_baseline_rejects_a_lock_digest_that_does_not_match_the_repository(self) -> None:
+        result = self.validate_mutation(
+            "baseline",
+            "baseline.json",
+            lambda value: value["source"].update(cargo_lock_sha256="0" * 64),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Cargo.lock digest does not match", result.stderr)
+
+    def test_baseline_rejects_a_benchmark_revision_that_does_not_match_ci(self) -> None:
+        result = self.validate_mutation(
+            "baseline",
+            "baseline.json",
+            lambda value: value["benchmark"].update(revision="0" * 40),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("benchmark revision does not match CI", result.stderr)
+
+    def test_client_scope_rejects_an_incomplete_api_category_inventory(self) -> None:
+        def remove_frames(value: dict) -> None:
+            value["capabilities"] = [
+                item for item in value["capabilities"] if item["category"] != "frame"
+            ]
+
+        result = self.validate_mutation(
+            "client",
+            "client-scope.json",
+            remove_frames,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("every migration category", result.stderr)
+
+    def test_client_scope_rejects_a_lock_digest_that_does_not_match(self) -> None:
+        result = self.validate_mutation(
+            "client",
+            "client-scope.json",
+            lambda value: value["client"].update(lockfile_sha256="0" * 64),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("client lockfile digest does not match", result.stderr)
+
+    def test_client_scope_rejects_a_version_that_does_not_match_the_lock(self) -> None:
+        result = self.validate_mutation(
+            "client",
+            "client-scope.json",
+            lambda value: value["client"].update(version="9.9.9"),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("client version does not match its lockfile", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

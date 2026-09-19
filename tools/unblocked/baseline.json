@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "task": "OB-001",
+  "captured_at": "2026-09-19",
+  "source": {
+    "revision": "e67e67b11eb265f097942055962622e43fcb9a16",
+    "cargo_lock_sha256": "927b15384674b9e19c227bf312bb9ec519abe5c678a17d1626b0cafee88750d8",
+    "runtime_cargo_lock_sha256": "b77e5ec468427c29bd0c15f37357c81d45e48248c412f0d125feca5723065c70"
+  },
+  "benchmark": {
+    "repository": "https://github.com/gster/obscura-benchmark",
+    "revision": "2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e",
+    "stage_count": 33
+  },
+  "toolchains": {
+    "root": {
+      "rust": "1.98.1",
+      "manifest": "rust-toolchain.toml"
+    },
+    "runtime": {
+      "rust": "1.98.1",
+      "manifest": "runtime/rust-toolchain.toml"
+    }
+  },
+  "configurations": [
+    {
+      "id": "macos-arm64",
+      "environment": {
+        "os": "macOS 26.6.2 (25G83)",
+        "architecture": "arm64",
+        "compiler": "Apple clang 21.0.0 (clang-2100.3.34.2)",
+        "ca": "SystemRootCertificates.keychain sha256:b56413319de32344b67ffc389a8a1eef39b6f338618ff983d8bd086adac52584",
+        "fonts": "tracked fonts manifest sha256:4a6c5bd805c08c8e2e46b685bf67fe8e13cdcf3d3ca0b94f42e95eb3506e67c1"
+      },
+      "results": [
+        {
+          "id": "root-nextest-render",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --features render --no-fail-fast",
+          "status": "passed",
+          "summary": "1762 passed, 4 skipped, 0 failed"
+        },
+        {
+          "id": "root-build-render",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --features render",
+          "status": "passed",
+          "summary": "obscura sha256 ee1c0893bf31a0cf85e41399a8c71535cdf775d0c0b5a6a79abdc32b6df35c2d; 113388976 bytes"
+        },
+        {
+          "id": "root-build-render-stealth",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --features render,stealth",
+          "status": "not-run",
+          "summary": "No result was recorded for this source revision on macOS",
+          "reason": "The 2026-09-19 audit only built the render configuration"
+        },
+        {
+          "id": "root-build-no-render",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features",
+          "status": "not-run",
+          "summary": "No result was recorded for this source revision on macOS",
+          "reason": "The 2026-09-19 audit only built the render configuration"
+        },
+        {
+          "id": "root-build-no-render-stealth",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features --features stealth",
+          "status": "not-run",
+          "summary": "No result was recorded for this source revision on macOS",
+          "reason": "The 2026-09-19 audit only built the render configuration"
+        },
+        {
+          "id": "runtime-nextest",
+          "command": "cd runtime && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --no-fail-fast",
+          "status": "passed",
+          "summary": "184 passed, 0 skipped, 0 failed"
+        },
+        {
+          "id": "obstacle-course",
+          "command": "OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0",
+          "status": "passed",
+          "summary": "33 of 33 stages passed"
+        }
+      ]
+    },
+    {
+      "id": "linux-x86_64",
+      "environment": {
+        "os": "Ubuntu 22.04 GitHub-hosted runner",
+        "architecture": "x86_64",
+        "compiler": "clang and libclang from ubuntu-22.04 apt repositories",
+        "ca": "ca-certificates from the ubuntu-22.04 runner image",
+        "fonts": "tracked fonts plus runner image fonts; exact inventory pending first captured run"
+      },
+      "results": [
+        {
+          "id": "root-nextest-render",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --features render --no-fail-fast",
+          "status": "not-run",
+          "summary": "No result is bound to the frozen qualification manifest",
+          "reason": "Requires the first CI qualification run"
+        },
+        {
+          "id": "root-build-render",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --features render",
+          "status": "not-run",
+          "summary": "No result is bound to the frozen qualification manifest",
+          "reason": "Requires the first CI qualification run"
+        },
+        {
+          "id": "root-build-render-stealth",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --features render,stealth",
+          "status": "not-run",
+          "summary": "No result is bound to the frozen qualification manifest",
+          "reason": "Requires the first CI qualification run"
+        },
+        {
+          "id": "root-build-no-render",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features",
+          "status": "not-run",
+          "summary": "No result is bound to the frozen qualification manifest",
+          "reason": "Requires the first CI qualification run"
+        },
+        {
+          "id": "root-build-no-render-stealth",
+          "command": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features --features stealth",
+          "status": "not-run",
+          "summary": "No result is bound to the frozen qualification manifest",
+          "reason": "Requires the first CI qualification run"
+        },
+        {
+          "id": "runtime-nextest",
+          "command": "cd runtime && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --no-fail-fast",
+          "status": "not-run",
+          "summary": "No result is bound to the frozen qualification manifest",
+          "reason": "The current PR workflow does not run the independent runtime workspace"
+        },
+        {
+          "id": "obstacle-course",
+          "command": "OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run.py --runs 3 --warmup 1 --json",
+          "status": "not-run",
+          "summary": "No result is bound to the frozen qualification manifest",
+          "reason": "Requires the first CI qualification run against the pinned benchmark revision"
+        }
+      ]
+    }
+  ]
+}

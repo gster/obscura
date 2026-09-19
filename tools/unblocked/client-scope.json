@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "task": "OB-025",
+  "client": {
+    "package": "playwright",
+    "version": "1.60.0",
+    "driver": "playwright-core 1.60.0 bundled with the official Python package",
+    "lockfile": "tools/unblocked/uv.lock",
+    "lockfile_sha256": "6fd9df4684414949d3add8a30946dd995e245b11e5b36e7dda4aabcf12007f53",
+    "reference_browser": {
+      "name": "chromium",
+      "revision": "1223",
+      "version": "148.0.7778.96"
+    },
+    "unmodified": true,
+    "connection": "BrowserType.connect_over_cdp",
+    "dependency_scope": "development-only"
+  },
+  "boundaries": {
+    "launch": "host",
+    "connect": "cdp",
+    "api_request_context": "driver-network",
+    "route_fetch": "driver-network",
+    "production_dependency": "none"
+  },
+  "capabilities": [
+    {
+      "category": "connect",
+      "api": "BrowserType.connect_over_cdp",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "The host starts obscura serve and supplies its browser WebSocket endpoint",
+      "acceptance": "Connect without patching Playwright and obtain the default BrowserContext"
+    },
+    {
+      "category": "connect",
+      "api": "BrowserType.launch",
+      "priority": "unsupported",
+      "execution_path": "host",
+      "boundary": "Obscura is not a Chromium executable and is started by the host",
+      "acceptance": "Examples and tests never pass Obscura as executable_path"
+    },
+    {
+      "category": "connect",
+      "api": "BrowserType.connect",
+      "priority": "unsupported",
+      "execution_path": "driver",
+      "boundary": "This method speaks the Playwright protocol rather than CDP",
+      "acceptance": "Examples and tests use connect_over_cdp exclusively"
+    },
+    {
+      "category": "context-page",
+      "api": "Browser.contexts",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "The initial CDP context is created by Obscura",
+      "acceptance": "The connected browser exposes exactly the contexts owned by that connection"
+    },
+    {
+      "category": "context-page",
+      "api": "Browser.new_context",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Maps to Target.createBrowserContext and disposeBrowserContext",
+      "acceptance": "Create, use, and dispose an isolated context without affecting another context"
+    },
+    {
+      "category": "context-page",
+      "api": "BrowserContext.new_page",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Each page owns its target, session, document, and realm lifetimes",
+      "acceptance": "Two pages navigate and execute concurrently without cross-page state loss"
+    },
+    {
+      "category": "context-page",
+      "api": "Page.goto",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Navigation requests use the Obscura network stack",
+      "acceptance": "Return the committed document response and preserve CDP event ordering"
+    },
+    {
+      "category": "context-page",
+      "api": "Page.evaluate",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Evaluation runs in the selected frame and realm",
+      "acceptance": "Values, exceptions, handles, and navigation invalidation match the profile"
+    },
+    {
+      "category": "locator",
+      "api": "Page.get_by_role",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "The unmodified Playwright locator injects its utility script",
+      "acceptance": "Resolve and act on a role locator in the isolated utility world"
+    },
+    {
+      "category": "locator",
+      "api": "Page.get_by_label",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Accessible-name and label behavior comes through the official locator",
+      "acceptance": "Fill a labelled control without a custom client-side selector fallback"
+    },
+    {
+      "category": "locator",
+      "api": "Locator.click",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Actionability checks and input commands cross the CDP profile",
+      "acceptance": "Focus, scroll, hit testing, input events, and user activation are observable"
+    },
+    {
+      "category": "locator",
+      "api": "Locator.fill",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Text input is delivered through the shared native input path",
+      "acceptance": "Input and change event ordering matches the fixed Chrome fixture"
+    },
+    {
+      "category": "locator",
+      "api": "Locator.select_option",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Selection uses the official locator and page DOM",
+      "acceptance": "Select one and multiple options with matching input and change events"
+    },
+    {
+      "category": "frame",
+      "api": "Page.frames",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Frame identity and events are owned by the page target",
+      "acceptance": "Enumerate main and child frames with stable parent relationships"
+    },
+    {
+      "category": "frame",
+      "api": "FrameLocator",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Locator utility worlds and object handles are scoped per frame",
+      "acceptance": "Locate and act in a child frame; reject handles from another frame"
+    },
+    {
+      "category": "network",
+      "api": "Page.expect_response",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Observation uses Network domain events from Obscura requests",
+      "acceptance": "Match request, response, body, failure, and redirect events causally"
+    },
+    {
+      "category": "network",
+      "api": "Page.route",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Continue, fulfill, and fail resolve Obscura Fetch interceptions",
+      "acceptance": "Each intercepted request is resolved once and cancellation does not replay it"
+    },
+    {
+      "category": "network",
+      "api": "Route.fetch",
+      "priority": "unsupported",
+      "execution_path": "driver",
+      "boundary": "Playwright performs this fetch outside Obscura and its primp transport",
+      "acceptance": "Do not certify route.fetch for protected site traffic"
+    },
+    {
+      "category": "network",
+      "api": "APIRequestContext",
+      "priority": "unsupported",
+      "execution_path": "driver",
+      "boundary": "Playwright performs these requests outside Obscura and its primp transport",
+      "acceptance": "Use page requests or Obscura interception for protected site traffic"
+    },
+    {
+      "category": "file-artifact",
+      "api": "Locator.set_input_files",
+      "priority": "deferred",
+      "execution_path": "cdp",
+      "boundary": "Paths are interpreted on the client or server according to the certified connection options",
+      "acceptance": "Define path authorization, size limits, transfer location, cancellation, and cleanup"
+    },
+    {
+      "category": "file-artifact",
+      "api": "Page.expect_download",
+      "priority": "deferred",
+      "execution_path": "cdp",
+      "boundary": "Download execution and artifact storage location require explicit certification",
+      "acceptance": "Define ownership, path authorization, size limits, cancellation, and cleanup"
+    },
+    {
+      "category": "file-artifact",
+      "api": "Page.screenshot",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Pixels are produced by obscura-render and returned through CDP",
+      "acceptance": "Return a nonblank image with fixed viewport, scale, settle, and capture boundary"
+    },
+    {
+      "category": "file-artifact",
+      "api": "BrowserContext.tracing",
+      "priority": "deferred",
+      "execution_path": "driver",
+      "boundary": "Trace and HAR behavior is not implied by CDP connection success",
+      "acceptance": "Expose only after artifact ownership and supported events are documented"
+    },
+    {
+      "category": "close-cancel",
+      "api": "Page.close",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Closing a target invalidates its sessions, realms, and handles",
+      "acceptance": "No later event is sent to the closed target and sibling pages remain live"
+    },
+    {
+      "category": "close-cancel",
+      "api": "BrowserContext.close",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Only explicitly created contexts are disposable through CDP",
+      "acceptance": "Dispose owned pages and resources without crossing context boundaries"
+    },
+    {
+      "category": "close-cancel",
+      "api": "Browser.close",
+      "priority": "required",
+      "execution_path": "cdp",
+      "boundary": "Disconnect and process ownership are explicit host contracts",
+      "acceptance": "Release connection resources without replaying or duplicating pending input"
+    },
+    {
+      "category": "close-cancel",
+      "api": "asyncio task cancellation",
+      "priority": "required",
+      "execution_path": "host",
+      "boundary": "Client cancellation does not prove the remote action was uncommitted",
+      "acceptance": "Bound waits and report indeterminate writes without automatic replay"
+    }
+  ]
+}
