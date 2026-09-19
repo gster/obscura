@@ -9,18 +9,18 @@
 | obscura-browser | BrowserContext/Page、导航、frame、资源、输入与捕获 |
 | obscura-js | deno_core/V8、bootstrap、Rust ops、frame/Worker |
 | obscura-dom | DOM 树及防环约束 |
-| obscura-net | reqwest、primp、Cookie、URL/DNS 策略、tracker 规则 |
+| obscura-net | primp 产品传输、兼容策略客户端、Cookie、URL/DNS 策略、tracker 规则 |
 | obscura-render | CSS、布局、字体、CPU 绘制、几何/命中 |
 | obscura-mcp | 当前 CLI 的非 optional 依赖，保留并复用共享能力 |
 | obscura | 底层 Rust facade |
-| runtime/ | 独立 Cargo workspace；直接嵌入引擎，默认 render+stealth，NDJSON |
+| runtime/ | 独立 Cargo workspace；直接嵌入引擎，默认 render 与强制 primp，NDJSON |
 | bindings/python/ | 自有 Python 客户端，连接上述 runtime，不走 CDP |
 
 ## 执行与会话
 
 CDP `server.rs::run_connection` 为连接创建 OS 线程、current-thread Tokio runtime 和 LocalSet。各 Page 的 JsRuntime 拥有自己的 V8 isolate；构造串行化和 isolate 进入约束仍须遵守。同一连接内同步 JS 可以阻塞调度，不等于多页面共用一个 isolate。
 
-Worker 在 `obscura-js/src/worker.rs` 的独立线程/Tokio runtime/V8 isolate 执行。普通与 stealth transport 均通过 detached 客户端获得独立连接池；配置、Cookie 和必要观察状态按现有策略共享。队列预算与 structured clone 有回归，不能据此声称完整 Worker 标准支持。
+Worker 在 `obscura-js/src/worker.rs` 的独立线程/Tokio runtime/V8 isolate 执行。Worker 通过 detached primp 客户端获得独立连接池；配置、Cookie 和必要观察状态按现有策略共享。队列预算与 structured clone 有回归，不能据此声称完整 Worker 标准支持。
 
 managed page session 通常为 `{targetId}-session`；显式 flattened attach 返回独立 session ID，客户端必须使用返回值。连接关闭会 abort 其 processor 并销毁 LocalSet/runtime 和页面，不能跨新连接恢复原 target，也不能让独立 viewer 观察另一连接的页面。
 

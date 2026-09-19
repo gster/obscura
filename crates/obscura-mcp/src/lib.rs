@@ -69,7 +69,6 @@ pub struct BrowserState {
     active_tab: Option<String>,
     tab_counter: u32,
     context: Arc<BrowserContext>,
-    user_agent: Option<String>,
     console_messages: Vec<String>,
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
     /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
@@ -80,13 +79,13 @@ pub struct BrowserState {
 }
 
 impl BrowserState {
-    pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+    pub fn new(proxy: Option<String>) -> Self {
+        let context = Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, true));
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
-            user_agent,
+            context,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
         }
@@ -236,13 +235,13 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
     }
 }
 
-pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
+pub async fn run(proxy: Option<String>) -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
 
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut state = BrowserState::new(proxy);
     let mut runtime_pump_armed = false;
 
     loop {
@@ -940,11 +939,7 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
-    let ua = state.user_agent.clone();
     let page = state.page_mut();
-    if let Some(ref ua) = ua {
-        page.http_client.set_user_agent(ua).await;
-    }
 
     page.navigate_with_wait(url, condition).await
         .map_err(|e| e.to_string())?;
@@ -1780,11 +1775,7 @@ async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, 
     let url = args.get("url").and_then(Value::as_str);
     let id = state.new_tab();
     if let Some(u) = url {
-        let ua = state.user_agent.clone();
         let page = state.page_mut();
-        if let Some(ref ua) = ua {
-            page.http_client.set_user_agent(ua).await;
-        }
         page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
             .await.map_err(|e| e.to_string())?;
         Ok(format!("Opened {id} and navigated to {}", page.url_string()))
@@ -2135,7 +2126,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn render_tool_calls_return_mcp_binary_content_and_reject_bad_options() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None);
         state.page_mut().navigate(
             "data:text/html,<html style='margin:0'><body style='margin:0;background:red'><div style='width:64px;height:48px'></div></body></html>",
         ).await.expect("render test page should navigate");
@@ -2186,7 +2177,7 @@ mod tests {
                 console.error('mcp-console-click');\
                 setTimeout(()=>{console.error('mcp-console-async');document.body.id='done'},25)\
             }</script>";
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None);
         state
             .page_mut()
             .navigate(PAGE)
@@ -2262,7 +2253,7 @@ mod tests {
         // --allow-private-network to run their repro.
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None);
         state
             .page_mut()
             .navigate(&base)
@@ -2299,7 +2290,7 @@ mod tests {
     async fn network_tool_includes_completed_script_fetches() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None);
         state
             .page_mut()
             .navigate(&base)
@@ -2334,7 +2325,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_tools_notify_controlled_input_tracker() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None);
         state
             .page_mut()
             .navigate("data:text/html,<div id=root><input id=field></div>")
@@ -2409,7 +2400,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_form_check_and_select_use_native_setter_and_trusted_events() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None);
         state
             .page_mut()
             .navigate(

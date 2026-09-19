@@ -207,7 +207,6 @@ struct WorkerConfig {
     cookies: Option<std::sync::Arc<obscura_net::CookieJar>>,
     http: Option<std::sync::Arc<obscura_net::ObscuraHttpClient>>,
     callbacks: Option<std::sync::Arc<obscura_net::CallbackRegistry>>,
-    #[cfg(feature = "stealth")]
     stealth: Option<std::sync::Arc<obscura_net::StealthHttpClient>>,
     blocked_urls: Vec<String>,
     referrer_policy: obscura_net::ReferrerPolicy,
@@ -886,18 +885,16 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
     // dead - its first reuse fails with a broken pipe. Build a sibling transport
     // that keeps the same identity (cookies, profile, proxy, policy) but owns a
     // fresh pool.
-    // Same reasoning for the non-stealth client: a pool belongs to the runtime
+    // Same reasoning for the policy client: a pool belongs to the runtime
     // that drives it, so the worker needs its own instance too.
     let worker_http = parent.http_client.as_ref()
         .map(|client| std::sync::Arc::new(client.detached()));
-    #[cfg(feature = "stealth")]
     let worker_stealth = parent.stealth_client.as_ref().map(|client| {
         std::sync::Arc::new(obscura_net::StealthHttpClient::detached(client))
     });
     let config = WorkerConfig { policy: registry.borrow().policy.clone(), resources: resources.clone(), url: url.into(), globals, blobs,
         identity: parent.device_identity.clone(), cookies: parent.cookie_jar.clone(),
         http: worker_http, callbacks: parent.callbacks.clone(),
-        #[cfg(feature = "stealth")]
         stealth: worker_stealth,
         blocked_urls: parent.blocked_urls.clone(), referrer_policy: parent.referrer_policy,
         intercept_tx: parent.intercept_tx.clone(), intercept_enabled: parent.intercept_enabled,
@@ -943,8 +940,7 @@ async fn run_worker(id: u32, config: WorkerConfig,
         state.cookie_jar = config.cookies;
         state.http_client = config.http;
         state.callbacks = config.callbacks;
-        #[cfg(feature = "stealth")]
-        { state.stealth_client = config.stealth; }
+        state.stealth_client = config.stealth;
         state.blocked_urls = config.blocked_urls;
         state.referrer_policy = config.referrer_policy;
         state.intercept_tx = config.intercept_tx;

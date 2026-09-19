@@ -26,7 +26,6 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let browser = Browser::builder()
-        .stealth(true)
         .storage_dir("/tmp/cookies")
         .build()?;
 

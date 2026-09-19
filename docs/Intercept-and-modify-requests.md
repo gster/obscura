@@ -119,7 +119,7 @@ page.on('request', req => {
 });
 ```
 
-Built-in: `--stealth` ships with a tracker blocklist that handles most of these without per-script setup. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
+Built-in: every build ships with a tracker blocklist that handles most of these without per-script setup. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 ## From the Rust library
 

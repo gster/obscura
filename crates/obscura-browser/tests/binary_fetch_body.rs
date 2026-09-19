@@ -79,13 +79,13 @@ fn spawn_echo_server() -> (String, mpsc::Receiver<Vec<u8>>) {
     (format!("http://{address}"), body_rx)
 }
 
-async fn assert_binary_fetch_body(stealth: bool) {
+async fn assert_binary_fetch_body() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let (base_url, body_rx) = spawn_echo_server();
     let context = Arc::new(BrowserContext::with_storage_and_network(
         "binary-fetch".to_string(),
         None,
-        stealth,
+        true,
         None,
         None,
         true,
@@ -133,11 +133,5 @@ async fn assert_binary_fetch_body(stealth: bool) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn fetch_preserves_binary_request_body() {
-    assert_binary_fetch_body(false).await;
-}
-
-#[cfg(feature = "stealth")]
-#[tokio::test(flavor = "current_thread")]
-async fn stealth_fetch_preserves_binary_request_body() {
-    assert_binary_fetch_body(true).await;
+    assert_binary_fetch_body().await;
 }

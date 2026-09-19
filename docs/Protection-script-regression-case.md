@@ -89,11 +89,11 @@ cargo nextest run --release --features render -p obscura-js \
   -E 'test(southwest_style_protection_probe_remains_coherent) or test(dynamic_classic_script_runs_after_post_insertion_callback_assignment)'
 ```
 
-For a stealth change, also build and exercise the stealth transport path:
+For an identity or transport change, build and exercise the mandatory primp path:
 
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release \
-  -p obscura-cli --bins --features render,stealth
+  -p obscura-cli --bins --features render
 ```
 
 ## Comparing a live failure

@@ -61,25 +61,13 @@ body:
     id: build
     attributes:
       label: Build variant
-      description: Official default and stealth archives include rendering. No-render archives and source builds without the render feature do not.
+      description: All builds include the primp transport and browser identity baseline. No-render builds omit rendering only.
       options:
         - Render-enabled (official default archive or --features render)
-        - Render-enabled with stealth (official stealth archive or --features render,stealth)
         - No-render (official no-render archive or source build without render)
-        - No-render with stealth (official no-render-stealth archive or --features stealth)
         - I do not know
     validations:
       required: true
-  - type: dropdown
-    id: stealth
-    attributes:
-      label: Stealth mode
-      options:
-        - "Off"
-        - "On (--stealth)"
-        - "Not applicable"
-    validations:
-      required: false
   - type: textarea
     id: repro
     attributes:

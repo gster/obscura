@@ -91,20 +91,6 @@ jobs:
             cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/no-render/
           fi
 
-      - name: Build no-render stealth release binary
-        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features stealth
-
-      - name: Stage no-render stealth release binary
-        shell: bash
-        run: |
-          BIN_DIR=target/${{ matrix.target }}/release-dist
-          mkdir -p dist/no-render-stealth
-          if [ -f "$BIN_DIR/obscura.exe" ]; then
-            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/no-render-stealth/
-          else
-            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/no-render-stealth/
-          fi
-
       - name: Build render-enabled release binary
         run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render
 
@@ -119,20 +105,6 @@ jobs:
             cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/default/
           fi
 
-      - name: Build render-enabled stealth release binary
-        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
-
-      - name: Stage stealth release binary
-        shell: bash
-        run: |
-          BIN_DIR=target/${{ matrix.target }}/release-dist
-          mkdir -p dist/stealth
-          if [ -f "$BIN_DIR/obscura.exe" ]; then
-            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/stealth/
-          else
-            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/stealth/
-          fi
-
       - name: Smoke test release binaries (V8 snapshot)
         # Run the V8 path once so a release never ships a binary that crashes at
         # isolate init from a mismatched snapshot (issue #290). The data: URL
@@ -140,19 +112,19 @@ jobs:
         # execute all variants it just built.
         shell: bash
         run: |
-          for VARIANT in default stealth no-render no-render-stealth; do
+          for VARIANT in default no-render; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
             "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
           done
-          for VARIANT in default stealth; do
+          for VARIANT in default; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
             "$BIN" fetch "data:text/html,<style>body{margin:0;background:%23123456}</style>" --screenshot smoke.png
             test -s smoke.png
             rm smoke.png
           done
-          for VARIANT in no-render no-render-stealth; do
+          for VARIANT in no-render; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
             if "$BIN" fetch "data:text/html,<title>no-render</title>" --screenshot smoke.png; then
@@ -166,21 +138,15 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker
-          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker
           tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
-          tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd dist/default
           7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
-          cd ../stealth
-          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
           cd ../no-render
           7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
-          cd ../no-render-stealth
-          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -188,13 +154,9 @@ jobs:
           name: release-${{ matrix.name }}
           path: |
             ${{ matrix.name }}.tar.gz
-            ${{ matrix.name }}-stealth.tar.gz
             ${{ matrix.name }}-no-render.tar.gz
-            ${{ matrix.name }}-no-render-stealth.tar.gz
             ${{ matrix.name }}.zip
-            ${{ matrix.name }}-stealth.zip
             ${{ matrix.name }}-no-render.zip
-            ${{ matrix.name }}-no-render-stealth.zip
           if-no-files-found: error
           retention-days: 1
 

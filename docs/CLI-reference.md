@@ -1,4 +1,4 @@
-> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+> MCP 与有用的 CLI 保留，用于自动化和 agent 接入。所有入口自动使用统一 persona 和 primp；没有运行时 stealth 开关。
 
 ## `obscura`
 
@@ -8,9 +8,7 @@ Global flags can appear before or after the subcommand. Their effect depends on 
 -v, --verbose                Enable info logging
 -p, --port <PORT>            CDP port (default 9222)
     --proxy <URL>            HTTP or SOCKS5 proxy
-    --stealth                Consistent browser fingerprint + tracker blocking
     --obey-robots            Respect robots.txt
-    --user-agent <UA>        Override the User-Agent
     --storage-dir <DIR>      Cookie persistence only; see storage limitations
     --allow-private-network  Permit loopback / RFC1918 / link-local
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
@@ -30,9 +28,7 @@ Load a URL and print its content or an evaluated expression.
     --timeout <SECONDS>      Navigation timeout (default 30)
     --wait-until <LEVEL>     domcontentloaded | load | networkidle2 | networkidle0
                              (default load)
-    --user-agent <UA>        Override the User-Agent
     --proxy <URL>            HTTP or SOCKS5 proxy
-    --stealth                Consistent browser fingerprint + tracker blocking (global)
 -e, --eval <JS>              Evaluate JS, print the result as JSON
 -o, --output <FILE>          Write to a file instead of stdout
 -s, --screenshot <FILE>      Capture the settled page as PNG (single URL)
@@ -69,8 +65,6 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
 -p, --port <PORT>            CDP port (default 9222)
     --host <HOST>            Bind host (default 127.0.0.1)
     --proxy <URL>            HTTP or SOCKS5 proxy
-    --user-agent <UA>        Override the User-Agent
-    --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
     --max-connections <N>    Maximum simultaneous CDP connections (default 128)
     --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
@@ -93,13 +87,12 @@ Run a JS expression across many URLs in parallel.
     --format <FORMAT>        Output format (default json)
     --timeout <SECONDS>      Per-URL timeout (default 60)
     --proxy <URL>            HTTP or SOCKS5 proxy
-    --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable verbose logging
 ```
 
-`--stealth`, `--proxy`, and `--allow-private-network` are global flags: they work before or after any subcommand, so each worker in a `scrape` run inherits stealth too.
+`--proxy` and `--allow-private-network` are global flags: they work before or after any subcommand, and each `scrape` worker inherits them.
 
 Read URLs from stdin with `-`:
 
@@ -118,8 +111,6 @@ Run obscura as an MCP server.
     --host <HOST>            HTTP bind host (default 127.0.0.1)
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
-    --user-agent <UA>        Override the User-Agent
-    --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
 -v, --verbose                Enable info logging
 ```
@@ -130,3 +121,12 @@ Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
 
 Render-enabled builds add `browser_screenshot` and `browser_pdf` to the MCP
 tool list. Streaming screencasts are available through CDP rather than MCP.
+
+`--stealth` and `--user-agent` are not CLI or `serve` parameters. The active
+persona owns the primp transport profile, HTTP headers, Client Hints and
+JavaScript navigator identity as one calibrated identity. The persona is fixed
+when a BrowserContext is created and remains immutable until that context is
+closed. `Network.setUserAgentOverride` is therefore unsupported.
+`Network.setExtraHTTPHeaders` still forwards ordinary headers unchanged, while
+persona-owned User-Agent, Client Hints, language, encoding, and DNT headers are
+rejected for the same context-lifetime reason.

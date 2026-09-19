@@ -126,7 +126,7 @@ impl Page {
     /// Enable CDP-Fetch-style interception of every JS `fetch()`/XHR. Returns a
     /// receiver yielding each request; resolve it through its `resolver` with
     /// [`obscura::InterceptResolution`] (`Continue`, `Fulfill`, `Fail`) to pass,
-    /// mock, or block it. Works in stealth and non-stealth.
+    /// mock, or block it.
     pub fn enable_interception(
         &mut self,
     ) -> tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest> {

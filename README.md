@@ -6,9 +6,9 @@
 
 本 fork 正在向 **CDP-first、未修改的 Playwright Python 客户端、macOS/Linux 独立内核**收敛。
 
-下一步清理自有 Python SDK 和配套 NDJSON runtime；保留 MCP 与有助于 agent 接入的 CLI。重点强化统一 persona，取消 `--stealth` 开关使其成为不可关闭的底层能力，以经校准的 primp 统一所有项目自有 HTTP(S) 出口，优先修补 Chrome 行为差异。Southwest shopping 不再 403 且返回有效查询结果，是重要业务验收点。
+下一步清理自有 Python SDK 和配套 NDJSON runtime；保留 MCP 与有助于 agent 接入的 CLI。统一 persona 与经校准的 primp 已成为不可关闭的底层能力，后续优先修补 Chrome 行为差异。Southwest shopping 不再 403 且返回有效查询结果，是重要业务验收点。
 
-上述迁移尚未实现；当前仍有双传输后端、可选 stealth 和分散的身份配置。支持部分 CDP 和 Web API，不承诺完整 Chrome 或 Playwright 替代能力。当前事实和测试结果见 [SUMMARY](docs/SUMMARY.md)，开发顺序见 [TODO](docs/TODO.md)。
+强制 primp 和统一身份基线的首个切片已经落地；全出口收敛、完整 persona 编译器和 Linux/容器资格仍在迁移。支持部分 CDP 和 Web API，不承诺完整 Chrome 或 Playwright 替代能力。当前事实和测试结果见 [SUMMARY](docs/SUMMARY.md)，开发顺序见 [TODO](docs/TODO.md)。
 
 ## 构建与运行
 
@@ -28,7 +28,7 @@ CDP browser endpoint：`ws://127.0.0.1:9222/devtools/browser`。官方 Playwrigh
 ./target/release/obscura fetch https://example.com --screenshot /tmp/obscura-example.png
 ```
 
-需要 primp 传输时，另以 `--features render,stealth` 构建并在运行时传入 `--stealth`。它不是网站可访问性或完整浏览器身份一致性的保证。依赖、证书和平台要求见 [源码构建](docs/Build-from-source.md)。本 fork 的安装应固定源码提交；不能仅凭上游发行包的版本号确认它包含本 fork 的固定提交及修复。
+所有构建和入口都使用 primp 与统一身份基线。它不是网站可访问性或完整浏览器身份一致性的保证。依赖、证书和平台要求见 [源码构建](docs/Build-from-source.md)。本 fork 的安装应固定源码提交；不能仅凭上游发行包的版本号确认它包含本 fork 的固定提交及修复。
 
 ## 验证与限制
 

@@ -7,7 +7,8 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
+# Compatibility alias. MCP pages always use the primp transport.
+stealth = []
 render = ["obscura-browser/render", "dep:base64"]
 
 [dependencies]

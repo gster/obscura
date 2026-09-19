@@ -15,7 +15,8 @@ path = "src/worker.rs"
 
 [features]
 default = []
-stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
+# Compatibility alias for existing build commands. Stealth is always enabled.
+stealth = []
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
 
 [dependencies]

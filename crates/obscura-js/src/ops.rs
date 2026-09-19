@@ -13,7 +13,6 @@ use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 #[cfg(feature = "render")]
 use obscura_net::RequestCredentials;
-#[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
     RequestMode, CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response, ResourceRequest, ReferrerPolicy,
@@ -70,6 +69,19 @@ pub struct InterceptedRequest {
 pub struct StoredNetworkResponseBody {
     pub body: String,
     pub base64_encoded: bool,
+}
+
+fn stored_network_response_body(bytes: &[u8]) -> StoredNetworkResponseBody {
+    match std::str::from_utf8(bytes) {
+        Ok(body) => StoredNetworkResponseBody {
+            body: body.to_owned(),
+            base64_encoded: false,
+        },
+        Err(_) => StoredNetworkResponseBody {
+            body: BASE64.encode(bytes),
+            base64_encoded: true,
+        },
+    }
 }
 
 /// A network request made from page JS (fetch()/XHR/dynamic resource) recorded
@@ -271,10 +283,9 @@ pub struct ObscuraState {
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
     /// the page that registered it.
     pub callbacks: Option<Arc<CallbackRegistry>>,
-    /// When set (stealth mode), scripted fetch()/XHR is routed through the primp
-    /// client so the request carries the Chrome TLS fingerprint and client
-    /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
-    #[cfg(feature = "stealth")]
+    /// Page runtimes route scripted fetch()/XHR through primp so transport and
+    /// JavaScript expose the same browser identity. Standalone runtimes leave
+    /// this unset because they do not own a page transport.
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub session_history: SharedSessionHistory,
     pub history_epoch: u64,
@@ -510,7 +521,6 @@ impl ObscuraState {
             opaque_storage: Default::default(),
             http_client: None,
             callbacks: None,
-            #[cfg(feature = "stealth")]
             stealth_client: None,
             session_history: Rc::new(RefCell::new(SessionHistory::default())),
             history_epoch: 0,
@@ -1330,14 +1340,7 @@ pub struct RenderResourceEvent {
 /// Whether this runtime is owned by a page with an asynchronous transport.
 #[cfg(feature = "render")]
 pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
-    #[cfg(feature = "stealth")]
-    {
-        state.http_client.is_some() || state.stealth_client.is_some()
-    }
-    #[cfg(not(feature = "stealth"))]
-    {
-        state.http_client.is_some()
-    }
+    state.http_client.is_some() || state.stealth_client.is_some()
 }
 
 /// Build the renderer resource cache for this runtime. A runtime owned by a
@@ -4061,7 +4064,6 @@ async fn op_fetch_url(
         }
         let preflight_request = preflight_request.build()
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-        #[cfg(feature = "stealth")]
         let stealth_preflight = {
             let stealth = {
                 let st = state.borrow();
@@ -4089,8 +4091,6 @@ async fn op_fetch_url(
                 Some((response.status, headers))
             } else { None }
         };
-        #[cfg(not(feature = "stealth"))]
-        let stealth_preflight: Option<(u16, reqwest::header::HeaderMap)> = None;
         let (preflight_status, preflight_headers) = match stealth_preflight {
             Some(response) => response,
             None => {
@@ -4158,10 +4158,9 @@ async fn op_fetch_url(
         }
     }
 
-    // Stealth mode: route scripted requests through the same client after CORS
+    // Route scripted requests through the page's primp client after CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
-    #[cfg(feature = "stealth")]
     {
         let stealth = {
             let st = state.borrow();
@@ -4171,6 +4170,7 @@ async fn op_fetch_url(
         };
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
+                state.clone(),
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
@@ -4427,10 +4427,7 @@ async fn op_fetch_url(
         if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
             gs.network_response_bodies.insert(
                 request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
+                stored_network_response_body(&resp_bytes),
             );
             gs.network_response_body_order.push_back(request_id.clone());
             while gs.network_response_body_order.len() > max_entries {
@@ -4506,14 +4503,14 @@ fn fetch_response(
     }
 }
 
-/// Stealth-mode scripted fetch()/XHR: mirrors op_fetch_url's redirect, SSRF,
+/// Scripted fetch()/XHR over primp: mirrors op_fetch_url's redirect, SSRF,
 /// and CORS semantics but sends every hop through the primp stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
-#[cfg(feature = "stealth")]
+/// context jar and records the same CDP/MCP network observations as every
+/// other page request.
 async fn stealth_fetch_all(
+    state: Rc<RefCell<OpState>>,
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
@@ -4677,10 +4674,54 @@ async fn stealth_fetch_all(
         }
     }
 
+    let response_request_id = {
+        let state_borrow = state.borrow();
+        let gs = state_borrow.borrow::<SharedState>().clone();
+        let mut gs = gs.borrow_mut();
+        let id = gs.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let request_id = format!("fetch-{id}");
+        let max_entries = response_body_entry_limit();
+        let max_bytes = response_body_byte_limit();
+        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
+            gs.network_response_bodies.insert(
+                request_id.clone(),
+                stored_network_response_body(&resp_bytes),
+            );
+            gs.network_response_body_order.push_back(request_id.clone());
+            while gs.network_response_body_order.len() > max_entries {
+                if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                    gs.network_response_bodies.remove(&oldest);
+                }
+            }
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        gs.js_network_events.push(JsNetworkEvent {
+            request_id: request_id.clone(),
+            url: current_url.clone(),
+            method: current_method.clone(),
+            status,
+            response_headers: resp_headers.clone(),
+            body_size: resp_bytes.len(),
+            timestamp,
+        });
+        const MAX_JS_NETWORK_EVENTS: usize = 4096;
+        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+            gs.js_network_events.drain(0..overflow);
+        }
+        request_id
+    };
+
+    crate::worker::flush_observations(&state.borrow());
+
     Ok(serde_json::json!({
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
+        "requestId": response_request_id,
         "url": current_url,
         "redirected": redirects_followed > 0,
         "opaque": mode == "no-cors" && crossed_origin,
@@ -7615,12 +7656,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         )
     };
 
-    #[cfg(feature = "stealth")]
     let stealth_client = shared.borrow().stealth_client.clone();
-    #[cfg(feature = "stealth")]
     let has_page_transport = http_client.is_some() || stealth_client.is_some();
-    #[cfg(not(feature = "stealth"))]
-    let has_page_transport = http_client.is_some();
     if !has_page_transport {
         return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
     }
@@ -7663,32 +7700,16 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
-        #[cfg(feature = "stealth")]
-        {
-            if let Some(client) = stealth_client {
-                client
-                    .fetch_resource_with_callbacks(
-                        parsed_url,
-                        resource_request.clone(),
-                        callbacks.as_deref(),
-                    )
-                    .await
-                    .ok()
-            } else {
-                http_client
-                    .as_ref()
-                    .unwrap()
-                    .fetch_resource_with_callbacks(
-                        parsed_url,
-                        resource_request,
-                        callbacks.as_deref(),
-                    )
-                    .await
-                    .ok()
-            }
-        }
-        #[cfg(not(feature = "stealth"))]
-        {
+        if let Some(client) = stealth_client {
+            client
+                .fetch_resource_with_callbacks(
+                    parsed_url,
+                    resource_request.clone(),
+                    callbacks.as_deref(),
+                )
+                .await
+                .ok()
+        } else {
             http_client
                 .as_ref()
                 .unwrap()

@@ -276,6 +276,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_persona_drives_the_primp_transport_profile() {
+        let mut persona: Persona = serde_json::from_value(json!({
+            "schema_version":"1", "persona_id":"fixture_macos153", "revision":"1",
+            "profile":"macos_chrome153", "viewport":{"width":640,"height":480},
+            "language":"zh-CN", "languages":["zh-CN","zh"],
+            "accept_language":"zh-CN,zh;q=0.9", "do_not_track":"1"
+        }))
+        .unwrap();
+        persona.apply_defaults();
+        let profile = persona.stealth_profile();
+        let mut context = BrowserContext::with_persona_profile(
+            "persona".into(),
+            None,
+            profile,
+            None,
+            false,
+        );
+        context.accept_language = persona.accept_language.clone().unwrap();
+        context.do_not_track = persona.do_not_track.clone();
+        let page = Page::new("persona-page".into(), Arc::new(context));
+        let transport = page.stealth_client.transport_params();
+
+        assert_eq!(transport.profile, obscura_net::StealthProfile::MacChrome153);
+        assert_eq!(transport.accept_language, persona.accept_language);
+        assert_eq!(transport.do_not_track, persona.do_not_track);
+        assert_eq!(page.context.user_agent, transport.profile.user_agent());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn native_submit_click_uses_private_validation_events_and_navigation() {
         let mut page=input_fixture(r#"<!doctype html><form id="f" method="get" action="/wrong"><input id="field" name="field" value="OLD"></form>
@@ -6066,6 +6095,14 @@ struct Persona {
 }
 
 impl Persona {
+    fn stealth_profile(&self) -> obscura_net::StealthProfile {
+        match self.profile.as_str() {
+            "macos_chrome153" => obscura_net::StealthProfile::MacChrome153,
+            "macos_chrome152" => obscura_net::StealthProfile::MacChrome152,
+            _ => obscura_net::StealthProfile::WindowsChrome145,
+        }
+    }
+
     fn apply_defaults(&mut self) {
         let macos = matches!(self.profile.as_str(), "macos_chrome152" | "macos_chrome153");
         if self.language.is_none() && self.languages.is_none() {
@@ -6464,21 +6501,15 @@ impl BrowserRuntime {
                 return Err(invalid("INVALID_PROXY"));
             }
         }
-        let profile = match persona.profile.as_str() {
-            "macos_chrome153" => obscura_net::StealthProfile::MacChrome153,
-            "macos_chrome152" => obscura_net::StealthProfile::MacChrome152,
-            _ => obscura_net::StealthProfile::WindowsChrome145,
-        };
-        let mut context = BrowserContext::with_storage_and_network(
+        let profile = persona.stealth_profile();
+        let mut context = BrowserContext::with_persona_profile(
             "autopilot".into(),
             init.proxy_url,
-            true,
-            Some(profile.user_agent().into()),
+            profile,
             None,
             loopbacks > 0,
         );
         context.device_identity = Some(persona.device_identity());
-        context.stealth_profile = profile;
         let (platform, ua_platform, version) = profile.platform();
         context.platform = platform.into();
         context.ua_platform = ua_platform.into();

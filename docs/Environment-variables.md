@@ -96,21 +96,9 @@ Override the coordinates the `navigator.geolocation` shim reports, as `lat,lon`.
 OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
 ```
 
-### `OBSCURA_PROFILE`
-
-Pin a specific browser profile from the built-in pool by index (`0`-based). Each profile keeps `navigator.platform`, `userAgentData`, the UA string, and the GPU renderer internally consistent. Without it a single stable profile is used.
-
-```bash
-OBSCURA_PROFILE=2 obscura serve
-```
-
-### `OBSCURA_ROTATE_PROFILE`
-
-Opt into picking a random profile per browser context instead of the stable default. Leave it off when you pin a TLS fingerprint, proxy region, or timezone, since a rotated profile would no longer match those.
-
-```bash
-OBSCURA_ROTATE_PROFILE=1 obscura serve
-```
+`OBSCURA_PROFILE` and `OBSCURA_ROTATE_PROFILE` are no longer product
+configuration. Product entry points use one calibrated primp/JavaScript persona
+until the unified persona configuration tracked by OB-015/016 replaces it.
 
 ## MCP
 

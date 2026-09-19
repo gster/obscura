@@ -4,29 +4,22 @@
 pub(crate) mod transport;
 use transport::header;
 
-#[cfg(feature = "stealth")]
 use std::collections::HashMap;
-#[cfg(feature = "stealth")]
 use std::error::Error;
-#[cfg(feature = "stealth")]
 use std::sync::Arc;
 
-#[cfg(feature = "stealth")]
 use futures_util::StreamExt;
-#[cfg(feature = "stealth")]
-use tokio::sync::RwLock;
-#[cfg(feature = "stealth")]
+use tokio::sync::{RwLock, watch};
 use url::Url;
 
-#[cfg(feature = "stealth")]
 use crate::cookies::CookieJar;
-#[cfg(feature = "stealth")]
 use crate::client::{
     CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
     ReferrerPolicy, ResourceRequest, Response, SsrfGuardResolver, cors_required, env_allows_private_network,
     fetch_file_url, is_forbidden_ip, redirect_taints_origin, request_fetch_site,
     request_referrer, response_too_large, serialized_request_origin, validate_cors_response,
-    validate_request_mode, validate_url,
+    validate_request_mode, validate_url, response_cache_lifetime, ResourceCacheKey,
+    ResourceLoaderState, SharedFetchLeader, SharedFetchOutcome, SharedFetchSender,
 };
 
 impl primp::dns::Resolve for SsrfGuardResolver {
@@ -50,7 +43,6 @@ async fn resolve_guarded(host: &str, allow: bool) -> Result<Vec<std::net::Socket
     Ok(addrs)
 }
 
-#[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
@@ -58,14 +50,10 @@ pub const STEALTH_USER_AGENT: &str =
 // UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
 // site cross-checks the mismatch as a bot signal.
-#[cfg(feature = "stealth")]
 pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
-#[cfg(feature = "stealth")]
 pub const STEALTH_UA_PLATFORM: &str = "Windows";
-#[cfg(feature = "stealth")]
 pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 
-#[cfg(feature = "stealth")]
 fn stealth_response_header_value<'a>(
     headers: &'a http::header::HeaderMap,
     name: &'static str,
@@ -86,7 +74,6 @@ fn stealth_response_header_value<'a>(
     })
 }
 
-#[cfg(feature = "stealth")]
 fn validate_stealth_cors_response(
     request: &ResourceRequest,
     target: &Url,
@@ -109,7 +96,6 @@ fn validate_stealth_cors_response(
     )
 }
 
-#[cfg(feature = "stealth")]
 async fn read_stealth_body_limited(
     response: transport::Response,
     url: &Url,
@@ -186,11 +172,11 @@ impl StealthProfile {
             Self::MacChrome153 => ("MacIntel", "macOS", "26.6.2"),
         }
     }
+
 }
 
 /// The parameters a transport client is built from. Kept on the client so a
 /// sibling can be constructed for a different runtime with the same identity.
-#[cfg(feature = "stealth")]
 #[derive(Clone, Debug)]
 pub struct TransportParams {
     pub profile: StealthProfile,
@@ -199,7 +185,6 @@ pub struct TransportParams {
     pub do_not_track: Option<String>,
 }
 
-#[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: transport::Client,
     allow_private_network: bool,
@@ -208,11 +193,11 @@ pub struct StealthHttpClient {
     /// the same header overrides.
     pub extra_headers: Arc<RwLock<HashMap<String, String>>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     policy: Option<Arc<crate::client::ObscuraHttpClient>>,
     transport: TransportParams,
 }
 
-#[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
         Self::with_proxy(cookie_jar, None, false)
@@ -251,6 +236,7 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             policy: Some(policy),
             transport: TransportParams {
                 profile,
@@ -270,6 +256,7 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             policy,
             transport: TransportParams {
                 profile,
@@ -308,6 +295,7 @@ impl StealthHttpClient {
             cookie_jar: self.cookie_jar.clone(),
             extra_headers: self.extra_headers.clone(),
             in_flight: self.in_flight.clone(),
+            resource_loader: self.resource_loader.clone(),
             policy: self.policy.clone(),
             transport: params.clone(),
         }
@@ -360,7 +348,141 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[]).await
+        let Some(cache_key) = self.resource_cache_key(url, &request).await else {
+            return self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[]).await;
+        };
+
+        enum Acquisition {
+            Cached(Response),
+            Follower(watch::Receiver<Option<SharedFetchOutcome>>),
+            Leader(SharedFetchSender),
+        }
+
+        let acquisition = {
+            let mut loader = self.resource_loader.lock().unwrap();
+            if let Some(response) = loader.cache.get(&cache_key) {
+                Acquisition::Cached(response)
+            } else if let Some(sender) = loader.shared_fetches.get(&cache_key) {
+                Acquisition::Follower(sender.subscribe())
+            } else {
+                let (sender, _receiver) = watch::channel(None);
+                loader.shared_fetches.insert(cache_key.clone(), sender.clone());
+                Acquisition::Leader(sender)
+            }
+        };
+
+        match acquisition {
+            Acquisition::Cached(response) => {
+                self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
+                Ok(response)
+            }
+            Acquisition::Follower(mut receiver) => loop {
+                let outcome = { receiver.borrow().clone() };
+                if let Some(outcome) = outcome {
+                    break match outcome {
+                        SharedFetchOutcome::Cacheable(response) => {
+                            self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
+                            Ok(response)
+                        }
+                        SharedFetchOutcome::RetryUncoalesced => {
+                            self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[]).await
+                        }
+                    };
+                }
+                if receiver.changed().await.is_err() {
+                    break self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[]).await;
+                }
+            },
+            Acquisition::Leader(sender) => {
+                let leader = SharedFetchLeader {
+                    loader: &self.resource_loader,
+                    key: cache_key.clone(),
+                    sender,
+                    finished: false,
+                };
+                let result = self.fetch_method_with_profile(
+                    url, request, callbacks, http::Method::GET, &[],
+                ).await;
+                let outcome = match &result {
+                    Ok(response) => match response_cache_lifetime(response) {
+                        Some(lifetime) => {
+                            self.resource_loader.lock().unwrap().cache.insert(
+                                cache_key, response.clone(), lifetime,
+                            );
+                            SharedFetchOutcome::Cacheable(response.clone())
+                        }
+                        None => SharedFetchOutcome::RetryUncoalesced,
+                    },
+                    Err(_) => SharedFetchOutcome::RetryUncoalesced,
+                };
+                leader.finish(outcome);
+                result
+            }
+        }
+    }
+
+    async fn resource_cache_key(
+        &self,
+        url: &Url,
+        request: &ResourceRequest,
+    ) -> Option<ResourceCacheKey> {
+        if request.resource_type == crate::client::ResourceType::Document
+            || !matches!(url.scheme(), "http" | "https")
+        {
+            return None;
+        }
+        if let Some(policy) = &self.policy {
+            if policy.interceptor.read().await.is_some() {
+                return None;
+            }
+        }
+        let mut extra_headers = self.extra_headers.read().await.iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect::<Vec<_>>();
+        extra_headers.sort();
+        if extra_headers.iter().any(|(name, value)| {
+            name == "authorization"
+                || name == "cookie"
+                || (name == "cache-control"
+                    && (value.to_ascii_lowercase().contains("no-cache")
+                        || value.to_ascii_lowercase().contains("no-store")))
+        }) {
+            return None;
+        }
+        if request.sends_credentials_to(url) && !self.cookie_jar.get_cookie_header(url).is_empty() {
+            return None;
+        }
+        Some(ResourceCacheKey {
+            url: url.to_string(),
+            resource_type: request.resource_type,
+            mode: request.mode,
+            credentials: request.credentials,
+            initiator: request.initiator.as_ref().map(ToString::to_string),
+            referrer: request.referrer.as_ref().map(ToString::to_string),
+            referrer_policy: request.referrer_policy,
+            user_agent: self.transport.profile.user_agent().to_string(),
+            extra_headers,
+            max_response_bytes: request.max_response_bytes,
+        })
+    }
+
+    async fn fire_logical_resource_callbacks(
+        &self,
+        callbacks: Option<&CallbackRegistry>,
+        url: &Url,
+        request: &ResourceRequest,
+        response: &Response,
+    ) {
+        let Some(callbacks) = callbacks else { return; };
+        let request_info = RequestInfo {
+            body: Vec::new(),
+            url: url.clone(),
+            method: http::Method::GET.to_string(),
+            headers: self.extra_headers.read().await.clone(),
+            resource_type: request.resource_type,
+        };
+        callbacks.fire_request(&request_info).await;
+        callbacks.fire_response(&request_info, response).await;
     }
 
     pub async fn post_form_resource_with_callbacks(
@@ -636,7 +758,7 @@ impl StealthHttpClient {
     }
 }
 
-#[cfg(all(test, feature = "stealth"))]
+#[cfg(test)]
 mod tests {
     /// A detached client exists so a worker on its own tokio runtime does not
     /// reuse the page's connection pool: a pooled connection is driven by the
@@ -996,11 +1118,18 @@ mod tests {
     async fn stealth_post_does_not_retry_connection_reset() {
         let (port, server) = reset_fixture(false);
         let client = StealthHttpClient {
-            client: super::transport::Client::new(super::StealthProfile::WindowsChrome145, None, true, None, None),
+            client: super::transport::Client::new(
+                super::StealthProfile::WindowsChrome145,
+                None,
+                true,
+                None,
+                None,
+            ),
             allow_private_network: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            resource_loader: Arc::new(std::sync::Mutex::new(crate::client::ResourceLoaderState::default())),
             policy: None,
             transport: super::TransportParams {
                 profile: super::StealthProfile::WindowsChrome145,

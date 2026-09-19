@@ -88,49 +88,42 @@ fn browser_close_response(req: &CdpRequest) -> Option<(CdpResponse, bool)> {
 }
 
 pub async fn start(port: u16) -> anyhow::Result<()> {
-    start_with_options(port, None, false).await
+    start_with_options(port, None).await
 }
 
 pub async fn start_with_options(
     port: u16,
     proxy: Option<String>,
-    stealth: bool,
 ) -> anyhow::Result<()> {
-    start_with_full_options(port, proxy, stealth, None, None).await
+    start_with_full_options(port, proxy, None).await
 }
 
 pub async fn start_with_full_options(
     port: u16,
     proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent, storage_dir).await
+    start_with_host(port, "127.0.0.1", proxy, storage_dir).await
 }
 
 pub async fn start_with_host(
     port: u16,
     host: &str,
     proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    start_with_host_and_security(port, host, proxy, stealth, user_agent, false, storage_dir).await
+    start_with_host_and_security(port, host, proxy, false, storage_dir).await
 }
 
 pub async fn start_with_host_and_security(
     port: u16,
     host: &str,
     proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     start_with_full_serve_options(
-        port, host, proxy, stealth, user_agent, allow_file_access, storage_dir, false,
+        port, host, proxy, allow_file_access, storage_dir, false,
     )
     .await
 }
@@ -139,13 +132,11 @@ pub async fn start_with_host_security_and_storage(
     port: u16,
     host: &str,
     proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     start_with_full_serve_options(
-        port, host, proxy, stealth, user_agent, allow_file_access, storage_dir, false,
+        port, host, proxy, allow_file_access, storage_dir, false,
     )
     .await
 }
@@ -157,8 +148,6 @@ pub async fn start_with_full_serve_options(
     port: u16,
     host: &str,
     proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
@@ -167,8 +156,6 @@ pub async fn start_with_full_serve_options(
         port,
         host,
         proxy,
-        stealth,
-        user_agent,
         allow_file_access,
         storage_dir,
         allow_private_network,
@@ -185,8 +172,6 @@ pub async fn start_with_serve_options_and_limit(
     port: u16,
     host: &str,
     proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
@@ -326,8 +311,8 @@ pub async fn start_with_serve_options_and_limit(
     let mut bctx = obscura_browser::BrowserContext::with_storage_and_network(
         "default".to_string(),
         proxy,
-        stealth,
-        user_agent,
+        true,
+        None,
         storage_dir,
         allow_private_network,
     );

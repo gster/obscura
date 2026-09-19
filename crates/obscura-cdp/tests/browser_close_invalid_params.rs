@@ -48,8 +48,6 @@ fn invalid_browser_close_does_not_close_the_websocket() {
                 None,
                 false,
                 None,
-                false,
-                None,
                 true,
                 1,
             )

@@ -7,6 +7,7 @@
 
 use obscura_cdp::dispatch::{dispatch, CdpContext};
 use obscura_cdp::types::CdpRequest;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -28,6 +29,16 @@ async fn serve() -> String {
                     let _ = socket.write_all(resp.as_bytes()).await;
                     return;
                 }
+                if req.starts_with("GET /api/blob.bin") {
+                    let body = [0u8, 128, 255, 16];
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    return;
+                }
                 let (ct, body) = if req.starts_with("GET /api/data.json") {
                     ("application/json", "{\"value\":42}")
                 } else {
@@ -37,9 +48,11 @@ async fn serve() -> String {
 <div id="r">stage1</div>
 <script>
 window.__done = new Promise(function (resolve) {
-  fetch("/api/start.json")
-    .then(function (r) { return r.json(); })
-    .then(function (d) { document.getElementById("r").textContent = "got:" + d.value; resolve("ok"); })
+  Promise.all([
+    fetch("/api/start.json").then(function (r) { return r.json(); }),
+    fetch("/api/blob.bin").then(function (r) { return r.arrayBuffer(); })
+  ])
+    .then(function (values) { document.getElementById("r").textContent = "got:" + values[0].value; resolve("ok"); })
     .catch(function (e) { resolve("err:" + e); });
 });
 </script>
@@ -151,6 +164,20 @@ async fn js_fetch_emits_network_request_and_response() {
         Some("{\"value\":42}"),
         "Network.getResponseBody must return the script-fetched JSON"
     );
+
+    let binary_request_id = response_request_id(&ctx, "/api/blob.bin")
+        .expect("binary fetch must emit Network.responseReceived with a requestId");
+    let binary = cdp(
+        &mut ctx,
+        3,
+        "Network.getResponseBody",
+        json!({"requestId": binary_request_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(binary.get("base64Encoded"), Some(&Value::Bool(true)));
+    let encoded = binary.get("body").and_then(Value::as_str).unwrap();
+    assert_eq!(BASE64.decode(encoded).unwrap(), [0u8, 128, 255, 16]);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -332,7 +332,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 ### OB-042 · P1 · 容器产物与功能声明对齐
 
 状态：未关闭。依赖：OB-001、OB-002，随 OB-024/004 更新。入口：Dockerfile、workspace patches、release。
-现状：Dockerfile 已复制 vendor，但仅构建 render；旧部署示例使用 --stealth，不能由这份构建证明该功能可用。本次未构建 Docker，也未认证 upstream registry 镜像。
+现状：Dockerfile 已复制 vendor 并构建 render；OB-044 后普通构建已无条件包含 primp，文档示例不再要求额外开关。本次仍未执行 Docker 干净构建，也未认证 upstream registry 镜像。
 完成：固定源码/基础镜像与实际依赖，干净构建、非 root 启动、强制 stealth/唯一 primp 出口、必要功能/证书/持久化 smoke 通过，发布清单与 fork SHA 一致；不能用 upstream 镜像代替。
 
 ### OB-043 · P1 · 服务端身份关联与报价影响的验收边界
@@ -343,7 +343,9 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 ### OB-044 · P0 · stealth 成为不可关闭的底层能力
 
-状态：未关闭。依赖：OB-005、OB-012、OB-015/016。入口：Cargo features、CLI --stealth、OBSCURA_STEALTH、配置分支、MCP/嵌入与 Docker/发布。
+状态：部分完成，保持未关闭。依赖：OB-005、OB-012、OB-015/016。入口：Cargo features、CLI、配置分支、MCP/嵌入与 Docker/发布。
+本轮完成：删除 CLI/serve 的 `--stealth`、`--user-agent`、`OBSCURA_STEALTH` 和嵌入 API 的运行时布尔开关；所有 Page、CDP、MCP、scrape worker 与 CLI 网络页面默认构造 primp，JS fetch/XHR、导航、表单、脚本、样式与渲染资源沿用该传输；普通与 no-default-features 发布构建都无条件编入 primp。旧 Cargo `stealth` feature 只保留为空兼容别名，不能关闭行为；CI/发布矩阵不再生成有无 stealth 的产品组合。新增回归验证旧 CLI 参数不存在、旧 Rust context bool 不能关闭能力、嵌入 API 默认 primp，并补齐 primp 子资源缓存合并、JS 网络事件/响应体记录和二进制正文无损 Base64 返回。persona 在 BrowserContext 初始化时同时确定 primp 传输配置与 JavaScript 身份，并在 context 生命周期内保持不变；运行中的 CDP User-Agent 覆盖明确不支持。
+本轮证据：根 release nextest **1817/1817**，独立 runtime **185/185**，render 与 no-default-features 两种 release CLI 构建均通过，旧 `stealth` feature 兼容编译通过，obstacle course **33/33**（含 `observer-intersection`）。Docker 干净构建及 OB-012/015/016 要求的全出口盘点和完整 persona 编译器尚未完成，因此本项不关闭。
 完成：移除运行时 stealth 开关与可绕过保护的产品编译路径，所有生产入口自动使用统一 persona 和 primp；旧开关仅可短期弃用兼容，不影响行为。无参数启动、各入口、容器与嵌入均有一致性验证；不能编出缺基线保护却正常发布的产物。隐私策略的明确例外不允许恢复其他传输或关闭身份一致性。
 
 ### OB-045 · P0 · Chrome 行为差异清单与修补闭环

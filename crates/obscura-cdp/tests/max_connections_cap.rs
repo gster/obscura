@@ -107,8 +107,6 @@ fn max_connections_refuses_then_recovers() {
                 None,
                 false,
                 None,
-                false,
-                None,
                 true,
                 LIMIT,
             )

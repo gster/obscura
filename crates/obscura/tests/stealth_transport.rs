@@ -1,5 +1,3 @@
-#![cfg(feature = "stealth")]
-
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -8,9 +6,6 @@ use obscura::Browser;
 
 const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-const ORDINARY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
-
 fn spawn_server() -> (String, mpsc::Receiver<String>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -47,29 +42,36 @@ fn spawn_server() -> (String, mpsc::Receiver<String>) {
     (format!("http://{}", addr), request_rx)
 }
 
-async fn navigate_user_agent(stealth: bool) -> String {
+async fn navigate_user_agents() -> (String, String) {
     let (url, request_rx) = spawn_server();
 
-    let browser = Browser::builder().stealth(stealth).build().unwrap();
+    let browser = Browser::builder().build().unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&url).await.unwrap();
+    let js_user_agent = page
+        .evaluate("navigator.userAgent")
+        .as_str()
+        .expect("navigator.userAgent should be a string")
+        .to_string();
 
     let request = request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    request
+    let network_user_agent = request
         .lines()
         .filter_map(|line| line.split_once(':'))
         .find_map(|(name, value)| {
             name.eq_ignore_ascii_case("user-agent")
                 .then(|| value.trim().to_string())
         })
-        .expect("request should include a user-agent header")
+        .expect("request should include a user-agent header");
+    (network_user_agent, js_user_agent)
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn stealth_transport_requires_compile_time_and_runtime_opt_in() {
+async fn primp_transport_is_the_default_api_transport() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     std::env::set_var("OBSCURA_PROFILE", "0");
 
-    assert_eq!(navigate_user_agent(true).await, STEALTH_USER_AGENT);
-    assert_eq!(navigate_user_agent(false).await, ORDINARY_USER_AGENT);
+    let (network, javascript) = navigate_user_agents().await;
+    assert_eq!(network, STEALTH_USER_AGENT);
+    assert_eq!(javascript, network, "wire and JS identity must stay aligned");
 }

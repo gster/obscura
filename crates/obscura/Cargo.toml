@@ -10,7 +10,8 @@ license = "Apache-2.0"
 [features]
 default = ["api"]
 api = ["obscura-browser", "obscura-net", "tokio"]
-stealth = ["api", "obscura-browser/stealth"]
+# Compatibility alias. The API always uses the primp transport.
+stealth = ["api"]
 render = ["api", "obscura-browser/render"]
 
 [dependencies]
@@ -28,4 +29,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 
 [[example]]
 name = "basic"
-required-features = ["stealth"]
+required-features = ["api"]

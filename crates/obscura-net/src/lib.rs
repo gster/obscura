@@ -4,10 +4,8 @@ pub mod encoding;
 pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
-#[cfg(feature = "stealth")]
 pub mod stealth_client;
 // Preserve the public module path for existing Rust callers.
-#[cfg(feature = "stealth")]
 pub use stealth_client as wreq_client;
 
 pub use client::{
@@ -22,7 +20,6 @@ pub use encoding::{
 };
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
-#[cfg(feature = "stealth")]
 pub use stealth_client::{
     StealthHttpClient, StealthProfile, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,

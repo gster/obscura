@@ -51,8 +51,6 @@ fn accept_thread_survives_silent_connections() {
                 None,
                 false,
                 None,
-                false,
-                None,
                 true,
                 128,
             )

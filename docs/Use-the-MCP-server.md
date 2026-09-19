@@ -1,4 +1,4 @@
-> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+> MCP 与有用的 CLI 保留，用于自动化和 agent 接入。所有入口自动使用统一身份基线和 primp；没有运行时 stealth 开关。
 
 `obscura mcp` exposes obscura as a Model Context Protocol server so MCP-capable clients (Claude Desktop, Claude Code, etc.) can drive it.
 
@@ -22,10 +22,10 @@ The HTTP transport binds `127.0.0.1` by default. Bind all interfaces with `--hos
 obscura mcp --http --host 0.0.0.0 --port 3000
 ```
 
-With stealth and proxy:
+With a proxy:
 
 ```bash
-obscura mcp --stealth --proxy http://proxy.example.com:8080
+obscura mcp --proxy http://proxy.example.com:8080
 ```
 
 ## Security

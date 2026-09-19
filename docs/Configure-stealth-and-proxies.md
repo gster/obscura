@@ -1,29 +1,27 @@
-> 目标变更：stealth 将成为不可关闭的基线，所有产品出站 HTTP(S) 统一使用校准后的 primp（OB-012/044）。本页保留当前源码所需的 feature/开关用法，不能将计划当作已实现。
-
-## Stealth mode
+## Browser identity baseline
 
 ```bash
-obscura fetch https://example.com --stealth
-obscura serve --stealth
-obscura scrape url1 url2 --stealth
-obscura mcp --stealth
+obscura fetch https://example.com
+obscura serve
+obscura scrape url1 url2
+obscura mcp
 ```
 
-`--stealth` is a global flag, so it works before or after the subcommand and applies to `fetch`, `serve`, `scrape`, and `mcp`. In a `scrape` run each worker inherits it.
-
-What `--stealth` changes:
+All product entry points always use the same baseline:
 
 - Uses the primp HTTP client with Chrome TLS profiles (ClientHello, ALPN, cipher order). See [known fidelity gaps](Primp-and-wreq-comparison.md).
 - Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
 - Uses bundled webpki roots and supports explicitly configured certificate roots; see [certificate configuration](Environment-variables.md).
 
-The primp transport requires a build that includes the stealth feature. Fix the source revision and build features in the artifact manifest. To build the rendering variant:
+The primp transport is part of every build. The legacy Cargo `stealth` feature
+is an empty compatibility alias and does not change behavior. Build the
+rendering variant with:
 
 ```bash
-cargo build --release -p obscura-cli --bins --features render,stealth
+cargo build --release -p obscura-cli --bins --features render
 ```
 
-Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-features --features stealth`.
+Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-features`.
 
 ## Verification boundary
 
@@ -50,25 +48,28 @@ SOCKS5:
 obscura fetch https://example.com --proxy socks5://proxy.example.com:1080
 ```
 
-## Custom User-Agent
+## Browser identity
 
-```bash
-obscura fetch https://example.com --user-agent "Mozilla/5.0 (...) ..."
-obscura serve --user-agent "Mozilla/5.0 (...) ..."
-```
-
-A custom UA does not automatically change the TLS, Client Hints, JavaScript, font or graphics configuration. Current primp presets include Windows Chrome 145 and macOS Chrome 152/153; these are implementation choices, not certified Linux/macOS personas.
+`--stealth` and `--user-agent` are not CLI or `serve` parameters. Browser
+identity is configured at the persona layer so the primp TLS/HTTP profile,
+Client Hints and JavaScript identity are compiled together before the first
+page or request. The effective persona is immutable for the BrowserContext
+lifetime; create a new context to use a different persona.
+`Network.setUserAgentOverride` is unsupported because its partial, page-scoped
+inputs cannot atomically replace an already-active context identity.
+`Network.setExtraHTTPHeaders` accepts ordinary headers with their complete
+values, but rejects persona-owned User-Agent, Client Hints, language, encoding,
+and DNT headers. Create a new context when those identity fields must change.
+Current primp presets include Windows Chrome 145 and macOS Chrome 152/153;
+these are implementation choices, not certified Linux/macOS personas.
 
 ## Browser profile, timezone, and geolocation
 
 The CLI's environment-selected profile and the isolated runtime's Persona are different configuration paths. Do not transfer a setting between them without checking its consumer. WebGL has a limited shim and renderer metadata; the old statement that every `getContext('webgl')` returns null is obsolete. Neither metadata nor a working clear/readPixels subset establishes complete GPU emulation.
 
-A single stable profile is used by default. Rotation is opt-in:
-
-```bash
-OBSCURA_PROFILE=2 obscura serve          # pin a specific profile by index
-OBSCURA_ROTATE_PROFILE=1 obscura serve   # random profile per browser context
-```
+A single stable profile is used by the product entry points. Persona selection
+will move to the unified configuration tracked by OB-015/016; the old
+`OBSCURA_PROFILE` and `OBSCURA_ROTATE_PROFILE` selectors are not product knobs.
 
 Timezone is driven by the process zone so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report the same region. Default is `Europe/Berlin`; set it to match the exit IP:
 
@@ -88,6 +89,5 @@ Keep these aligned. A rotated or mismatched profile carries no matching TLS or t
 
 ```bash
 obscura serve \
-  --stealth \
   --proxy http://user:pass@proxy.example.com:8080
 ```

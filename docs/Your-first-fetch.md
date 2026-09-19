@@ -1,4 +1,4 @@
-> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+> `fetch` 自动使用统一身份基线和 primp；没有运行时 stealth 开关。
 
 `obscura fetch` loads a URL, runs its JavaScript, and prints the result.
 
@@ -60,12 +60,10 @@ Client navigation defaults come from the pinned client version; use an explicit 
 ## Common flags
 
 ```
---user-agent "..."        Override the User-Agent
 --timeout 30                Navigation timeout in seconds (default 30)
 --wait 5                    Fixed settle window; omitted uses adaptive settle (5s cap)
 --selector ".main"          CSS selector to narrow output to
 --proxy http://host:port    Route through a proxy
---stealth                   Stealth client (TLS fingerprint, tracker blocking)
 -o, --output file.html      Write output to a file
 -q, --quiet                 Suppress info logging
 ```

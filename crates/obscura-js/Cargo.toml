@@ -7,10 +7,8 @@ repository.workspace = true
 
 [features]
 default = []
-# Builds obscura-net with its stealth (primp) HTTP client and lets scripted
-# fetch()/XHR be routed through it so JS-level requests carry the same Chrome
-# TLS fingerprint and client hints as stealth navigation.
-stealth = ["obscura-net/stealth"]
+# Compatibility alias. Browser-owned fetch/XHR always uses primp.
+stealth = []
 # Builds the obscura-render layout layer and exposes real box geometry to JS
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.

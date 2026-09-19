@@ -100,7 +100,6 @@ fn remaining_settle_resource_warmup_ms(
         .unwrap_or(0)
 }
 
-#[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 
 /// Returns true when a JS-initiated navigation would step from a
@@ -315,8 +314,7 @@ pub struct Page {
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
     callbacks: Arc<CallbackRegistry>,
-    #[cfg(feature = "stealth")]
-    pub stealth_client: Option<Arc<StealthHttpClient>>,
+    pub stealth_client: Arc<StealthHttpClient>,
 }
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
@@ -1097,20 +1095,16 @@ impl Page {
         // Page.getFrameTree return a frame the client cannot match,
         // triggering a Target.closeTarget and "Frame has been detached".
         let frame_id = id.clone();
-        #[cfg(feature = "stealth")]
-        let stealth_client = if context.stealth {
-            // Preserve the explicitly configured proxy scheme and endpoint.
-            Some(Arc::new(StealthHttpClient::with_policy_profile_persona(
-                context.cookie_jar.clone(),
-                context.proxy_url.as_deref(),
-                context.http_client.clone(),
-                context.stealth_profile,
-                &context.accept_language,
-                context.do_not_track.as_deref(),
-            )))
-        } else {
-            None
-        };
+        // Preserve the explicitly configured proxy scheme and endpoint. Every
+        // page uses primp; there is no plain-transport product path.
+        let stealth_client = Arc::new(StealthHttpClient::with_policy_profile_persona(
+            context.cookie_jar.clone(),
+            context.proxy_url.as_deref(),
+            context.http_client.clone(),
+            context.stealth_profile,
+            &context.accept_language,
+            context.do_not_track.as_deref(),
+        ));
 
         Page {
             id,
@@ -1155,7 +1149,6 @@ impl Page {
             suspended_started_script_ids: Vec::new(),
             suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
             callbacks: Arc::new(CallbackRegistry::new()),
-            #[cfg(feature = "stealth")]
             stealth_client,
         }
     }
@@ -1748,25 +1741,12 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url, request: ResourceRequest) -> Result<Response, ObscuraNetError> {
-        #[cfg(feature = "stealth")]
-        if let Some(ref stealth) = self.stealth_client {
-            // Pass the page callbacks so CDP Network events and
-            // page.on('request'/'response') observers fire for stealth-mode
-            // navigations too, matching the non-stealth path below.
-            return stealth
-                .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
-                .await;
-        }
-        self.http_client
+        self.stealth_client
             .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
             .await
     }
     async fn do_post_form(&self, url: &Url, body: &str, request: ResourceRequest) -> Result<Response, ObscuraNetError> {
-        #[cfg(feature = "stealth")]
-        if let Some(ref stealth) = self.stealth_client {
-            return stealth.post_form_resource_with_callbacks(url, body, request, Some(&self.callbacks)).await;
-        }
-        self.http_client.post_form_resource_with_callbacks(url, body, request, Some(&self.callbacks)).await
+        self.stealth_client.post_form_resource_with_callbacks(url, body, request, Some(&self.callbacks)).await
     }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
@@ -1810,39 +1790,16 @@ impl Page {
         rt.set_do_not_track(self.context.do_not_track.as_deref());
         rt.set_webgl_identity(&self.context.webgl_vendor, &self.context.webgl_renderer);
 
-        #[cfg(feature = "stealth")]
-        if self.stealth_client.is_some() {
-            rt.set_stealth(true);
-            let profile = self.context.stealth_profile;
-            rt.set_user_agent(profile.user_agent());
-            let (platform, ua_platform, version) = profile.platform();
-            rt.set_platform(platform, ua_platform, version);
-            if matches!(
-                profile,
-                obscura_net::StealthProfile::MacChrome152 | obscura_net::StealthProfile::MacChrome153
-            ) {
-                rt.set_user_agent_details(profile.full_version(), "arm");
-            }
-        } else {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
-        }
-        #[cfg(not(feature = "stealth"))]
-        {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
+        rt.set_stealth(true);
+        let profile = self.context.stealth_profile;
+        rt.set_user_agent(profile.user_agent());
+        let (platform, ua_platform, version) = profile.platform();
+        rt.set_platform(platform, ua_platform, version);
+        if matches!(
+            profile,
+            obscura_net::StealthProfile::MacChrome152 | obscura_net::StealthProfile::MacChrome153
+        ) {
+            rt.set_user_agent_details(profile.full_version(), "arm");
         }
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
@@ -1859,10 +1816,7 @@ impl Page {
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
-        #[cfg(feature = "stealth")]
-        if let Some(ref stealth) = self.stealth_client {
-            rt.set_stealth_client(stealth.clone());
-        }
+        rt.set_stealth_client(self.stealth_client.clone());
 
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
@@ -1990,8 +1944,6 @@ impl Page {
         let mut aliases = std::collections::HashMap::new();
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
-            let client = self.http_client.clone();
-            #[cfg(feature = "stealth")]
             let stealth_client = self.stealth_client.clone();
             let callbacks = self.callbacks.clone();
             let initiator = document_url.clone();
@@ -1999,8 +1951,6 @@ impl Page {
             use futures::StreamExt as _;
             let results: Vec<_> =
                 futures::stream::iter(batch.into_iter().map(|(key, requested_url, depth)| {
-                    let client = client.clone();
-                    #[cfg(feature = "stealth")]
                     let stealth_client = stealth_client.clone();
                     let callbacks = callbacks.clone();
                     let initiator = initiator.clone();
@@ -2008,26 +1958,7 @@ impl Page {
                         let mut request =
                             ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
                         request.referrer_policy = referrer_policy;
-                        #[cfg(feature = "stealth")]
-                        let result = if let Some(stealth_client) = stealth_client {
-                            stealth_client
-                                .fetch_resource_with_callbacks(
-                                    &requested_url,
-                                    request,
-                                    Some(&callbacks),
-                                )
-                                .await
-                        } else {
-                            client
-                                .fetch_resource_with_callbacks(
-                                    &requested_url,
-                                    request,
-                                    Some(&callbacks),
-                                )
-                                .await
-                        };
-                        #[cfg(not(feature = "stealth"))]
-                        let result = client
+                        let result = stealth_client
                             .fetch_resource_with_callbacks(
                                 &requested_url,
                                 request,
@@ -2389,8 +2320,6 @@ impl Page {
             }
         }
 
-        let client = self.http_client.clone();
-        #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let referrer_policy = self.js.as_ref().map(|js| js.referrer_policy()).unwrap_or(self.referrer_policy);
@@ -2401,8 +2330,6 @@ impl Page {
         let fetch_futures: Vec<_> = fetch_tasks
             .iter()
             .map(|(idx, url)| {
-                let client = client.clone();
-                #[cfg(feature = "stealth")]
                 let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
@@ -2438,14 +2365,9 @@ impl Page {
                     }
                     let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
                     request.referrer_policy = referrer_policy;
-                    #[cfg(feature = "stealth")]
-                    let response = if let Some(stealth) = stealth_client {
-                        stealth.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
-                    } else {
-                        client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
-                    };
-                    #[cfg(not(feature = "stealth"))]
-                    let response = client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await;
+                    let response = stealth_client
+                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                        .await;
                     match response {
                         Ok(resp) => (idx, Some((url, resp))),
                         Err(e) => {
@@ -3986,10 +3908,7 @@ impl Page {
             if !js.has_page_transport() {
                 js.set_http_client(self.http_client.clone());
                 js.set_callbacks(self.callbacks.clone());
-                #[cfg(feature = "stealth")]
-                if let Some(stealth) = &self.stealth_client {
-                    js.set_stealth_client(stealth.clone());
-                }
+                js.set_stealth_client(self.stealth_client.clone());
             }
         }
         let (loadable, rejected) = self.render_resource_candidates();
@@ -4788,7 +4707,7 @@ impl Page {
     /// Enable CDP-Fetch-style interception of JS-initiated `fetch()`/XHR.
     /// Returns a receiver yielding every such request; resolve each through its
     /// `resolver` with `InterceptResolution::{Continue, Fulfill, Fail}` to pass,
-    /// mock, or block it. Works in stealth and non-stealth. Mirrors how the CDP
+    /// mock, or block it. Mirrors how the CDP
     /// server wires the channel (`obscura-cdp/src/server.rs`).
     pub fn enable_interception(
         &mut self,
@@ -4926,7 +4845,20 @@ impl Drop for Page {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "stealth")]
+    #[test]
+    fn page_always_constructs_primp_transport() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "always-primp".into(),
+            None,
+            false,
+        ));
+        let page = super::Page::new("always-primp".into(), context);
+        assert_eq!(
+            page.stealth_client.transport_params().profile,
+            obscura_net::StealthProfile::default(),
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn form_navigation_uses_page_stealth_transport() {
         use std::io::{Read, Write};
@@ -4950,7 +4882,7 @@ mod tests {
             "form-transport".into(), None, true, None, None, true,
         ));
         let mut page = super::Page::new("form-transport".into(), context);
-        page.stealth_client.as_ref().unwrap().set_extra_headers(
+        page.stealth_client.set_extra_headers(
             [("x-transport-test".into(), "stealth".into())].into_iter().collect(),
         ).await;
         page.navigate_with_wait_post(&format!("http://{address}/login"),

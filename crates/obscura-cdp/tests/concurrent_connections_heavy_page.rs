@@ -218,8 +218,6 @@ async fn concurrent_connections_heavy_page_do_not_abort_v8() {
                     None,
                     false,
                     None,
-                    false,
-                    None,
                     true,
                 )
                 .await;

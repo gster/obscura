@@ -8,7 +8,7 @@ description: Operate and validate Obscura for JavaScript page loading, stealth b
 Use Obscura as a lightweight, stealth-capable Rust headless browser for
 automation. It embeds V8, owns the DOM and rendering pipeline, and exposes
 Chrome DevTools Protocol workflows without launching Chromium. Treat rendering
-and stealth as first-class, complementary capabilities.
+as optional and the primp/browser-identity baseline as an invariant.
 
 ## Build variants
 
@@ -19,39 +19,25 @@ checkout, build release mode with the render feature:
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
 ```
 
-Build rendering and stealth together for the wreq/BoringSSL transport,
-browser-identity protections, and tracker blocking:
-
-```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
-```
-
 Build without rendering when only DOM, extraction, or CDP automation is needed:
 
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 Use `./target/release/obscura` in the commands below when working from source.
 
-## Use stealth
+## Browser identity baseline
 
-The stealth build keeps the complete rendering, screenshot, screencast, PDF,
-CDP, and MCP surface. It adds a consistent browser fingerprint across TLS,
+Every build uses primp and a consistent browser fingerprint across TLS,
 HTTP headers, user agent, navigator, and WebGL surfaces; masks
 `navigator.webdriver`; masks patched native functions; and blocks the built-in
 tracker-domain list.
 
-Enable stealth at runtime with the global `--stealth` flag. It applies to
-`fetch`, `serve`, `scrape`, and `mcp`, before or after the subcommand:
-
 ```bash
-obscura --stealth fetch https://example.com --screenshot page.png
-obscura serve --stealth --port 9222
+obscura fetch https://example.com --screenshot page.png
+obscura serve --port 9222
 ```
-
-The runtime flag needs a `render,stealth` build for the wreq/BoringSSL transport.
 
 ## Fetch, evaluate, and capture
 

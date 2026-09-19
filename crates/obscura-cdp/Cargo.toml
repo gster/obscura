@@ -7,7 +7,8 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["obscura-browser/stealth"]
+# Compatibility alias. CDP pages always use the primp transport.
+stealth = []
 # Enable Page.captureScreenshot via obscura-render. Propagates render to
 # obscura-browser so Page::screenshot is available.
 render = ["obscura-browser/render", "dep:image", "dep:png"]

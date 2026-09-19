@@ -1,5 +1,3 @@
-> 目标变更：stealth 将成为不可关闭的基线，所有产品出站 HTTP(S) 统一使用校准后的 primp（OB-012/044）。本页保留当前源码所需的 feature/开关用法，不能将计划当作已实现。
-
 ## Requirements
 
 - Rust 1.98.1 (validated toolchain; [rustup.rs](https://rustup.rs))
@@ -23,27 +21,20 @@ own workspace, lockfile, and pinned toolchain in `runtime/`.
 This produces the release binary with geometry, screenshots, screencasting,
 and PDF export.
 
-## Rendering and stealth
-
-```bash
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --features render,stealth
-```
-
-This is the complete rendering build with the stealth primp/Rustls transport,
-browser TLS profiles, browser-identity protections, and tracker
-blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
+Every build includes the primp/Rustls transport, browser TLS profiles,
+browser-identity protections, and tracker blocklist. See
+[Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 ## Without rendering
 
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
-The second command keeps stealth while excluding layout, screenshots,
-screencasting, and PDF export.
+This excludes layout, screenshots, screencasting, and PDF export while keeping
+the same transport and identity baseline.
 
-The stealth feature builds primp with Rustls/AWS-LC. In addition
+Primp builds with Rustls/AWS-LC. In addition
 to the default requirements, install CMake, Clang, and the libclang/LLVM
 development libraries. On Ubuntu/Debian:
 

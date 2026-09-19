@@ -1421,10 +1421,7 @@ impl ObscuraJsRuntime {
         frame.blocked_urls = parent.blocked_urls.clone();
         frame.intercept_enabled = parent.intercept_enabled;
         frame.page_in_flight = parent.page_in_flight.clone();
-        #[cfg(feature = "stealth")]
-        {
-            frame.stealth_client = parent.stealth_client.clone();
-        }
+        frame.stealth_client = parent.stealth_client.clone();
         // A frame realm shares the page transport, so its renderer cache must
         // not open synchronous requests either. Frame geometry currently
         // resolves against the main document's renderer state, so frame-scoped
@@ -1649,9 +1646,8 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().callbacks = Some(callbacks);
     }
 
-    /// Install the stealth (primp) HTTP client so scripted fetch()/XHR is routed
-    /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
-    #[cfg(feature = "stealth")]
+    /// Install the primp HTTP client so scripted fetch()/XHR uses the same
+    /// transport as the owning page (see op_fetch_url / stealth_fetch_all).
     pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
         let mut state = self.state.borrow_mut();
         state.stealth_client = Some(client);
@@ -4407,10 +4403,9 @@ impl ObscuraJsRuntime {
             state.render_resource_backlog.extend(requests);
             return 0;
         }
-        // The page transport is the plain client or, when installed, the
-        // stealth client; either one on its own is enough (`has_page_transport`).
+        // Standalone runtimes may have only the plain client; page runtimes
+        // always install primp (`has_page_transport`).
         let http_client = state.http_client.clone();
-        #[cfg(feature = "stealth")]
         let stealth_client = state.stealth_client.clone();
         let initiator = url::Url::parse(&state.url).ok();
         if !crate::ops::has_page_transport(&state) || initiator.is_none() {
@@ -4433,7 +4428,6 @@ impl ObscuraJsRuntime {
             use deno_core::futures::StreamExt as _;
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(|(raw, profile, is_font)| {
                 let http_client = http_client.clone();
-                #[cfg(feature = "stealth")]
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
@@ -4473,7 +4467,6 @@ impl ObscuraJsRuntime {
                         }
                         _ => {}
                     }
-                    #[cfg(feature = "stealth")]
                     let response = match (stealth_client, http_client) {
                         (Some(stealth_client), _) => stealth_client
                             .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
@@ -4484,14 +4477,6 @@ impl ObscuraJsRuntime {
                             .await
                             .ok(),
                         (None, None) => None,
-                    };
-                    #[cfg(not(feature = "stealth"))]
-                    let response = match http_client {
-                        Some(http_client) => http_client
-                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
-                            .await
-                            .ok(),
-                        None => None,
                     };
                     crate::ops::RenderResourceLoad {
                         generation,
@@ -6761,7 +6746,7 @@ mod tests {
 
     /// A runtime with only the stealth client installed has a page transport
     /// (`has_page_transport`, cache-only renderer) and must load through it.
-    #[cfg(all(feature = "render", feature = "stealth"))]
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_only_transport_starts_render_resource_loads() {
         let url = "http://127.0.0.1:9/a.svg".to_string();
@@ -21755,14 +21740,15 @@ return {before,removed,reinsert,moved,cleared};
         );
     }
 
-    #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_fetch_response_reports_the_final_redirect_url() {
         let mut rt = redirect_chain_runtime(2);
         rt.set_stealth_client(std::sync::Arc::new(
-            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
-                obscura_net::CookieJar::new(),
-            )),
+            obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
         ));
         let result = rt
             .call_function_on_for_cdp(
@@ -21928,14 +21914,15 @@ return {before,removed,reinsert,moved,cleared};
         );
     }
 
-    #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_cross_origin_no_cors_filters_response_identity() {
         let mut rt = cross_origin_redirect_runtime();
         rt.set_stealth_client(std::sync::Arc::new(
-            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
-                obscura_net::CookieJar::new(),
-            )),
+            obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
         ));
         let result = rt
             .call_function_on_for_cdp(
@@ -24783,7 +24770,6 @@ return {before,removed,reinsert,moved,cleared};
         assert!(r5.to_ascii_lowercase().contains("accept: text/plain"), "r5: {r5}");
     }
 
-    #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_same_origin_cors_script_origin_and_accept_headers() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

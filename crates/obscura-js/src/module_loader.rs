@@ -224,26 +224,20 @@ impl ModuleLoader for ObscuraModuleLoader {
                     .http_client
                     .clone()
                     .ok_or_else(|| "No http_client wired to module loader".to_string())?;
-                // Fork: in stealth mode an ES module must be fetched over the
+                // An ES module must be fetched over the
                 // same transport as the document. Upstream sends it through the
                 // plain reqwest client, so a `type="module"` script arrives with
                 // a different TLS fingerprint and none of the browser identity
                 // headers, while the HTML that referenced it came over primp.
                 // That cross-transport mismatch is trivially detectable.
-                #[cfg(feature = "stealth")]
                 let stealth = state.stealth_client.clone();
-                #[cfg(not(feature = "stealth"))]
-                let stealth: Option<std::sync::Arc<()>> = None;
                 Ok((client, stealth, state.callbacks.clone(), state.referrer_policy))
             })(),
             None => self
                 .standalone_client
                 .clone()
                 .map(|client| {
-                    #[cfg(feature = "stealth")]
                     let stealth = None;
-                    #[cfg(not(feature = "stealth"))]
-                    let stealth: Option<std::sync::Arc<()>> = None;
                     (client, stealth, None, obscura_net::ReferrerPolicy::default())
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
@@ -267,7 +261,6 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let mut request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
                     request.referrer_policy = referrer_policy;
-                    #[cfg(feature = "stealth")]
                     let resp = match stealth {
                         Some(stealth) => stealth
                             .fetch_resource_with_callbacks(
@@ -287,18 +280,6 @@ impl ModuleLoader for ObscuraModuleLoader {
                         }
                     }
                     .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
-                    #[cfg(not(feature = "stealth"))]
-                    let resp = {
-                        let _ = &stealth;
-                        client
-                            .fetch_resource_with_callbacks(
-                                &requested,
-                                request,
-                                callbacks.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
-                    };
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",

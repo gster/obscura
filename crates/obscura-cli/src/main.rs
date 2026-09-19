@@ -26,19 +26,10 @@ struct Args {
     #[arg(long, global = true)]
     proxy: Option<String>,
 
-    /// Enable stealth mode (consistent browser fingerprint, and with the
-    /// `stealth` build feature, TLS impersonation plus tracker blocking).
-    /// Global: applies to fetch, serve, scrape, and mcp.
-    #[arg(long, global = true)]
-    stealth: bool,
-
     /// Respect robots.txt before navigating to an HTTP(S) URL.
     /// Global: applies to fetch and scrape.
     #[arg(long, global = true)]
     obey_robots: bool,
-
-    #[arg(long)]
-    user_agent: Option<String>,
 
     #[arg(long)]
     storage_dir: Option<std::path::PathBuf>,
@@ -73,9 +64,6 @@ enum Command {
 
         #[arg(long)]
         proxy: Option<String>,
-
-        #[arg(long)]
-        user_agent: Option<String>,
 
         #[arg(long, default_value_t = 1)]
         workers: u16,
@@ -148,9 +136,6 @@ enum Command {
         #[arg(long, default_value = "load")]
         wait_until: String,
 
-        #[arg(long)]
-        user_agent: Option<String>,
-
         #[arg(long, short)]
         eval: Option<String>,
 
@@ -200,8 +185,6 @@ enum Command {
         #[arg(long)]
         proxy: Option<String>,
 
-        #[arg(long)]
-        user_agent: Option<String>,
     },
 }
 
@@ -383,7 +366,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
-    let stealth = args.stealth;
     let obey_robots = args.obey_robots;
 
     match args.command {
@@ -391,7 +373,6 @@ async fn main() -> anyhow::Result<()> {
             port,
             host,
             proxy,
-            user_agent,
             workers,
             max_connections,
             allow_file_access,
@@ -415,20 +396,10 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            if let Some(ref ua) = user_agent {
-                tracing::info!("User-Agent: {}", ua);
-            }
             for directory in &font_dirs {
                 tracing::info!("Font dir: {}", directory.display());
             }
-            if stealth {
-                #[cfg(feature = "stealth")]
-                tracing::info!(
-                    "Stealth mode enabled (TLS fingerprint impersonation + tracker blocking)"
-                );
-                #[cfg(not(feature = "stealth"))]
-                tracing::info!("Stealth mode enabled (tracker blocking)");
-            }
+            tracing::info!("Chrome identity and primp transport enabled");
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
@@ -437,8 +408,6 @@ async fn main() -> anyhow::Result<()> {
                     host,
                     workers,
                     proxy,
-                    stealth,
-                    user_agent,
                     font_dirs,
                 )
                 .await?;
@@ -447,8 +416,6 @@ async fn main() -> anyhow::Result<()> {
                     port,
                     &host,
                     proxy,
-                    stealth,
-                    user_agent,
                     allow_file_access,
                     storage_dir,
                     args.allow_private_network,
@@ -464,7 +431,6 @@ async fn main() -> anyhow::Result<()> {
             wait,
             timeout,
             wait_until,
-            user_agent,
             eval,
             output,
             quiet,
@@ -493,11 +459,9 @@ async fn main() -> anyhow::Result<()> {
                     urls,
                     concurrency.get(),
                     timeout,
-                    user_agent,
                     global_proxy,
                     output,
                     quiet,
-                    stealth
                 )
                 .await?;
             } else {
@@ -515,8 +479,6 @@ async fn main() -> anyhow::Result<()> {
                     wait_is_fixed,
                     timeout,
                     &wait_until,
-                    user_agent,
-                    stealth,
                     eval,
                     output,
                     quiet,
@@ -545,7 +507,6 @@ async fn main() -> anyhow::Result<()> {
                 timeout,
                 quiet,
                 global_proxy,
-                stealth,
                 obey_robots,
             )
             .await?;
@@ -555,13 +516,12 @@ async fn main() -> anyhow::Result<()> {
             host,
             port,
             proxy,
-            user_agent,
         }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::http::run(host, port, mcp_proxy).await?;
             } else {
-                obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::run(mcp_proxy).await?;
             }
         }
         None => {
@@ -569,7 +529,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, stealth).await?;
+            obscura_cdp::start_with_options(args.port, args.proxy).await?;
         }
     }
 
@@ -581,8 +541,6 @@ async fn run_multi_worker_serve(
     host: String,
     workers: u16,
     proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
     font_dirs: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
@@ -602,14 +560,8 @@ async fn run_multi_worker_serve(
             // (issue #366). The worker's serve path reads this env as a fallback.
             cmd.env("OBSCURA_PROXY", p);
         }
-        if let Some(ref ua) = user_agent {
-            cmd.arg("--user-agent").arg(ua);
-        }
         for directory in &font_dirs {
             cmd.arg("--font-dir").arg(directory);
-        }
-        if stealth {
-            cmd.arg("--stealth");
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -731,8 +683,6 @@ async fn run_fetch(
     wait_is_fixed: bool,
     timeout_secs: u64,
     wait_until: &str,
-    user_agent: Option<String>,
-    stealth: bool,
     eval: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
@@ -753,13 +703,7 @@ async fn run_fetch(
     // payloads (images, fonts, …) and any non-HTML resource where parsing the
     // body through the DOM/JS layer would corrupt or discard data.
     if dump == DumpFormat::Original {
-        let bytes = fetch_original_bytes(
-            url_str,
-            proxy,
-            user_agent.clone(),
-            timeout_secs,
-            stealth,
-        )
+        let bytes = fetch_original_bytes(url_str, proxy, timeout_secs)
         .await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
         return Ok(());
@@ -768,8 +712,8 @@ async fn run_fetch(
     let mut context = BrowserContext::with_storage_and_network(
         "fetch".to_string(),
         proxy,
-        stealth,
-        user_agent.clone(),
+        true,
+        None,
         storage_dir.clone(),
         allow_private_network,
     );
@@ -797,10 +741,6 @@ async fn run_fetch(
     });
     if let Some(viewport) = screenshot_viewport {
         page.set_viewport(viewport);
-    }
-
-    if let Some(ref ua) = user_agent {
-        page.http_client.set_user_agent(ua).await;
     }
 
     let wait_condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
@@ -1139,49 +1079,31 @@ async fn run_fetch(
 async fn fetch_original_response(
     url_str: &str,
     proxy: Option<String>,
-    user_agent: Option<String>,
     timeout_secs: u64,
-    stealth: bool,
 ) -> anyhow::Result<obscura_net::Response> {
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
 
-    // `--dump original` short-circuits the browser stack (see run_fetch) and
-    // builds its own client here instead of going through BrowserContext /
-    // Page::do_fetch, which is where --stealth is normally applied. Without
-    // this, the request stays on plain HTTP/1.1 with no TLS impersonation
-    // regardless of --stealth (issue #482). file:// has no TLS handshake to
-    // impersonate and the primp client only speaks http(s), so it is excluded
-    // here the same way ObscuraHttpClient::fetch_with_method excludes it
-    // internally.
-    if stealth && url.scheme() != "file" {
-        #[cfg(feature = "stealth")]
-        {
-            // `false` matches the reqwest path below (`with_options`); the
-            // CLI mirrors --allow-private-network into
-            // OBSCURA_ALLOW_PRIVATE_NETWORK at startup, which this client
-            // honours.
-            let client = obscura_net::StealthHttpClient::with_proxy(
-                Arc::new(obscura_net::CookieJar::new()),
-                proxy.as_deref(),
-                false,
-            );
-            return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
-                Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
-                Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
-            };
-        }
+    // `--dump original` bypasses BrowserContext, so construct the same primp
+    // transport directly. file:// has no network fingerprint and stays on the
+    // file-capable policy client.
+    if url.scheme() != "file" {
+        let client = obscura_net::StealthHttpClient::with_proxy(
+            Arc::new(obscura_net::CookieJar::new()),
+            proxy.as_deref(),
+            false,
+        );
+        return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+            Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
+        };
     }
 
     let client = obscura_net::ObscuraHttpClient::with_options(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
     );
-    if let Some(ua) = user_agent {
-        client.set_user_agent(&ua).await;
-    }
-
     match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
@@ -1192,12 +1114,10 @@ async fn fetch_original_response(
 async fn fetch_original_bytes(
     url_str: &str,
     proxy: Option<String>,
-    user_agent: Option<String>,
     timeout_secs: u64,
-    stealth: bool,
 ) -> anyhow::Result<Vec<u8>> {
     Ok(
-        fetch_original_response(url_str, proxy, user_agent, timeout_secs, stealth)
+        fetch_original_response(url_str, proxy, timeout_secs)
             .await?
             .body,
     )
@@ -1235,11 +1155,9 @@ async fn run_batch_fetch(
     urls: Vec<String>,
     concurrency: usize,
     timeout_secs: u64,
-    user_agent: Option<String>,
     proxy: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
-    stealth: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     if total == 0 {
@@ -1255,13 +1173,11 @@ async fn run_batch_fetch(
 
     let start = Instant::now();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let user_agent = Arc::new(user_agent);
     let proxy = Arc::new(proxy);
 
     let mut handles = Vec::with_capacity(total);
     for (i, url) in urls.into_iter().enumerate() {
         let sem = semaphore.clone();
-        let user_agent = user_agent.clone();
         let proxy = proxy.clone();
 
         handles.push(tokio::spawn(async move {
@@ -1270,9 +1186,7 @@ async fn run_batch_fetch(
             let result = fetch_original_response(
                 &url,
                 (*proxy).clone(),
-                (*user_agent).clone(),
                 timeout_secs,
-                stealth,
             )
             .await;
             let elapsed_ms = task_start.elapsed().as_millis();
@@ -1596,7 +1510,6 @@ async fn run_parallel_scrape(
     timeout_secs: u64,
     quiet: bool,
     proxy: Option<String>,
-    stealth: bool,
     obey_robots: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
@@ -1654,7 +1567,6 @@ async fn run_parallel_scrape(
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
-                .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
                 .spawn()
             {
@@ -2072,6 +1984,27 @@ mod tests {
     }
 
     #[test]
+    fn removed_stealth_flag_is_rejected() {
+        let error = Args::try_parse_from([
+            "obscura",
+            "--stealth",
+            "fetch",
+            "https://example.com",
+        ]);
+        assert!(error.is_err(), "stealth is an invariant, not a runtime option");
+    }
+
+    #[test]
+    fn user_agent_is_not_a_cli_parameter() {
+        for args in [
+            vec!["obscura", "--user-agent", "Custom/1.0", "fetch", "https://example.com"],
+            vec!["obscura", "fetch", "--user-agent", "Custom/1.0", "https://example.com"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn read_urls_skips_blanks_and_comments() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("obscura_urls_{}.txt", std::process::id()));
@@ -2115,7 +2048,7 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5, false)
+        let bytes = fetch_original_bytes(&file_url, None, 5)
             .await
             .expect("fetch_original_bytes should round-trip the file body");
 
@@ -2127,12 +2060,10 @@ mod tests {
         );
     }
 
-    // A stealth-enabled build routes `--dump original` through
-    // StealthHttpClient (primp), which only speaks http(s). file:// must keep
-    // working the same as without --stealth instead of being handed to primp
-    // (issue #482).
+    // `--dump original` routes network URLs through primp, which only speaks
+    // http(s). file:// must remain on the file-capable policy client (#482).
     #[tokio::test(flavor = "current_thread")]
-    async fn fetch_original_bytes_file_url_ignores_stealth_flag() {
+    async fn fetch_original_bytes_file_url_bypasses_network_transport() {
         const PNG_BYTES: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
             0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
@@ -2142,7 +2073,7 @@ mod tests {
         ];
 
         let path = std::env::temp_dir().join(format!(
-            "obscura-fetch-original-stealth-test-{}.png",
+            "obscura-fetch-original-file-test-{}.png",
             std::process::id()
         ));
         let _ = tokio::fs::remove_file(&path).await;
@@ -2151,13 +2082,13 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5, true)
+        let bytes = fetch_original_bytes(&file_url, None, 5)
             .await
-            .expect("fetch_original_bytes should still round-trip file:// with stealth=true");
+            .expect("fetch_original_bytes should round-trip file://");
 
         let _ = tokio::fs::remove_file(&path).await;
 
-        assert_eq!(bytes, PNG_BYTES, "stealth=true must not change file:// handling");
+        assert_eq!(bytes, PNG_BYTES, "file:// must not be sent to primp");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2492,7 +2423,6 @@ mod tests {
             wait: Some(5),
             timeout: 30,
             wait_until: "load".to_string(),
-            user_agent: None,
             eval: None,
             quiet: true,
             output: None,

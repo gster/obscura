@@ -127,41 +127,29 @@ pub struct CdpContext {
 
 impl CdpContext {
     pub fn new() -> Self {
-        Self::new_with_options(None, false)
+        Self::new_with_options(None)
     }
 
     pub fn new_with_proxy(proxy: Option<String>) -> Self {
-        Self::new_with_options(proxy, false)
+        Self::new_with_options(proxy)
     }
 
-    pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
-        Self::new_with_full_options(proxy, stealth, None)
-    }
-
-    pub fn new_with_full_options(
-        proxy: Option<String>,
-        stealth: bool,
-        user_agent: Option<String>,
-    ) -> Self {
-        Self::new_with_security(proxy, stealth, user_agent, false)
+    pub fn new_with_options(proxy: Option<String>) -> Self {
+        Self::new_with_security(proxy, false)
     }
 
     pub fn new_with_storage(
         proxy: Option<String>,
-        stealth: bool,
-        user_agent: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        Self::_new_inner(proxy, stealth, user_agent, storage_dir, false, false)
+        Self::_new_inner(proxy, storage_dir, false, false)
     }
 
     pub fn new_with_security(
         proxy: Option<String>,
-        stealth: bool,
-        user_agent: Option<String>,
         allow_file_access: bool,
     ) -> Self {
-        Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access, false)
+        Self::_new_inner(proxy, None, allow_file_access, false)
     }
 
     /// Build a CDP context around an already-constructed default browser
@@ -205,8 +193,6 @@ impl CdpContext {
 
     fn _new_inner(
         proxy: Option<String>,
-        stealth: bool,
-        user_agent: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
         allow_file_access: bool,
         allow_private_network: bool,
@@ -214,8 +200,8 @@ impl CdpContext {
         let mut ctx = BrowserContext::with_storage_and_network(
             "default".to_string(),
             proxy,
-            stealth,
-            user_agent,
+            true,
+            None,
             storage_dir,
             allow_private_network,
         );

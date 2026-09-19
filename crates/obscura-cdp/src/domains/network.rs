@@ -53,21 +53,36 @@ pub async fn handle(
             let headers = params.get("headers").and_then(|v| v.as_object());
             if let Some(page) = ctx.get_session_page(session_id) {
                 if let Some(headers) = headers {
+                    if let Some(name) = headers.keys().find(|name| {
+                        let name = name.to_ascii_lowercase();
+                        matches!(
+                            name.as_str(),
+                            "user-agent" | "accept-language" | "accept-encoding" | "dnt"
+                        ) || name.starts_with("sec-ch-ua")
+                    }) {
+                        return Err(format!(
+                            "Network.setExtraHTTPHeaders cannot override persona-owned header {name}"
+                        ));
+                    }
                     let header_map: std::collections::HashMap<String, String> = headers
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map).await;
+                    page.http_client.set_extra_headers(header_map.clone()).await;
+                    page.stealth_client.set_extra_headers(header_map).await;
                 }
             }
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
-            let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(page) = ctx.get_session_page(session_id) {
-                page.http_client.set_user_agent(ua).await;
-            }
-            Ok(json!({}))
+            let _user_agent = params
+                .get("userAgent")
+                .and_then(Value::as_str)
+                .ok_or("Network.setUserAgentOverride requires a string userAgent")?;
+            Err(
+                "Network.setUserAgentOverride is unsupported after BrowserContext initialization; configure the immutable browser persona when creating the context"
+                    .to_string(),
+            )
         }
         "getCookies" | "getAllCookies" => {
             let cookies = cookie_jar_for(ctx, session_id).get_all_cookies();
@@ -421,6 +436,55 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extra_headers_are_applied_to_the_page_primp_transport() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("headers-session".to_string());
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
+
+        handle(
+            "setExtraHTTPHeaders",
+            &json!({"headers": {"X-Probe": "complete-raw-value"}}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+
+        let page = ctx.get_page(&page_id).unwrap();
+        assert_eq!(
+            page.stealth_client
+                .extra_headers
+                .read()
+                .await
+                .get("X-Probe")
+                .map(String::as_str),
+            Some("complete-raw-value")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extra_headers_cannot_bypass_the_immutable_persona() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("persona-headers-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        for name in ["User-Agent", "Accept-Language", "Accept-Encoding", "DNT", "Sec-CH-UA-Platform"] {
+            let error = handle(
+                "setExtraHTTPHeaders",
+                &json!({"headers": {name: "override"}}),
+                &mut ctx,
+                &session_id,
+            )
+            .await
+            .expect_err("persona-owned header must be rejected");
+            assert!(error.contains("persona-owned header"), "{error}");
+        }
     }
 }
 

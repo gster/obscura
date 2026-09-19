@@ -1,4 +1,4 @@
-> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+> `fetch` 自动使用统一身份基线和 primp；没有运行时 stealth 开关。
 
 `--dump` formats the page output without writing JavaScript.
 

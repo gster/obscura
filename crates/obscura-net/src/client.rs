@@ -762,7 +762,7 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
 /// lookup passes through unfiltered.
 ///
 /// Implemented for both transports: `reqwest::dns::Resolve` just below, and
-/// `primp::dns::Resolve` in `stealth_client.rs`, so `--stealth` never trades the
+/// `primp::dns::Resolve` in `stealth_client.rs`, so primp never trades the
 /// guard away for a better TLS fingerprint.
 pub struct SsrfGuardResolver {
     pub(crate) allow_private: bool,
@@ -1017,17 +1017,17 @@ const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
 const RESOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct ResourceCacheKey {
-    url: String,
-    resource_type: ResourceType,
-    mode: RequestMode,
-    credentials: RequestCredentials,
-    initiator: Option<String>,
-    referrer: Option<String>,
-    referrer_policy: ReferrerPolicy,
-    user_agent: String,
-    extra_headers: Vec<(String, String)>,
-    max_response_bytes: usize,
+pub(crate) struct ResourceCacheKey {
+    pub(crate) url: String,
+    pub(crate) resource_type: ResourceType,
+    pub(crate) mode: RequestMode,
+    pub(crate) credentials: RequestCredentials,
+    pub(crate) initiator: Option<String>,
+    pub(crate) referrer: Option<String>,
+    pub(crate) referrer_policy: ReferrerPolicy,
+    pub(crate) user_agent: String,
+    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) max_response_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -1037,35 +1037,35 @@ struct ResourceCacheEntry {
 }
 
 #[derive(Default)]
-struct ResourceCache {
+pub(crate) struct ResourceCache {
     entries: HashMap<ResourceCacheKey, ResourceCacheEntry>,
     insertion_order: VecDeque<ResourceCacheKey>,
     body_bytes: usize,
 }
 
 #[derive(Default)]
-struct ResourceLoaderState {
-    cache: ResourceCache,
-    shared_fetches: HashMap<ResourceCacheKey, SharedFetchSender>,
+pub(crate) struct ResourceLoaderState {
+    pub(crate) cache: ResourceCache,
+    pub(crate) shared_fetches: HashMap<ResourceCacheKey, SharedFetchSender>,
 }
 
 #[derive(Clone)]
-enum SharedFetchOutcome {
+pub(crate) enum SharedFetchOutcome {
     Cacheable(Response),
     RetryUncoalesced,
 }
 
-type SharedFetchSender = watch::Sender<Option<SharedFetchOutcome>>;
+pub(crate) type SharedFetchSender = watch::Sender<Option<SharedFetchOutcome>>;
 
-struct SharedFetchLeader<'a> {
-    loader: &'a std::sync::Mutex<ResourceLoaderState>,
-    key: ResourceCacheKey,
-    sender: SharedFetchSender,
-    finished: bool,
+pub(crate) struct SharedFetchLeader<'a> {
+    pub(crate) loader: &'a std::sync::Mutex<ResourceLoaderState>,
+    pub(crate) key: ResourceCacheKey,
+    pub(crate) sender: SharedFetchSender,
+    pub(crate) finished: bool,
 }
 
 impl SharedFetchLeader<'_> {
-    fn finish(mut self, outcome: SharedFetchOutcome) {
+    pub(crate) fn finish(mut self, outcome: SharedFetchOutcome) {
         self.loader.lock().unwrap().shared_fetches.remove(&self.key);
         let _ = self.sender.send(Some(outcome));
         self.finished = true;
@@ -1083,7 +1083,7 @@ impl Drop for SharedFetchLeader<'_> {
 }
 
 impl ResourceCache {
-    fn get(&mut self, key: &ResourceCacheKey) -> Option<Response> {
+    pub(crate) fn get(&mut self, key: &ResourceCacheKey) -> Option<Response> {
         let entry = self.entries.get(key)?;
         if entry.expires_at <= Instant::now() {
             let expired = self.entries.remove(key)?;
@@ -1093,7 +1093,7 @@ impl ResourceCache {
         Some(entry.response.clone())
     }
 
-    fn insert(&mut self, key: ResourceCacheKey, response: Response, lifetime: Duration) {
+    pub(crate) fn insert(&mut self, key: ResourceCacheKey, response: Response, lifetime: Duration) {
         let response_bytes = response.body.len();
         if response_bytes > RESOURCE_CACHE_MAX_BYTES {
             return;
@@ -1124,7 +1124,7 @@ impl ResourceCache {
     }
 }
 
-fn response_cache_lifetime(response: &Response) -> Option<Duration> {
+pub(crate) fn response_cache_lifetime(response: &Response) -> Option<Duration> {
     if !(200..300).contains(&response.status)
         || !response.redirected_from.is_empty()
         || response.header("set-cookie").is_some()
@@ -1152,7 +1152,7 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
 
 /// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
 /// User-Agent string, using Chromium's per-major-version GREASE algorithm so
-/// the non-stealth HTTP path agrees with navigator.userAgentData instead of
+/// standalone policy clients agree with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
 fn chrome_client_hints(ua: &str) -> (String, String) {
     let major: usize = ua

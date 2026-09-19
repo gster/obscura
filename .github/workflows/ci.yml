@@ -190,17 +190,14 @@ jobs:
       - name: Stage candidate binary for comparison
         run: install -D -m 0755 target/release/obscura "$RUNNER_TEMP/obscura-ci/obscura-pr"
 
-      - name: Build render and stealth release
-        run: cargo build --release -p obscura-cli --bins --features render,stealth
-
-      - name: Test the stealth transport
+      - name: Test the primp transport
         run: |
           # The gzip fixture binds loopback. Keep the ordinary suite under the
           # default SSRF policy, then opt in only for that single focused test.
-          cargo nextest run --release -p obscura-net --features stealth \
+          cargo nextest run --release -p obscura-net \
             --no-fail-fast -- --skip stealth_client_decodes_gzip_response
           OBSCURA_ALLOW_PRIVATE_NETWORK=1 cargo nextest run --release \
-            -p obscura-net --features stealth \
+            -p obscura-net \
             stealth_client_decodes_gzip_response --no-fail-fast
 
       - name: Build no-render release
@@ -219,9 +216,6 @@ jobs:
             --exclude obscura-render \
             --no-default-features --no-fail-fast
           cargo check --release -p obscura-render --no-default-features
-
-      - name: Build no-render and stealth release
-        run: cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 
       - name: Upload candidate binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

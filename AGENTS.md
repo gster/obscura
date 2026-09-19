@@ -15,12 +15,8 @@ capabilities. It targets web scraping and AI-agent automation.
 ```bash
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
 
-# Rendering and stealth
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render,stealth
-
-# No rendering, with rustls or stealth
+# No rendering
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
-CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 - The first build compiles V8 from source: ~5 minutes and a few GB of disk.
@@ -28,9 +24,9 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 - **Iterating on one crate? Scope it:** `cargo build -p obscura-cli`. A bare
   `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
   avoid touching it when you don't need to.
-- **Stealth:** `--features render,stealth` retains the complete rendering
-  surface and adds the primp/Rustls transport, fingerprint protections, and
-  tracker blocklist. Its AWS-LC build needs CMake, Clang, and libclang; see
+- **Browser identity baseline:** every build includes the primp/Rustls
+  transport, fingerprint protections, and tracker blocklist. Its AWS-LC build
+  needs CMake, Clang, and libclang; see
   `docs/Build-from-source.md` for platform requirements.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.
@@ -69,8 +65,8 @@ For any code change:
 4. The obstacle course still reports **33/33**.
 5. For render changes, run deterministic fixtures and broad top/bottom real-site
    captures using the methodology below.
-6. For stealth changes, re-test with `--stealth` (a non-stealth binary won't
-   exercise the `primp` path).
+6. For identity or transport changes, test both render and no-render builds;
+   both exercise the `primp` path.
 
 Do not bulk-run `cargo fmt`: the tree is not rustfmt-clean, so a blanket format
 produces a huge unrelated diff. Match the surrounding style in the files you
@@ -78,7 +74,7 @@ edit instead.
 
 ## Architecture
 
-- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy`, `--stealth`, and `--allow-private-network` are global flags: valid before or after the subcommand and applied to `fetch`, `serve`, `scrape`, and `mcp` (a `scrape` run forwards `--stealth` to each worker via `OBSCURA_STEALTH`).
+- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy` and `--allow-private-network` are global flags, valid before or after the subcommand and applied to every product entry point.
 - **obscura-cdp** — Chrome DevTools Protocol server (WebSocket). Managed page
   sessions use `"{targetId}-session"`; explicit flattened attachments receive
   distinct session ids so Playwright and Puppeteer can open raw page sessions.
@@ -168,8 +164,8 @@ One page must never hang or crash a worker:
 
 ## Stealth
 
-The stealth features (the `primp` client, fingerprint and browser-identity
-adjustments) are privacy-first anti-fingerprinting: they present a normal,
+The mandatory `primp` client and browser-identity adjustments are privacy-first
+anti-fingerprinting: they present a normal,
 consistent browser fingerprint (user agent, timezone, navigator properties, and
 similar surfaces) so ordinary automation traffic is not singled out. They
 contain no bot or automation-abuse payload.

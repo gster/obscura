@@ -1,4 +1,4 @@
-> 目标变更：stealth 将成为不可关闭的基线，所有产品出站 HTTP(S) 统一使用校准后的 primp（OB-012/044）。本页保留当前源码所需的 feature/开关用法，不能将计划当作已实现。
+> 所有产品出站 HTTP(S) 默认使用统一 persona 和 primp；没有运行时 stealth 开关。
 
 # 当前部署边界
 
@@ -6,7 +6,7 @@
 
 ## Container build status
 
-The tracked Dockerfile copies vendored dependencies and builds the root CLI with `--features render`, then uses a nonroot distroless runtime (uid/gid 65532). It does not enable `stealth`, so a deployment recipe requiring that feature needs a separately built and tested artifact. The registry image is an upstream artifact and does not identify this fork's build. No Docker build was run in this audit.
+The tracked Dockerfile copies vendored dependencies and builds the root CLI with `--features render`, including the mandatory primp and browser-identity baseline, then uses a nonroot distroless runtime (uid/gid 65532). The registry image is an upstream artifact and does not identify this fork's build. No Docker build was run in this audit.
 
 Before deployment, select and test a pinned build, bind published ports to host loopback, set writable private storage and explicit resource limits. The current cookie save path can ignore write errors; inspect persisted files and restored behavior.
 
@@ -20,7 +20,7 @@ Description=Obscura headless browser
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/obscura serve --port 9222 --stealth --storage-dir /var/lib/obscura
+ExecStart=/usr/local/bin/obscura serve --port 9222 --storage-dir /var/lib/obscura
 Restart=always
 RestartSec=5
 User=obscura

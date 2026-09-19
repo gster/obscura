@@ -4,7 +4,7 @@ The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/gster/obscura", rev = "e67e67b11eb265f097942055962622e43fcb9a16", features = ["render", "stealth"] }
+obscura = { git = "https://github.com/gster/obscura", rev = "e67e67b11eb265f097942055962622e43fcb9a16", features = ["render"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```
@@ -19,9 +19,7 @@ use std::time::Duration;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let browser = Browser::builder()
-        .stealth(true)
-        .build()?;
+    let browser = Browser::builder().build()?;
 
     let mut page = browser.new_page().await?;
     page.goto("https://example.com").await?;
@@ -41,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## API surface
 
-`Browser::builder()` configures the engine: `.stealth(bool)`, `.proxy(url)`, `.user_agent(ua)`, `.storage_dir(dir)`, then `.build()`. `Browser::new()` uses defaults.
+`Browser::builder()` configures `.proxy(url)` and `.storage_dir(dir)`, then `.build()`. `Browser::new()` uses defaults. The primp transport and calibrated browser identity are mandatory; arbitrary User-Agent overrides are not exposed because the wire and JavaScript identity must remain consistent.
 
 `Page`:
 - `goto(url).await` navigate and wait for load

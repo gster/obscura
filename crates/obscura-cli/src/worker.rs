@@ -51,13 +51,10 @@ async fn main() {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let stealth = std::env::var("OBSCURA_STEALTH")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
     let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let mut context = BrowserContext::with_options("worker".to_string(), proxy, stealth);
+    let mut context = BrowserContext::with_options("worker".to_string(), proxy, true);
     context.obey_robots = obey_robots;
     let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);

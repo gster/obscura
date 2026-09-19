@@ -1,6 +1,6 @@
 # 迁移期独立 runtime
 
-`runtime/` 直接嵌入引擎，产物名为 `autopilot-browser-runtime`，启用 render+stealth。`bindings/python/` 的自有 SDK 通过有界 stdin/stdout NDJSON 与它通信，**不运行 CDP，也不是官方 Playwright Python**。
+`runtime/` 直接嵌入引擎，产物名为 `autopilot-browser-runtime`，启用 render，并自动包含强制 primp 和统一身份基线。`bindings/python/` 的自有 SDK 通过有界 stdin/stdout NDJSON 与它通信，**不运行 CDP，也不是官方 Playwright Python**。
 
 ```bash
 (cd runtime && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release)

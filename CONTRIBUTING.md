@@ -29,15 +29,13 @@ A few notes to keep the project maintainable:
 
 ## Building
 
-Obscura supports four release configurations. Keep all four building when you
-change feature gates or shared code:
+Obscura supports render and no-render release configurations. Both include the
+same primp transport and browser identity baseline:
 
 | Configuration | Command |
 | --- | --- |
 | Rendering | `cargo build --release -p obscura-cli --bins --features render` |
-| Rendering and stealth | `cargo build --release -p obscura-cli --bins --features render,stealth` |
 | No rendering | `cargo build --release -p obscura-cli --bins --no-default-features` |
-| No rendering, with stealth | `cargo build --release -p obscura-cli --bins --no-default-features --features stealth` |
 
 The standard release archives and Docker image include rendering. The
 `-no-render` release variants keep the smaller DOM, JavaScript, networking,
@@ -52,10 +50,9 @@ cargo build --release -p obscura-cli --bins --features render
 - The first build compiles V8 from source: roughly 5 minutes and a few GB of
   disk. Incremental builds are seconds.
 - Iterating on one crate? Scope it: `cargo build -p obscura-cli`.
-- **Stealth** (`--features render,stealth`) retains rendering and adds the
-  wreq/BoringSSL transport, browser-identity protections, and tracker blocklist.
-  BoringSSL builds through CMake, so `cmake` must be installed. The rendering
-  build uses rustls and needs neither CMake nor OpenSSL.
+- **Transport baseline:** every build includes primp/Rustls, browser-identity
+  protections, and the tracker blocklist. AWS-LC builds through CMake, so
+  `cmake`, Clang, and libclang must be installed.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.
 
@@ -147,8 +144,8 @@ For any code change:
    about plus or minus 10%.
 6. For rendering changes, complete the rendering checks above. For shared or
    feature-gated changes, also build and test without the `render` feature.
-7. For stealth changes, re-test with `--stealth`. A non-stealth binary does not
-   exercise the `wreq` path.
+7. For identity or transport changes, test both render and no-render builds;
+   both exercise primp.
 
 Keep ops panic-safe: a panic in an op must degrade to a null result, never
 unwind into V8's FFI frame. Do not remove the robustness guards described in
@@ -191,8 +188,8 @@ Fixes #316.
 Open an issue with enough detail to reproduce:
 
 - The obscura version or commit, plus OS and architecture.
-- The build configuration: render, render and stealth, no-render, or no-render
-  and stealth.
+- The build configuration: render or no-render. The primp transport and
+  calibrated identity baseline are present in both configurations.
 - A repro: a URL, an `--eval` snippet, or a short CDP sequence.
 - What you expected and what actually happened.
 - If it is a rendering or compatibility issue, whether headless Chrome behaves

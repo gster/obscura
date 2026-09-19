@@ -8,7 +8,7 @@
 - 消息采用 V8 序列化，覆盖 typed array、BigInt、Date、Map、Set、循环/共享引用。ArrayBuffer transfer 当前复制后 detach，不声称零拷贝。
 - 启动队列、一次初始化、handler 状态、消息顺序、close/terminate 与 owner 清理有回归。
 - `worker_queue.rs` 使用页面树共享预算：单消息 16 MiB、队列 payload 64 MiB、4096 条、32 个活跃 Worker。payload 预算不等于进程 RSS 上限。
-- 普通/stealth 客户端分别 detached，配置和 Cookie 保留、连接池独立。旧版“直接复用父 transport”及“普通路径尚未处理”均已过时。
+- Worker 使用 detached primp 客户端，配置和 Cookie 保留、连接池独立。旧版“直接复用父 transport”及双产品传输路径均已过时。
 - 网络拦截、计数、正文与观察向 owner 转发；Worker 对象句柄不能冒充父 isolate 句柄。
 
 源码：[Worker](../crates/obscura-js/src/worker.rs)、[队列](../crates/obscura-js/src/worker_queue.rs)、[回归](../crates/obscura-js/src/runtime.rs)。
@@ -21,6 +21,6 @@
 cargo nextest run --locked --release --features render -p obscura-js -E 'test(worker)'
 ```
 
-涉及 stealth 的改动必须另外启用并运行该路径；单纯构建或普通 HTTP fixture 不证明 TLS 行为。Web Worker 与批量抓取的 `obscura-worker` 可执行文件是不同概念，产品裁剪不能混删。任务见 OB-038。
+涉及身份或传输的改动必须运行强制 primp 路径；单纯构建或普通 HTTP fixture 不证明 TLS 行为。Web Worker 与批量抓取的 `obscura-worker` 可执行文件是不同概念，产品裁剪不能混删。任务见 OB-038。
 
 Southwest 固定输入回放和现场结果是不同验收；通用 Worker 测试通过不解释 shopping 403。历史实验的限制见 [Southwest 摘要](Southwest-handoff.md)。

@@ -7,7 +7,9 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["primp", "futures-util", "bytes", "http"]
+# Compatibility alias. The primp transport is part of every build and cannot
+# be disabled; downstream manifests may remove this feature at their leisure.
+stealth = []
 
 [dependencies]
 reqwest = { workspace = true }
@@ -20,10 +22,10 @@ thiserror = { workspace = true }
 async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"
-futures-util = { version = "0.3", optional = true }
-bytes = { version = "1", optional = true }
-primp = { version = "=2.0.1", optional = true, default-features = false, features = ["gzip", "brotli", "deflate", "zstd", "stream"] }
-http = { version = "1", optional = true }
+futures-util = "0.3"
+bytes = "1"
+primp = { version = "=2.0.1", default-features = false, features = ["gzip", "brotli", "deflate", "zstd", "stream"] }
+http = "1"
 
 [dev-dependencies]
 socket2 = "0.6"
