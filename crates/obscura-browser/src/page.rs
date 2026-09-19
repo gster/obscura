@@ -4206,7 +4206,7 @@ impl Page {
                 request_id: ev.request_id,
                 url: ev.url,
                 method: ev.method,
-                resource_type: "Fetch".to_string(),
+                resource_type: format!("{:?}", ev.resource_type),
                 status: ev.status,
                 headers: ev.request_raw_headers.as_ref().map(|h| h.text_headers()).unwrap_or_default(),
                 response_headers: Arc::new(ev.response_headers),

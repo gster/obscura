@@ -9273,6 +9273,66 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_fetch_override_consumes_private_init_mark_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const originalFetch = globalThis.fetch;
+            const originalOp = Deno.core.ops.op_fetch_url;
+            const originalWeakSetDelete = WeakSet.prototype.delete;
+            const calls = [];
+            let overrideCalls = 0;
+            let workerArgumentCount;
+            let workerInitKeys;
+            try {
+                Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, destination) => {
+                    calls.push({url, destination: destination || null});
+                    return JSON.stringify({status: 200, headers: {}, url, body: 'postMessage("ready");'});
+                };
+                globalThis.fetch = (...args) => {
+                    overrideCalls++;
+                    const response = originalFetch(...args);
+                    if (String(args[0]).endsWith('/worker.js')) {
+                        workerArgumentCount = args.length;
+                        workerInitKeys = Reflect.ownKeys(args[1]);
+                        // A captured init can be replayed, but its mark is already consumed.
+                        return Promise.all([response, originalFetch(...args)]).then(([first]) => first);
+                    }
+                    return response;
+                };
+                await fetch('/string-token', {}, 'worker');
+                await fetch('/object-token', {}, {});
+                await fetch('/symbol-token', {}, Symbol('worker'));
+                WeakSet.prototype.delete = () => true;
+                await fetch('/ordinary-init', {destination: 'worker'});
+                WeakSet.prototype.delete = originalWeakSetDelete;
+                const reply = await new Promise((resolve, reject) => {
+                    const worker = new Worker('/worker.js');
+                    worker.onmessage = event => { worker.terminate(); resolve(event.data); };
+                    worker.onerror = reject;
+                });
+                return {calls, overrideCalls, workerArgumentCount, workerInitKeys, reply,
+                    markerVisible: typeof _workerFetchInits !== 'undefined'};
+            } finally {
+                globalThis.fetch = originalFetch;
+                Deno.core.ops.op_fetch_url = originalOp;
+                WeakSet.prototype.delete = originalWeakSetDelete;
+            }
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "calls": [
+                {"url": "http://example.com/string-token", "destination": null},
+                {"url": "http://example.com/object-token", "destination": null},
+                {"url": "http://example.com/symbol-token", "destination": null},
+                {"url": "http://example.com/ordinary-init", "destination": null},
+                {"url": "http://example.com/worker.js", "destination": "worker"},
+                {"url": "http://example.com/worker.js", "destination": null},
+            ],
+            "overrideCalls": 5, "workerArgumentCount": 2, "workerInitKeys": [],
+            "reply": "ready", "markerVisible": false,
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_termination_discards_queued_messages() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(

@@ -7843,7 +7843,13 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
+// Worker metadata is a one-shot mark on an ordinary init object. Capture the
+// native methods so page overrides cannot forge marks or observe the private set.
+const _workerFetchInits = new WeakSet();
+const _markWorkerFetchInit = _workerFetchInits.add.bind(_workerFetchInits);
+const _consumeWorkerFetchInit = _workerFetchInits.delete.bind(_workerFetchInits);
 globalThis.fetch = async (input, init = {}) => {
+  const destination = _consumeWorkerFetchInit(init) ? "worker" : undefined;
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -7889,7 +7895,7 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, destination);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -16510,7 +16516,9 @@ function Worker(url) {
       state.url = resolvedUrl;
       (async () => {
         try {
-          const resp = await fetch(resolvedUrl);
+          const init = {};
+          _markWorkerFetchInit(init);
+          const resp = await globalThis.fetch(resolvedUrl, init);
           state.code = await resp.text();
           if (!state.terminated) _autoRunWorker(worker);
         } catch(e) { _workerError(worker, e); }

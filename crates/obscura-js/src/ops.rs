@@ -96,6 +96,7 @@ pub struct JsNetworkEvent {
     pub request_id: String,
     pub url: String,
     pub method: String,
+    pub resource_type: ResourceType,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
     pub raw_headers: Option<obscura_net::HeaderCapture>,
@@ -3739,7 +3740,7 @@ async fn op_fetch_url(
 ) -> Result<String, deno_error::JsErrorBox> {
     crate::worker::refresh_policy(&state.borrow());
     let resource_type = match destination.as_deref() {
-        Some("script") => ResourceType::Script,
+        Some("script" | "worker") => ResourceType::Script,
         _ => ResourceType::Fetch,
     };
     let body = body.to_vec();
@@ -4077,6 +4078,9 @@ async fn stealth_fetch_all(
         crossed_origin |= current_is_cross_origin;
         let mut req_headers: HashMap<String, String> = scripted_fetch_metadata(&page_origin, &current_url, &mode, resource_type)
             .into_iter().map(|(name, value)| (name.into(), value.into())).collect();
+        if destination.as_deref() == Some("worker") {
+            req_headers.insert("sec-fetch-dest".into(), "worker".into());
+        }
         if let Some(origin) = fetch_origin_header(&current_method, &page_origin, &current_url, &mode, referrer_policy, destination.as_deref()) {
             req_headers.insert("origin".to_string(), origin.into());
         }
@@ -4234,6 +4238,7 @@ async fn stealth_fetch_all(
             request_id: request_id.clone(),
             url: current_url.clone(),
             method: current_method.clone(),
+            resource_type,
             status,
             response_headers: resp_headers.clone(),
             raw_headers: response.raw_headers.clone(),

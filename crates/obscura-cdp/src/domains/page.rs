@@ -1915,6 +1915,163 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_worker_raw_headers_and_bodies_reach_owning_page_cdp() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while requests.len() < 5 {
+                assert!(std::time::Instant::now() < deadline, "missing worker requests");
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                let target = request.split_whitespace().nth(1).unwrap();
+                let path = url::Url::parse(target).unwrap().path().to_owned();
+                let (status, body): (u16, &[u8]) = match path.as_str() {
+                    "/" => (200, b"<html></html>"),
+                    "/workers/main.js" => (200, br#"
+                        const child = new Worker('nested.js');
+                        const nested = new Promise(resolve => {
+                            child.onmessage = event => { child.terminate(); resolve(event.data); };
+                        });
+                        Promise.all([
+                            fetch('text', {method: 'POST', body: 'sent'}).then(r => r.text()),
+                            nested
+                        ]).then(postMessage);
+                    "#),
+                    "/workers/nested.js" => (200, br#"
+                        fetch('binary').then(r => r.arrayBuffer()).then(bytes => postMessage(Array.from(new Uint8Array(bytes))));
+                    "#),
+                    "/workers/text" => (201, b"worker-text"),
+                    "/workers/binary" => (200, &[0, 128, 255, 16]),
+                    _ => panic!("unexpected request: {path}"),
+                };
+                stream.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    if path == "/" { "text/html" } else if path.ends_with(".js") { "text/javascript" } else { "application/octet-stream" }, body.len()).as_bytes()).unwrap();
+                stream.write_all(b"Set-Cookie: first=Raw+/=123; Path=/\r\nSet-Cookie: second=Keep; Path=/\r\nX-Repeated: one\r\nX-Repeated: two\r\nX-Bytes: \x80\xff\r\n\r\n").unwrap();
+                stream.write_all(body).unwrap();
+                requests.push(bytes);
+            }
+            requests
+        });
+        let mut ctx = CdpContext::new();
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("worker-headers".into(), Some(proxy)));
+        ctx.default_context.http_client.set_extra_headers([
+            ("Authorization".into(), "Bearer Raw+/=123".into()),
+            ("Cookie".into(), "explicit=Raw+/=123".into()),
+        ].into_iter().collect()).await;
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = requests.clone();
+        let response_sink = responses.clone();
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.on_request(Arc::new(move |request| request_sink.lock().unwrap().push(request.clone())));
+        page.on_response(Arc::new(move |request, response| response_sink.lock().unwrap().push((request.clone(), response.clone()))));
+        page.navigate("http://worker-headers.test/").await.unwrap();
+        page.network_events.clear();
+        let result = page.evaluate_for_cdp(r#"new Promise((resolve, reject) => {
+            const worker = new Worker('/workers/main.js');
+            worker.onmessage = event => { worker.terminate(); resolve(event.data); };
+            worker.onerror = reject;
+        })"#, true, true).await;
+        assert!(!result.thrown, "{result:?}");
+        assert_eq!(result.value, Some(json!(["worker-text", [0, 128, 255, 16]])));
+        page.sync_js_network_events();
+        let events: Vec<_> = page.network_events.drain(..).collect();
+        assert_eq!(events.len(), 4, "both workers must report to their owning page");
+        page.sync_js_network_events();
+        assert!(page.network_events.is_empty(), "observations must drain exactly once");
+        let ids: std::collections::HashSet<_> = events.iter().map(|event| &event.request_id).collect();
+        assert_eq!(ids.len(), events.len());
+        let values = |capture: &obscura_net::HeaderCapture, name: &[u8]| -> Vec<Vec<u8>> {
+            capture.fields.iter().filter(|field| field.name == name).map(|field| field.value.clone()).collect()
+        };
+        assert_eq!(requests.lock().unwrap().len(), 5);
+        assert_eq!(responses.lock().unwrap().len(), 5);
+        for event in &events {
+            let responses = responses.lock().unwrap();
+            let (request, response) = responses.iter().find(|(request, _)| request.url.as_str() == event.url).unwrap();
+            assert_eq!(event.request_raw_headers, request.raw_headers);
+            assert_eq!(event.request_raw_headers, response.request_raw_headers);
+            assert_eq!(event.raw_headers, response.raw_headers);
+            assert_eq!(event.resource_type, format!("{:?}", request.resource_type));
+            assert_eq!(event.resource_type, if event.url.ends_with(".js") { "Script" } else { "Fetch" });
+            assert_eq!(event.method, if event.url.ends_with("/text") { "POST" } else { "GET" });
+            assert_eq!(event.status, if event.url.ends_with("/text") { 201 } else { 200 });
+            assert_eq!(event.body_size, response.body.len());
+            if event.url.ends_with("/text") { assert_eq!(request.body, b"sent"); }
+            let raw = event.raw_headers.as_ref().unwrap();
+            assert_eq!(raw.capture_stage, "transportResponse");
+            assert_eq!(values(raw, b"x-repeated"), [b"one".to_vec(), b"two".to_vec()]);
+            assert_eq!(values(raw, b"x-bytes"), [b"\x80\xff".to_vec()]);
+            assert_eq!(values(raw, b"set-cookie"), [b"first=Raw+/=123; Path=/".to_vec(), b"second=Keep; Path=/".to_vec()]);
+            assert!(!event.response_headers.contains_key("x-bytes"));
+            let raw = event.request_raw_headers.as_ref().unwrap();
+            assert_eq!(raw.capture_stage, "transportRequest");
+            assert_eq!(values(raw, b"authorization"), [b"Bearer Raw+/=123".to_vec()]);
+            assert_eq!(values(raw, b"sec-fetch-dest"), [if event.url.ends_with(".js") { b"worker".to_vec() } else { b"empty".to_vec() }]);
+            let cookies = values(raw, b"cookie");
+            assert_eq!(cookies.len(), 2, "explicit and jar Cookie fields must remain separate");
+            assert!(cookies.contains(&b"explicit=Raw+/=123".to_vec()));
+            assert!(cookies.iter().any(|value| value.windows(b"first=Raw+/=123".len()).any(|part| part == b"first=Raw+/=123")));
+        }
+        emit_runtime_network_events(&mut ctx, &session, "frame-worker", "http://worker-headers.test/", &page_id, &events);
+        for event in &events {
+            let emitted: Vec<_> = ctx.pending_events.iter().filter(|item| item.params["requestId"] == event.request_id).collect();
+            assert_eq!(emitted.len(), 3);
+            assert!(emitted.iter().all(|item| item.session_id == session));
+            assert_eq!(emitted[0].method, "Network.requestWillBeSent");
+            assert_eq!(emitted[0].params["request"]["rawHeaders"], json!(event.request_raw_headers));
+            assert_eq!(emitted[0].params["type"], event.resource_type);
+            assert_eq!(emitted[1].method, "Network.responseReceived");
+            assert_eq!(emitted[1].params["response"]["rawHeaders"], json!(event.raw_headers));
+            assert_eq!(emitted[1].params["response"]["status"], event.status);
+            assert_eq!(emitted[2].method, "Network.loadingFinished");
+            assert_eq!(emitted[2].params["encodedDataLength"], event.body_size);
+        }
+        let binary = events.iter().find(|event| event.url.ends_with("/binary")).unwrap();
+        let body = super::super::network::handle("getResponseBody", &json!({"requestId": binary.request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(body, json!({"body": "AID/EA==", "base64Encoded": true}));
+        let text = events.iter().find(|event| event.url.ends_with("/text")).unwrap();
+        let body = super::super::network::handle("getResponseBody", &json!({"requestId": text.request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(body, json!({"body": "worker-text", "base64Encoded": false}));
+        // Navigation-time Fetch observations use the same completed capture.
+        // A live pre-transport pause cannot have transport headers yet.
+        ctx.pending_events.clear();
+        ctx.fetch_intercept.enabled = true;
+        emit_navigation_events(&mut ctx, &session, "frame-worker", "loader-worker", "http://worker-headers.test/", &page_id, &events, WaitUntil::Load, false);
+        let paused: Vec<_> = ctx.pending_events.iter().filter(|event| event.method == "Fetch.requestPaused").collect();
+        assert_eq!(paused.len(), events.len());
+        for (paused, event) in paused.iter().zip(&events) {
+            assert_eq!(paused.params["request"]["rawHeaders"], json!(event.request_raw_headers));
+            assert_eq!(paused.params["resourceType"], event.resource_type);
+        }
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
     // #920: a history navigation that fails to load must not move the recorded
     // currentIndex — the page never actually went anywhere, so a later
     // getNavigationHistory must still report where it really is.

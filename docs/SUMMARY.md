@@ -18,7 +18,7 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 | 检查 | 本次结果 | 边界 |
 | --- | --- | --- |
-| 根 release nextest，render | **1844 passed，4 skipped，0 failed** | OB-012 raw transport header 切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
+| 根 release nextest，render | **1847 passed，4 skipped，0 failed** | OB-012 raw transport header 与 Worker 观察切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
 | 独立 runtime release nextest，locked | **185 passed，0 skipped** | runtime 普通依赖已无条件包含 primp；不能替代全部网络/线级测试 |
 | 指定 release CLI build，render | **通过** | 默认产品构建无条件包含 primp |
 | 指定 release CLI build，no-default-features | **通过** | 无渲染产物仍包含 primp；不能借 feature 组合关闭该能力 |
@@ -41,18 +41,18 @@ OB-044 本轮删除 CLI/serve 的 `--stealth`、`--user-agent`、`OBSCURA_STEALT
 
 OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓存改为只消费已注入字节；robots.txt 改走 persona-owned primp，并验证其与导航使用同一 persona User-Agent；每个 Page 的 primp 与其 detached Worker 共享 transport in-flight 计数，兄弟 Page 保持隔离，`networkidle` 合并观察互斥的预发送/CDP 拦截与 primp 传输阶段；native policy `RequestInterceptor` 保留完整二进制请求体。页面和独立 `ObscuraJsRuntime` 的 fetch/XHR、CORS OPTIONS、module、图片、字体与样式请求均只经 primp 获取；独立 runtime 在初始化时固定默认 Windows Chrome145 persona，frame/Worker 继承身份、Cookie 和策略。context baseline、Page override 与 request-specific headers 分层合并且兄弟 Page 隔离；无效代理 fail closed，PEM/DER CA、scripted 逐跳 timeout 与 body cap 保持。运行时挂接 Page 时会明确接管 transport，保留 Page persona、私网策略、Cookie 和回调。第二切片将 `ObscuraHttpClient` 收敛为 policy/context 类型，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖、根与独立 runtime 锁文件中的对应 package，以及 `wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。
 
-本轮 raw header 切片将 `HeaderCapture`/`RawHeader` 从 primp 边界贯穿 `Response`、`RequestInfo`、JS/render/Page 到 CDP 观察面。`rawHeaders` 是 Obscura 加法扩展，格式为 `captureStage=transportRequest|transportResponse`、`encoding=base64`、`fields=[{nameBase64,valueBase64}]`；重复值、非 UTF-8、Cookie、Authorization、Set-Cookie 的原始 bytes 均不脱敏、不裁剪，兼容性的 map 只是派生视图。本轮不宣称已经取得 wire capture。仍有 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、Worker→Page/CDP、preflight/失败链、公开 HashMap 输入限制、完整响应 body 持久化，以及 Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、下载和线级校准缺口，因此 OB-012 只记录为部分完成。删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。所有采集与日志保留 Cookie、Authorization、重复头、原始字节和完整 body，不做脱敏或字段裁剪。
+本轮 raw header 切片将 `HeaderCapture`/`RawHeader` 从 primp 边界贯穿 `Response`、`RequestInfo`、JS/render/Page 到 CDP 观察面。`rawHeaders` 是 Obscura 加法扩展，格式为 `captureStage=transportRequest|transportResponse`、`encoding=base64`、`fields=[{nameBase64,valueBase64}]`；重复值、非 UTF-8、Cookie、Authorization、Set-Cookie 的原始 bytes 均不脱敏、不裁剪，兼容性的 map 只是派生视图。本轮不宣称已经取得 wire capture。Worker 观察切片已完成成功型请求的贯通：`WorkerObservations` 将 raw captures 和 body 回灌 owning Page；保留 `JsNetworkEvent` 的真实 resource type，Worker 主脚本在 CDP 标为 `Script` 且 transport `Sec-Fetch-Dest: worker`，普通 fetch 的 `Sec-Fetch-Dest` 保持 `empty`；Worker queue 字节预算计入 request/response raw header 的全部 name/value；端到端 nested Worker 回归覆盖 raw headers、body 和 `Network.getResponseBody`。仍有 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、preflight/失败链、独立 Worker target、`importScripts`、公开 HashMap 输入限制、完整响应 body 持久化，以及 Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、下载和线级校准缺口，因此 OB-012 只记录为部分完成。删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。所有采集与日志保留 Cookie、Authorization、重复头、原始字节和完整 body，不做脱敏或字段裁剪。
 
 本次未运行：Linux 原生验证、完整官方客户端矩阵、WPT、24h 长稳、受控性能/TLS/H2 测量、Docker 构建、Southwest/ZG 现场流程和报价对照。没有新的生产发布或部署结论。
 
 ### 构建与证据定位
 
-本次 render CLI SHA-256：`6cc8c9cd9a9ebc962901cb0e0faf7389e9c4e91a3ae04c3c4f7daced595765a6`（118922656 bytes）。
+本次 render CLI SHA-256：`9e765f706f031a3fb31d9a182df151bdb5505d085e41b6520227221f5d9b5aa6`（118923232 bytes）。
 
 - 根 Cargo.lock SHA-256：`813ac17dfae3d60a779ee6d892d9989bbb92c7f18b3bc4f16bb569868f280343`。
 - runtime/Cargo.lock SHA-256：`279f5b950dbb6d03500cf231fc5554e704f762804e81fc7fbccacde4a720ccf7`。
 - benchmark revision：`2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`（`gster/obscura-benchmark`），与当前 CI pin 一致；旧失败归因使用 `6ebac8293d7477f59e837768bfd4e74173f04f1c`。
-- 本机原始日志、合成探针和 JSON：`/tmp/obscura-doc-audit-20260919/`；临时文件不入 Git，也不保证跨设备或长期存在。仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
+- 本机最终门禁日志：`/tmp/ob012-worker-full-root-final.log`、`/tmp/ob012-worker-runtime-final.log`、`/tmp/ob012-worker-obstacle-final.log`；官方 Playwright smoke 与完整协议日志位于 `/var/folders/r8/vzjpyytd6yx0wwcwtl1wd81w0000gp/T/tmp.tP0WFZt2NY/`。这些临时文件不入 Git，也不保证跨设备或长期存在；仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
 
 ```bash
 # 仓库根

@@ -122,6 +122,10 @@ impl Size for WorkerEvent {
                 let network: usize = value.network.iter().map(|(event, body)| {
                     std::mem::size_of_val(event) + event.request_id.len() + event.url.len() + event.method.len()
                         + event.response_headers.iter().map(|(k,v)| k.len() + v.len()).sum::<usize>()
+                        + event.raw_headers.iter().chain(event.request_raw_headers.iter())
+                            .map(|capture| capture.fields.iter().map(|field|
+                                std::mem::size_of_val(field) + field.name.len() + field.value.len()
+                            ).sum::<usize>()).sum::<usize>()
                         + body.as_ref().map_or(0, |body| body.body.len())
                 }).sum();
                 let runtime: usize = value.runtime.iter().map(|event| match event {
@@ -1183,4 +1187,38 @@ pub fn op_worker_deserialize<'s>(scope: &mut v8::HandleScope<'s>, #[string] data
     let deserializer = v8::ValueDeserializer::new(scope, Box::new(WorkerDeserializer), &bytes);
     if deserializer.read_header(scope.get_current_context()) != Some(true) { return v8::undefined(scope).into(); }
     deserializer.read_value(scope.get_current_context()).unwrap_or_else(|| v8::undefined(scope).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_observation_queue_accounts_for_raw_header_fields() {
+        let mut event = crate::ops::JsNetworkEvent {
+            request_id: "fetch-1".into(), url: "http://example.test/".into(), method: "GET".into(),
+            resource_type: obscura_net::ResourceType::Fetch, status: 200,
+            response_headers: HashMap::new(), raw_headers: None, request_raw_headers: None,
+            body_size: 0, timestamp: 0.0,
+        };
+        let size_without_headers = WorkerEvent::Observations(WorkerObservations {
+            network: vec![(event.clone(), None)], ..Default::default()
+        }).queued_bytes();
+        event.request_raw_headers = Some(obscura_net::HeaderCapture {
+            capture_stage: "transportRequest", encoding: "base64",
+            fields: vec![
+                obscura_net::RawHeader { name: b"cookie".to_vec(), value: b"first=keep".to_vec() },
+                obscura_net::RawHeader { name: b"cookie".to_vec(), value: b"second=keep".to_vec() },
+            ],
+        });
+        event.raw_headers = Some(obscura_net::HeaderCapture {
+            capture_stage: "transportResponse", encoding: "base64",
+            fields: vec![obscura_net::RawHeader { name: b"x-bytes".to_vec(), value: b"\x80\xff".to_vec() }],
+        });
+        let size_with_headers = WorkerEvent::Observations(WorkerObservations {
+            network: vec![(event, None)], ..Default::default()
+        }).queued_bytes();
+        assert_eq!(size_with_headers - size_without_headers,
+            3 * std::mem::size_of::<obscura_net::RawHeader>() + 6 + 10 + 6 + 11 + 7 + 2);
+    }
 }

@@ -1,6 +1,6 @@
 # 当前传输实现与统一目标
 
-2026-09-20 复核。产品 Page、CDP、MCP、Worker、JS fetch/XHR 和独立 runtime/module loader 路径统一使用 persona-owned primp；renderer 默认 cache 已不再自行联网，robots.txt 也进入同一 primp。第二切片已将 `ObscuraHttpClient` 收敛为 policy/context，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖和 `obscura-net::wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径也统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。OB-012 仍不能关闭，因为 raw header 观察仍未取得 wire capture，且 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、Worker→Page/CDP、preflight/失败链、公开 HashMap 输入限制、完整响应 body 持久化、Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、download 和线级校准仍未完成。这里的删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。旧比较中的 upstream commit、Python 探针和现场请求只代表迁移前历史，不是本次传输测量。
+2026-09-20 复核。产品 Page、CDP、MCP、Worker、JS fetch/XHR 和独立 runtime/module loader 路径统一使用 persona-owned primp；renderer 默认 cache 已不再自行联网，robots.txt 也进入同一 primp。第二切片已将 `ObscuraHttpClient` 收敛为 policy/context，删除其自有发送 backend、timeout 假配置、项目自有直接 reqwest 依赖和 `obscura-net::wreq_client` alias；CLI `original` 文件和 HTTP 辅助路径也统一走 `StealthHttpClient`，原有 37 项 legacy 网络测试完整迁移到 primp。Worker 观察切片已完成成功型请求的贯通：`WorkerObservations` 将 raw captures 和 body 回灌 owning Page；保留 `JsNetworkEvent` 的真实 resource type，Worker 主脚本在 CDP 标为 `Script` 且 transport `Sec-Fetch-Dest: worker`，普通 fetch 的 `Sec-Fetch-Dest` 保持 `empty`；Worker queue 字节预算计入 request/response raw header 的全部 name/value；端到端 nested Worker 回归覆盖 raw headers、body 和 `Network.getResponseBody`。OB-012 仍不能关闭，因为 raw header 观察仍未取得 wire capture，且 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、preflight/失败链、独立 Worker target、`importScripts`、公开 HashMap 输入限制、完整响应 body 持久化、Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、download 和线级校准仍未完成。这里的删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。旧比较中的 upstream commit、Python 探针和现场请求只代表迁移前历史，不是本次传输测量。
 
 ## 当前源码事实
 
@@ -15,7 +15,7 @@
 
 ## 验证边界
 
-本轮 raw header 结果不宣称 wire capture；仍待处理 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、Worker→Page/CDP、preflight/失败链、公开 HashMap 输入限制、完整响应 body 持久化，以及 Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、download 和线级校准。
+本轮 raw header 结果不宣称 wire capture；Worker 观察切片已完成成功型请求的 Worker→Page/CDP 贯通，保留真实 `JsNetworkEvent` resource type，Worker 主脚本在 CDP 标为 `Script` 且 transport `Sec-Fetch-Dest: worker`，普通 fetch 的 `Sec-Fetch-Dest` 保持 `empty`；Worker queue 字节预算计入 request/response raw header 的全部 name/value，nested Worker 回归覆盖 raw headers、body 和 `Network.getResponseBody`。仍待处理 HTTP/proxy 后注入字段、wire casing/跨字段顺序、redirect 中间响应、preflight/失败链、独立 Worker target、`importScripts`、公开 HashMap 输入限制、完整响应 body 持久化，以及 Abort/CORS 细节、最终线上请求头观察、CDP Fetch、Beacon、download 和线级校准。
 
 本次没有重跑 TLS/H2 抓包、Chrome 线级对照或网站验收。历史 ALPS/trust-anchor/头顺序差异需要在固定构建上重新采集才能声明当前数值。JA3/JA4、版本名、单次导航成功不证明所有资源类别的传输等价；具体 method/body、redirect、credentials、预检、代理和连接复用分别验收。
 
