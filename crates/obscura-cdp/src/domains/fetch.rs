@@ -189,7 +189,19 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => Ok(json!({ "body": "", "base64Encoded": false })),
+        "getResponseBody" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(|v| v.as_str())
+                .ok_or("Fetch.getResponseBody requires requestId")?;
+            if ctx.fetch_intercept.paused.contains_key(request_id) {
+                return Err(response_body_not_ready(request_id));
+            }
+            // Obscura accepts completed capture IDs, as takeResponseBodyAsStream
+            // does. This is not response-stage interception: an active request
+            // pause has no complete response body and must remain paused.
+            super::network::get_response_body(ctx, session_id, request_id)
+        },
         "takeResponseBodyAsStream" => {
             // Move raw storage into IO; file-backed bodies are read in chunks.
             let request_id = params
@@ -197,16 +209,12 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("Fetch.takeResponseBodyAsStream requires requestId")?;
 
-            let page = ctx.get_session_page(session_id);
-            let mut diagnostic = None;
-            let (page_id, size) = page.into_iter().chain(ctx.pages.iter()).find_map(|page| {
-                match page.response_body_size(request_id)? {
-                    Ok(size) => Some((page.id.clone(), size)),
-                    Err(error) => { diagnostic.get_or_insert(error); None },
-                }
-            }).ok_or_else(|| diagnostic.unwrap_or_else(|| {
-                format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}")
-            }))?;
+            if ctx.fetch_intercept.paused.contains_key(request_id) {
+                return Err(response_body_not_ready(request_id));
+            }
+            let page = super::network::response_body_page(ctx, session_id, request_id)?;
+            let page_id = page.id.clone();
+            let size = page.response_body_size(request_id).unwrap()?;
             let page = ctx.pages.iter_mut().find(|page| page.id == page_id).unwrap();
             let reservation = ctx.io_streams.reserve(size)?;
             let bytes = page.take_response_body_result(request_id)
@@ -216,6 +224,10 @@ pub async fn handle(
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
     }
+}
+
+pub(crate) fn response_body_not_ready(request_id: &str) -> String {
+    format!("response_body_not_ready: request {request_id} is paused before the response")
 }
 
 #[cfg(test)]
@@ -300,6 +312,10 @@ mod tests {
         for (event, bytes) in events.iter().zip([&text, &binary, &module]) {
             assert_eq!(event.body_size, bytes.len());
             let value = super::super::network::handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
+            for _ in 0..2 {
+                let fetched = handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
+                assert_eq!(fetched, value, "Fetch reads must be repeatable and match Network");
+            }
             let actual = if value["base64Encoded"] == true {
                 base64::engine::general_purpose::STANDARD.decode(value["body"].as_str().unwrap()).unwrap()
             } else { value["body"].as_str().unwrap().as_bytes().to_vec() };
@@ -312,6 +328,8 @@ mod tests {
         let stream = result["stream"].as_str().unwrap();
         let error = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("response_body_already_consumed"), "{error}");
+        let error = handle("getResponseBody", &json!({"requestId": "js-alias"}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_already_consumed"), "{error}");
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.set_response_body_limits(obscura_net::response_body::ResponseBodyLimits { memory_threshold: 0, total_bytes: 4, entries: 1 });
         let result = page.evaluate_for_cdp("fetch('/budget').then(r => r.text())", true, true).await;
@@ -319,6 +337,8 @@ mod tests {
         page.sync_js_network_events();
         let rejected = page.network_events.last().unwrap().request_id.clone();
         let error = super::super::network::handle("getResponseBody", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_budget_exhausted"), "{error}");
+        let error = handle("getResponseBody", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("response_body_budget_exhausted"), "{error}");
         let error = handle("takeResponseBodyAsStream", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("response_body_budget_exhausted"), "{error}");
@@ -348,10 +368,19 @@ mod tests {
         page.navigate(&url).await.unwrap();
         let request_id = page.network_events.last().unwrap().request_id.clone();
         page.alias_response_body(&request_id, "loader");
+        for id in [&request_id, "loader"] {
+            for _ in 0..2 {
+                let body = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap();
+                assert_eq!(body["base64Encoded"], true);
+                assert_eq!(base64::engine::general_purpose::STANDARD.decode(body["body"].as_str().unwrap()).unwrap(), bytes);
+            }
+        }
         let result = handle("takeResponseBodyAsStream", &json!({"requestId": "loader"}), &mut ctx, &session).await.unwrap();
         let stream = result["stream"].as_str().unwrap();
         for id in [&request_id, "loader"] {
             let error = handle("takeResponseBodyAsStream", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_already_consumed"), "{error}");
+            let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
             assert!(error.contains("response_body_already_consumed"), "{error}");
             let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
             assert!(error.contains("response_body_already_consumed"), "{error}");
@@ -402,6 +431,70 @@ mod tests {
         assert!(error.contains("io_stream_budget_exhausted"));
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(body["body"], "hello");
+    }
+
+    #[tokio::test]
+    async fn get_response_body_requires_completed_capture_and_preserves_request_pause() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/plain,complete").await.unwrap();
+        let request_id = page.network_events.last().unwrap().request_id.clone();
+        let mut rx = pause(&mut ctx, &request_id);
+        for method in ["getResponseBody", "takeResponseBodyAsStream"] {
+            let error = handle(method, &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_not_ready"), "{error}");
+            assert!(ctx.fetch_intercept.paused.contains_key(&request_id));
+            assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        }
+        handle("continueRequest", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+        assert!(matches!(rx.await.unwrap(), FetchResolution::Continue { .. }));
+        let body = handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(body, json!({"body": "complete", "base64Encoded": false}));
+        let error = handle("getResponseBody", &json!({}), &mut ctx, &session).await.unwrap_err();
+        assert_eq!(error, "Fetch.getResponseBody requires requestId");
+        let error = handle("getResponseBody", &json!({"requestId": "unfinished-or-unknown"}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("No response body found"), "{error}");
+        ctx.get_page_mut(&page_id).unwrap().clear_response_bodies();
+        assert!(handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_reads_and_streams_are_session_scoped_with_overlapping_ids() {
+        let mut ctx = CdpContext::new();
+        let mut sessions = Vec::new();
+        let mut ids = Vec::new();
+        for text in ["first", "second"] {
+            let page_id = ctx.create_page();
+            let session = Some(format!("{page_id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.navigate(&format!("data:text/plain,{text}")).await.unwrap();
+            let request_id = page.network_events.last().unwrap().request_id.clone();
+            page.alias_response_body(&request_id, "shared-id");
+            sessions.push(session);
+            ids.push(request_id);
+        }
+        for (session, expected) in sessions.iter().zip(["first", "second"]) {
+            let body = handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, session).await.unwrap();
+            assert_eq!(body["body"], expected);
+        }
+        let stream = handle("takeResponseBodyAsStream", &json!({"requestId": "shared-id"}), &mut ctx, &sessions[0]).await.unwrap();
+        super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx).await.unwrap();
+        for method in ["getResponseBody", "takeResponseBodyAsStream"] {
+            let error = handle(method, &json!({"requestId": "shared-id"}), &mut ctx, &sessions[0]).await.unwrap_err();
+            assert!(error.contains("response_body_already_consumed"), "{error}");
+            let error = handle(method, &json!({"requestId": ids[1]}), &mut ctx, &sessions[0]).await.unwrap_err();
+            assert!(error.contains("No response body found"), "{error}");
+            let error = handle(method, &json!({"requestId": "shared-id"}), &mut ctx, &Some("unknown-session".into())).await.unwrap_err();
+            assert!(error.contains("No page found for sessionId"), "{error}");
+        }
+        let body = handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, &None).await.unwrap();
+        assert_eq!(body["body"], "second");
+        let body = handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, &sessions[1]).await.unwrap();
+        assert_eq!(body["body"], "second");
     }
 
     // Parity with server.rs handle_fetch_resolution: continueRequest must

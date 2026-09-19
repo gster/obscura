@@ -1334,6 +1334,21 @@ fn handle_fetch_resolution(
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
+        if matches!(method, "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream")
+            && intercepted_paused.contains_key(request_id)
+        {
+            let response = crate::types::CdpResponse::error(
+                req.id, -32000, crate::domains::fetch::response_body_not_ready(request_id), req.session_id,
+            );
+            if let Ok(json) = serde_json::to_string(&response) {
+                let _ = reply_tx.send(json);
+            }
+            return true;
+        }
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest") {
+            return false;
+        }
+
         if let Some(resolver) = intercepted_paused.remove(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let resolution = match method {
@@ -1532,15 +1547,11 @@ async fn process_with_interception(
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
-                        if msg.text.contains("Fetch.continueRequest")
-                            || msg.text.contains("Fetch.fulfillRequest")
-                            || msg.text.contains("Fetch.failRequest")
-                        {
-                            // Safe: only flips a oneshot to resume the parked
-                            // op inside the spawned nav task. No V8 enter on
-                            // this side; the actual V8 work happens back on
-                            // the nav task's thread.
-                            handle_fetch_resolution(&msg.text, ctx, &msg.reply_tx, intercepted_paused);
+                        if msg.text.contains("Fetch.") && handle_fetch_resolution(
+                            &msg.text, ctx, &msg.reply_tx, intercepted_paused,
+                        ) {
+                            // Safe: resolves the pause or rejects a premature
+                            // body read without entering V8.
                         } else {
                             // UNSAFE during nav: would route through dispatch,
                             // which can `suspend_js` other pages and trip the
@@ -2056,6 +2067,30 @@ mod tests {
     #[test]
     fn parse_cdp_headers_absent_is_none() {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
+    }
+
+    #[test]
+    fn fetch_body_read_during_request_pause_errors_without_dropping_resolver() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolver, mut resolved) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("paused".to_string(), resolver)]);
+        for method in ["Fetch.getResponseBody", "Fetch.takeResponseBodyAsStream"] {
+            let command = json!({"id": 1, "method": method, "params": {"requestId": "paused"}, "sessionId": "session"}).to_string();
+            assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert_eq!(reply["id"], 1);
+            assert_eq!(reply["sessionId"], "session");
+            assert!(reply["error"]["message"].as_str().unwrap().contains("response_body_not_ready"));
+            assert!(paused.contains_key("paused"));
+            assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        }
+        let unrelated = json!({"id": 2, "method": "Fetch.unsupported", "params": {"requestId": "paused"}}).to_string();
+        assert!(!handle_fetch_resolution(&unrelated, &mut ctx, &reply_tx, &mut paused));
+        assert!(paused.contains_key("paused"));
+        let command = json!({"id": 3, "method": "Fetch.continueRequest", "params": {"requestId": "paused"}}).to_string();
+        assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+        assert!(matches!(resolved.try_recv().unwrap(), obscura_js::ops::InterceptResolution::Continue { .. }));
     }
 
     #[test]

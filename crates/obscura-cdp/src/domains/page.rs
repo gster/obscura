@@ -2056,11 +2056,15 @@ mod tests {
         }
         let binary = events.iter().find(|event| event.url.ends_with("/binary")).unwrap();
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": binary.request_id}), &mut ctx, &session).await.unwrap();
+        let fetched = super::super::fetch::handle("getResponseBody", &json!({"requestId": binary.request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(fetched, body);
         let binary_bytes: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
         assert_eq!(body, json!({"body": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &binary_bytes), "base64Encoded": true}));
         let text = events.iter().find(|event| event.url.ends_with("/text")).unwrap();
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": text.request_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(body, json!({"body": "w".repeat(2 * 1024 * 1024 + 31), "base64Encoded": false}));
+        let fetched = super::super::fetch::handle("getResponseBody", &json!({"requestId": text.request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(fetched, body);
         // Navigation-time Fetch observations use the same completed capture.
         // A live pre-transport pause cannot have transport headers yet.
         ctx.pending_events.clear();

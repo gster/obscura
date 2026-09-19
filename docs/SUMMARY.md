@@ -18,7 +18,7 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 | 检查 | 本次结果 | 边界 |
 | --- | --- | --- |
-| 根 release nextest，render | **1867 passed，4 skipped，0 failed** | OB-012 raw transport header、Worker 观察与 JS/模块/Worker/Page response body spool 切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
+| 根 release nextest，render | **1870 passed，4 skipped，0 failed** | OB-012 raw transport header、Worker 观察、统一 response body spool 与 Fetch 读取切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
 | 独立 runtime release nextest，locked | **185 passed，0 skipped** | runtime 普通依赖已无条件包含 primp；不能替代全部网络/线级测试 |
 | 指定 release CLI build，render | **通过** | 默认产品构建无条件包含 primp |
 | 指定 release CLI build，no-default-features | **通过** | 无渲染产物仍包含 primp；不能借 feature 组合关闭该能力 |
@@ -43,18 +43,18 @@ OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓�
 
 本轮 raw header 切片将 `HeaderCapture`/`RawHeader` 从 primp 边界贯穿 `Response`、`RequestInfo`、JS/render/Page 到 CDP 观察面。`rawHeaders` 是 Obscura 加法扩展，格式为 `captureStage=transportRequest|transportResponse`、`encoding=base64`、`fields=[{nameBase64,valueBase64}]`；重复值、非 UTF-8、Cookie、Authorization、Set-Cookie 的原始 bytes 均不脱敏、不裁剪，兼容性的 map 只是派生视图。本轮不宣称已经取得 wire capture。Worker 观察切片已完成成功型请求的贯通：`WorkerObservations` 将 raw captures 和 body 回灌 owning Page；保留 `JsNetworkEvent` 的真实 resource type，Worker 主脚本在 CDP 标为 `Script` 且 transport `Sec-Fetch-Dest: worker`，普通 fetch 的 `Sec-Fetch-Dest` 保持 `empty`；Worker queue 字节预算计入 request/response raw header 的全部 name/value；端到端 nested Worker 回归覆盖 raw headers、body 和 `Network.getResponseBody`。Page-owned response body 切片已完成：Document、classic Script、Stylesheet、Image、Font 保存原始 bytes；默认超过 2 MiB 转为 `NamedTempFile`，Page 总预算为 256 MiB/16384 entries，预算失败显式报告并在 `clear` 前停止新增，不静默 eviction；alias 共享。invalid UTF-8 文本经 CDP 以 base64 精确返回；Fetch stream 转移 raw store，活动 stream 不被驱逐，Page clear/drop 后仍可读，`IO.close`/context drop 清理。该切片聚焦 release nextest 为 25/25。删除范围是项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。所有采集与日志保留 Cookie、Authorization、重复头、原始字节和完整 body，不做脱敏或字段裁剪。
 
-上述 Page-only 记录随后扩展为 JS fetch/XHR、module loader 和 Worker 的 owning Page 共享 `ResponseBodyStore`：成功 transport 响应超过 2 MiB 进入 spool，invalid UTF-8 保留原字节，Worker 观察队列只传 metadata、不复制 body；module 仅记录最终 URL 的成功 2xx 响应，resource type 为 `Script`。该扩展聚焦 release nextest 为 27/27，根 release nextest 为 1867/1867，4 skipped。仍有 transport 先完整 materialize `Vec`、JS 100 MiB 与 module 32 MiB 默认硬帽、JS/module/Worker 的 redirect 中间响应、preflight/失败链、Fulfill/CORS early return、metadata 4096 上限、独立 Worker target、`importScripts`、公开 HashMap 输入限制、其他完整响应体出口；`Fetch.getResponseBody` 仍是 stub，低层 `ObscuraState` 字段也有源码兼容变化。OB-012 保持未关闭。
+上述 Page-only 记录随后扩展为 JS fetch/XHR、module loader 和 Worker 的 owning Page 共享 `ResponseBodyStore`：成功 transport 响应超过 2 MiB 进入 spool，invalid UTF-8 保留原字节，Worker 观察队列只传 metadata、不复制 body；module 仅记录最终 URL 的成功 2xx 响应，resource type 为 `Script`。该扩展聚焦 release nextest 为 27/27，根 release nextest 为 1870/1870，4 skipped。`Fetch.getResponseBody` 现已读取统一 raw store，重复 get 不消费正文并与 `Network.getResponseBody` 使用同一编码；`takeResponseBodyAsStream` 之后 get 明确返回 consumed。session 严格隔离，带 session 的请求或未知 session 不会跨 Page 查找；无 session 时多 Page 同 ID 按顺序选取首个仍可读的 body。live request-stage 请求的 get/take 返回 `response_body_not_ready` 并保留 resolver。这是 completed-capture requestId 扩展，不是标准 response-stage interception；whole-body get 会 materialize spool，磁盘 IO 故障注入尚未单测。该 Fetch 切片聚焦 release nextest 为 16/16。仍有 transport 先完整 materialize `Vec`、JS 100 MiB 与 module 32 MiB 默认硬帽、JS/module/Worker 的 redirect 中间响应、preflight/失败链、Fulfill/CORS early return、metadata 4096 上限、独立 Worker target、`importScripts`、公开 HashMap 输入限制、其他完整响应体出口；低层 `ObscuraState` 字段也有源码兼容变化。OB-012 保持未关闭。
 
 本次未运行：Linux 原生验证、完整官方客户端矩阵、WPT、24h 长稳、受控性能/TLS/H2 测量、Docker 构建、Southwest/ZG 现场流程和报价对照。没有新的生产发布或部署结论。
 
 ### 构建与证据定位
 
-本次 render CLI SHA-256：`dc0bf98e5c8e417d223f859ae3f3708e88902d4f7647fa8fe02c391ea9214402`（118889200 bytes）。
+本次 render CLI SHA-256：`afe68bc174abbd3e58225c50db49cff5cf90dcc806886bf1f6bbdd410d7efd7c`（118918144 bytes）。
 
 - 根 Cargo.lock SHA-256：`813ac17dfae3d60a779ee6d892d9989bbb92c7f18b3bc4f16bb569868f280343`。
 - runtime/Cargo.lock SHA-256：`279f5b950dbb6d03500cf231fc5554e704f762804e81fc7fbccacde4a720ccf7`。
 - benchmark revision：`2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`（`gster/obscura-benchmark`），与当前 CI pin 一致；旧失败归因使用 `6ebac8293d7477f59e837768bfd4e74173f04f1c`。
-- 本机最终门禁日志：`/tmp/ob012-js-body-root-nextest.log`、`/tmp/ob012-js-body-runtime-nextest.log`、`/tmp/ob012-js-body-build-minimal.log`、`/tmp/ob012-js-body-build-stealth.log`、`/tmp/ob012-js-body-build-render.log`、`/tmp/ob012-js-body-obstacle.log`、`/tmp/ob012-js-body-playwright-validate.log`；官方 Playwright smoke 与完整协议日志位于 `/var/folders/r8/vzjpyytd6yx0wwcwtl1wd81w0000gp/T/tmp.JjGQ18T5yn/`。这些临时文件不入 Git，也不保证跨设备或长期存在；仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
+- 本机最终门禁日志：`/tmp/ob012-fetch-get-body-root-nextest.log`、`/tmp/ob012-fetch-get-body-runtime-nextest.log`、`/tmp/ob012-fetch-get-body-build-minimal.log`、`/tmp/ob012-fetch-get-body-build-stealth.log`、`/tmp/ob012-fetch-get-body-build-render.log`、`/tmp/ob012-fetch-get-body-obstacle.log`、`/tmp/ob012-fetch-get-body-playwright-validate.log`；官方 Playwright smoke 与完整协议日志位于 `/var/folders/r8/vzjpyytd6yx0wwcwtl1wd81w0000gp/T/tmp.Y0PCaAEoCO/`。这些临时文件不入 Git，也不保证跨设备或长期存在；仓库内保留命令、结果和源码入口，外部原始证据缺失时须重跑。
 
 ```bash
 # 仓库根

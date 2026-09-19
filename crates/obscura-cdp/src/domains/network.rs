@@ -144,29 +144,48 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("Network.getResponseBody requires requestId")?;
 
-            let body = if let Some(page) = ctx.get_session_page(session_id) {
-                page.get_response_body_result(request_id)
-            } else {
-                let mut diagnostic = None;
-                let found = ctx.pages.iter().find_map(|page| {
-                    match page.get_response_body_result(request_id)? {
-                        Ok(body) => Some(body),
-                        Err(error) => { diagnostic.get_or_insert(error); None },
-                    }
-                });
-                found.map(Ok).or_else(|| diagnostic.map(Err))
-            };
-
-            match body {
-                Some(body) => {
-                    let body = body?;
-                    Ok(json!({ "body": body.body, "base64Encoded": body.base64_encoded }))
-                },
-                None => Err(format!("No response body found for requestId {}", request_id)),
-            }
+            get_response_body(ctx, session_id, request_id)
         }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
+}
+
+/// Read a completed capture without consuming its shared raw storage.
+/// Fetch uses the same lookup and protocol encoding as Network.
+pub(super) fn get_response_body(
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+    request_id: &str,
+) -> Result<Value, String> {
+    let body = response_body_page(ctx, session_id, request_id)?
+        .get_response_body_result(request_id)
+        .ok_or_else(|| format!("No response body found for requestId {request_id}"))??;
+    Ok(json!({ "body": body.body, "base64Encoded": body.base64_encoded }))
+}
+
+/// A session never falls through to another Page, even if IDs overlap or its
+/// capture failed. Sessionless reads search all Pages, retaining diagnostics.
+pub(super) fn response_body_page<'a>(
+    ctx: &'a CdpContext,
+    session_id: &Option<String>,
+    request_id: &str,
+) -> Result<&'a obscura_browser::Page, String> {
+    let missing = || format!("No response body found for requestId {request_id}");
+    if let Some(session) = session_id {
+        let page = ctx.get_session_page(session_id)
+            .ok_or_else(|| format!("No page found for sessionId {session}"))?;
+        page.response_body_size(request_id).ok_or_else(missing)??;
+        return Ok(page);
+    }
+    let mut diagnostic = None;
+    let found = ctx.pages.iter().find(|page| {
+        match page.response_body_size(request_id) {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => { diagnostic.get_or_insert(error); false },
+            None => false,
+        }
+    });
+    found.ok_or_else(|| diagnostic.unwrap_or_else(missing))
 }
 
 #[cfg(test)]
@@ -491,13 +510,15 @@ mod tests {
         });
         page.navigate("data:text/plain,rejected").await.unwrap();
         let owner = ctx.create_page();
-        for session in [None, exhausted_session] {
+        for _ in 0..2 {
             let page = ctx.get_page_mut(&owner).unwrap();
             page.navigate("data:text/plain,retained").await.unwrap();
             let request_id = page.network_events.last().unwrap().request_id.clone();
             let body = handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &None).await.unwrap();
             assert_eq!(body["body"], "retained");
-            let result = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+            let error = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &exhausted_session).await.unwrap_err();
+            assert!(error.contains("response_body_budget_exhausted"));
+            let result = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &None).await.unwrap();
             let result = super::super::io::handle("read", &json!({"handle": result["stream"]}), &mut ctx).await.unwrap();
             assert_eq!(base64::engine::general_purpose::STANDARD.decode(result["data"].as_str().unwrap()).unwrap(), b"retained");
         }
