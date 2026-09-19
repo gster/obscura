@@ -80,7 +80,7 @@ Cookie 内部状态与 CDP 视图分离，持久化保留 host-only、domain/pat
 
 ## 开发实验室
 
-`tools/unblocked/` 已建立首批开发侧基础：机器可读的构建/测试基线、官方 Playwright Python 1.60.0 范围清单、独立依赖锁和校验器。它们不进入 Rust 生产依赖，也尚未完成 Linux 资格或最小 CDP trace。下一批按 OB-026 增加合成 fixture、CDP 记录、差分与结果清单，后续再增加 persona 编译、网络采集、规约和资格报告。原始参考语料、Chrome、实验室服务和密钥不进入产品包。
+`tools/unblocked/` 已建立首批开发侧基础：机器可读的构建/测试基线、官方 Playwright Python 1.60.0 范围清单、独立依赖锁和校验器，以及 macOS 上的合成 fixture、三路 CDP 原始记录、差分与结果清单。它们不进入 Rust 生产依赖；Linux 资格和采集开关前后的观察副作用仍未验证。后续再增加 persona 编译、网络采集、规约和资格报告。原始参考语料、Chrome、实验室服务和密钥不进入产品包。
 
 参考组区分：最少控制的 headed Chrome、Playwright launch Chrome、同版 Chrome CDP、固定 upstream、fork。先区分控制方式差异，再定位内核差异。记录 OS/字体/GPU、viewport、网络、settle、客户端、工具和源码版本；直连与插桩分别对照。
 

@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "task": "OB-026",
+  "implementationRevision": "fc65daa6c40a69c603bae42df2b72ced9709124d",
   "repositoryBaseRevision": "193d19222a00d8009be6ee5db9b4f4e083a86251",
   "fixtureSha256": "e8e6db859ea7173049889338b8c732e451dab517afbd570cdfb8ca7af4c33934",
   "platform": {

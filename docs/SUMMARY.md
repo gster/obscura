@@ -8,7 +8,7 @@
 
 CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径。反追踪不能用 `DNT=1`、清空 Cookie 或几个伪装字段代替；分别验收 RPA 正确性/效率、网络与行为一致性、跨站/会话/身份空间关联抵抗、完整进程链性能及兼容性成本。受控报价实验在使用方进行，内核提供隔离、配置和完整原始证据。开发工具不做脱敏或删字段，日志的保管、清理和对外流转由执行方负责。
 
-**当前处于迁移前的基线阶段。** 已有 Rust/V8/DOM/渲染、CDP 和 Worker 能力；CLI/MCP、自有 Python SDK/NDJSON runtime 仍存在。`tools/unblocked/` 已包含机器可读的基线、官方 Playwright Python 1.60.0 范围、独立锁和校验器；Linux 资格与 CDP trace 尚未完成。统一 persona 编译器和 AutomationProfile 仍未建立。最新范围：删除自有 Python SDK/配套私有 runtime；保留 MCP 和有用 CLI，不强制新增宿主产物；统一 persona、强制 stealth、全出口 primp 与 Chrome 差异修补为重点。Southwest shopping 不再 403 且返回有效结果是重要业务门槛。不要把规划中的删除、认证和独立发布写成已经完成。
+**当前处于迁移前的基线阶段。** 已有 Rust/V8/DOM/渲染、CDP 和 Worker 能力；CLI/MCP、自有 Python SDK/NDJSON runtime 仍存在。`tools/unblocked/` 已包含机器可读的基线、官方 Playwright Python 1.60.0 范围、独立锁和校验器，以及 macOS 首批三路 CDP 记录/差分证据；Linux 资格与采集开关副作用验证尚未完成。统一 persona 编译器和 AutomationProfile 仍未建立。最新范围：删除自有 Python SDK/配套私有 runtime；保留 MCP 和有用 CLI，不强制新增宿主产物；统一 persona、强制 stealth、全出口 primp 与 Chrome 差异修补为重点。Southwest shopping 不再 403 且返回有效结果是重要业务门槛。不要把规划中的删除、认证和独立发布写成已经完成。
 
 目标与阶段：[New_ACH](New_ACH.md)。唯一执行队列：[TODO](TODO.md)。
 
