@@ -14893,6 +14893,38 @@ globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _Softwa
 // a one-line context-family probe, so a WebGL1 context must not answer for them.
 Object.assign(globalThis.WebGL2RenderingContext.prototype, { MAX_DRAW_BUFFERS: 0x8824 });
 
+// These two are the interfaces a page sees; _SoftwareWebGLContext is the
+// implementation they extend. Extending gives instances working methods but leaves
+// the interface prototypes empty, so `WebGLRenderingContext.prototype.getParameter`
+// was undefined and `Object.getOwnPropertyNames(WebGLRenderingContext.prototype)`
+// returned one entry where Chrome returns several hundred - the GL constants live
+// on the prototype in a real browser, and `'MAX_TEXTURE_SIZE' in WebGLRendering
+// Context.prototype` is a shape check a page can run.
+//
+// Each copied function goes through _markNative for the same reason every other
+// interface implemented in JS here does: `Function.prototype.toString` must report
+// the native binding this stands in for, not this file's source. WebGL was the one
+// surface not covered by that convention, which is why its methods were the only
+// ones still announcing themselves.
+(function installWebGLInterfacePrototypes() {
+  const implProto = _SoftwareWebGLContext.prototype;
+  const members = [
+    ...Object.getOwnPropertyNames(implProto),
+    ...Object.getOwnPropertySymbols(implProto),
+  ];
+  for (const ctor of [globalThis.WebGLRenderingContext, globalThis.WebGL2RenderingContext]) {
+    const target = ctor.prototype;
+    for (const name of members) {
+      if (name === 'constructor') continue;
+      if (typeof name === 'string' && name.charAt(0) === '_') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(implProto, name);
+      if (!descriptor) continue;
+      if (typeof descriptor.value === 'function') descriptor.value = _markNative(descriptor.value);
+      Object.defineProperty(target, name, descriptor);
+    }
+  }
+})();
+
 HTMLCanvasElement.prototype.getContext = function getContext(type) {
   type = String(type).toLowerCase();
   if (type === '2d') {
@@ -17526,8 +17558,59 @@ if (typeof ImageData === 'undefined') {
   };
 }
 
+// `CanvasRenderingContext2D` is the interface a page sees; `_Canvas2D` is the
+// implementation. Handing the implementation class out as the interface would
+// publish its twelve underscore-prefixed helpers as interface members, which no
+// browser has, and a page can read `getOwnPropertyNames(CanvasRenderingContext2D
+// .prototype)` - so the interface carries the public methods only, and instances
+// are made to satisfy `instanceof` through the class's own hasInstance hook.
+//
+// This used to be an empty stub class, which made a 2D context report
+// `constructor.name === '_Canvas2D'`, fail `instanceof CanvasRenderingContext2D`,
+// and have no methods on the interface prototype at all - three differences a
+// one-line check finds, on the surface the sensor samples most heavily.
 if (typeof CanvasRenderingContext2D === 'undefined') {
-  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
+  const _canvas2dProto = _Canvas2D.prototype;
+  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {
+    static [Symbol.hasInstance](value) { return value instanceof _Canvas2D; }
+  };
+  // Symbols are copied too, and not only as a convenience: `Symbol.toStringTag` is
+  // what makes `Object.prototype.toString.call(ctx)` answer
+  // "[object CanvasRenderingContext2D]". Instances inherit from the implementation
+  // prototype, so a tag defined only on the interface prototype would leave every
+  // real context reporting "[object Object]".
+  for (const prop of [
+    ...Object.getOwnPropertyNames(_canvas2dProto),
+    ...Object.getOwnPropertySymbols(_canvas2dProto),
+  ]) {
+    if (prop === 'constructor') continue;
+    if (typeof prop === 'string' && prop.charAt(0) === '_') continue;
+    Object.defineProperty(
+      globalThis.CanvasRenderingContext2D.prototype,
+      prop,
+      Object.getOwnPropertyDescriptor(_canvas2dProto, prop),
+    );
+  }
+  // Instances come from the implementation, so its constructor property has to
+  // name the interface rather than the implementation.
+  Object.defineProperty(_canvas2dProto, 'constructor', {
+    value: globalThis.CanvasRenderingContext2D,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  // And so does its toStringTag: `Object.prototype.toString.call(ctx)` walks the
+  // instance's own chain, which reaches _Canvas2D.prototype and never the interface
+  // prototype. Without this a real context answers "[object Object]" whenever the
+  // tag is set on the interface alone.
+  if (!Object.getOwnPropertySymbols(_canvas2dProto).includes(Symbol.toStringTag)) {
+    Object.defineProperty(_canvas2dProto, Symbol.toStringTag, {
+      value: 'CanvasRenderingContext2D',
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+  }
 }
 
 if (typeof OffscreenCanvas === 'undefined') {
