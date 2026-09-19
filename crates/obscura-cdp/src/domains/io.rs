@@ -1,6 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use base64::Engine as _;
+use obscura_net::response_body::ResponseBody;
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
@@ -25,24 +26,33 @@ fn io_stream_max_bytes() -> usize {
         .unwrap_or(256 * 1024 * 1024)
 }
 
-/// Bounded store of the response bodies handed out by
-/// Fetch.takeResponseBodyAsStream. Streaming exists to keep large downloads out
-/// of memory (issue #360), but each taken body is moved out of the page's
-/// LRU-bounded cache into this map, which lives for the whole server lifetime.
-/// A client that opens streams and never calls IO.close, or simply disconnects
-/// mid-download, would otherwise pin every taken body forever and reintroduce
-/// exactly the unbounded accumulation streaming was meant to avoid. Cap the
-/// number of open streams and their total bytes, evicting the oldest first, so
-/// memory stays bounded regardless of client behavior. Reading an evicted
-/// handle fails cleanly (the client re-takes or gives up), which is the right
-/// trade against an OOM.
+/// Context-owned raw response streams. Active handles are never evicted: new
+/// streams fail explicitly when the context entry/byte budget is exhausted.
+/// File-backed bodies stay on disk and are released on close/context drop.
 pub struct IoStreamStore {
-    streams: HashMap<String, (Vec<u8>, usize)>,
-    order: VecDeque<String>,
+    streams: HashMap<String, (ResponseBody, usize)>,
     total_bytes: usize,
     counter: u64,
     max_entries: usize,
     max_bytes: usize,
+}
+
+/// Holds exclusive access until the body is taken from its Page. Dropping a
+/// reservation without committing changes neither capacity nor handle state.
+pub(crate) struct IoStreamReservation<'a> {
+    store: &'a mut IoStreamStore,
+    handle: String,
+    next_counter: u64,
+    total_bytes: usize,
+}
+
+impl IoStreamReservation<'_> {
+    pub(crate) fn commit(self, body: ResponseBody) -> String {
+        self.store.counter = self.next_counter;
+        self.store.total_bytes = self.total_bytes;
+        self.store.streams.insert(self.handle.clone(), (body, 0));
+        self.handle
+    }
 }
 
 impl Default for IoStreamStore {
@@ -52,56 +62,50 @@ impl Default for IoStreamStore {
 }
 
 impl IoStreamStore {
-    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+    pub(crate) fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             streams: HashMap::new(),
-            order: VecDeque::new(),
             total_bytes: 0,
             counter: 0,
-            max_entries: max_entries.max(1),
+            max_entries,
             max_bytes,
         }
     }
 
-    /// Store a body and return its handle, evicting the oldest streams if this
-    /// would push the store past its entry or byte cap. A single body larger
-    /// than the byte cap is rejected rather than becoming an unbounded
-    /// exception to the store's memory contract.
-    pub fn insert(&mut self, bytes: Vec<u8>) -> Result<String, String> {
-        if bytes.len() > self.max_bytes {
-            return Err(format!(
-                "IO stream body is {} bytes, exceeding the {}-byte per-context limit",
-                bytes.len(),
-                self.max_bytes,
-            ));
+    /// Check before taking a Page body so admission failure does not consume it.
+    pub fn ensure_capacity(&self, len: usize) -> Result<(), String> {
+        let error = if self.streams.len() >= self.max_entries {
+            Some(format!("io_stream_budget_exhausted: entries limit {}", self.max_entries))
+        } else if self.total_bytes.checked_add(len).is_none_or(|total| total > self.max_bytes) {
+            Some(format!("io_stream_budget_exhausted: adding {len} bytes to {} exceeds {}-byte per-context limit", self.total_bytes, self.max_bytes))
+        } else if self.counter == u64::MAX {
+            Some("IO stream handle space exhausted".to_string())
+        } else { None };
+        if let Some(error) = error {
+            tracing::warn!(reason = %error, "Response body stream rejected");
+            return Err(error);
         }
+        Ok(())
+    }
 
-        while !self.order.is_empty()
-            && (self.order.len() >= self.max_entries
-                || self
-                    .total_bytes
-                    .checked_add(bytes.len())
-                    .is_none_or(|total| total > self.max_bytes))
-        {
-            if let Some(oldest) = self.order.pop_front() {
-                if let Some((body, _)) = self.streams.remove(&oldest) {
-                    self.total_bytes = self.total_bytes.saturating_sub(body.len());
-                }
-            }
-        }
+    pub(crate) fn reserve(&mut self, len: usize) -> Result<IoStreamReservation<'_>, String> {
+        self.ensure_capacity(len)?;
+        Ok(IoStreamReservation {
+            handle: format!("stream-{}", self.counter),
+            next_counter: self.counter + 1,
+            total_bytes: self.total_bytes + len,
+            store: self,
+        })
+    }
 
-        let handle = format!("stream-{}", self.counter);
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .ok_or("IO stream handle space exhausted")?;
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(bytes.len())
-            .ok_or("IO stream byte accounting overflow")?;
-        self.streams.insert(handle.clone(), (bytes, 0));
-        self.order.push_back(handle.clone());
-        Ok(handle)
+    pub fn insert(&mut self, bytes: impl Into<ResponseBody>) -> Result<String, String> {
+        let bytes = bytes.into();
+        Ok(self.reserve(bytes.len())?.commit(bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_handle_counter(&mut self, counter: u64) {
+        self.counter = counter;
     }
 
     /// Read up to `size` bytes from the stream, advancing its cursor. Returns
@@ -113,6 +117,16 @@ impl IoStreamStore {
         offset: Option<usize>,
         size: usize,
     ) -> Option<(String, bool)> {
+        self.read_result(handle, offset, size)?.ok()
+    }
+
+    /// CDP retains I/O failures so a failed spool read is not an unknown handle.
+    pub fn read_result(
+        &mut self,
+        handle: &str,
+        offset: Option<usize>,
+        size: usize,
+    ) -> Option<Result<(String, bool), String>> {
         let (bytes, cursor) = self.streams.get_mut(handle)?;
         if let Some(offset) = offset {
             *cursor = offset.min(bytes.len());
@@ -120,16 +134,18 @@ impl IoStreamStore {
         let size = size.min(MAX_READ_CHUNK);
         let start = (*cursor).min(bytes.len());
         let end = start.saturating_add(size).min(bytes.len());
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]);
+        let data = match bytes.read(start, end - start) {
+            Ok(chunk) => base64::engine::general_purpose::STANDARD.encode(chunk),
+            Err(error) => return Some(Err(error.to_string())),
+        };
         *cursor = end;
-        Some((data, end >= bytes.len()))
+        Some(Ok((data, end >= bytes.len())))
     }
 
     /// Free a stream's buffer (IO.close). A no-op for an unknown handle.
     pub fn remove(&mut self, handle: &str) {
         if let Some((b, _)) = self.streams.remove(handle) {
             self.total_bytes -= b.len();
-            self.order.retain(|h| h != handle);
         }
     }
 }
@@ -168,8 +184,8 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
 
             let (data, eof) = ctx
                 .io_streams
-                .read(handle, offset, size)
-                .ok_or_else(|| format!("IO.read: unknown handle {handle}"))?;
+                .read_result(handle, offset, size)
+                .ok_or_else(|| format!("IO.read: unknown handle {handle}"))??;
 
             Ok(json!({ "data": data, "eof": eof, "base64Encoded": true }))
         }
@@ -191,6 +207,14 @@ mod tests {
 
     fn decode(s: &str) -> Vec<u8> {
         base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    #[test]
+    fn response_body_unused_reservation_does_not_change_capacity_or_handle() {
+        let mut store = IoStreamStore::with_limits(1, 4);
+        drop(store.reserve(4).unwrap());
+        assert_eq!(store.total_bytes, 0);
+        assert_eq!(store.insert(vec![1; 4]).unwrap(), "stream-0");
     }
 
     #[test]
@@ -240,43 +264,33 @@ mod tests {
     }
 
     #[test]
-    fn evicts_oldest_over_entry_cap() {
-        let mut store = IoStreamStore::with_limits(3, 1024);
-        let h0 = store.insert(vec![0]).unwrap();
-        let h1 = store.insert(vec![1]).unwrap();
-        let _h2 = store.insert(vec![2]).unwrap();
-        let h3 = store.insert(vec![3]).unwrap(); // 4th entry, cap 3 -> h0 evicted
-
-        assert!(
-            store.read(&h0, None, 10).is_none(),
-            "oldest stream should be evicted"
-        );
-        assert!(store.read(&h1, None, 10).is_some());
-        assert!(store.read(&h3, None, 10).is_some());
+    fn entry_budget_rejects_new_stream_and_keeps_active_handles() {
+        let mut store = IoStreamStore::with_limits(1, 1024);
+        let first = store.insert(vec![1]).unwrap();
+        let error = store.insert(vec![2]).unwrap_err();
+        assert!(error.contains("io_stream_budget_exhausted"));
+        assert_eq!(decode(&store.read(&first, None, 10).unwrap().0), vec![1]);
+        store.remove(&first);
+        assert!(store.insert(vec![2]).is_ok());
     }
 
     #[test]
-    fn evicts_over_byte_cap_and_rejects_oversized_body() {
+    fn byte_budget_rejects_new_stream_and_keeps_active_handles() {
         let mut store = IoStreamStore::with_limits(4, 10);
-        let h0 = store.insert(vec![0u8; 8]).unwrap();
-        let h1 = store.insert(vec![1u8; 8]).unwrap(); // 16 > 10 -> h0 evicted
-        let error = store
-            .insert(vec![2u8; 100])
-            .expect_err("a single body cannot bypass the context byte cap");
-
-        assert!(store.read(&h0, None, 100).is_none());
-        assert!(store.read(&h1, None, 100).is_some());
-        assert!(error.contains("exceeding"), "{error}");
+        let first = store.insert(vec![1u8; 8]).unwrap();
+        assert!(store.insert(vec![2u8; 8]).unwrap_err().contains("io_stream_budget_exhausted"));
+        assert!(store.insert(vec![2u8; 100]).is_err());
+        assert_eq!(decode(&store.read(&first, None, 100).unwrap().0), vec![1; 8]);
     }
 
     #[test]
     fn requested_read_size_is_capped() {
         let mut store = IoStreamStore::with_limits(2, MAX_READ_CHUNK * 2);
         let handle = store.insert(vec![7u8; MAX_READ_CHUNK + 17]).unwrap();
-        let (first, eof) = store.read(&handle, None, usize::MAX).unwrap();
+        let (first, eof) = store.read_result(&handle, None, usize::MAX).unwrap().unwrap();
         assert_eq!(decode(&first).len(), MAX_READ_CHUNK);
         assert!(!eof);
-        let (second, eof) = store.read(&handle, None, usize::MAX).unwrap();
+        let (second, eof) = store.read_result(&handle, None, usize::MAX).unwrap().unwrap();
         assert_eq!(decode(&second).len(), 17);
         assert!(eof);
     }

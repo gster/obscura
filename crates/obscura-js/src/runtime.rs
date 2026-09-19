@@ -2102,6 +2102,12 @@ impl ObscuraJsRuntime {
             .cloned()
     }
 
+    pub fn take_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        let mut state = self.state.borrow_mut();
+        state.network_response_body_order.retain(|id| id != request_id);
+        state.network_response_bodies.remove(request_id)
+    }
+
     pub fn clear_network_response_bodies(&self) {
         let mut state = self.state.borrow_mut();
         state.network_response_bodies.clear();

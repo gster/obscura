@@ -1,4 +1,5 @@
 pub mod client;
+pub mod response_body;
 pub mod headers;
 pub use headers::{HeaderCapture, RawHeader};
 pub mod cookies;

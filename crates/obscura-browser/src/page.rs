@@ -286,8 +286,7 @@ pub struct Page {
     session_storage: obscura_js::ops::SharedWebStorage,
     requested_history: Option<obscura_js::ops::HistoryNavigation>,
     pub network_events: Vec<NetworkEvent>,
-    response_bodies: std::collections::HashMap<String, StoredResponseBody>,
-    response_body_order: std::collections::VecDeque<String>,
+    response_bodies: obscura_net::response_body::ResponseBodyStore,
     network_event_counter: u32,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
@@ -1137,8 +1136,7 @@ impl Page {
             session_storage: Default::default(),
             requested_history: None,
             network_events: Vec::new(),
-            response_bodies: std::collections::HashMap::new(),
-            response_body_order: std::collections::VecDeque::new(),
+            response_bodies: obscura_net::response_body::ResponseBodyStore::default(),
             network_event_counter: 0,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
@@ -4525,91 +4523,75 @@ impl Page {
     }
 
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
-            return;
-        }
-        let body = if base64_encoded {
-            BASE64.encode(body)
-        } else {
-            String::from_utf8_lossy(body).to_string()
-        };
-        self.response_bodies.insert(
-            request_id.clone(),
-            StoredResponseBody {
-                body,
-                base64_encoded,
-            },
-        );
-        self.response_body_order.push_back(request_id);
-        while self.response_body_order.len() > max_entries {
-            if let Some(oldest) = self.response_body_order.pop_front() {
-                self.response_bodies.remove(&oldest);
-            }
-        }
+        // Capture failure is retained by the store and returned to CDP readers.
+        let _ = self.response_bodies.insert(request_id, body, base64_encoded);
     }
 
+    /// Changing limits clears retained bodies; already taken streams keep ownership.
+    pub fn set_response_body_limits(&mut self, limits: obscura_net::response_body::ResponseBodyLimits) {
+        self.response_bodies = obscura_net::response_body::ResponseBodyStore::new(limits);
+    }
+
+    /// Compatibility API. CDP uses the result variant to report capture failures.
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
-        self.response_bodies.get(request_id).cloned().or_else(|| {
-            self.js
-                .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|body| StoredResponseBody {
-                    body: body.body,
-                    base64_encoded: body.base64_encoded,
-                })
+        self.get_response_body_result(request_id)?.ok()
+    }
+
+    pub fn get_response_body_result(&self, request_id: &str) -> Option<Result<StoredResponseBody, String>> {
+        // JS capture remains independent; a Page-store admission failure must
+        // not hide a body that the JS runtime has already retained.
+        if let Some(body) = self.js.as_ref().and_then(|js| js.get_network_response_body(request_id)) {
+            return Some(Ok(StoredResponseBody { body: body.body, base64_encoded: body.base64_encoded }));
+        }
+        self.response_bodies.get(request_id).map(|stored| {
+            stored.and_then(|(body, binary)| body.with_bytes(|bytes| {
+                // Invalid UTF-8 declared as text must still round-trip exactly.
+                if !binary {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        return StoredResponseBody { body: text.to_owned(), base64_encoded: false };
+                    }
+                }
+                StoredResponseBody { body: BASE64.encode(bytes), base64_encoded: true }
+            })).map_err(|error| error.to_string())
         })
     }
 
-    /// Take a stored response body as raw bytes for CDP streaming
-    /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
-    /// transfers ownership to the caller, so a large body is held once and freed
-    /// when the stream is closed rather than lingering in this long-running
-    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
-    /// bodies return their UTF-8 bytes. Returns None if the body was never
-    /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
-    /// dropped) or the id is unknown.
-    pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
-        let stored = if let Some(body) = self.response_bodies.remove(request_id) {
-            self.response_body_order.retain(|id| id != request_id);
-            body
-        } else {
-            self.js
-                .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|b| StoredResponseBody {
-                    body: b.body,
-                    base64_encoded: b.base64_encoded,
-                })?
-        };
-        if stored.base64_encoded {
-            BASE64.decode(stored.body.as_bytes()).ok()
-        } else {
-            Some(stored.body.into_bytes())
+    pub fn response_body_size(&self, request_id: &str) -> Option<Result<usize, String>> {
+        if let Some(stored) = self.js.as_ref().and_then(|js| js.get_network_response_body(request_id)) {
+            return Some(Ok(if stored.base64_encoded {
+                stored.body.len() / 4 * 3 - stored.body.bytes().rev().take_while(|b| *b == b'=').count()
+            } else { stored.body.len() }));
         }
+        self.response_bodies.get(request_id).map(|body| {
+            body.map(|(body, _)| body.len()).map_err(|error| error.to_string())
+        })
     }
 
-    /// Make the body stored under `from_id` also retrievable under `to_id`.
-    /// The main navigation resource is stored under its internal request id, but
-    /// the CDP layer reports it to clients with the navigation's loaderId as the
-    /// requestId (Chrome's `requestId === loaderId` convention). Without this
-    /// alias, `Network.getResponseBody(loaderId)` misses and a client navigating
-    /// straight to an image or other resource cannot read the main-response body
-    /// (issue #340).
+    /// Compatibility API that materializes the raw bytes of the taken body.
+    pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
+        self.take_response_body_result(request_id)?.ok()?.with_bytes(|bytes| bytes.to_vec()).ok()
+    }
+
+    /// CDP transfers the backing storage instead of materializing its contents.
+    pub fn take_response_body_result(&mut self, request_id: &str) -> Option<Result<obscura_net::response_body::ResponseBody, String>> {
+        // JS fetch/module/Worker retention is not yet backed by this store.
+        if let Some(stored) = self.js.as_ref().and_then(|js| js.take_network_response_body(request_id)) {
+            return Some(if stored.base64_encoded {
+                BASE64.decode(stored.body.as_bytes()).map(Into::into).map_err(|error| error.to_string())
+            } else {
+                Ok(stored.body.into_bytes().into())
+            });
+        }
+        self.response_bodies.take(request_id).map(|body| body.map_err(|error| error.to_string()))
+    }
+
+    /// Navigation's loaderId and internal request ID share storage and take state.
     pub fn alias_response_body(&mut self, from_id: &str, to_id: &str) {
-        if from_id == to_id || self.response_bodies.contains_key(to_id) {
-            return;
-        }
-        if let Some(body) = self.response_bodies.get(from_id).cloned() {
-            self.response_bodies.insert(to_id.to_string(), body);
-            self.response_body_order.push_back(to_id.to_string());
-        }
+        let _ = self.response_bodies.alias(from_id, to_id);
     }
 
     pub fn clear_response_bodies(&mut self) {
         self.response_bodies.clear();
-        self.response_body_order.clear();
         if let Some(js) = &self.js {
             js.clear_network_response_bodies();
         }
@@ -9680,18 +9662,4 @@ fn is_text_like_content_type(content_type: Option<&str>) -> bool {
         || ct == "image/svg+xml"
         || ct.ends_with("+json")
         || ct.ends_with("+xml")
-}
-
-fn response_body_entry_limit() -> usize {
-    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128)
-}
-
-fn response_body_byte_limit() -> usize {
-    std::env::var("OBSCURA_NETWORK_BODY_BUFFER_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2 * 1024 * 1024)
 }

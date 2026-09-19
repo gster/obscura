@@ -112,8 +112,8 @@ pub struct CdpContext {
     // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
     // body taken out of the page cache so a large download is streamed
     // chunk-by-chunk via IO.read and freed on IO.close (issue #360). The store
-    // caps how many bodies (and how many bytes) can be held at once, evicting
-    // the oldest, so an abandoned or disconnected stream cannot leak unbounded.
+    // caps open bodies and their total bytes by rejecting new streams, keeping
+    // active handles readable until IO.close or this context is dropped.
     pub io_streams: crate::domains::io::IoStreamStore,
     /// Serializes V8 work within THIS connection. With the thread-per-connection
     /// server (#430) each connection runs on its own OS thread, so isolates never

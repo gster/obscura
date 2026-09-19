@@ -145,16 +145,23 @@ pub async fn handle(
                 .ok_or("Network.getResponseBody requires requestId")?;
 
             let body = if let Some(page) = ctx.get_session_page(session_id) {
-                page.get_response_body(request_id)
+                page.get_response_body_result(request_id)
             } else {
-                ctx.pages.iter().find_map(|page| page.get_response_body(request_id))
+                let mut diagnostic = None;
+                let found = ctx.pages.iter().find_map(|page| {
+                    match page.get_response_body_result(request_id)? {
+                        Ok(body) => Some(body),
+                        Err(error) => { diagnostic.get_or_insert(error); None },
+                    }
+                });
+                found.map(Ok).or_else(|| diagnostic.map(Err))
             };
 
             match body {
-                Some(body) => Ok(json!({
-                    "body": body.body,
-                    "base64Encoded": body.base64_encoded,
-                })),
+                Some(body) => {
+                    let body = body?;
+                    Ok(json!({ "body": body.body, "base64Encoded": body.base64_encoded }))
+                },
                 None => Err(format!("No response body found for requestId {}", request_id)),
             }
         }
@@ -378,6 +385,147 @@ mod tests {
 
         assert_eq!(result["body"], "<html><body>hello body</body></html>");
         assert_eq!(result["base64Encoded"], false);
+    }
+
+    #[tokio::test]
+    async fn response_body_large_text_binary_and_legacy_text_round_trip() {
+        use base64::Engine as _;
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let cases = [
+            ("text/plain", vec![b'x'; 2 * 1024 * 1024 + 31], false),
+            ("application/octet-stream", (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect(), true),
+            ("text/plain;charset=windows-1252", vec![0xff, 0xe9, 0, b'a'], true),
+        ];
+        for (mime, bytes, binary) in cases {
+            let url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.navigate(&url).await.unwrap();
+            let request_id = page.network_events.last().unwrap().request_id.clone();
+            let result = handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+            assert_eq!(result["base64Encoded"], binary);
+            let returned = result["body"].as_str().unwrap();
+            if binary {
+                assert_eq!(base64::engine::general_purpose::STANDARD.decode(returned).unwrap(), bytes);
+            } else {
+                assert_eq!(returned.as_bytes(), bytes);
+            }
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_page_owned_subresources_reach_cdp_byte_exact() {
+        use base64::Engine as _;
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        let padding = "x".repeat(2 * 1024 * 1024 + 1);
+        let resources: std::collections::HashMap<_, _> = [
+            ("/", ("text/html", br#"<link rel="stylesheet" href="/style.css"><link rel="preload" as="font" href="/font.woff"><script src="/script.js"></script><body>probe<img src="/image.png"></body>"#.to_vec(), "Document")),
+            ("/style.css", ("text/css", format!("@font-face{{font-family:Probe;src:url('/font.woff')}}body{{font-family:Probe}}/*{padding}*/").into_bytes(), "Stylesheet")),
+            ("/script.js", ("application/javascript", format!("/*{padding}*/globalThis.captureScriptRan=true;").into_bytes(), "Script")),
+            ("/image.png", ("image/png", vec![0x89; padding.len()], "Image")),
+            ("/font.woff", ("font/woff", vec![0xff; padding.len()], "Font")),
+        ].into_iter().collect();
+        let resources = Arc::new(resources);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let served = resources.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..served.len() {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 4096];
+                    let len = stream.read(&mut chunk).unwrap();
+                    assert!(len > 0);
+                    request.extend_from_slice(&chunk[..len]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let (mime, body, _) = served.get(path).unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nSet-Cookie: retained=Raw+/=123; Path=/\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let mut ctx = CdpContext::new();
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+            "body-resources".into(), None, false, None, None, true,
+        ));
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate(&format!("{origin}/")).await.unwrap();
+        page.prepare_screenshot_resources(3000).await;
+        let events = page.network_events.clone();
+        for (path, (_, expected, resource_type)) in resources.iter() {
+            let event = events.iter().find(|event| event.url == format!("{origin}{path}"))
+                .unwrap_or_else(|| panic!("missing {resource_type} event"));
+            assert_eq!(&event.resource_type, resource_type);
+            assert_eq!(event.body_size, expected.len());
+            assert_eq!(event.response_headers["set-cookie"], "retained=Raw+/=123; Path=/");
+            let result = handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
+            let body = result["body"].as_str().unwrap();
+            let actual = if result["base64Encoded"] == true {
+                base64::engine::general_purpose::STANDARD.decode(body).unwrap()
+            } else { body.as_bytes().to_vec() };
+            assert_eq!(&actual, expected, "{resource_type} body");
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_exhausted_page_does_not_hide_another_pages_body() {
+        use base64::Engine as _;
+        let mut ctx = CdpContext::new();
+        let exhausted = ctx.create_page();
+        let exhausted_session = Some(format!("{exhausted}-session"));
+        ctx.sessions.insert(exhausted_session.clone().unwrap(), exhausted.clone());
+        let page = ctx.get_page_mut(&exhausted).unwrap();
+        page.set_response_body_limits(obscura_net::response_body::ResponseBodyLimits {
+            memory_threshold: 0, total_bytes: 0, entries: 16,
+        });
+        page.navigate("data:text/plain,rejected").await.unwrap();
+        let owner = ctx.create_page();
+        for session in [None, exhausted_session] {
+            let page = ctx.get_page_mut(&owner).unwrap();
+            page.navigate("data:text/plain,retained").await.unwrap();
+            let request_id = page.network_events.last().unwrap().request_id.clone();
+            let body = handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &None).await.unwrap();
+            assert_eq!(body["body"], "retained");
+            let result = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+            let result = super::super::io::handle("read", &json!({"handle": result["stream"]}), &mut ctx).await.unwrap();
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(result["data"].as_str().unwrap()).unwrap(), b"retained");
+        }
+        let error = handle("getResponseBody", &json!({"requestId": "missing"}), &mut ctx, &None).await.unwrap_err();
+        assert!(error.contains("response_body_budget_exhausted"));
+        let error = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": "missing"}), &mut ctx, &None).await.unwrap_err();
+        assert!(error.contains("response_body_budget_exhausted"));
+    }
+
+    #[tokio::test]
+    async fn response_body_budget_exhaustion_is_not_unknown_request() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.set_response_body_limits(obscura_net::response_body::ResponseBodyLimits {
+            memory_threshold: 2, total_bytes: 4, entries: 16,
+        });
+        page.navigate("data:text/plain,hello").await.unwrap();
+        let request_id = page.network_events.last().unwrap().request_id.clone();
+        page.alias_response_body(&request_id, "loader");
+        for id in [&request_id, "loader"] {
+            let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_budget_exhausted"), "{error}");
+            let error = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_budget_exhausted"), "{error}");
+        }
     }
 
     #[tokio::test]

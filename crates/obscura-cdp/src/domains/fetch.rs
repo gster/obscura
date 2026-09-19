@@ -191,34 +191,27 @@ pub async fn handle(
         }
         "getResponseBody" => Ok(json!({ "body": "", "base64Encoded": false })),
         "takeResponseBodyAsStream" => {
-            // Hand the client a streaming handle for a large response body so it
-            // can pull it in chunks via IO.read and free it with IO.close,
-            // instead of receiving one giant base64 blob (issue #360). The body
-            // is moved out of the page cache into the stream, so it is held once
-            // and released on close. Requires the body to have been cached
-            // (raise OBSCURA_NETWORK_BODY_BUFFER_BYTES for large downloads).
+            // Move raw storage into IO; file-backed bodies are read in chunks.
             let request_id = params
                 .get("requestId")
                 .and_then(|v| v.as_str())
                 .ok_or("Fetch.takeResponseBodyAsStream requires requestId")?;
 
-            let bytes = {
-                let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-                page.take_response_body_raw(request_id)
-            }
-            .or_else(|| {
-                ctx.pages
-                    .iter_mut()
-                    .find_map(|p| p.take_response_body_raw(request_id))
-            })
-            .ok_or_else(|| {
+            let page = ctx.get_session_page(session_id);
+            let mut diagnostic = None;
+            let (page_id, size) = page.into_iter().chain(ctx.pages.iter()).find_map(|page| {
+                match page.response_body_size(request_id)? {
+                    Ok(size) => Some((page.id.clone(), size)),
+                    Err(error) => { diagnostic.get_or_insert(error); None },
+                }
+            }).ok_or_else(|| diagnostic.unwrap_or_else(|| {
                 format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}")
-            })?;
-
-            let handle = ctx
-                .io_streams
-                .insert(bytes)
-                .map_err(|error| format!("Fetch.takeResponseBodyAsStream: {error}"))?;
+            }))?;
+            let page = ctx.pages.iter_mut().find(|page| page.id == page_id).unwrap();
+            let reservation = ctx.io_streams.reserve(size)?;
+            let bytes = page.take_response_body_result(request_id)
+                .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))??;
+            let handle = reservation.commit(bytes);
             Ok(json!({ "stream": handle }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
@@ -246,6 +239,75 @@ mod tests {
             },
         );
         rx
+    }
+
+    #[tokio::test]
+    async fn response_body_stream_spool_is_once_and_survives_page_drop() {
+        use base64::Engine as _;
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 19).map(|i| (i % 256) as u8).collect();
+        let url = format!("data:application/octet-stream;base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate(&url).await.unwrap();
+        let request_id = page.network_events.last().unwrap().request_id.clone();
+        page.alias_response_body(&request_id, "loader");
+        let result = handle("takeResponseBodyAsStream", &json!({"requestId": "loader"}), &mut ctx, &session).await.unwrap();
+        let stream = result["stream"].as_str().unwrap();
+        for id in [&request_id, "loader"] {
+            let error = handle("takeResponseBodyAsStream", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_already_consumed"), "{error}");
+            let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
+            assert!(error.contains("response_body_already_consumed"), "{error}");
+        }
+        ctx.get_page_mut(&page_id).unwrap().clear_response_bodies();
+        ctx.remove_page(&page_id);
+        let mut received = Vec::new();
+        loop {
+            let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx).await.unwrap();
+            received.extend(base64::engine::general_purpose::STANDARD.decode(result["data"].as_str().unwrap()).unwrap());
+            if result["eof"] == true { break; }
+        }
+        assert_eq!(received, bytes);
+        super::super::io::handle("close", &json!({"handle": stream}), &mut ctx).await.unwrap();
+        assert!(super::super::io::handle("read", &json!({"handle": stream}), &mut ctx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn response_body_stream_handle_exhaustion_does_not_consume_body() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/plain,retained").await.unwrap();
+        let request_id = page.network_events.last().unwrap().request_id.clone();
+        ctx.io_streams.set_handle_counter(u64::MAX);
+        let error = handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("handle space exhausted"), "{error}");
+        let body = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(body["body"], "retained");
+        ctx.io_streams.set_handle_counter(0);
+        let result = handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(result["stream"], "stream-0");
+    }
+
+    #[tokio::test]
+    async fn response_body_stream_budget_failure_does_not_consume_page_body() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        ctx.io_streams = super::super::io::IoStreamStore::with_limits(0, 0);
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/plain,hello").await.unwrap();
+        let request_id = page.network_events.last().unwrap().request_id.clone();
+        let error = handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("io_stream_budget_exhausted"));
+        let body = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(body["body"], "hello");
     }
 
     // Parity with server.rs handle_fetch_resolution: continueRequest must
