@@ -2185,7 +2185,24 @@ function _seedUnchangedConnection(node, connected) {
   node._treeConnectedEpoch = _treeMutationEpoch;
 }
 
-class Node {
+// EventTarget is its own interface, not an alias of Node. Aliasing them made
+// `window.EventTarget === window.Node` true (a one-line bot check) and made
+// non-node event targets such as PermissionStatus and BatteryManager claim to
+// be Nodes. Listener state lives in a WeakMap keyed by the target object, so a
+// standalone base class needs no backing node id.
+class EventTarget {
+  addEventListener(type, callback, options) {
+    _eventTargetAdd(this, type, callback, options);
+  }
+  removeEventListener(type, callback, options) {
+    _eventTargetRemove(this, type, callback, options);
+  }
+  dispatchEvent(event) {
+    return _eventTargetDispatch(this, event);
+  }
+}
+globalThis.EventTarget = EventTarget;
+class Node extends EventTarget {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
@@ -2205,7 +2222,7 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
+  constructor(nid) { super(); this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
@@ -2533,20 +2550,9 @@ class Node {
     return true;
   }
   isSameNode(other) { return !!other && this._nid === other._nid; }
-  addEventListener(type, callback, options) {
-    _eventTargetAdd(this, type, callback, options);
-  }
-  removeEventListener(type, callback, options) {
-    _eventTargetRemove(this, type, callback, options);
-  }
-  dispatchEvent(event) {
-    return _eventTargetDispatch(this, event);
-  }
 }
 // Fragment insertion must not re-enter a page replacement of appendChild.
 const _nodeAppendChild = Node.prototype.appendChild;
-const EventTarget = Node;
-globalThis.EventTarget = Node;
 class CharacterData extends Node {
   get textContent() { return this.data; }
   set textContent(v) { this.data = v == null ? "" : v; }
@@ -5163,6 +5169,13 @@ class Element extends Node {
   }
 }
 
+// HTMLElement is its own interface between Element and the concrete HTML*
+// element interfaces. Aliasing it to Element made
+// `window.HTMLElement === window.Element` true and gave every HTML element
+// interface the wrong ancestor. SVGElement stays a direct child of Element,
+// as in the browser.
+class HTMLElement extends Element {}
+globalThis.HTMLElement = HTMLElement;
 // WHATWG "convert nodes into a node": a Node argument passes through, anything
 // else is stringified into a Text node, so e.g. append(null) inserts the text
 // "null" and append(undefined) inserts "undefined" per the (Node or DOMString)
@@ -6227,7 +6240,7 @@ function _imageEncodingError() {
 // layout/paint. The render-only native op owns responsive candidate selection,
 // fetching, and metadata sniffing; bootstrap owns only the observable request
 // state and event timing.
-class HTMLImageElement extends Element {
+class HTMLImageElement extends HTMLElement {
   constructor(nid) {
     super(nid);
     this._imageRequest = 0;
@@ -6553,7 +6566,7 @@ _markNative(HTMLImageElement.prototype.decode);
 
 // Report only capabilities backed by a real decoder. Poster rendering is an
 // image operation and does not make any audio/video container playable.
-class HTMLMediaElement extends Element {
+class HTMLMediaElement extends HTMLElement {
   static NETWORK_EMPTY = 0;
   static NETWORK_IDLE = 1;
   static NETWORK_LOADING = 2;
@@ -6630,7 +6643,7 @@ class HTMLVideoElement extends HTMLMediaElement {
   get videoHeight() { return 0; }
 }
 class HTMLAudioElement extends HTMLMediaElement {}
-class HTMLTrackElement extends Element {
+class HTMLTrackElement extends HTMLElement {
   static NONE = 0;
   static LOADING = 1;
   static LOADED = 2;
@@ -6688,6 +6701,9 @@ function _elementClassFor(nid) {
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
+  // An XHTML element with an interface we do not model is still an
+  // HTMLElement; only foreign-namespace elements fall back to Element.
+  if (_domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") return HTMLElement;
   return Element;
 }
 function _elementClassForKnownName(namespace, qualifiedName) {
@@ -6710,6 +6726,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
+    // Unknown XHTML tag: an unmodelled HTML interface, which is an HTMLElement.
+    return HTMLElement;
   }
   return Element;
 }
@@ -7147,7 +7165,12 @@ function _chromeMajor() {
 // hardcoding one static token.
 var _GREASE_CHARS = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
 var _GREASE_VER = ['8', '99', '24'];
-var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+// Entries 3 and 4 were transposed, which produced the wrong brand order for
+// Chrome 147, 148 and 153 while 149-152 happened to be right. The seed is the
+// Chrome major version and this table is index [major % 6]; the expected orders
+// are the ones primp captured from real builds
+// (vendor/primp/src/imp/chrome/mod.rs), which is the authority here.
+var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[2,0,1],[1,2,0],[2,1,0]];
 function _uaBrands() {
   var seed = _chromeMajor();
   var grease = {
@@ -12506,7 +12529,6 @@ globalThis.CSS = {
 
 // Platform objects must not look like plain records to configuration mergers.
 Object.defineProperty(Element.prototype, Symbol.toStringTag, {value: 'Element', configurable: true});
-globalThis.HTMLElement = Element;
 // Distinct prototypes keep interface-specific instrumentation on its own tag.
 // Sharing Element as every HTML constructor made a script.src hook apply to
 // inputs, buttons and links too, unlike the browser's interface hierarchy.
@@ -12552,7 +12574,7 @@ for (const [tag, name] of Object.entries({
   OUTPUT: "HTMLOutputElement",
   FRAMESET: "HTMLFrameSetElement",
 })) {
-  const type = { [name]: class extends Element {} }[name];
+  const type = { [name]: class extends HTMLElement {} }[name];
   Object.defineProperty(type.prototype, Symbol.toStringTag, {value: name, configurable: true});
   _htmlElementClasses[tag] = type;
   globalThis[name] = type;
@@ -12562,13 +12584,13 @@ Object.defineProperty(globalThis.HTMLInputElement.prototype, 'onsearch', {
 });
 for (const tag of ['H2','H3','H4','H5','H6']) _htmlElementClasses[tag] = _htmlElementClasses.H1;
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLFormElement = class HTMLFormElement extends Element {
+globalThis.HTMLFormElement = class HTMLFormElement extends HTMLElement {
   get elements() { return HTMLCollection._from((_domParse('form_controls',this._nid)||[]).map(_wrap)); }
   get length() { return this.elements.length; }
   // submit() inherits the script submission path; reset is installed with the
   // private input dispatcher after the bootstrap has captured its intrinsics.
 };
-globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
+globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends HTMLElement {
   // `rows`/`cols` reflect the content attributes and drive the control's
   // intrinsic box (the renderer sizes a textarea from them). The attributes
   // are limited to positive non-zero numbers; anything else falls back to the
@@ -12629,7 +12651,7 @@ function _slotAssignedNodes(slot, flatten) {
   }
   return out;
 }
-globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
+globalThis.HTMLSlotElement = class HTMLSlotElement extends HTMLElement {
   get name() { return this.getAttribute('name') || ''; }
   set name(v) { this.setAttribute('name', String(v)); }
   assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
@@ -12964,7 +12986,8 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.prepend = Element.prototype.prepend;
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
-globalThis.EventTarget = Node;
+// EventTarget was previously re-aliased to Node here; the real interface is
+// declared above and Node extends it.
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;
@@ -14551,7 +14574,7 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
-class HTMLCanvasElement extends Element {
+class HTMLCanvasElement extends HTMLElement {
   get width() {
     const raw = this.getAttribute('width');
     const parsed = raw === null ? 300 : Number.parseInt(raw, 10);
@@ -15090,11 +15113,53 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
-// Minimal but spec-shape-correct IndexedDB shim. We don't persist anything,
-// but authentication libraries (Firebase, Supabase, dexie) hang forever on
-// the first `get` because their request's `onsuccess` is never called. Fire
-// `onsuccess` asynchronously with `null` so reads complete-but-empty, which
-// most libraries treat as a cache miss and fall back to the network.
+// Spec-shape-correct in-memory IndexedDB shim.
+//
+// Requests are real EventTargets, so they must SETTLE BY DISPATCHING EVENTS.
+// Calling only the `onsuccess` property is not enough: a caller that uses
+// `addEventListener("success", ...)` - which is what modern libraries and the
+// Airship web SDK do - would never be notified and its awaiting promise would
+// hang forever. `open()` must likewise fire `upgradeneeded` before `success`,
+// otherwise a caller never gets the chance to create the object stores it is
+// about to transact with.
+//
+// Object stores live in a per-page registry keyed by database name, so data
+// written in one connection is visible to the next, and `count()` reflects
+// what was actually stored.
+const _IDB_DATABASES = new Map(); // name -> { version, stores: Map<name, IDBObjectStore> }
+
+function _idbDispatch(req, type, handlerProp, event) {
+  req.readyState = 'done';
+  let ev = event;
+  if (!ev) {
+    try { ev = new Event(type); } catch (e) { ev = { type: type, target: req }; }
+  }
+  try { req.dispatchEvent(ev); } catch (e) {}
+  try {
+    const handler = req[handlerProp];
+    if (typeof handler === 'function') handler.call(req, ev);
+  } catch (e) {}
+}
+
+function _idbRequest(produceResult, tx) {
+  const req = new IDBRequest();
+  Promise.resolve().then(() => {
+    let value;
+    try {
+      value = produceResult();
+    } catch (e) {
+      req.error = e;
+      if (tx && typeof tx._finish === 'function') tx._finish();
+      _idbDispatch(req, 'error', 'onerror');
+      return;
+    }
+    req.result = value;
+    if (tx && typeof tx._finish === 'function') tx._finish();
+    _idbDispatch(req, 'success', 'onsuccess');
+  });
+  return req;
+}
+
 class IDBRequest extends EventTarget {
   constructor() {
     super();
@@ -15136,18 +15201,31 @@ class IDBTransaction extends EventTarget {
     this.db = null;
     this.mode = 'readonly';
     this.error = null;
-    const names = Array.isArray(storeNames) ? storeNames : (storeNames ? [storeNames] : []);
+    this._pending = 0;
+    this._completed = false;
+    this._storeNames = Array.isArray(storeNames) ? storeNames.map(String) : (storeNames ? [String(storeNames)] : []);
     this._stores = new Map();
-    for (const n of names) this._stores.set(String(n), new IDBObjectStore(String(n)));
-    this.objectStoreNames = { contains: (n) => this._stores.has(String(n)), length: this._stores.size };
+    this.objectStoreNames = {
+      contains: (n) => this._stores.has(String(n)),
+      get length() { return this._stores.size; },
+      item: (i) => { const k = Array.from(this._stores.keys()); return i >= 0 && i < k.length ? k[i] : null; },
+    };
     this._onabort = null;
     this._oncomplete = null;
     this._onerror = null;
-    Promise.resolve().then(() => {
-      if (typeof this._oncomplete === 'function') {
-        try { this._oncomplete({ target: this, type: 'complete' }); } catch (e) {}
-      }
-    });
+    // A transaction completes only once every request started inside it has
+    // settled, so `complete` can never overtake the reads it should follow.
+    Promise.resolve().then(() => this._maybeComplete());
+  }
+  _begin() { this._pending += 1; }
+  _finish() {
+    this._pending -= 1;
+    Promise.resolve().then(() => this._maybeComplete());
+  }
+  _maybeComplete() {
+    if (this._completed || this._pending > 0) return;
+    this._completed = true;
+    _idbDispatch(this, 'complete', 'oncomplete');
   }
   get onabort() { return this._onabort; }
   set onabort(fn) { this._onabort = typeof fn === 'function' ? fn : null; }
@@ -15158,10 +15236,23 @@ class IDBTransaction extends EventTarget {
   abort() {}
   commit() {}
   objectStore(name) {
-    let s = this._stores.get(name);
-    if (!s) { s = new IDBObjectStore(name); this._stores.set(name, s); }
-    s.transaction = this;
-    return s;
+    const key = String(name);
+    let store = this._stores.get(key);
+    if (!store && this.db && this.db._registry) {
+      // During a versionchange upgrade the transaction must also see object
+      // stores that the upgrade itself just created, so resolve through the
+      // database registry rather than the list captured at construction.
+      const registered = this.db._registry.stores.get(key);
+      if (registered) {
+        store = registered;
+        this._stores.set(key, store);
+      }
+    }
+    // Returning a detached placeholder here would silently throw away writes
+    // and index registrations; an unknown store is an error.
+    if (!store) throw new Error("NotFoundError");
+    store.transaction = this;
+    return store;
   }
 }
 Object.defineProperty(IDBTransaction.prototype, Symbol.toStringTag, { value: 'IDBTransaction', configurable: true });
@@ -15176,7 +15267,7 @@ class IDBDatabase extends EventTarget {
     super();
     this.name = name;
     this.version = version;
-    this.objectStoreNames = { contains: () => false, length: 0, item: () => null };
+    this._registry = null;
     this._onabort = null;
     this._onclose = null;
     this._onerror = null;
@@ -15190,13 +15281,51 @@ class IDBDatabase extends EventTarget {
   set onerror(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
   get onversionchange() { return this._onversionchange; }
   set onversionchange(fn) { this._onversionchange = typeof fn === 'function' ? fn : null; }
+  // A live, array-like view of the registry. Callers reach these stores through
+  // `Array.from(...)`, `.length`, `.item()` and `.contains()`, so the numeric
+  // indices have to exist as well - a bare `length` getter silently yields `[]`.
+  get objectStoreNames() {
+    const keys = this._registry ? Array.from(this._registry.stores.keys()) : [];
+    const list = {
+      length: keys.length,
+      contains: (n) => keys.indexOf(String(n)) !== -1,
+      item: (i) => (i >= 0 && i < keys.length ? keys[i] : null),
+    };
+    keys.forEach((k, i) => { list[i] = k; });
+    return list;
+  }
   close() {}
-  createObjectStore(name) { return new IDBObjectStore(name); }
-  deleteObjectStore(name) {}
+  _storeFor(name) {
+    if (!this._registry) return new IDBObjectStore(String(name));
+    let store = this._registry.stores.get(String(name));
+    if (!store) {
+      store = new IDBObjectStore(String(name));
+      this._registry.stores.set(String(name), store);
+    }
+    return store;
+  }
+  createObjectStore(name, options = {}) {
+    // Valid only while `upgradeneeded` is running, where the new store must be
+    // registered on the database so later transactions can reach it.
+    if (!this._registry) throw new Error("InvalidStateError");
+    const key = String(name);
+    if (this._registry.stores.has(key)) throw new Error("ConstraintError");
+    const store = new IDBObjectStore(key);
+    if (options && options.keyPath !== undefined) store.keyPath = options.keyPath;
+    if (options && options.autoIncrement !== undefined) store.autoIncrement = !!options.autoIncrement;
+    this._registry.stores.set(key, store);
+    return store;
+  }
+  deleteObjectStore(name) { if (this._registry) this._registry.stores.delete(String(name)); }
   transaction(storeNames, mode) {
     const tx = new IDBTransaction(storeNames);
     tx.db = this;
     tx.mode = mode || 'readonly';
+    for (const n of tx._storeNames) {
+      const store = this._storeFor(n);
+      store.transaction = tx;
+      tx._stores.set(n, store);
+    }
     return tx;
   }
 }
@@ -15211,28 +15340,76 @@ globalThis.IDBDatabase = IDBDatabase;
 class IDBFactory {
   open(name, version) {
     const req = new IDBOpenDBRequest();
+    const key = String(name);
     Promise.resolve().then(() => {
       try {
-        req.result = new IDBDatabase(name, version || 1);
-        req.readyState = 'done';
-        if (typeof req.onsuccess === 'function') req.onsuccess({ target: req, type: 'success' });
+        let requested = version;
+        if (requested !== undefined) {
+          requested = Number(requested);
+          if (!Number.isInteger(requested) || requested < 1) {
+            req.error = new Error("TypeError: version must be a positive integer");
+            return _idbDispatch(req, 'error', 'onerror');
+          }
+        }
+        const existing = _IDB_DATABASES.get(key);
+        const current = existing ? existing.version : 0;
+        if (requested !== undefined && requested < current) {
+          req.error = new Error("VersionError: requested version is lower than the existing version");
+          return _idbDispatch(req, 'error', 'onerror');
+        }
+        const target = requested !== undefined ? requested : (current || 1);
+        const registry = existing || { version: current, stores: new Map() };
+        const db = new IDBDatabase(key, target);
+        db._registry = registry;
+        if (current === 0 || target > current) {
+          // `upgradeneeded` runs with the database already usable so the handler
+          // can create object stores; the new version is committed after it.
+          //
+          // The handler receives the upgrade transaction as `request.transaction`
+          // - that is how callers reach the stores and register indexes. Leaving
+          // it null makes every migration fail, and the schema (including every
+          // index) is then silently never created.
+          const upgrade = new IDBTransaction(Array.from(registry.stores.keys()));
+          upgrade.db = db;
+          upgrade.mode = 'versionchange';
+          for (const storeName of upgrade._storeNames) {
+            const store = db._storeFor(storeName);
+            store.transaction = upgrade;
+            upgrade._stores.set(storeName, store);
+          }
+          req.transaction = upgrade;
+          // Hold the transaction open across the handler so `complete` cannot
+          // fire before the migration has run.
+          upgrade._begin();
+          req.result = db;
+          _idbDispatch(req, 'upgradeneeded', 'onupgradeneeded',
+            new IDBVersionChangeEvent('upgradeneeded', { oldVersion: current, newVersion: target }));
+          upgrade._finish();
+          registry.version = target;
+          db.version = target;
+          req.transaction = null;
+        }
+        _IDB_DATABASES.set(key, registry);
+        req.result = db;
+        _idbDispatch(req, 'success', 'onsuccess');
       } catch (e) {
-        req.error = e; req.readyState = 'done';
-        if (typeof req.onerror === 'function') req.onerror({ target: req, type: 'error' });
+        req.error = e;
+        _idbDispatch(req, 'error', 'onerror');
       }
     });
     return req;
   }
   deleteDatabase(name) {
     const req = new IDBOpenDBRequest();
+    const key = String(name);
     Promise.resolve().then(() => {
+      _IDB_DATABASES.delete(key);
       req.result = undefined;
-      req.readyState = 'done';
-      if (typeof req.onsuccess === 'function') req.onsuccess({ target: req, type: 'success' });
+      _idbDispatch(req, 'success', 'onsuccess');
     });
     return req;
   }
-  databases() { return Promise.resolve([]); }
+  databases() { return Promise.resolve(Array.from(_IDB_DATABASES.entries()).map(([name, r]) => ({ name: name, version: r.version }))); }
   cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 }
 Object.defineProperty(IDBFactory.prototype, Symbol.toStringTag, { value: 'IDBFactory', configurable: true });
@@ -15243,29 +15420,259 @@ _markNative(IDBFactory.prototype.databases);
 _markNative(IDBFactory.prototype.cmp);
 globalThis.IDBFactory = IDBFactory;
 
+// IndexedDB key semantics. Keys are ordered by type first (number < date <
+// string < binary < array) and then within type, and an index key path may be
+// an array of paths. Everything below follows that ordering rather than raw
+// `>`/`<`, which would compare arrays by their string form.
+function _idbKeyRank(k) {
+  if (typeof k === 'number') return 0;
+  if (k instanceof Date) return 1;
+  if (typeof k === 'string') return 2;
+  if (typeof ArrayBuffer !== 'undefined' && (k instanceof ArrayBuffer || ArrayBuffer.isView(k))) return 3;
+  if (Array.isArray(k)) return 4;
+  return -1;
+}
+
+function _idbCompareKeys(a, b) {
+  const ra = _idbKeyRank(a), rb = _idbKeyRank(b);
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  switch (ra) {
+    case 0:
+      if (a === b) return 0;
+      return a < b ? -1 : 1;
+    case 1: {
+      const ta = a.getTime(), tb = b.getTime();
+      return ta === tb ? 0 : (ta < tb ? -1 : 1);
+    }
+    case 2:
+      return a === b ? 0 : (a < b ? -1 : 1);
+    case 3: {
+      const ba = new Uint8Array(a.buffer || a, a.byteOffset || 0, a.byteLength);
+      const bb = new Uint8Array(b.buffer || b, b.byteOffset || 0, b.byteLength);
+      const n = Math.min(ba.length, bb.length);
+      for (let i = 0; i < n; i++) { if (ba[i] !== bb[i]) return ba[i] < bb[i] ? -1 : 1; }
+      return ba.length === bb.length ? 0 : (ba.length < bb.length ? -1 : 1);
+    }
+    case 4: {
+      const n = Math.min(a.length, b.length);
+      for (let i = 0; i < n; i++) {
+        const c = _idbCompareKeys(a[i], b[i]);
+        if (c) return c;
+      }
+      return a.length === b.length ? 0 : (a.length < b.length ? -1 : 1);
+    }
+  }
+  return 0;
+}
+
+function _idbExtractOnePath(value, path) {
+  let current = value;
+  for (const part of String(path).split('.')) {
+    if (current == null) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function _idbExtractKey(value, keyPath) {
+  if (value == null) return undefined;
+  if (Array.isArray(keyPath)) {
+    const out = [];
+    for (const path of keyPath) {
+      const v = _idbExtractOnePath(value, path);
+      if (v === undefined) return undefined;
+      out.push(v);
+    }
+    return out;
+  }
+  return _idbExtractOnePath(value, keyPath);
+}
+
+function _idbRangeFor(query) {
+  if (query === undefined || query === null) return null;
+  if (query instanceof IDBKeyRange) return query;
+  if (typeof query === 'object' && typeof query.includes === 'function') return query;
+  return IDBKeyRange.only(query);
+}
+
+function _idbInRange(key, range) {
+  if (!range) return true;
+  try { return range.includes(key); } catch (e) { return true; }
+}
+
+/// Order rows for a cursor. `direction` is one of next/nextunique/prev/prevunique;
+/// rows are sorted by index key then primary key, and the unique variants keep
+/// the first row seen for each key.
+function _idbOrderRows(rows, direction) {
+  const dir = (direction === 'prev' || direction === 'prevunique') ? -1 : 1;
+  rows.sort((x, y) => {
+    const c = _idbCompareKeys(x.key, y.key);
+    if (c) return dir * c;
+    return dir * _idbCompareKeys(x.primaryKey, y.primaryKey);
+  });
+  if (direction === 'nextunique' || direction === 'prevunique') {
+    const out = [];
+    let last;
+    let seeded = false;
+    for (const row of rows) {
+      if (!seeded || _idbCompareKeys(row.key, last) !== 0) {
+        out.push(row);
+        last = row.key;
+        seeded = true;
+      }
+    }
+    return out;
+  }
+  return rows;
+}
+
+/// A cursor reuses ONE request: the request settles with the first cursor, and
+/// every `continue()` settles the same request again. Callers that drive
+/// iteration by awaiting the request (rather than by listening once) would
+/// otherwise stop after the first record.
+function _idbCursorRequest(rows, direction, withValue, source, tx) {
+  const req = new IDBRequest();
+  let index = 0;
+  if (tx && typeof tx._begin === 'function') tx._begin();
+  const step = () => {
+    if (index >= rows.length) {
+      req.result = null;
+      if (tx && typeof tx._finish === 'function') tx._finish();
+      _idbDispatch(req, 'success', 'onsuccess');
+      return;
+    }
+    const row = rows[index];
+    const cursor = withValue ? new IDBCursorWithValue() : new IDBCursor();
+    cursor.source = source;
+    cursor.direction = direction;
+    cursor.key = row.key;
+    cursor.primaryKey = row.primaryKey;
+    if (withValue) cursor.value = row.value;
+    cursor._advance = (n) => { index += (n > 0 ? n : 1); Promise.resolve().then(step); };
+    req.result = cursor;
+    _idbDispatch(req, 'success', 'onsuccess');
+  };
+  Promise.resolve().then(step);
+  return req;
+}
+
 class IDBObjectStore {
   constructor(name = '') {
     this.name = name;
     this.keyPath = null;
     this.autoIncrement = false;
-    this.indexNames = { contains: () => false, length: 0, item: () => null };
     this.transaction = null;
     this._data = new Map();
+    this._indexes = new Map();
+    this._autoKey = 0;
   }
-  add(val, key) { const k = key ?? Date.now(); this._data.set(k, val); return _idbRequest(() => k); }
-  put(val, key) { const k = key ?? Date.now(); this._data.set(k, val); return _idbRequest(() => k); }
-  get(key) { return _idbRequest(() => this._data.get(key) ?? undefined); }
-  getAll() { return _idbRequest(() => Array.from(this._data.values())); }
-  getAllKeys() { return _idbRequest(() => Array.from(this._data.keys())); }
-  getKey(key) { return _idbRequest(() => (this._data.has(key) ? key : undefined)); }
-  delete(key) { return _idbRequest(() => { this._data.delete(key); return undefined; }); }
-  clear() { return _idbRequest(() => { this._data.clear(); return undefined; }); }
-  count() { return _idbRequest(() => this._data.size); }
-  openCursor() { return _idbRequest(() => null); }
-  openKeyCursor() { return _idbRequest(() => null); }
-  createIndex() { return new IDBIndex(); }
-  index() { return new IDBIndex(); }
-  deleteIndex() {}
+  // A live, array-like view - callers use `Array.from(...)`, `.length`,
+  // `.item()` and `.contains()`, so the numeric indices must exist too.
+  get indexNames() {
+    const keys = Array.from(this._indexes.keys());
+    const list = {
+      length: keys.length,
+      contains: (n) => keys.indexOf(String(n)) !== -1,
+      item: (i) => (i >= 0 && i < keys.length ? keys[i] : null),
+    };
+    keys.forEach((k, i) => { list[i] = k; });
+    return list;
+  }
+  _keyFor(value, key) {
+    if (key !== undefined) return key;
+    if (this.keyPath) {
+      let current = value;
+      for (const part of String(this.keyPath).split('.')) {
+        if (current == null) return undefined;
+        current = current[part];
+      }
+      return current;
+    }
+    if (this.autoIncrement) { this._autoKey += 1; return this._autoKey; }
+    return undefined;
+  }
+  _op(produce) {
+    if (this.transaction && typeof this.transaction._begin === 'function') this.transaction._begin();
+    return _idbRequest(produce, this.transaction);
+  }
+  add(value, key) {
+    return this._op(() => {
+      const k = this._keyFor(value, key);
+      if (k === undefined) throw new Error("DataError");
+      if (this._data.has(k)) throw new Error("ConstraintError");
+      this._data.set(k, value);
+      return k;
+    });
+  }
+  put(value, key) {
+    return this._op(() => {
+      const k = this._keyFor(value, key);
+      if (k === undefined) throw new Error("DataError");
+      this._data.set(k, value);
+      return k;
+    });
+  }
+  // Records in primary-key order, which is the order IndexedDB reports them in.
+  _rows(range) {
+    const rows = [];
+    for (const [k, v] of this._data) {
+      if (!_idbInRange(k, range)) continue;
+      rows.push({ key: k, primaryKey: k, value: v });
+    }
+    return _idbOrderRows(rows, 'next');
+  }
+  get(query) { return this._op(() => { const r = this._rows(_idbRangeFor(query)); return r.length ? r[0].value : undefined; }); }
+  getAll(query, count) {
+    return this._op(() => {
+      const values = this._rows(_idbRangeFor(query)).map((r) => r.value);
+      return count === undefined ? values : values.slice(0, count);
+    });
+  }
+  getAllKeys(query, count) {
+    return this._op(() => {
+      const keys = this._rows(_idbRangeFor(query)).map((r) => r.primaryKey);
+      return count === undefined ? keys : keys.slice(0, count);
+    });
+  }
+  getKey(query) { return this._op(() => { const r = this._rows(_idbRangeFor(query)); return r.length ? r[0].primaryKey : undefined; }); }
+  delete(query) {
+    return this._op(() => {
+      const targets = _idbRangeFor(query) ? this._rows(_idbRangeFor(query)).map((r) => r.primaryKey) : [query];
+      for (const k of targets) this._data.delete(k);
+      return undefined;
+    });
+  }
+  clear() { return this._op(() => { this._data.clear(); return undefined; }); }
+  count(query) { return this._op(() => this._rows(_idbRangeFor(query)).length); }
+  openCursor(query, direction) {
+    const dir = direction || 'next';
+    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, true, this, this.transaction);
+  }
+  openKeyCursor(query, direction) {
+    const dir = direction || 'next';
+    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, false, this, this.transaction);
+  }
+  // Indexes must be registered on the store. Returning a throwaway object here
+  // makes every later `store.index(name)` query empty, and libraries that read
+  // their queue or cache through an index silently see nothing at all.
+  createIndex(name, keyPath, options = {}) {
+    const key = String(name);
+    if (this._indexes.has(key)) throw new Error("ConstraintError");
+    const index = new IDBIndex();
+    index.name = key;
+    index.objectStore = this;
+    index.keyPath = keyPath;
+    index.multiEntry = !!options.multiEntry;
+    index.unique = !!options.unique;
+    this._indexes.set(key, index);
+    return index;
+  }
+  index(name) {
+    const index = this._indexes.get(String(name));
+    if (!index) throw new Error("NotFoundError");
+    return index;
+  }
+  deleteIndex(name) { this._indexes.delete(String(name)); }
 }
 Object.defineProperty(IDBObjectStore.prototype, Symbol.toStringTag, { value: 'IDBObjectStore', configurable: true });
 _markNative(IDBObjectStore);
@@ -15279,11 +15686,64 @@ class IDBIndex {
     this.multiEntry = false;
     this.unique = false;
   }
-  get() { return _idbRequest(() => undefined); }
-  getAll() { return _idbRequest(() => []); }
-  count() { return _idbRequest(() => 0); }
-  openCursor() { return _idbRequest(() => null); }
-  openKeyCursor() { return _idbRequest(() => null); }
+  // Project the store's records onto this index's key path, keeping the primary
+  // key alongside so cursors and `getKey()` can report it. Records whose key
+  // path is absent are not in the index at all.
+  _rows(range) {
+    const store = this.objectStore;
+    const rows = [];
+    if (!store) return rows;
+    for (const [primaryKey, value] of store._data) {
+      const extracted = _idbExtractKey(value, this.keyPath);
+      if (extracted === undefined) continue;
+      const keys = (this.multiEntry && Array.isArray(extracted)) ? extracted : [extracted];
+      for (const key of keys) {
+        if (!_idbInRange(key, range)) continue;
+        rows.push({ key: key, primaryKey: primaryKey, value: value });
+      }
+    }
+    return rows;
+  }
+  _op(produce) {
+    const tx = this.objectStore ? this.objectStore.transaction : null;
+    if (tx && typeof tx._begin === 'function') tx._begin();
+    return _idbRequest(produce, tx);
+  }
+  get(query) {
+    return this._op(() => {
+      const rows = _idbOrderRows(this._rows(_idbRangeFor(query)), 'next');
+      return rows.length ? rows[0].value : undefined;
+    });
+  }
+  getKey(query) {
+    return this._op(() => {
+      const rows = _idbOrderRows(this._rows(_idbRangeFor(query)), 'next');
+      return rows.length ? rows[0].primaryKey : undefined;
+    });
+  }
+  getAll(query, count) {
+    return this._op(() => {
+      const values = _idbOrderRows(this._rows(_idbRangeFor(query)), 'next').map((r) => r.value);
+      return count === undefined ? values : values.slice(0, count);
+    });
+  }
+  getAllKeys(query, count) {
+    return this._op(() => {
+      const keys = _idbOrderRows(this._rows(_idbRangeFor(query)), 'next').map((r) => r.primaryKey);
+      return count === undefined ? keys : keys.slice(0, count);
+    });
+  }
+  count(query) { return this._op(() => this._rows(_idbRangeFor(query)).length); }
+  openCursor(query, direction) {
+    const dir = direction || 'next';
+    const tx = this.objectStore ? this.objectStore.transaction : null;
+    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, true, this, tx);
+  }
+  openKeyCursor(query, direction) {
+    const dir = direction || 'next';
+    const tx = this.objectStore ? this.objectStore.transaction : null;
+    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, false, this, tx);
+  }
 }
 Object.defineProperty(IDBIndex.prototype, Symbol.toStringTag, { value: 'IDBIndex', configurable: true });
 _markNative(IDBIndex);
@@ -15295,12 +15755,34 @@ class IDBCursor {
     this.direction = 'next';
     this.key = undefined;
     this.primaryKey = undefined;
+    this._advance = null;
   }
-  advance(count) {}
-  continue(key) {}
-  continuePrimaryKey(key, primaryKey) {}
-  delete() { return _idbRequest(() => undefined); }
-  update(value) { return _idbRequest(() => undefined); }
+  _store() {
+    const source = this.source;
+    if (!source) return null;
+    return source.objectStore ? source.objectStore : source;
+  }
+  advance(count) {
+    if (typeof this._advance === 'function') this._advance(count | 0);
+  }
+  continue(key) {
+    if (typeof this._advance === 'function') this._advance(1);
+  }
+  continuePrimaryKey(key, primaryKey) {
+    if (typeof this._advance === 'function') this._advance(1);
+  }
+  delete() {
+    const store = this._store();
+    if (!store) return _idbRequest(() => undefined);
+    return store.delete(this.primaryKey);
+  }
+  // `update` writes against the cursor's primary key, so it must pass the key
+  // explicitly - the record's own key path may not match the store's.
+  update(value) {
+    const store = this._store();
+    if (!store) return _idbRequest(() => undefined);
+    return store.put(value, this.primaryKey);
+  }
 }
 Object.defineProperty(IDBCursor.prototype, Symbol.toStringTag, { value: 'IDBCursor', configurable: true });
 _markNative(IDBCursor);
@@ -15327,32 +15809,36 @@ Object.defineProperty(IDBVersionChangeEvent.prototype, Symbol.toStringTag, { val
 _markNative(IDBVersionChangeEvent);
 globalThis.IDBVersionChangeEvent = IDBVersionChangeEvent;
 
-function _idbRequest(produceResult) {
-  const req = new IDBRequest();
-  Promise.resolve().then(() => {
-    try {
-      req.result = produceResult();
-      req.readyState = 'done';
-      if (typeof req.onsuccess === 'function') {
-        try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {}
-      }
-    } catch (e) {
-      req.error = e; req.readyState = 'done';
-      if (typeof req.onerror === 'function') {
-        try { req.onerror({ target: req, type: 'error' }); } catch (e2) {}
-      }
-    }
-  });
-  return req;
-}
-
 globalThis.indexedDB = new IDBFactory();
-globalThis.IDBKeyRange = {
-  only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
-  lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },
-  upperBound(v, open) { return { lower: null, upper: v, lowerOpen: false, upperOpen: !!open, includes(x) { return open ? x < v : x <= v; } }; },
-  bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
-};
+// A real constructor, not a bag of object literals: `instanceof` has to work,
+// and `includes` must compare with IndexedDB key ordering - plain `>`/`<` would
+// compare array keys by their string form and silently match the wrong records.
+class IDBKeyRange {
+  constructor(lower, upper, lowerOpen, upperOpen) {
+    this.lower = lower;
+    this.upper = upper;
+    this.lowerOpen = !!lowerOpen;
+    this.upperOpen = !!upperOpen;
+  }
+  includes(key) {
+    if (this.lower !== undefined && this.lower !== null) {
+      const c = _idbCompareKeys(key, this.lower);
+      if (c < 0 || (c === 0 && this.lowerOpen)) return false;
+    }
+    if (this.upper !== undefined && this.upper !== null) {
+      const c = _idbCompareKeys(key, this.upper);
+      if (c > 0 || (c === 0 && this.upperOpen)) return false;
+    }
+    return true;
+  }
+  static only(value) { return new IDBKeyRange(value, value, false, false); }
+  static lowerBound(lower, open) { return new IDBKeyRange(lower, null, open, true); }
+  static upperBound(upper, open) { return new IDBKeyRange(null, upper, true, open); }
+  static bound(lower, upper, lowerOpen, upperOpen) { return new IDBKeyRange(lower, upper, lowerOpen, upperOpen); }
+}
+Object.defineProperty(IDBKeyRange.prototype, Symbol.toStringTag, { value: 'IDBKeyRange', configurable: true });
+_markNative(IDBKeyRange);
+globalThis.IDBKeyRange = IDBKeyRange;
 
 globalThis.caches = {
   open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
@@ -18662,5 +19148,105 @@ for (const [name, evList] of Object.entries(_auditedEvents)) {
     .filter(name => name in globalThis);
   _iframeRealmGlobalNameSet = new Set(_iframeRealmGlobalNames);
 })();
+
+
+// ---------------------------------------------------------------------------
+// WebIDL interface brand: Symbol.toStringTag + native member naming.
+//
+// Per WebIDL, every interface prototype object carries a configurable
+// Symbol.toStringTag whose value is the interface name, and every interface
+// member is a native function whose `name` is the member name. Obscura's
+// interfaces were built from plain JS functions, so
+// `Object.prototype.toString.call(navigator)` returned "[object Object]"
+// instead of "[object Navigator]" and members stringified as
+// "function () { [native code] }". Both are trivially machine-detectable and
+// are the exact shape bot-detection libraries look for.
+//
+// Fix it centrally rather than at each definition site: the tag is derived
+// from the constructor's own name, which is already correct.
+(function _installInterfaceBrands() {
+  var ifaceNames = [
+    'AbortController', 'AbortSignal', 'AnimationEvent', 'Attr', 'AudioContext',
+    'CSSRule', 'CSSStyleDeclaration', 'CSSStyleRule', 'CSSStyleSheet',
+    'CanvasRenderingContext2D', 'Comment', 'Crypto', 'CustomEvent', 'DOMPoint',
+    'DOMRect', 'Document', 'DocumentFragment', 'Element', 'ErrorEvent', 'Event',
+    'EventTarget', 'FocusEvent', 'HTMLCanvasElement', 'HTMLCollection',
+    'HTMLElement', 'HashChangeEvent', 'Headers', 'ImageBitmap', 'ImageData',
+    'InputEvent', 'IntersectionObserver', 'KeyboardEvent', 'MediaQueryList',
+    'MediaStream', 'MessageChannel', 'MouseEvent', 'MutationObserver',
+    'NamedNodeMap', 'Navigator', 'NetworkInformation', 'Node', 'Notification',
+    'OfflineAudioContext', 'PerformanceObserver',
+    'PointerEvent', 'PopStateEvent', 'ProgressEvent', 'PromiseRejectionEvent',
+    'RTCPeerConnection', 'Range', 'ReadableStream', 'Request', 'ResizeObserver',
+    'Response', 'SVGElement', 'Screen', 'Selection', 'SharedWorker',
+    'SpeechSynthesisUtterance', 'Storage', 'StorageEvent', 'SubtleCrypto',
+    'Text', 'TextDecoder', 'TextEncoder', 'TransformStream', 'TransitionEvent',
+    'URL', 'URLSearchParams', 'WebGL2RenderingContext', 'WebGLRenderingContext',
+    'WebSocket', 'WheelEvent', 'Window', 'Worker', 'WritableStream',
+    'XMLHttpRequest',
+  ];
+  for (var _i = 0; _i < ifaceNames.length; _i++) {
+    var _name = ifaceNames[_i];
+    var _ctor;
+    try { _ctor = globalThis[_name]; } catch (e) { continue; }
+    if (typeof _ctor !== 'function') { continue; }
+    var _proto;
+    try { _proto = _ctor.prototype; } catch (e) { continue; }
+    if (!_proto) { continue; }
+    try {
+      Object.defineProperty(_proto, Symbol.toStringTag, { value: _name, configurable: true });
+    } catch (e) {}
+  }
+
+  // Objects whose brand does not resolve through the constructor prototype we
+  // just fixed (host-backed or singleton objects on their own chain).
+  var _instances = [
+    ['window', 'Window'], ['navigator', 'Navigator'],
+    ['location', 'Location'], ['screen', 'Screen'],
+  ];
+  for (var _j = 0; _j < _instances.length; _j++) {
+    var _objName = _instances[_j][0], _brand = _instances[_j][1];
+    var _obj;
+    try { _obj = globalThis[_objName]; } catch (e) { continue; }
+    if (!_obj) { continue; }
+    try {
+      if (Object.prototype.toString.call(_obj) === '[object ' + _brand + ']') { continue; }
+      Object.defineProperty(_obj, Symbol.toStringTag, { value: _brand, configurable: true });
+    } catch (e) {}
+  }
+
+  // Native members stringify as `function <name>() { [native code] }`. The
+  // underlying functions are anonymous, so both `.name` and Function.prototype
+  // .toString() leaked the engine's identity (and, for members wrapped in JS,
+  // the wrapper's source).
+  if (typeof _markNativeAs !== 'function') { return; }
+  var memberNames = [
+    'addEventListener', 'removeEventListener', 'dispatchEvent', 'alert',
+    'confirm', 'prompt', 'open', 'close', 'fetch', 'setTimeout', 'setInterval',
+    'clearTimeout', 'clearInterval', 'requestAnimationFrame',
+    'cancelAnimationFrame', 'requestIdleCallback', 'queueMicrotask',
+    'structuredClone', 'atob', 'btoa', 'postMessage', 'getComputedStyle',
+    'matchMedia', 'scroll', 'scrollTo', 'focus', 'blur', 'print', 'stop',
+    'reportError', 'createImageBitmap',
+  ];
+  for (var _k = 0; _k < memberNames.length; _k++) {
+    var _member = memberNames[_k];
+    var _owner = globalThis, _desc = null;
+    while (_owner && !(_desc = Object.getOwnPropertyDescriptor(_owner, _member))) {
+      _owner = Object.getPrototypeOf(_owner);
+    }
+    if (!_desc || typeof _desc.value !== 'function') { continue; }
+    var _fn = _desc.value;
+    if (_fn.name !== _member) {
+      try { Object.defineProperty(_fn, 'name', { value: _member, configurable: true }); } catch (e) {}
+    }
+    // Only claim native code when the name actually took; a failed rename would
+    // otherwise produce a lie that disagrees with the function's own name.
+    if (_fn.name === _member) {
+      _markNativeAs(_fn, 'function ' + _member + '() { [native code] }');
+    }
+  }
+})();
+
 
 })();

@@ -6618,6 +6618,7 @@ impl Default for ObscuraJsRuntime {
     fn default() -> Self {
         Self::new()
     }
+
 }
 
 #[cfg(test)]
@@ -7892,6 +7893,254 @@ return {before,removed,reinsert,moved,cleared};
         rt_loopback.set_url("http://127.0.0.1:18791/test");
         let secure_loopback: bool = serde_json::from_value(rt_loopback.evaluate("isSecureContext").unwrap()).unwrap();
         assert!(secure_loopback);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_agent_data_brands_match_real_chrome_captures() {
+        // Goldens are the sec-ch-ua strings primp captured from real Chrome
+        // builds (vendor/primp/src/imp/chrome/mod.rs). Chromium seeds both the
+        // GREASE brand name/version and the brand order from the major version,
+        // so navigator.userAgentData.brands must reproduce the same brands in
+        // the same order. Chrome 146 is deliberately absent: that build ships
+        // only two brands, which this deriver does not model.
+        let cases: [(u32, &[(&str, &str)]); 8] = [
+            (145, &[("Not:A-Brand", "99"), ("Google Chrome", "145"), ("Chromium", "145")]),
+            (147, &[("Google Chrome", "147"), ("Not.A/Brand", "8"), ("Chromium", "147")]),
+            (148, &[("Chromium", "148"), ("Google Chrome", "148"), ("Not/A)Brand", "99")]),
+            (149, &[("Google Chrome", "149"), ("Chromium", "149"), ("Not)A;Brand", "24")]),
+            (150, &[("Not;A=Brand", "8"), ("Chromium", "150"), ("Google Chrome", "150")]),
+            (151, &[("Not=A?Brand", "99"), ("Google Chrome", "151"), ("Chromium", "151")]),
+            (152, &[("Chromium", "152"), ("Not?A_Brand", "24"), ("Google Chrome", "152")]),
+            (153, &[("Google Chrome", "153"), ("Not_A Brand", "8"), ("Chromium", "153")]),
+        ];
+        for (major, expected) in cases {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.set_user_agent(&format!(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+            ));
+            let actual = rt
+                .evaluate("navigator.userAgentData.brands.map(b => [b.brand, b.version])")
+                .unwrap();
+            let expected: serde_json::Value = serde_json::Value::Array(
+                expected
+                    .iter()
+                    .map(|(brand, version)| serde_json::json!([brand, version]))
+                    .collect(),
+            );
+            assert_eq!(actual, expected, "brands mismatch for Chrome {major}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interface_prototypes_carry_webidl_brands_and_native_member_names() {
+        let mut rt = setup_runtime("<html><body><div id=\"d\">x</div></body></html>");
+        rt.execute_script("webidl-brands", r#"
+            function brandOf(value) {
+                return Object.prototype.toString.call(value);
+            }
+            function memberName(owner, member) {
+                let target = owner, desc = null;
+                while (target && !(desc = Object.getOwnPropertyDescriptor(target, member))) {
+                    target = Object.getPrototypeOf(target);
+                }
+                return desc && typeof desc.value === 'function' ? desc.value.name : null;
+            }
+            function memberToString(owner, member) {
+                let target = owner, desc = null;
+                while (target && !(desc = Object.getOwnPropertyDescriptor(target, member))) {
+                    target = Object.getPrototypeOf(target);
+                }
+                return desc && typeof desc.value === 'function'
+                    ? Function.prototype.toString.call(desc.value) : null;
+            }
+            globalThis.__brands = {
+                window: brandOf(window),
+                navigator: brandOf(navigator),
+                location: brandOf(location),
+                screen: brandOf(screen),
+                document: brandOf(document),
+                performance: brandOf(performance),
+                history: brandOf(history),
+                xhr: brandOf(new XMLHttpRequest()),
+                headers: brandOf(new Headers()),
+                request: brandOf(new Request('https://example.com/')),
+                blob: brandOf(new Blob([])),
+                event: brandOf(new Event('x')),
+                url: brandOf(new URL('https://example.com/')),
+                params: brandOf(new URLSearchParams('a=1')),
+                element: brandOf(document.createElement('div')),
+                canvas: brandOf(document.createElement('canvas')),
+                style: brandOf(document.createElement('div').style),
+                text: brandOf(document.createTextNode('t')),
+                fragment: brandOf(document.createDocumentFragment()),
+                nodelist: brandOf(document.querySelectorAll('div')),
+                plain: brandOf({}),
+            };
+            globalThis.__hierarchy = (() => {
+                let div = document.createElement('div');
+                let svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                return {
+                    sameCtor: globalThis.HTMLElement === globalThis.Element,
+                    sameProto: globalThis.HTMLElement.prototype === globalThis.Element.prototype,
+                    divIsHTMLElement: div instanceof globalThis.HTMLElement,
+                    divIsElement: div instanceof globalThis.Element,
+                    divIsNode: div instanceof globalThis.Node,
+                    elementIsNotHTMLElement: !(globalThis.Element.prototype instanceof globalThis.HTMLElement),
+                    svgIsElement: svg instanceof globalThis.Element,
+                    svgIsNotHTMLElement: !(svg instanceof globalThis.HTMLElement),
+                    canvasIsHTMLElement: document.createElement('canvas') instanceof globalThis.HTMLElement,
+                    inputIsHTMLElement: document.createElement('input') instanceof globalThis.HTMLElement,
+                    formIsHTMLElement: document.createElement('form') instanceof globalThis.HTMLElement,
+                    chain: (() => {
+                        let names = [], proto = Object.getPrototypeOf(div);
+                        while (proto && proto !== Object.prototype) {
+                            let d = Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag);
+                            names.push(d && d.value ? d.value : '?');
+                            proto = Object.getPrototypeOf(proto);
+                        }
+                        return names;
+                    })(),
+                };
+            })();
+            globalThis.__eventTargetDistinct = (() => {
+                const out = {};
+                out.sameConstructor = globalThis.EventTarget === globalThis.Node;
+                out.samePrototype = globalThis.EventTarget.prototype === globalThis.Node.prototype;
+                try { out.newEventTargetWorks = new globalThis.EventTarget() instanceof globalThis.EventTarget; }
+                catch (e) { out.newEventTargetWorks = 'ERR:' + e.name; }
+                out.nodeIsEventTarget = document.createElement('div') instanceof globalThis.EventTarget;
+                out.nodeOwnsListeners = !!(globalThis.Node.prototype &&
+                    Object.getOwnPropertyDescriptor(globalThis.Node.prototype, 'addEventListener'));
+                try {
+                    const ps = globalThis.PermissionStatus ? new globalThis.PermissionStatus('granted', 'notifications') : null;
+                    out.permissionStatusIsNode = ps ? ps instanceof globalThis.Node : 'no-PermissionStatus';
+                    out.permissionStatusIsEventTarget = ps ? ps instanceof globalThis.EventTarget : 'no-PermissionStatus';
+                } catch (e) {
+                    out.permissionStatusIsNode = 'ERR:' + e.name;
+                    out.permissionStatusIsEventTarget = 'ERR:' + e.name;
+                }
+                return out;
+            })();
+            globalThis.__memberNames = {
+                fetch: memberName(window, 'fetch'),
+                alert: memberName(window, 'alert'),
+                setTimeout: memberName(window, 'setTimeout'),
+                addEventListener: memberName(window, 'addEventListener'),
+                getComputedStyle: memberName(window, 'getComputedStyle'),
+                createImageBitmap: memberName(window, 'createImageBitmap'),
+            };
+            globalThis.__memberToStrings = {
+                fetch: memberToString(window, 'fetch'),
+                alert: memberToString(window, 'alert'),
+                createImageBitmap: memberToString(window, 'createImageBitmap'),
+                navigatorGetBattery: memberToString(navigator, 'getBattery'),
+            };
+        "#).unwrap();
+
+        let brands = rt.evaluate("__brands").unwrap();
+        for (probe, expected) in [
+            ("window", "[object Window]"),
+            ("navigator", "[object Navigator]"),
+            ("location", "[object Location]"),
+            ("screen", "[object Screen]"),
+            ("document", "[object HTMLDocument]"),
+            ("performance", "[object Performance]"),
+            ("history", "[object History]"),
+            ("xhr", "[object XMLHttpRequest]"),
+            ("headers", "[object Headers]"),
+            ("request", "[object Request]"),
+            ("blob", "[object Blob]"),
+            ("event", "[object Event]"),
+            ("url", "[object URL]"),
+            ("params", "[object URLSearchParams]"),
+            ("element", "[object HTMLDivElement]"),
+            ("canvas", "[object HTMLCanvasElement]"),
+            ("style", "[object CSSStyleDeclaration]"),
+            ("text", "[object Text]"),
+            ("fragment", "[object DocumentFragment]"),
+            ("nodelist", "[object NodeList]"),
+            // A plain object must stay a plain object: the brand must not be
+            // applied to Object.prototype.
+            ("plain", "[object Object]"),
+        ] {
+            assert_eq!(
+                brands[probe].as_str().unwrap(),
+                expected,
+                "brand mismatch for {probe}"
+            );
+        }
+
+        // EventTarget is a distinct interface, not an alias of Node. Aliasing
+        // them made `window.EventTarget === window.Node` true and let non-node
+        // event targets claim to be Nodes.
+        let distinct = rt.evaluate("__eventTargetDistinct").unwrap();
+        assert_eq!(distinct["sameConstructor"], false, "EventTarget must not be Node");
+        assert_eq!(distinct["samePrototype"], false, "EventTarget.prototype must not be Node.prototype");
+        assert_eq!(distinct["newEventTargetWorks"], true, "new EventTarget() must be constructible");
+        assert_eq!(distinct["nodeIsEventTarget"], true, "every Node must be an EventTarget");
+        assert_eq!(distinct["nodeOwnsListeners"], false, "Node.prototype must inherit listeners from EventTarget.prototype");
+        assert_eq!(distinct["permissionStatusIsNode"], false, "a non-node event target must not be a Node");
+        assert_eq!(distinct["permissionStatusIsEventTarget"], true, "PermissionStatus must be an EventTarget");
+
+        // The HTML element hierarchy must mirror the browser's: HTMLElement is a
+        // distinct interface between Element and the concrete HTML*Element
+        // classes, and SVG elements are not HTMLElements.
+        let hierarchy = rt.evaluate("__hierarchy").unwrap();
+        assert_eq!(hierarchy["sameCtor"], false, "HTMLElement must not be Element");
+        assert_eq!(hierarchy["sameProto"], false, "HTMLElement.prototype must not be Element.prototype");
+        assert_eq!(hierarchy["divIsHTMLElement"], true, "a div must be an HTMLElement");
+        assert_eq!(hierarchy["divIsElement"], true, "a div must be an Element");
+        assert_eq!(hierarchy["divIsNode"], true, "a div must be a Node");
+        assert_eq!(hierarchy["elementIsNotHTMLElement"], true, "Element.prototype must sit above HTMLElement.prototype");
+        assert_eq!(hierarchy["svgIsElement"], true, "an SVG element must be an Element");
+        assert_eq!(hierarchy["svgIsNotHTMLElement"], true, "an SVG element must not be an HTMLElement");
+        for probe in ["canvasIsHTMLElement", "inputIsHTMLElement", "formIsHTMLElement"] {
+            assert_eq!(hierarchy[probe], true, "{probe} must hold");
+        }
+        assert_eq!(
+            hierarchy["chain"],
+            serde_json::json!([
+                "HTMLDivElement", "HTMLElement", "Element", "Node", "EventTarget"
+            ]),
+            "the div prototype chain must match the browser interface hierarchy"
+        );
+
+        let names = rt.evaluate("__memberNames").unwrap();
+        for member in [
+            "fetch",
+            "alert",
+            "setTimeout",
+            "addEventListener",
+            "getComputedStyle",
+            "createImageBitmap",
+        ] {
+            assert_eq!(
+                names[member].as_str().unwrap(),
+                member,
+                "window.{member} must expose its own name"
+            );
+        }
+
+        // Native members must stringify as native code and must never leak the
+        // engine's JS wrapper source.
+        let strings = rt.evaluate("__memberToStrings").unwrap();
+        for (probe, member) in [
+            ("fetch", "fetch"),
+            ("alert", "alert"),
+            ("createImageBitmap", "createImageBitmap"),
+        ] {
+            let text = strings[probe].as_str().unwrap();
+            assert_eq!(
+                text,
+                format!("function {member}() {{ [native code] }}"),
+                "toString mismatch for window.{member}"
+            );
+        }
+        let battery = strings["navigatorGetBattery"].as_str().unwrap();
+        assert!(
+            battery.contains("[native code]") && !battery.contains("Promise"),
+            "navigator.getBattery leaked wrapper source: {battery}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12769,6 +13018,85 @@ return {before,removed,reinsert,moved,cleared};
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, 300, 90, 90]));
+    }
+
+    /// A version upgrade must hand the handler a real transaction.
+    ///
+    /// Callers receive it as `request.transaction` and use it to create object
+    /// stores and register indexes. With `null` there, every migration fails -
+    /// and because the failure is swallowed, the database simply ends up with no
+    /// indexes at all, which silently breaks any queue or cache read through an
+    /// index.
+    #[tokio::test(flavor = "current_thread")]
+    async fn version_upgrade_exposes_a_transaction_and_registers_indexes() {
+        let mut rt = setup_runtime(r#"<html><body></body></html>"#);
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    const out = {};
+                    const open = indexedDB.open('upgrade_probe', 1);
+                    open.onupgradeneeded = () => {
+                        const db = open.result;
+                        out.hasTransaction = !!open.transaction;
+                        out.mode = open.transaction ? open.transaction.mode : null;
+                        const store = db.createObjectStore('items', { keyPath: 'id' });
+                        // Migrations reach a store *through the upgrade
+                        // transaction*, including one created moments earlier.
+                        out.sameStore =
+                            open.transaction.objectStore('items') === store;
+                        store.createIndex('kind', 'kind');
+                        store.createIndex('kind-id', ['kind', 'id']);
+                        out.indexes = Array.from(store.indexNames);
+                        out.newVersion = db.version;
+                    };
+                    open.onerror = () => resolve(['open failed']);
+                    open.onsuccess = () => {
+                        const db = open.result;
+                        const write = db.transaction('items', 'readwrite');
+                        const store = write.objectStore('items');
+                        store.put({ id: 1, kind: 'a' });
+                        store.put({ id: 2, kind: 'a' });
+                        store.put({ id: 3, kind: 'b' });
+                        write.oncomplete = () => {
+                            const read = db.transaction('items', 'readonly');
+                            const index = read.objectStore('items').index('kind-id');
+                            // The composite bound the Airship SDK uses verbatim:
+                            // the upper limit is Infinity.
+                            const req = index.openCursor(
+                                IDBKeyRange.bound(['a', 0], ['a', 1/0]));
+                            const seen = [];
+                            req.onsuccess = () => {
+                                const cursor = req.result;
+                                if (!cursor) {
+                                    out.matched = seen;
+                                    out.directIndexGet = index.get(['b', 3]) ? index.get(['b', 3]).result : undefined;
+                                    resolve(out);
+                                    return;
+                                }
+                                seen.push([cursor.key[0], cursor.primaryKey]);
+                                cursor.continue();
+                            };
+                        };
+                    };
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let out = result.value.unwrap();
+        assert_eq!(out.get("hasTransaction"), Some(&serde_json::json!(true)),
+            "upgradeneeded must expose the upgrade transaction");
+        assert_eq!(out.get("mode"), Some(&serde_json::json!("versionchange")));
+        assert_eq!(out.get("newVersion"), Some(&serde_json::json!(1)));
+        assert_eq!(out.get("sameStore"), Some(&serde_json::json!(true)),
+            "the store created by the upgrade must be reachable through its transaction");
+        assert_eq!(out.get("indexes"), Some(&serde_json::json!(["kind", "kind-id"])),
+            "indexes created during the upgrade must be registered on the store");
+        assert_eq!(out.get("matched"), Some(&serde_json::json!([["a", 1], ["a", 2]])),
+            "a composite-key index cursor must find exactly the matching records in key order");
     }
 
     /// Issue #468: a scroll event must reach listeners on both the window and

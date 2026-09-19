@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "aa330d36d4b8815d4efede6338818d6ec08c4a2d"
+  },
+  "path_in_vcs": "crates/primp-rustls/rustls"
+}

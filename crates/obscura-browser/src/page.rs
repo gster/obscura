@@ -1817,8 +1817,11 @@ impl Page {
             rt.set_user_agent(profile.user_agent());
             let (platform, ua_platform, version) = profile.platform();
             rt.set_platform(platform, ua_platform, version);
-            if profile == obscura_net::StealthProfile::MacChrome152 {
-                rt.set_user_agent_details("152.0.7977.83", "arm");
+            if matches!(
+                profile,
+                obscura_net::StealthProfile::MacChrome152 | obscura_net::StealthProfile::MacChrome153
+            ) {
+                rt.set_user_agent_details(profile.full_version(), "arm");
             }
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {

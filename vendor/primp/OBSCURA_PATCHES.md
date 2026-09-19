@@ -11,9 +11,15 @@ connection. Run with nextest so this global-cache test has its own process.
 The obscura-net macos_transport_rejects_localhost test also checks direct
 loopback rejection.
 
-No TLS fingerprints, certificate verification, crypto implementation or request
-retry policy are patched. See docs/Primp-and-wreq-comparison.md for known fidelity
+No certificate verification, crypto implementation or request retry policy are
+patched in this crate. See docs/Primp-and-wreq-comparison.md for known fidelity
 limits. The dependency's MIT license is retained.
+
+One TLS-level change does exist, but it lives in the layer underneath: primp
+builds on `primp-rustls`, which is now vendored separately and carries a
+ClientHello extension-ordering fix. primp itself pulls it in unchanged via its
+`rustls = { package = "primp-rustls" }` dependency. See
+`vendor/primp-rustls/OBSCURA_PATCHES.md` for the evidence and the exact change.
 
 The manifest declares an independent workspace for focused dependency testing:
 

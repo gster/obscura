@@ -236,7 +236,7 @@ async fn fulfilled_response_cannot_supply_navigation_referrer() {
         None,
         true,
     ));
-    *client.interceptor.write().await = Some(Box::new(Fixture));
+    *client.interceptor.write().await = Some(std::sync::Arc::new(Fixture));
     let transport = StealthHttpClient::with_policy(jar, None, client.clone());
     let source = Url::parse("https://source.example/private").unwrap();
     let target = Url::parse("https://target.example/page").unwrap();
@@ -288,7 +288,7 @@ async fn fulfilled_file_response_has_no_navigation_referrer() {
         None,
         true,
     ));
-    *client.interceptor.write().await = Some(Box::new(Fixture));
+    *client.interceptor.write().await = Some(std::sync::Arc::new(Fixture));
     let transport = StealthHttpClient::with_policy(jar, None, client);
     let response = transport
         .fetch(&Url::parse("file:///fixture-not-read").unwrap())
