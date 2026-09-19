@@ -1,7 +1,7 @@
 > 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
 
-Obscura speaks the Chrome DevTools Protocol over WebSocket. Puppeteer and
-Playwright can connect to its CDP endpoint for the supported workflows below.
+Obscura speaks the Chrome DevTools Protocol over WebSocket. The supported
+client path is official Playwright Python through `connect_over_cdp`.
 
 ## Start the server
 
@@ -13,66 +13,55 @@ obscura serve --port 9222
 obscura listening on ws://127.0.0.1:9222
 ```
 
-## Puppeteer
-
-```bash
-npm install puppeteer-core
-```
-
-```js
-const puppeteer = require('puppeteer-core');
-
-const browser = await puppeteer.connect({
-  browserWSEndpoint: 'ws://127.0.0.1:9222',
-});
-
-const page = await browser.newPage();
-await page.goto('https://example.com');
-console.log(await page.title()); // "Example Domain"
-
-await browser.disconnect();
-```
-
-Use `puppeteer-core`, not `puppeteer`. The `puppeteer` package bundles a Chrome download.
-
 ## Playwright
 
 ```bash
-npm install playwright
+python -m pip install playwright==1.60.0
 ```
 
-```js
-const { chromium } = require('playwright');
+```python
+import asyncio
+from playwright.async_api import async_playwright
 
-const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222');
-const context = browser.contexts()[0] || await browser.newContext();
-const page = await context.newPage();
+async def main():
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(
+            "ws://127.0.0.1:9222/devtools/browser"
+        )
+        context = browser.contexts[0]
+        page = await context.new_page()
+        await page.goto("https://example.com")
+        print(await page.title())
+        await browser.close()
 
-await page.goto('https://example.com');
-console.log(await page.title());
-
-await browser.close();
+asyncio.run(main())
 ```
 
-Use `connectOverCDP`, not `connect`. Playwright's `connect` speaks Playwright's own protocol, which obscura does not implement.
+Use `connect_over_cdp`, not `connect`. Playwright's `connect` speaks
+Playwright's own protocol, which Obscura does not implement. The qualified
+client version is pinned in [SUMMARY](SUMMARY.md).
 
 ## `waitUntil`
 
-Specify the client wait condition explicitly. Both client navigation APIs default to `load`; Puppeteer accepts `networkidle0/2`, while Playwright uses `networkidle`. Obscura's CLI wait levels are a separate interface.
+Specify the client wait condition explicitly. Playwright defaults to `load` and
+uses `networkidle`. Obscura's CLI wait levels are a separate interface.
 
 ## Compatibility boundary
 
 The handlers cover navigation, evaluation, DOM/input, networking, cookies and render output, but method presence does not certify every parameter or event contract. Current utility-world IDs do not create independent globals. The first observed Playwright 1.60 method slice is recorded in [`automation-cdp-profile.json`](../tools/unblocked/automation-cdp-profile.json); unlisted methods and unvalidated parameter shapes are not qualified. Use the fixed-client results and backlog in [SUMMARY](SUMMARY.md) and [TODO](TODO.md).
 
-The following capture example uses Puppeteer APIs; Playwright equivalents are in its separate guide.
+Puppeteer compatibility is deprecated. It is not a product target or release
+gate, and the compatibility profile is no longer expanded or maintained for
+Puppeteer. Historical Puppeteer initializer entries may remain until their
+removal is shown not to affect Playwright or shared raw CDP behavior.
 
 ## Capture example
 
-```js
-await page.setViewport({ width: 1440, height: 1000 });
-await page.screenshot({ path: 'viewport.png' });
-await page.screenshot({ path: 'full-page.png', fullPage: true });
-await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
+```python
+await page.set_viewport_size({"width": 1440, "height": 1000})
+await page.screenshot(path="viewport.png")
+await page.screenshot(path="full-page.png", full_page=True)
+await page.pdf(path="page.pdf", format="A4", print_background=True)
 ```
 
 Rendering is included in official binaries and requires `--features render`

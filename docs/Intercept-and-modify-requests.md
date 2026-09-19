@@ -1,126 +1,97 @@
-> 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
+# Intercept and modify requests
 
-CDP `Fetch.enable` provides request interception. Coverage must be tested per request type, frame/Worker, phase and parameter combination; this guide does not establish universal interception coverage.
+> The qualified client path is official Playwright Python. `Fetch.enable`
+> coverage must still be tested per request type, frame or Worker, phase, and
+> parameter combination; these examples do not establish universal coverage.
+
+The snippets below run inside an `async def` with an existing Playwright
+`page`; the complete connection scaffold is in
+[Use with Playwright](Use-with-Playwright.md).
 
 ## Block by resource type
 
-Puppeteer:
+```python
+async def block_assets(route):
+    if route.request.resource_type in {"image", "media", "font"}:
+        await route.abort()
+    else:
+        await route.continue_()
 
-```js
-await page.setRequestInterception(true);
-
-page.on('request', req => {
-  if (['image', 'media', 'font'].includes(req.resourceType())) {
-    req.abort();
-  } else {
-    req.continue();
-  }
-});
-```
-
-Playwright:
-
-```js
-await page.route('**/*', route => {
-  if (['image', 'media', 'font'].includes(route.request().resourceType())) {
-    route.abort();
-  } else {
-    route.continue();
-  }
-});
+await page.route("**/*", block_assets)
 ```
 
 ## Block by URL pattern
 
-```js
-// Puppeteer
-page.on('request', req => {
-  const url = req.url();
-  if (url.includes('google-analytics.com') || url.includes('doubleclick.net')) {
-    req.abort();
-  } else {
-    req.continue();
-  }
-});
-```
+```python
+import re
 
-```js
-// Playwright
-await page.route(/google-analytics\.com|doubleclick\.net/, route => route.abort());
+async def block_tracking(route):
+    await route.abort()
+
+await page.route(
+    re.compile(r"google-analytics\.com|doubleclick\.net"),
+    block_tracking,
+)
 ```
 
 ## Modify headers
 
-```js
-// Puppeteer
-page.on('request', req => {
-  req.continue({
-    headers: { ...req.headers(), 'X-Custom': 'value' },
-  });
-});
-```
+```python
+async def add_header(route):
+    await route.continue_(headers={
+        **route.request.headers,
+        "X-Custom": "value",
+    })
 
-```js
-// Playwright
-await page.route('**/*', route => {
-  route.continue({
-    headers: { ...route.request().headers(), 'X-Custom': 'value' },
-  });
-});
+await page.route("**/*", add_header)
 ```
 
 ## Return a fake response
 
-```js
-// Puppeteer
-page.on('request', req => {
-  if (req.url().endsWith('/api/feature-flags')) {
-    req.respond({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ newDashboard: true }),
-    });
-  } else {
-    req.continue();
-  }
-});
-```
+```python
+import json
 
-```js
-// Playwright
-await page.route('**/api/feature-flags', route => {
-  route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    body: JSON.stringify({ newDashboard: true }),
-  });
-});
+async def fulfill_flags(route):
+    await route.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps({"newDashboard": True}),
+    )
+
+await page.route("**/api/feature-flags", fulfill_flags)
 ```
 
 ## Strip analytics in production scrapes
 
-```js
-const BLOCK = [
-  'google-analytics.com',
-  'googletagmanager.com',
-  'doubleclick.net',
-  'facebook.net',
-  'segment.io',
-  'mixpanel.com',
-  'hotjar.com',
-];
+```python
+BLOCK = {
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "facebook.net",
+    "segment.io",
+    "mixpanel.com",
+    "hotjar.com",
+}
 
-page.on('request', req => {
-  if (BLOCK.some(host => req.url().includes(host))) {
-    req.abort();
-  } else {
-    req.continue();
-  }
-});
+async def block_analytics(route):
+    if any(host in route.request.url for host in BLOCK):
+        await route.abort()
+    else:
+        await route.continue_()
+
+await page.route("**/*", block_analytics)
 ```
 
-Built-in: every build ships with a tracker blocklist that handles most of these without per-script setup. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
+Every build also ships with a tracker blocklist. See
+[Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 ## From the Rust library
 
-The patterns above drive interception over CDP from Puppeteer or Playwright. If you embed the engine with the `obscura` crate, the same capability is a native API on `Page`: `on_request` / `on_response` callbacks, an `enable_interception()` channel that can block, mock, or rewrite requests, and `add_preload_script` to run code before the page's own scripts. See [Use as a Rust library](Use-as-a-Rust-library.md#intercept-requests).
+The examples above drive interception over CDP from official Playwright Python.
+Puppeteer is deprecated and is not a compatibility target. If you embed the
+engine with the `obscura` crate, the same capability is a native API on `Page`:
+`on_request` / `on_response` callbacks, an `enable_interception()` channel that
+can block, mock, or rewrite requests, and `add_preload_script` to run code before
+the page's own scripts. See
+[Use as a Rust library](Use-as-a-Rust-library.md#intercept-requests).

@@ -74,7 +74,7 @@ wscat -c ws://127.0.0.1:9222
 > {"id":4,"sessionId":"<sessionId returned by attachToTarget>","method":"Runtime.evaluate","params":{"expression":"document.title"}}
 ```
 
-Useful for reproducing what Puppeteer or Playwright is doing without their abstraction.
+Useful for reproducing what Playwright is doing without its abstraction.
 
 ## Common failure modes
 

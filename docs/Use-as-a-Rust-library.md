@@ -131,6 +131,6 @@ page.goto("https://example.com").await?;
 ## When to use which interface
 
 - Embedding the engine in a Rust service: this crate.
-- Driving from Node/Python with existing Puppeteer/Playwright code: the [CDP server](Connect-Puppeteer-or-Playwright.md).
+- Driving through the supported official Playwright Python path: the [Playwright guide](Use-with-Playwright.md).
 - Giving an AI agent browser tools: the [MCP server](Use-the-MCP-server.md).
 - One-off fetches and scraping from the shell: the [CLI](CLI-reference.md).

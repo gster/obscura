@@ -1,161 +1,161 @@
-> 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
+# Use with Playwright Python
+
+> The qualified client path is unmodified official Playwright Python through
+> `connect_over_cdp`. Method presence does not imply full Playwright or Chrome
+> compatibility; see [SUMMARY](SUMMARY.md) and [TODO](TODO.md).
 
 ## Setup
 
 ```bash
 obscura serve --port 9222
-npm install playwright
+python -m pip install playwright==1.60.0
 ```
 
 ## Connect
 
-```js
-const { chromium } = require('playwright');
+```python
+import asyncio
+from playwright.async_api import async_playwright
 
-const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222');
-const context = browser.contexts()[0] || await browser.newContext();
-const page = await context.newPage();
+async def main():
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(
+            "ws://127.0.0.1:9222/devtools/browser"
+        )
+        context = browser.contexts[0]
+        page = await context.new_page()
+        # Continue with the snippets below inside this function.
+
+asyncio.run(main())
 ```
 
-Use `connectOverCDP`, not `connect`. Playwright's `connect` speaks Playwright's own protocol.
+Use `connect_over_cdp`, not `connect`. Playwright's `connect` speaks
+Playwright's own protocol, which Obscura does not implement.
 
-## Navigate
+The remaining snippets assume `page`, `context`, and `browser` are inside the
+`main()` function above.
 
-```js
-await page.goto('https://example.com');
-await page.goto('https://example.com', { waitUntil: 'load' });
-await page.goto('https://example.com', { waitUntil: 'networkidle' });
+## Navigate and evaluate
+
+```python
+await page.goto("https://example.com", wait_until="load")
+await page.goto("https://example.com", wait_until="networkidle")
+title = await page.title()
+items = await page.locator(".item").evaluate_all(
+    "els => els.map(el => ({text: el.textContent, href: el.href}))"
+)
 ```
 
-Set `waitUntil` explicitly for repeatable comparisons. Playwright navigation defaults to `load` ([official navigation API](https://playwright.dev/python/docs/api/class-page#page-goto)); its API uses `networkidle`, not `networkidle0/2`.
-
-## Evaluate
-
-```js
-const title = await page.evaluate(() => document.title);
-
-const items = await page.$$eval('.item', els => els.map(el => ({
-  text: el.textContent,
-  href: el.querySelector('a')?.href,
-})));
-```
+Set `wait_until` explicitly for repeatable comparisons. Playwright uses
+`networkidle`; Puppeteer's `networkidle0/2` values are outside the supported
+client contract.
 
 ## Interact
 
-```js
-await page.click('#login-button');
-await page.fill('#username', 'alice');
-await page.fill('#password', 'secret');
-
-await page.waitForSelector('#dashboard');
-await page.waitForFunction(() => window.appReady === true);
-```
-
-## Locators
-
-```js
-await page.locator('button.submit').click();
-await page.getByRole('button', { name: 'Submit' }).click();
-await page.getByLabel('Email').fill('alice@example.com');
+```python
+await page.get_by_label("Email").fill("alice@example.com")
+await page.get_by_role("button", name="Submit").click()
+await page.wait_for_selector("#dashboard")
+await page.wait_for_function("window.appReady === true")
 ```
 
 ## Cookies
 
-```js
-await context.addCookies([{
-  name: 'session',
-  value: 'abc123',
-  domain: 'example.com',
-  path: '/',
-}]);
-
-const cookies = await context.cookies();
+```python
+await context.add_cookies([{
+    "name": "session",
+    "value": "abc123",
+    "domain": "example.com",
+    "path": "/",
+}])
+cookies = await context.cookies()
 ```
+
+For session persistence across runs, see
+[Persist cookies and storage](Persist-cookies-and-storage.md).
 
 ## Intercept requests
 
-```js
-await page.route('**/*', route => {
-  if (route.request().resourceType() === 'image') {
-    route.abort();
-  } else {
-    route.continue();
-  }
-});
+```python
+async def route_request(route):
+    if route.request.resource_type == "image":
+        await route.abort()
+    else:
+        await route.continue_()
+
+await page.route("**/*", route_request)
 ```
+
+Coverage must be qualified per resource type, frame or Worker, request phase,
+and parameter combination. See
+[Intercept and modify requests](Intercept-and-modify-requests.md).
 
 ## Multiple pages
 
-```js
-const page1 = await context.newPage();
-const page2 = await context.newPage();
-
-await Promise.all([
-  page1.goto('https://a.example.com'),
-  page2.goto('https://b.example.com'),
-]);
+```python
+page1 = await context.new_page()
+page2 = await context.new_page()
+await page1.goto("https://a.example.com")
+await page2.goto("https://b.example.com")
 ```
 
-Each page owns a V8 isolate. Pages on one CDP connection share its owner thread, so synchronous work can delay that connection; separate isolates do not imply arbitrary parallel execution.
+Each page owns a V8 isolate. Pages on one CDP connection share its owner
+thread, so synchronous work can delay that connection.
 
 ## Screenshots, scrolling, and PDF
 
-```js
-await page.setViewportSize({ width: 1440, height: 1000 });
-await page.screenshot({ path: 'viewport.png' });
-
-await page.evaluate(() => window.scrollTo(0, 1200));
-await page.screenshot({ path: 'scrolled.png' });
-
-await page.screenshot({ path: 'full-page.png', fullPage: true });
-await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
+```python
+await page.set_viewport_size({"width": 1440, "height": 1000})
+await page.screenshot(path="viewport.png")
+await page.evaluate("window.scrollTo(0, 1200)")
+await page.screenshot(path="scrolled.png")
+await page.screenshot(path="full-page.png", full_page=True)
+await page.pdf(path="page.pdf", format="A4", print_background=True)
 ```
 
-A normal screenshot captures the live viewport and scroll position;
-`fullPage: true` captures document space. PDF output is raster-backed.
+A normal screenshot captures the live viewport and scroll position. Full-page
+screenshots capture document space. PDF output is raster-backed.
 
 ## Screencasting
 
 Playwright does not expose CDP screencasting as a page method. Attach a raw CDP
-session to the page, acknowledge every frame, and detach it when finished:
+session, acknowledge every frame, and detach it when finished:
 
-```js
-const client = await context.newCDPSession(page);
+```python
+import base64
 
-client.on('Page.screencastFrame', async ({ data, sessionId }) => {
-  const jpeg = Buffer.from(data, 'base64');
-  // Consume or forward `jpeg` here.
-  await client.send('Page.screencastFrameAck', { sessionId });
-});
+client = await context.new_cdp_session(page)
 
-await client.send('Page.startScreencast', {
-  format: 'jpeg',
-  quality: 80,
-  maxWidth: 1280,
-  maxHeight: 720,
-});
+async def on_frame(event):
+    jpeg = base64.b64decode(event["data"])
+    # Consume or forward jpeg here.
+    await client.send("Page.screencastFrameAck", {
+        "sessionId": event["sessionId"],
+    })
 
-// ...navigate, scroll, and interact...
-
-await client.send('Page.stopScreencast');
-await client.detach();
+client.on("Page.screencastFrame", on_frame)
+await client.send("Page.startScreencast", {
+    "format": "jpeg",
+    "quality": 80,
+    "maxWidth": 1280,
+    "maxHeight": 720,
+})
+# Navigate, scroll, and interact.
+await client.send("Page.stopScreencast")
+await client.detach()
 ```
 
 Frames are activity-driven page captures, not fixed-rate desktop video.
 
 ## Disconnect
 
-```js
-await browser.close();  // closes the CDP connection, leaves obscura serve running
+```python
+await browser.close()  # Leaves obscura serve running.
 ```
 
 ## Current limits
 
-- Playwright `page.video()` and tracing artifacts that require desktop capture
-  are not implemented. Use the raw CDP flow above for page frames.
-- `BrowserContext` storage-state save/restore remains limited; use
-  `--storage-dir` on `obscura serve`, as described in
-  [Persist cookies and storage](Persist-cookies-and-storage.md).
-- Service workers, native media, some Web APIs, long-tail CSS, and compositor
-  behavior remain incomplete relative to Chromium.
-- PDF text is not selectable/searchable and tagged PDF is not yet available.
+- Playwright video and tracing artifacts that require desktop capture are not implemented.
+- BrowserContext storage-state save/restore remains limited; use `--storage-dir`.
+- Service workers, native media, some Web APIs, long-tail CSS, and compositor behavior remain incomplete relative to Chromium.
+- PDF text is not selectable/searchable and tagged PDF is not available.

@@ -1,6 +1,6 @@
 # 当前页面捕获与观察边界
 
-render 构建提供 `Page.captureScreenshot` 和 `Page.startScreencast`；接收 screencast 时须用帧内 sessionId 调用 `Page.screencastFrameAck`。客户端示例见 [Playwright](Use-with-Playwright.md#screencasting) 和 [Puppeteer](Use-with-Puppeteer.md#screencasting)。
+render 构建提供 `Page.captureScreenshot` 和 `Page.startScreencast`；接收 screencast 时须用帧内 sessionId 调用 `Page.screencastFrameAck`。客户端示例见 [Playwright](Use-with-Playwright.md#screencasting)。
 
 捕获必须通过**拥有该页面的同一 CDP 连接**中的 page session。当前 server 为每个连接创建独立上下文和页面注册表，新的 viewer 连接不能发现另一客户端的 target。`obscura fetch` 和 MCP 也不会把其页面注册到独立 `serve` 连接。
 

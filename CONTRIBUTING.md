@@ -91,7 +91,7 @@ The native renderer is shared by every capture surface:
 - CLI `fetch --screenshot` (`-s`), including viewport and full-page captures.
 - CDP `Page.captureScreenshot`, `Page.startScreencast`,
   `Page.stopScreencast`, and `Page.printToPDF`.
-- Puppeteer and Playwright screenshot and PDF calls made through CDP.
+- Qualified Playwright screenshot and PDF calls, plus the underlying raw CDP methods.
 - MCP `browser_screenshot` and `browser_pdf`.
 
 It currently covers block, inline, flex, grid, table, float, positioned,

@@ -59,7 +59,7 @@ requests a fixed `N`-second delay. `--timeout` separately bounds navigation.
 
 ## `obscura serve`
 
-Run the CDP server. Puppeteer and Playwright connect over WebSocket.
+Run the CDP server. The supported client path is official Playwright Python over WebSocket.
 
 ```
 -p, --port <PORT>            CDP port (default 9222)

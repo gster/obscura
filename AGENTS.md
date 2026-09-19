@@ -6,8 +6,9 @@ building, testing, or changing anything.
 
 Obscura is a headless browser engine in Rust. It runs real JavaScript through
 V8 (`deno_core`), keeps a real DOM tree, owns its layout and paint pipeline,
-speaks the Chrome DevTools Protocol, and is a drop-in replacement for headless
-Chrome with Puppeteer and Playwright. Rendering and stealth are both first-class
+speaks the Chrome DevTools Protocol, and exposes the qualified subset through
+official Playwright Python. Puppeteer compatibility is deprecated and is not a
+product or regression target. Rendering and stealth are both first-class
 capabilities. It targets web scraping and AI-agent automation.
 
 ## Build
@@ -77,7 +78,7 @@ edit instead.
 - **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy` and `--allow-private-network` are global flags, valid before or after the subcommand and applied to every product entry point.
 - **obscura-cdp** — Chrome DevTools Protocol server (WebSocket). Managed page
   sessions use `"{targetId}-session"`; explicit flattened attachments receive
-  distinct session ids so Playwright and Puppeteer can open raw page sessions.
+  distinct session ids so Playwright can open raw page sessions.
 - **obscura-js** — V8/`deno_core` runtime. `js/bootstrap.js` is the DOM/browser shim; `src/ops.rs` bridges JS to Rust DOM ops; `src/runtime.rs` owns the isolate and the per-page `ObscuraState`.
 - **obscura-dom** — DOM tree (`src/tree.rs`).
 - **obscura-net** — HTTP client (`client.rs`), stealth client (`stealth_client.rs`, `stealth_transport.rs`), cookie jar, robots cache, tracker blocklist.

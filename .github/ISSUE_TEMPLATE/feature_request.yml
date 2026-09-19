@@ -14,7 +14,7 @@ body:
         - JavaScript or DOM behavior
         - Rendering, layout, or paint
         - Screenshot, screencast, or PDF output
-        - CDP, Puppeteer, or Playwright compatibility
+        - CDP or official Playwright Python compatibility
         - Networking, cookies, or proxies
         - CLI or MCP
         - Rust API

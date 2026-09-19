@@ -37,7 +37,7 @@ body:
       label: How are you using obscura?
       options:
         - CLI (fetch / serve / scrape / mcp)
-        - CDP server with Puppeteer or Playwright
+        - CDP server with official Playwright Python
         - Embedded Rust library (obscura crate)
         - Other
     validations:
@@ -50,7 +50,7 @@ body:
         - JavaScript or DOM behavior
         - Rendering, layout, or paint
         - Screenshot, screencast, or PDF output
-        - CDP, Puppeteer, or Playwright compatibility
+        - CDP or official Playwright Python compatibility
         - Networking, cookies, or proxies
         - CLI or MCP
         - Build, packaging, or installation

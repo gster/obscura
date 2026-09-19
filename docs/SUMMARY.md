@@ -29,7 +29,7 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 | 当前 CI pin 的完整 obstacle course | **33/33** | Obscura release render 二进制，`--runs 1 --warmup 0` |
 | deterministic render fixtures | Obscura **66/66** 捕获且行为断言无失败；双方 132 张图均可解码、900×1000、非纯色 | 系统 Chrome 153 有 4 条固化字体/表单几何参考断言失败，故 harness 总退出 1；完整记录该环境差异，不把它计成全绿 |
 | representative top/bottom captures | top、bottom 均退出 0，各 **15/15** 双引擎捕获；有效 fidelity 分别 10/15、11/15 | 1440×1000、默认 3 秒 settle、固定动画时刻；Remix 双方内容为空，另有捕获边界状态不稳项被排除，不从像素距离单独推断正确性 |
-| 官方 Playwright Python **1.58.0** async/CDP | 连接、建页、导航、title、label fill、role click、DOM 结果、evaluate、关闭均成功 | 单个本地合成页面；填写 `audit` 后输出确为 `audit`，evaluate 为 2；没有官方包补丁；没有完整 API/多平台认证 |
+| 较早的官方 Playwright Python **1.58.0** async/CDP 证据 | 连接、建页、导航、title、label fill、role click、DOM 结果、evaluate、关闭均成功 | 历史单页证据；当前必需门槛已固定为 1.60.0，见下文；没有完整 API/多平台认证 |
 | raw WebSocket/CDP 和 CLI 本地夹具 | 复现下节 6 项行为 | 使用本次 render 二进制；不涉及真实网站或凭据 |
 
 4 个 skip 对应源码中的 ignored tests：`benchmark_sparse_cascade_hot_path`、`concurrency_5_does_not_abort_v8`、`http_control_plane_unblocked_during_long_js`、`fetch_intercept_concurrency_5_does_not_abort_v8`。没有把忽略项算作通过。
@@ -135,7 +135,7 @@ shopping 不再 403 且有有效航班/报价结果现已列为 OB-046 的重要
 | [Architecture](Architecture-overview.md)、[Adding API](Adding-a-CDP-method-or-Web-API.md)、[Testing](Testing-and-debugging.md) | 修正 isolate/连接模型、域路由模板、错误 crypto 示例和不存在的测试入口 |
 | [Build](Build-from-source.md)、[Installation](Installation.md)、[Production](Run-in-production-at-scale.md) | 固定 fork 构建；不沿用 upstream latest 安装/资格；Dockerfile 仅 render，未认证容器 |
 | [CLI](CLI-reference.md)、[Environment](Environment-variables.md)、[Stealth/proxy](Configure-stealth-and-proxies.md) | 修正存储、DNS/代理边界、默认身份/WebGL 等过强说明 |
-| [Connect](Connect-Puppeteer-or-Playwright.md)、[Playwright](Use-with-Playwright.md)、[Puppeteer](Use-with-Puppeteer.md)、[Interception](Intercept-and-modify-requests.md) | 参考用法；修正客户端等待值、Puppeteer fill 和全覆盖承诺；完整客户端仍未认证 |
+| [Connect](Connect-Puppeteer-or-Playwright.md)、[Playwright](Use-with-Playwright.md)、[Puppeteer 弃用边界](Use-with-Puppeteer.md)、[Interception](Intercept-and-modify-requests.md) | 官方 Playwright Python 是唯一客户端兼容目标；Puppeteer 已弃用，不再新增或维护其 profile 资格，遗留 initializer 待确认不影响 Playwright/raw CDP 后清理；完整 Playwright 客户端仍未认证 |
 | [Persistence](Persist-cookies-and-storage.md)、[Live view](Watch-agent-sessions-live.md) | 重写实际持久化和连接所有权边界，撤下无效跨连接 viewer 教程 |
 | [Rust library](Use-as-a-Rust-library.md)、[Isolated runtime](Use-the-isolated-runtime.md) | 底层嵌入与迁移期私有协议分开；移除外部消费仓库当前状态猜测 |
 | [First fetch](Your-first-fetch.md)、[Extract](Extract-data.md)、[Markdown](Markdown-extraction.md)、[MCP](Use-the-MCP-server.md) | 保留的 CLI/MCP 使用参考；与尚未实现的统一身份/传输目标分开 |

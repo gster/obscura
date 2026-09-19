@@ -1,6 +1,6 @@
 ---
 name: obscura
-description: Operate and validate Obscura for JavaScript page loading, stealth browsing, anti-fingerprinting, tracker blocking, screenshots and visual comparison, CDP automation with Puppeteer or Playwright, screencasting, PDF export, MCP browser interaction, and web extraction. Use when running Obscura against deterministic fixtures or real sites, diagnosing rendering, geometry, resource, identity, or transport failures, or choosing the correct CLI, CDP, MCP, rendering, or stealth workflow.
+description: Operate and validate Obscura for JavaScript page loading, stealth browsing, anti-fingerprinting, tracker blocking, screenshots and visual comparison, CDP automation with official Playwright Python, screencasting, PDF export, MCP browser interaction, and web extraction. Use when running Obscura against deterministic fixtures or real sites, diagnosing rendering, geometry, resource, identity, or transport failures, or choosing the correct CLI, CDP, MCP, rendering, or stealth workflow.
 ---
 
 # Obscura
@@ -67,9 +67,10 @@ Start the server:
 obscura serve --port 9222
 ```
 
-Connect Puppeteer with `puppeteer-core` or Playwright with
-`chromium.connectOverCDP`. Standard `page.screenshot()` supports viewport and
-full-page capture; `page.pdf()` produces raster-backed print output. Scroll
+Connect unmodified official Playwright Python with
+`chromium.connect_over_cdp`. Standard `page.screenshot()` supports viewport
+and full-page capture; `page.pdf()` produces raster-backed print output.
+Puppeteer compatibility is deprecated and is not a validation target. Scroll
 with page JavaScript before a viewport capture when the user wants a lower
 section of the page.
 

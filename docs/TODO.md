@@ -4,7 +4,7 @@
 审阅基线：`e67e67b11eb265f097942055962622e43fcb9a16`
 总体方案：[新架构](New_ACH.md)；当前证据：[SUMMARY](SUMMARY.md)
 
-根本目标是：面向机票采购效率，完成对 RPA 友好、性能突出、在服务端可观察的行为与指纹上与固定参考 Chrome 一致，并具备强匿踪、反追踪和防身份标记能力的浏览器内核，降低身份关联被用于差异化报价、侵害消费权益的风险。CDP-first 和官方 Playwright Python 是实现路径，不替代这些产品目标。反追踪不等于主动设置 `DNT=1`。
+根本目标是：面向机票采购效率，完成对 RPA 友好、性能突出、在服务端可观察的行为与指纹上与固定参考 Chrome 一致，并具备强匿踪、反追踪和防身份标记能力的浏览器内核，降低身份关联被用于差异化报价、侵害消费权益的风险。CDP-first 和官方 Playwright Python 是实现路径，不替代这些产品目标。Puppeteer 兼容已弃用，不再作为 Automation CDP Profile 的新增/维护资格目标或发布门槛；现有 profile 中仍可能保留历史 Puppeteer initializer，清理前必须确认不影响 Playwright/raw CDP 共用行为。反追踪不等于主动设置 `DNT=1`。
 
 ## 使用规则
 
@@ -46,6 +46,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 依赖：OB-026。入口：crates/obscura-cdp/src/dispatch.rs、domains/、types.rs。
 现状：当前 raw protocol 中的 37 个发送方法均已进入 `tools/unblocked/automation-cdp-profile.json`，CI 会直接读取未改写的完整日志并持续对账；官方 locator 路径新增覆盖 `DOM.getContentQuads`、`DOM.scrollIntoViewIfNeeded`、`Input.dispatchMouseEvent` 与 `Input.insertText`，并通过 `Runtime.callFunctionOn` 执行单选和多选 select option。截图路径固定 320×240 viewport，验证 `Page.getLayoutMetrics` 与 `Page.captureScreenshot`，解码 PNG 像素证明画面非空，并完整保留 PNG 数据。独立 context 路径验证 create/use/dispose、同源 localStorage/全局对象隔离、默认页面存活和默认 1280×720 指标；同一显式 context 的双页面路径验证 `Target.closeTarget`、关闭页拒绝后续 evaluation，以及存活页的闭包、Promise、remote handle 和 document 不受影响。生命周期探针先由服务端确认 B 页 fetch 仍被挂起，记录 close 边界后才释放响应，并完整保留分阶段 console 事件；本次 close 后事件为空。截图格式/选项全矩阵、代理等 context options、断连清理和完整 context 生命周期尚未取得资格。不存在的 `Log.auditMethodDoesNotExist` 及已限定 initializer 的越界参数会明确失败。utility world 真隔离、完整 actionability/focus/user-activation 语义、未列方法和未逐项验证的非法参数仍标为未完成或 not-qualified，不能从本切片外推。
+范围修正：Puppeteer 已弃用。清理仅为 Puppeteer 保留的 utility-world 默认值、测试命名和客户端特例时，必须先确认不影响官方 Playwright Python 与 raw CDP 的已登记行为；Puppeteer 专属行为不再新增或作为回归门槛。
 动作：逐方法标记 SUPPORTED / LIMITED / VERIFIED_NOOP / UNSUPPORTED，实施/验证状态另存；覆盖参数组合、返回、事件、作用域、错误。审计整域空成功和 Browser 域占位行为。
 完成：最终迁移范围内的未知方法、非法参数明确失败；no-op 仅是有依据的精确允许项；版本号/空对象/初始化成功不能充当资格证据。正式 Python smoke 保持必需测试，profile 与实际 raw protocol 方法集合持续对账。
 
