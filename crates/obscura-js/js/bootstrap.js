@@ -4352,7 +4352,12 @@ class Element extends Node {
     }
   }
   get text() {
-    if (['option', 'script', 'title', 'a'].includes(this.localName)) {
+    if (this.localName === 'option') {
+      return this.textContent
+        .replace(/[\t\n\f\r ]+/g, ' ')
+        .replace(/^ | $/g, '');
+    }
+    if (['script', 'title', 'a'].includes(this.localName)) {
       return this.textContent;
     }
     return undefined;
@@ -12579,6 +12584,17 @@ for (const [tag, name] of Object.entries({
   _htmlElementClasses[tag] = type;
   globalThis[name] = type;
 }
+globalThis.HTMLOptionElement = class HTMLOptionElement extends HTMLElement {
+  get label() {
+    const label = this.getAttribute('label');
+    return label === null ? this.text : label;
+  }
+  set label(value) { this.setAttribute('label', String(value)); }
+};
+Object.defineProperty(globalThis.HTMLOptionElement.prototype, Symbol.toStringTag, {
+  value: 'HTMLOptionElement', configurable: true
+});
+_htmlElementClasses.OPTION = globalThis.HTMLOptionElement;
 Object.defineProperty(globalThis.HTMLInputElement.prototype, 'onsearch', {
   configurable: true, enumerable: true, writable: true, value: null,
 });
@@ -19140,6 +19156,7 @@ for (const [name, members] of Object.entries({
   HTMLTextAreaElement: 'autocomplete defaultValue disabled form maxLength minLength name placeholder readOnly required selectionDirection selectionEnd selectionStart type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity select setRangeText setSelectionRange',
   HTMLButtonElement: 'disabled form formAction formaction formEnctype formMethod formNoValidate formTarget name type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
   HTMLSelectElement: 'autocomplete disabled form length multiple name required selectedIndex size type value validity validationMessage willValidate checkValidity reportValidity setCustomValidity',
+  HTMLOptionElement: 'disabled label selected text value',
   HTMLScriptElement: 'src type text innerText innerHTML textContent async defer crossOrigin integrity referrerPolicy noModule',
   HTMLIFrameElement: 'src srcdoc name width height contentDocument contentWindow',
   HTMLStyleElement: 'media type disabled sheet',

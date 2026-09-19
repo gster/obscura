@@ -92,12 +92,21 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         """(() => {
                           globalThis.__obscuraLocatorEvents = [];
                           const input = document.querySelector('#name');
+                          const select = document.querySelector('#city');
                           const button = document.querySelector('#submit');
                           for (const type of ['focus', 'input', 'change']) {
                             input.addEventListener(type, event => {
                               __obscuraLocatorEvents.push({
                                 target: 'input', type, trusted: event.isTrusted,
                                 value: input.value
+                              });
+                            });
+                          }
+                          for (const type of ['input', 'change']) {
+                            select.addEventListener(type, event => {
+                              __obscuraLocatorEvents.push({
+                                target: 'select', type, trusted: event.isTrusted,
+                                value: select.value
                               });
                             });
                           }
@@ -110,14 +119,17 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                           }
                         })()"""
                     )
+                    result["selectedOptions"] = None
                     try:
                         page.get_by_label("Name").fill("official-playwright")
+                        result["selectedOptions"] = page.get_by_label("City").select_option("pek")
                         page.get_by_role("button", name="Submit").click()
                     finally:
                         try:
                             result["locator"] = page.evaluate(
                                 """({
                                   input: document.querySelector('#name').value,
+                                  city: document.querySelector('#city').value,
                                   result: document.querySelector('#result').textContent,
                                   activeElement: document.activeElement && document.activeElement.id,
                                   events: globalThis.__obscuraLocatorEvents
@@ -134,6 +146,8 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         raise AssertionError(f"unexpected initial page state: {initial!r}")
                     if locator["input"] != "official-playwright":
                         raise AssertionError(f"locator fill did not update the input: {locator!r}")
+                    if result["selectedOptions"] != ["pek"] or locator["city"] != "pek":
+                        raise AssertionError(f"locator select did not choose Beijing: {locator!r}")
                     if locator["result"] != "official-playwright":
                         raise AssertionError(f"locator click did not update the output: {locator!r}")
                     observed_events = [
@@ -142,6 +156,8 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                     required_events = [
                         ("input", "focus"),
                         ("input", "input"),
+                        ("select", "input"),
+                        ("select", "change"),
                         ("button", "mousedown"),
                         ("button", "mouseup"),
                         ("button", "click"),
@@ -149,8 +165,10 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                     positions = [observed_events.index(event) for event in required_events]
                     if positions != sorted(positions):
                         raise AssertionError(f"locator events are out of order: {locator!r}")
-                    if not all(event.get("trusted") is True for event in locator["events"]):
-                        raise AssertionError(f"locator emitted an untrusted event: {locator!r}")
+                    for event in locator["events"]:
+                        expected_trusted = event["target"] != "select"
+                        if event.get("trusted") is not expected_trusted:
+                            raise AssertionError(f"locator event trust differs from Chrome: {locator!r}")
 
                     session = context.new_cdp_session(page)
                     document = trace.send(

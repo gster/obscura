@@ -18120,6 +18120,42 @@ return {before,removed,reinsert,moved,cleared};
             .contains(r#"<option value="en" selected="">English</option>"#));
     }
 
+    #[test]
+    fn option_label_matches_the_html_interface_contract() {
+        let mut rt = setup_runtime(
+            "<html><body><select><option id='plain'>  Shanghai\n city </option><option id='nbsp'>\u{a0}Beijing\u{a0}</option><option id='named' label='Capital'>Beijing</option></select><div id='other'></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const plain = document.getElementById('plain');
+                    const nbsp = document.getElementById('nbsp');
+                    const named = document.getElementById('named');
+                    named.label = 'Capital city';
+                    return JSON.stringify({
+                        plainLabel: plain.label,
+                        plainText: plain.text,
+                        nbspText: nbsp.text,
+                        namedLabel: named.label,
+                        reflectedLabel: named.getAttribute('label'),
+                        optionBrand: plain instanceof HTMLOptionElement,
+                        descriptorOwner: Object.hasOwn(HTMLOptionElement.prototype, 'label'),
+                        unrelatedElementHasLabel: 'label' in document.getElementById('other'),
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["plainLabel"], "Shanghai city");
+        assert_eq!(value["plainText"], "Shanghai city");
+        assert_eq!(value["nbspText"], "\u{a0}Beijing\u{a0}");
+        assert_eq!(value["namedLabel"], "Capital city");
+        assert_eq!(value["reflectedLabel"], "Capital city");
+        assert_eq!(value["optionBrand"], true);
+        assert_eq!(value["descriptorOwner"], true);
+        assert_eq!(value["unrelatedElementHasLabel"], false);
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]
