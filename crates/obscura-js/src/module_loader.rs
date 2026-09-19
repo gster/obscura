@@ -78,8 +78,8 @@ pub struct ObscuraModuleLoader {
     /// entry module. Directly-constructed standalone loaders remain supported.
     page_state: Option<Weak<RefCell<ObscuraState>>>,
     /// Directly-constructed loaders still use Obscura's network policy and
-    /// connection pool; they simply have an isolated cookie jar.
-    standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
+    /// connection pool, with an isolated cookie jar and default calibrated persona.
+    standalone_client: Option<Arc<obscura_net::StealthHttpClient>>,
     import_map: Rc<RefCell<ImportMap>>,
     activity: Arc<ModuleLoadActivity>,
     /// Canonical and requested specifiers fetched into deno_core's module map.
@@ -104,9 +104,13 @@ impl ObscuraModuleLoader {
         proxy_url: Option<String>,
         import_map: Rc<RefCell<ImportMap>>,
     ) -> Self {
-        let standalone_client = Arc::new(obscura_net::ObscuraHttpClient::with_options(
-            Arc::new(obscura_net::CookieJar::new()),
-            proxy_url.as_deref(),
+        let cookie_jar = Arc::new(obscura_net::CookieJar::new());
+        let policy = Arc::new(obscura_net::ObscuraHttpClient::with_options(
+            cookie_jar.clone(), proxy_url.as_deref(),
+        ));
+        let standalone_client = Arc::new(obscura_net::StealthHttpClient::with_policy_profile_persona(
+            cookie_jar, proxy_url.as_deref(), policy,
+            obscura_net::StealthProfile::default(), "en-US,en;q=0.9", None,
         ));
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
@@ -221,25 +225,15 @@ impl ModuleLoader for ObscuraModuleLoader {
                     .try_borrow()
                     .map_err(|_| "Module loader page state is already borrowed".to_string())?;
                 let client = state
-                    .http_client
+                    .stealth_client
                     .clone()
-                    .ok_or_else(|| "No http_client wired to module loader".to_string())?;
-                // An ES module must be fetched over the
-                // same transport as the document. Upstream sends it through the
-                // plain reqwest client, so a `type="module"` script arrives with
-                // a different TLS fingerprint and none of the browser identity
-                // headers, while the HTML that referenced it came over primp.
-                // That cross-transport mismatch is trivially detectable.
-                let stealth = state.stealth_client.clone();
-                Ok((client, stealth, state.callbacks.clone(), state.referrer_policy))
+                    .ok_or_else(|| "No persona-owned primp client wired to module loader".to_string())?;
+                Ok((client, state.callbacks.clone(), state.referrer_policy))
             })(),
             None => self
                 .standalone_client
                 .clone()
-                .map(|client| {
-                    let stealth = None;
-                    (client, stealth, None, obscura_net::ReferrerPolicy::default())
-                })
+                .map(|client| (client, None, obscura_net::ReferrerPolicy::default()))
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
 
@@ -255,31 +249,16 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, stealth, callbacks, referrer_policy)) => {
+                Ok((client, callbacks, referrer_policy)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     let mut request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
                     request.referrer_policy = referrer_policy;
-                    let resp = match stealth {
-                        Some(stealth) => stealth
-                            .fetch_resource_with_callbacks(
-                                &requested,
-                                request,
-                                callbacks.as_deref(),
-                            )
-                            .await,
-                        None => {
-                            client
-                                .fetch_resource_with_callbacks(
-                                    &requested,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                                .await
-                        }
-                    }
-                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    let resp = client
+                        .fetch_resource_with_callbacks(&requested, request, callbacks.as_deref())
+                        .await
+                        .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",
@@ -306,5 +285,131 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Err(error) => Err(io_err(error)),
             }
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    async fn load(loader: &ObscuraModuleLoader, url: &str) -> Result<ModuleSource, ModuleLoaderError> {
+        let url = ModuleSpecifier::parse(url).unwrap();
+        match loader.load(&url, None, false, RequestedModuleType::None) {
+            ModuleLoadResponse::Sync(result) => result,
+            ModuleLoadResponse::Async(future) => future.await,
+        }
+    }
+
+    fn proxy(response: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buffer = [0; 4096];
+                let length = socket.read(&mut buffer).unwrap();
+                assert!(length > 0);
+                request.extend_from_slice(&buffer[..length]);
+            }
+            socket.write_all(response).unwrap();
+            request
+        });
+        (format!("http://{address}"), thread)
+    }
+
+    #[tokio::test]
+    async fn standalone_module_uses_persona_proxy_and_isolated_cookies() {
+        let (proxy_url, server) = proxy(b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 17\r\nConnection: close\r\n\r\nexport default 7;");
+        let loader = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
+        let client = loader.standalone_client.as_ref().unwrap();
+        client.cookie_jar.set_cookie("session=raw-secret; Path=/", &ModuleSpecifier::parse("http://example.com/").unwrap());
+        client.set_extra_headers(std::collections::HashMap::from([
+            ("x-module-test".into(), "complete-header".into()),
+        ])).await;
+        let result = load(&loader, "http://example.com/entry.js").await.unwrap();
+        let ModuleSourceCode::String(code) = result.code else { panic!("expected decoded module source") };
+        assert_eq!(code.as_str(), "export default 7;");
+        let request = String::from_utf8(server.join().unwrap()).unwrap();
+        let lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("GET http://example.com/entry.js HTTP/1.1\r\n"), "{request}");
+        for header in [
+            format!("user-agent: {}\r\n", obscura_net::StealthProfile::default().user_agent().to_ascii_lowercase()),
+            "sec-ch-ua-platform: \"windows\"\r\n".into(),
+            "accept-language: en-us,en;q=0.9\r\n".into(),
+            "sec-fetch-dest: script\r\n".into(),
+            "cookie: session=raw-secret\r\n".into(),
+            "x-module-test: complete-header\r\n".into(),
+        ] {
+            assert!(lower.contains(&header), "missing {header:?} in {request}");
+        }
+        let other = ObscuraModuleLoader::new("http://example.com/");
+        assert!(other.standalone_client.as_ref().unwrap().cookie_jar
+            .get_cookie_header(&ModuleSpecifier::parse("http://example.com/").unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn standalone_module_preserves_file_and_rejects_data_scheme() {
+        let path = std::env::temp_dir().join(format!("obscura-module-{}.js", std::process::id()));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        file.write_all(b"export default 'local';").unwrap();
+        let url = ModuleSpecifier::from_file_path(&path).unwrap();
+        let loader = ObscuraModuleLoader::new(url.as_str());
+        let result = load(&loader, url.as_str()).await;
+        std::fs::remove_file(path).unwrap();
+        let ModuleSourceCode::String(code) = result.unwrap().code else { panic!("expected decoded module source") };
+        assert_eq!(code.as_str(), "export default 'local';");
+        let error = load(&loader, "data:text/javascript,export%20default%201").await.unwrap_err();
+        assert!(error.to_string().contains("Forbidden URL scheme"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn standalone_module_rejects_private_initial_and_redirect_targets() {
+        let loader = ObscuraModuleLoader::new("http://127.0.0.1/");
+        let error = load(&loader, "http://127.0.0.1/entry.js").await.unwrap_err();
+        assert!(error.to_string().contains("private/internal IP address"), "{error}");
+        let (proxy_url, server) = proxy(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/private.js\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let loader = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
+        let error = load(&loader, "http://example.com/entry.js").await.unwrap_err();
+        assert!(error.to_string().contains("private/internal IP address"), "{error}");
+        assert!(!server.join().unwrap().is_empty());
+    }
+
+    struct FulfillModule;
+
+    impl obscura_net::interceptor::RequestInterceptor for FulfillModule {
+        fn intercept<'a, 'b, 'c>(
+            &'a self, request: &'b obscura_net::RequestInfo,
+        ) -> Pin<Box<dyn std::future::Future<Output = obscura_net::interceptor::InterceptAction> + Send + 'c>>
+        where 'a: 'c, 'b: 'c, Self: 'c {
+            Box::pin(async move {
+                assert_eq!(request.resource_type, obscura_net::ResourceType::Script);
+                obscura_net::interceptor::InterceptAction::Fulfill(obscura_net::Response {
+                    status: 200, url: request.url.clone(), headers: Default::default(),
+                    body: b"export default 'intercepted';".to_vec(),
+                    redirected_from: Vec::new(), request_referrer: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn page_module_keeps_bound_primp_interceptor_without_plain_client() {
+        let policy = Arc::new(obscura_net::ObscuraHttpClient::new());
+        *policy.interceptor.write().await = Some(Arc::new(FulfillModule));
+        let client = Arc::new(obscura_net::StealthHttpClient::with_policy_profile_persona(
+            policy.cookie_jar.clone(), None, policy,
+            obscura_net::StealthProfile::MacChrome153, "en-US,en;q=0.9", None,
+        ));
+        let state = Rc::new(RefCell::new(ObscuraState::new()));
+        state.borrow_mut().stealth_client = Some(client);
+        let loader = ObscuraModuleLoader::with_page_state(
+            "https://example.com/", None, &state, state.borrow().import_map.clone(),
+        );
+        let result = load(&loader, "https://example.com/entry.js").await.unwrap();
+        let ModuleSourceCode::String(code) = result.code else { panic!("expected decoded module source") };
+        assert_eq!(code.as_str(), "export default 'intercepted';");
     }
 }

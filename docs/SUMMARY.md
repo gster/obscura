@@ -18,7 +18,7 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 | 检查 | 本次结果 | 边界 |
 | --- | --- | --- |
-| 根 release nextest，render | **1823 passed，4 skipped，0 failed** | OB-012 renderer/robots/interceptor/networkidle 切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
+| 根 release nextest，render | **1828 passed，4 skipped，0 failed** | OB-012 renderer/robots/interceptor/networkidle/module loader 切片后的完整 workspace 门禁；不是完整客户端或多平台资格 |
 | 独立 runtime release nextest，locked | **185 passed，0 skipped** | runtime 普通依赖已无条件包含 primp；不能替代全部网络/线级测试 |
 | 指定 release CLI build，render | **通过** | 默认产品构建无条件包含 primp |
 | 指定 release CLI build，no-default-features | **通过** | 无渲染产物仍包含 primp；不能借 feature 组合关闭该能力 |
@@ -38,13 +38,13 @@ CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径�
 
 OB-044 本轮删除 CLI/serve 的 `--stealth`、`--user-agent`、`OBSCURA_STEALTH`、scrape worker 转发和嵌入 API 开关；CDP、MCP、CLI、Page 与独立 runtime 的产品路径默认使用 primp。Cargo `stealth` feature 只保留为空兼容别名，不能改变行为；发布矩阵不再生成有无 stealth 的组合。强制路径同时保留子资源缓存合并，将 JS fetch/XHR 的完整响应体和网络事件写入 CDP/MCP 观察面，并以原字节或明确 Base64 保存二进制响应。persona 在 BrowserContext 初始化时同时确定 primp 传输配置与 JavaScript 身份，并在 context 生命周期内保持不变；运行中的 CDP User-Agent 覆盖明确不支持。全出口盘点、完整 persona 编译器和 Docker 干净构建仍由 OB-012/015/016/042 跟进，OB-044 保持未关闭。
 
-OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓存改为只消费已注入字节；robots.txt 改走 persona-owned primp，并验证其与导航使用同一 persona User-Agent；每个 Page 的 primp 与其 detached Worker 共享 transport in-flight 计数，兄弟 Page 保持隔离，`networkidle` 合并观察互斥的预发送/CDP 拦截与 primp 传输阶段；native policy `RequestInterceptor` 保留完整二进制请求体。审计同时确认 standalone runtime/module loader 及公开 `ObscuraHttpClient` 仍有 reqwest 出口，CORS/取消/体积限制、最终线上请求头、重复与非 UTF-8 头、完整响应体保存、Beacon/下载仍有缺口，因此 OB-012 只记录为部分完成。
+OB-012 本轮移除 renderer 的隐式 `ureq` 图片出口，将默认资源缓存改为只消费已注入字节；robots.txt 改走 persona-owned primp，并验证其与导航使用同一 persona User-Agent；每个 Page 的 primp 与其 detached Worker 共享 transport in-flight 计数，兄弟 Page 保持隔离，`networkidle` 合并观察互斥的预发送/CDP 拦截与 primp 传输阶段；native policy `RequestInterceptor` 保留完整二进制请求体。页面和独立 ES module loader 也已改为只经 primp 获取 HTTP(S) module：页面要求已绑定 persona-owned primp，独立 loader 使用固定默认 persona 和隔离 Cookie jar，并继续执行统一资源策略。其他 standalone runtime 资源路径及公开 `ObscuraHttpClient` 仍有 reqwest 出口，CORS/取消/体积限制、最终线上请求头、重复与非 UTF-8 头、完整响应体保存、Beacon/下载仍有缺口，因此 OB-012 只记录为部分完成。
 
 本次未运行：Linux 原生验证、完整官方客户端矩阵、WPT、24h 长稳、受控性能/TLS/H2 测量、Docker 构建、Southwest/ZG 现场流程和报价对照。没有新的生产发布或部署结论。
 
 ### 构建与证据定位
 
-本次 render CLI SHA-256：`49a8b12d38c36cfed31e2075f7522131f4e6202eb5bc826c213ec7cde73f4e41`（122127456 bytes）。
+本次 render CLI SHA-256：`a57b36df1bdad0cd9b0b05fc266603fa8f58d8202ab4a63fce564acd5a62b780`（122081984 bytes）。
 
 - 根 Cargo.lock SHA-256：`3a8256dacf51bd2ac0f6491f97360d845094a34b77ce2669b54244de075057fb`。
 - runtime/Cargo.lock SHA-256：`bb4ee97177ebcb698cf1b9dc082aa889d9bbf9ed4ba55620c4e61713c893ebc0`。
@@ -105,7 +105,7 @@ raw CDP 复验次序：创建并 attach target → Page.navigate 本地页面 �
 
 Cookie 键已区分 domain/name/path，已有 host-only、HttpOnly 写保护和过期导入回归；应修剩余语义，不从旧快照重新实现已有保护。iframe/fragment、Text 更新、表单传输、预检和原生输入已有修复，现有回归位于 browser/page、JS runtime/bootstrap、net 与独立 runtime tests；迁移时保留这些能力。保留成果与回归，不据此夸大完整标准资格。
 
-页面所有的产品传输当前强制使用 primp；standalone runtime/module loader 的 reqwest fallback 与 `wreq_client` 兼容别名仍是待删除迁移项。V8 依赖通常取预构建 archive；`V8_FROM_SOURCE` 才走源码构建，本项目还会执行 bootstrap snapshot 生成。旧“首次必编译 V8、固定五分钟”不是准确的构建契约。
+页面所有的产品传输及页面/独立 ES module loader 当前强制使用 primp；其他 standalone runtime 资源路径的 reqwest fallback 与 `wreq_client` 兼容别名仍是待删除迁移项。V8 依赖通常取预构建 archive；`V8_FROM_SOURCE` 才走源码构建，本项目还会执行 bootstrap snapshot 生成。旧“首次必编译 V8、固定五分钟”不是准确的构建契约。
 
 ## Southwest 与历史记录的结论
 

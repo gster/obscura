@@ -22891,9 +22891,15 @@ return {before,removed,reinsert,moved,cleared};
 
             for _ in 0..request_count {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = vec![0u8; 8192];
-                let length = stream.read(&mut request).unwrap();
-                let request = String::from_utf8_lossy(&request[..length]).to_string();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let length = stream.read(&mut buffer).unwrap();
+                    assert!(length > 0);
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                let request = String::from_utf8(request).unwrap();
                 let lower_request = request.to_ascii_lowercase();
                 let path = request
                     .lines()
@@ -22913,7 +22919,7 @@ return {before,removed,reinsert,moved,cleared};
                     (ModuleGraphFixture::CookieProtected, "/child.js")
                         if lower_request.contains("\r\ncookie: session=ok\r\n")
                             && lower_request
-                                .contains("\r\nuser-agent: modulegraphtest/1.0\r\n")
+                                .contains(&format!("\r\nuser-agent: {}\r\n", obscura_net::StealthProfile::MacChrome153.user_agent().to_ascii_lowercase()))
                             && lower_request.contains("\r\nx-module-test: shared\r\n") =>
                     {
                         ("200 OK", "", "export const value = 'cookie-child';")
@@ -23022,6 +23028,33 @@ return {before,removed,reinsert,moved,cleared};
         (format!("http://{}", address), requests_rx)
     }
 
+    async fn bind_module_test_network(
+        rt: &mut ObscuraJsRuntime,
+        policy: std::sync::Arc<obscura_net::ObscuraHttpClient>,
+    ) {
+        let profile = obscura_net::StealthProfile::MacChrome153;
+        let primp = std::sync::Arc::new(obscura_net::StealthHttpClient::with_policy_profile_persona(
+            policy.cookie_jar.clone(), policy.proxy_url(), policy.clone(),
+            profile, "en-US,en;q=0.9", None,
+        ));
+        primp.set_extra_headers(policy.extra_headers.read().await.clone()).await;
+        rt.set_user_agent(profile.user_agent());
+        let (platform, ua_platform, version) = profile.platform();
+        rt.set_platform(platform, ua_platform, version);
+        rt.set_user_agent_details(profile.full_version(), "arm");
+        rt.set_cookie_jar(policy.cookie_jar.clone());
+        rt.set_http_client(policy);
+        rt.set_stealth_client(primp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_graph_requires_bound_persona_transport() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        let error = rt.load_module("https://example.com/entry.js", 1_000).await.unwrap_err();
+        assert!(error.contains("No persona-owned primp client wired to module loader"), "{error}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn entry_module_http_failure_is_not_evaluated_as_empty_source() {
         let base = spawn_one_response_server("404 Not Found", "not found");
@@ -23030,7 +23063,7 @@ return {before,removed,reinsert,moved,cleared};
             jar, None, true,
         ));
         let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
 
         let error = rt
             .load_module(&format!("{}/entry.js", base), 1_000)
@@ -23051,7 +23084,7 @@ return {before,removed,reinsert,moved,cleared};
             jar, None, true,
         ));
         let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
 
         // The HTML scheduler prepares all module graphs before evaluating any
         // of them. The shared URL is both a dependency and a later root, which
@@ -23112,7 +23145,6 @@ return {before,removed,reinsert,moved,cleared};
             None,
             true,
         ));
-        client.set_user_agent("ModuleGraphTest/1.0").await;
         client
             .set_extra_headers(std::collections::HashMap::from([(
                 "x-module-test".to_string(),
@@ -23131,7 +23163,7 @@ return {before,removed,reinsert,moved,cleared};
 
         let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
         rt.set_cookie_jar(jar);
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
         rt.set_callbacks(callbacks);
         rt.load_module(&format!("{}/entry.js", base), 1_000)
             .await
@@ -23161,7 +23193,7 @@ return {before,removed,reinsert,moved,cleared};
             "{child}"
         );
         assert!(
-            child_lower.contains("\r\nuser-agent: modulegraphtest/1.0\r\n"),
+            child_lower.contains(&format!("\r\nuser-agent: {}\r\n", obscura_net::StealthProfile::MacChrome153.user_agent().to_ascii_lowercase())),
             "{child}"
         );
         assert!(
@@ -23223,7 +23255,7 @@ return {before,removed,reinsert,moved,cleared};
             jar, None, true,
         ));
         let mut rt = ObscuraJsRuntime::with_base_url(document_url);
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
         rt.load_module(&format!("{module_base}/entry.js"), 1_000)
             .await
             .unwrap();
@@ -23263,7 +23295,7 @@ return {before,removed,reinsert,moved,cleared};
             jar, None, true,
         ));
         let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
         rt.load_module(&format!("{}/entry.js", base), 1_000)
             .await
             .unwrap();
@@ -23301,7 +23333,7 @@ return {before,removed,reinsert,moved,cleared};
             jar, None, true,
         ));
         let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/app/index.html", base));
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
         rt.add_import_map(
             r#"{
                 "imports": {
@@ -23352,7 +23384,7 @@ return {before,removed,reinsert,moved,cleared};
             jar, None, true,
         ));
         let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/index.html", base));
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
         rt.add_import_map(
             &format!(r#"{{"imports":{{"{base}/entry.js":"{base}/remapped.js"}}}}"#),
             &format!("{}/index.html", base),
@@ -23429,7 +23461,7 @@ return {before,removed,reinsert,moved,cleared};
             jar, None, true,
         ));
         let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/page/index.html"));
-        rt.set_http_client(client);
+        bind_module_test_network(&mut rt, client).await;
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.run_page_init();
         rt.add_import_map(
