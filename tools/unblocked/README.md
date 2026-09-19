@@ -94,15 +94,16 @@ python3 tools/unblocked/validate.py protocol-log \
   "$RUN_ROOT/playwright-protocol.log"
 ```
 
-The smoke navigates the fixed local fixture, evaluates page state, reads the
-DOM through CDP, and proves that an unknown method and invalid initializer
+The smoke navigates the fixed local fixture, fills a labelled input and clicks
+a role locator through the official client, evaluates page state, reads the DOM
+through CDP, and proves that an unknown method and invalid initializer
 parameters fail. Its optional JSON output retains the complete document
-response, complete DOM response, and every explicit CDP command, response, and
-error it collects. `DEBUG=pw:protocol` emits the official client's complete raw
-driver protocol stream without normalization or field deletion. The
-`protocol-log` validator reads that untouched file and fails if the smoke's
-required inventory is truncated or any observed method is absent from the
-profile.
+response, locator event records, complete DOM response, and every explicit CDP
+command, response, and error it collects. `DEBUG=pw:protocol` emits the
+official client's complete raw driver protocol stream without normalization or
+field deletion. The `protocol-log` validator reads that untouched file and
+fails if the smoke's required inventory is truncated or any observed method is
+absent from the profile.
 
 Each successful mode writes one trace and `result.json` reports the first exact
 normalized divergence. Exit status is zero only when every selected mode runs

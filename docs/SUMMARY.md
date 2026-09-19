@@ -57,14 +57,14 @@ OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run
 
 ### OB-027 首批 profile 后续验证
 
-`9be460d` 基于未修改的 Playwright Python 1.60.0 `connect_over_cdp` 路径运行。raw `pw:protocol` 日志中 25 个实际发送方法全部进入 profile；HTTP body/headers、完整 `DOM.getDocument` 响应、显式 CDP 命令/响应/错误均原样保留。profile 明确是 observed slice，未列方法和未验证参数均为 not-qualified，OB-027 未关闭。
+当前必需 smoke 基于未修改的 Playwright Python 1.60.0 `connect_over_cdp` 路径运行。raw `pw:protocol` 日志中 29 个实际发送方法全部进入 profile；`08afec2` 增加 CI 对未改写完整日志的方法集合对账。smoke 还通过官方 `get_by_label().fill()` 与 `get_by_role().click()` 验证 labelled input 和 role button，保留 HTTP body/headers、完整 `DOM.getDocument` 响应、locator 事件记录以及显式 CDP 命令/响应/错误。profile 明确是 observed slice；utility world 真隔离、完整 actionability/focus/user-activation、未列方法和未验证参数均未取得资格，OB-027 未关闭。
 
 | 检查 | 结果 | 边界 |
 | --- | --- | --- |
 | obscura-cdp release nextest，render | **221 passed，3 skipped，0 failed** | 覆盖首批契约和真实 WebSocket 非法 `Browser.close` 回归 |
 | 根 release nextest，render | **1782 passed，4 skipped，0 failed** | 不替代 Linux、stealth、WPT 或完整客户端资格 |
 | 指定 release CLI build，render | **通过** | 精确 AGENTS.md build 命令；不宣称 stealth |
-| Playwright 1.60.0 required smoke | **通过，25/25 observed methods 已登记** | 单个本地合成页面；不是完整 API 或参数矩阵 |
+| Playwright 1.60.0 required smoke | **通过，29/29 observed methods 已登记**；官方 label fill 和 role click 成功，事件记录完整保留 | 单个本地合成页面；不是完整 API、参数矩阵或 utility-world 隔离证明 |
 | 固定 benchmark obstacle course | **33/33** | `--runs 1 --warmup 0`；包括 `observer-intersection` |
 
 本轮完整 raw protocol 日志和 smoke JSON 位于执行方临时目录，不进入 Git；开发工具不做脱敏或删字段，测试后由执行方处理日志。

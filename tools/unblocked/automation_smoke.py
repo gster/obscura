@@ -88,18 +88,69 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                         "({title:document.title,input:document.querySelector('#name').value})"
                     )
                     result["initial"] = initial
-                    changed = page.evaluate(
+                    page.evaluate(
                         """(() => {
-                          document.querySelector('#name').value = 'official-playwright';
-                          document.querySelector('#submit').click();
-                          return document.querySelector('#result').textContent;
+                          globalThis.__obscuraLocatorEvents = [];
+                          const input = document.querySelector('#name');
+                          const button = document.querySelector('#submit');
+                          for (const type of ['focus', 'input', 'change']) {
+                            input.addEventListener(type, event => {
+                              __obscuraLocatorEvents.push({
+                                target: 'input', type, trusted: event.isTrusted,
+                                value: input.value
+                              });
+                            });
+                          }
+                          for (const type of ['mousedown', 'focus', 'mouseup', 'click']) {
+                            button.addEventListener(type, event => {
+                              __obscuraLocatorEvents.push({
+                                target: 'button', type, trusted: event.isTrusted
+                              });
+                            });
+                          }
                         })()"""
                     )
-                    result["changed"] = changed
+                    try:
+                        page.get_by_label("Name").fill("official-playwright")
+                        page.get_by_role("button", name="Submit").click()
+                    finally:
+                        try:
+                            result["locator"] = page.evaluate(
+                                """({
+                                  input: document.querySelector('#name').value,
+                                  result: document.querySelector('#result').textContent,
+                                  activeElement: document.activeElement && document.activeElement.id,
+                                  events: globalThis.__obscuraLocatorEvents
+                                })"""
+                            )
+                        except Exception as snapshot_error:
+                            result["locatorSnapshotError"] = {
+                                "type": type(snapshot_error).__name__,
+                                "message": str(snapshot_error),
+                            }
+                    locator = result["locator"]
+                    result["changed"] = locator["result"]
                     if initial != {"title": "OB-026 CDP fixture", "input": "fixture"}:
                         raise AssertionError(f"unexpected initial page state: {initial!r}")
-                    if changed != "official-playwright":
-                        raise AssertionError(f"unexpected evaluated result: {changed!r}")
+                    if locator["input"] != "official-playwright":
+                        raise AssertionError(f"locator fill did not update the input: {locator!r}")
+                    if locator["result"] != "official-playwright":
+                        raise AssertionError(f"locator click did not update the output: {locator!r}")
+                    observed_events = [
+                        (event["target"], event["type"]) for event in locator["events"]
+                    ]
+                    required_events = [
+                        ("input", "focus"),
+                        ("input", "input"),
+                        ("button", "mousedown"),
+                        ("button", "mouseup"),
+                        ("button", "click"),
+                    ]
+                    positions = [observed_events.index(event) for event in required_events]
+                    if positions != sorted(positions):
+                        raise AssertionError(f"locator events are out of order: {locator!r}")
+                    if not all(event.get("trusted") is True for event in locator["events"]):
+                        raise AssertionError(f"locator emitted an untrusted event: {locator!r}")
 
                     session = context.new_cdp_session(page)
                     document = trace.send(

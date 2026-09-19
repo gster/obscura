@@ -39,9 +39,13 @@ CDP_VERIFICATION_STATES = {"verified", "partial", "not-run"}
 PLAYWRIGHT_SMOKE_METHODS = {
     "Browser.getVersion",
     "Browser.setDownloadBehavior",
+    "DOM.getContentQuads",
     "DOM.getDocument",
+    "DOM.scrollIntoViewIfNeeded",
     "Emulation.setEmulatedMedia",
     "Emulation.setFocusEmulationEnabled",
+    "Input.dispatchMouseEvent",
+    "Input.insertText",
     "Log.auditMethodDoesNotExist",
     "Log.enable",
     "Network.enable",
