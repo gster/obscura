@@ -14,10 +14,22 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from .cdp_fixture import external_process, fixture_server, free_port
+    from .cdp_fixture import (
+        external_process,
+        fixture_control_get,
+        fixture_server,
+        free_port,
+        wait_for_fixture_hold,
+    )
     from .cdp_trace import Trace
 else:
-    from cdp_fixture import external_process, fixture_server, free_port
+    from cdp_fixture import (
+        external_process,
+        fixture_control_get,
+        fixture_server,
+        free_port,
+        wait_for_fixture_hold,
+    )
     from cdp_trace import Trace
 
 
@@ -120,7 +132,7 @@ def inspect_png(data: bytes) -> dict[str, Any]:
 
 
 def run(obscura_bin: Path) -> dict[str, Any]:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
     result: dict[str, Any] = {
         "schemaVersion": 1,
@@ -333,6 +345,8 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                     )
                     isolated_context = None
                     isolated_page = None
+                    sibling_page = None
+                    page_a_handle = None
                     try:
                         isolated_context = browser.new_context()
                         context_result["createdContextCount"] = len(browser.contexts)
@@ -381,6 +395,119 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                               isolatedSentinel: globalThis.__obscuraIsolatedContextSentinel
                             })"""
                         )
+                        isolated_page.evaluate(
+                            """(() => {
+                              globalThis.__obscuraPageAClosure = (() => {
+                                let value = 40;
+                                return () => ++value;
+                              })();
+                              globalThis.__obscuraPageAPromise = new Promise(resolve =>
+                                setTimeout(() => resolve('page-a-timer'), 40));
+                            })()"""
+                        )
+                        page_a_handle = isolated_page.evaluate_handle(
+                            "({owner: 'page-a', value: 41})"
+                        )
+                        sibling_page = isolated_context.new_page()
+                        sibling_response = sibling_page.goto(
+                            f"{fixture_origin}/fixture?token=sibling-page-value",
+                            wait_until="load",
+                        )
+                        if sibling_response is None:
+                            raise AssertionError("sibling Page.goto returned no document response")
+                        context_result["siblingDocumentResponse"] = {
+                            "url": sibling_response.url,
+                            "status": sibling_response.status,
+                            "statusText": sibling_response.status_text,
+                            "headers": sibling_response.all_headers(),
+                            "body": sibling_response.body().decode(
+                                "utf-8", errors="surrogateescape"
+                            ),
+                        }
+                        closed_page_events: list[dict[str, Any]] = []
+                        context_result["closedPageRuntimeEvents"] = closed_page_events
+                        close_phase = {"value": "before-close"}
+                        sibling_session = isolated_context.new_cdp_session(sibling_page)
+                        sibling_session.send("Runtime.enable")
+                        sibling_session.on(
+                            "Runtime.consoleAPICalled",
+                            lambda event: closed_page_events.append(
+                                {"phase": close_phase["value"], "event": event}
+                            ),
+                        )
+                        context_result["heldFetchInitialState"] = sibling_page.evaluate(
+                            """(() => {
+                              globalThis.__obscuraPageBSentinel = 'page-b';
+                              globalThis.__obscuraHeldFetchState = 'pending';
+                              fetch('/lifecycle-hold?token=closed-page-pending-request')
+                                .then(response => response.text())
+                                .then(body => {
+                                  globalThis.__obscuraHeldFetchState = 'resolved';
+                                  console.log('closed-page-held-fetch', body);
+                                }, error => {
+                                  globalThis.__obscuraHeldFetchState = 'rejected';
+                                  console.log('closed-page-held-fetch-error', String(error));
+                                });
+                              return globalThis.__obscuraHeldFetchState;
+                            })()"""
+                        )
+                        held_start_observations: list[dict[str, Any]] = []
+                        context_result["heldRequestStartObservations"] = (
+                            held_start_observations
+                        )
+                        context_result["heldRequestStarted"] = wait_for_fixture_hold(
+                            fixture_origin, "started", held_start_observations
+                        )
+                        context_result["pageCountWhileOpen"] = len(isolated_context.pages)
+                        context_result["siblingBeforeClose"] = sibling_page.evaluate(
+                            """({
+                              sentinel: globalThis.__obscuraPageBSentinel,
+                              heldFetchState: globalThis.__obscuraHeldFetchState,
+                              title: document.title
+                            })"""
+                        )
+                        context_result["eventCountBeforeClose"] = len(closed_page_events)
+                        close_phase["value"] = "closing"
+                        sibling_page.close()
+                        close_phase["value"] = "closed"
+                        context_result["pageCountAfterSiblingClose"] = len(
+                            isolated_context.pages
+                        )
+                        context_result["siblingPageClosed"] = sibling_page.is_closed()
+                        try:
+                            sibling_page.evaluate("document.title")
+                        except PlaywrightError as error:
+                            context_result["closedPageError"] = str(error)
+                        else:
+                            raise AssertionError("closed sibling page still accepted evaluation")
+                        context_result["heldRequestRelease"] = fixture_control_get(
+                            f"{fixture_origin}/lifecycle-hold/release"
+                        )
+                        held_finish_observations: list[dict[str, Any]] = []
+                        context_result["heldRequestFinishObservations"] = (
+                            held_finish_observations
+                        )
+                        context_result["heldRequestFinished"] = wait_for_fixture_hold(
+                            fixture_origin, "finished", held_finish_observations
+                        )
+                        context_result["survivorAfterSiblingClose"] = {
+                            "closure": isolated_page.evaluate(
+                                "globalThis.__obscuraPageAClosure()"
+                            ),
+                            "timer": isolated_page.evaluate(
+                                "() => globalThis.__obscuraPageAPromise"
+                            ),
+                            "handle": page_a_handle.json_value(),
+                            "title": isolated_page.title(),
+                        }
+                        isolated_page.wait_for_timeout(100)
+                        context_result["postCloseRuntimeEvents"] = [
+                            item
+                            for item in closed_page_events
+                            if item["phase"] == "closed"
+                        ]
+                        page_a_handle.dispose()
+                        page_a_handle = None
                         isolated_context.close()
                         isolated_context = None
                         context_result["closedContextCount"] = len(browser.contexts)
@@ -393,6 +520,11 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                             })"""
                         )
                     finally:
+                        if page_a_handle is not None:
+                            try:
+                                page_a_handle.dispose()
+                            except PlaywrightError:
+                                pass
                         if isolated_context is not None:
                             isolated_context.close()
 
@@ -416,6 +548,23 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                             "defaultSentinel": None,
                             "isolatedSentinel": 91,
                         },
+                        "pageCountWhileOpen": 2,
+                        "heldFetchInitialState": "pending",
+                        "siblingBeforeClose": {
+                            "sentinel": "page-b",
+                            "heldFetchState": "pending",
+                            "title": "OB-026 CDP fixture",
+                        },
+                        "eventCountBeforeClose": 0,
+                        "pageCountAfterSiblingClose": 1,
+                        "siblingPageClosed": True,
+                        "survivorAfterSiblingClose": {
+                            "closure": 41,
+                            "timer": "page-a-timer",
+                            "handle": {"owner": "page-a", "value": 41},
+                            "title": "OB-026 CDP fixture",
+                        },
+                        "postCloseRuntimeEvents": [],
                         "closedContextCount": 1,
                         "isolatedPageClosed": True,
                         "defaultAfterClose": {
@@ -429,6 +578,35 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                             raise AssertionError(
                                 f"browser context {name} differs from Chrome: {context_result!r}"
                             )
+                    if "closed" not in context_result.get("closedPageError", "").lower():
+                        raise AssertionError(
+                            f"closed page returned the wrong error: {context_result!r}"
+                        )
+                    started = context_result["heldRequestStarted"]["state"]
+                    finished = context_result["heldRequestFinished"]["state"]
+                    release = context_result["heldRequestRelease"]
+                    if started != {
+                        "started": True,
+                        "released": False,
+                        "finished": False,
+                    }:
+                        raise AssertionError(
+                            f"held request was not pending before close: {context_result!r}"
+                        )
+                    if finished != {
+                        "started": True,
+                        "released": True,
+                        "finished": True,
+                    }:
+                        raise AssertionError(
+                            f"held request did not finish after release: {context_result!r}"
+                        )
+                    if release["status"] != 200 or json.loads(release["body"]) != {
+                        "released": True
+                    }:
+                        raise AssertionError(
+                            f"held request release failed: {context_result!r}"
+                        )
 
                     session = context.new_cdp_session(page)
                     document = trace.send(

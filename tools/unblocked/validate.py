@@ -68,6 +68,7 @@ PLAYWRIGHT_SMOKE_METHODS = {
     "Runtime.runIfWaitingForDebugger",
     "Target.attachToBrowserTarget",
     "Target.attachToTarget",
+    "Target.closeTarget",
     "Target.createBrowserContext",
     "Target.createTarget",
     "Target.disposeBrowserContext",

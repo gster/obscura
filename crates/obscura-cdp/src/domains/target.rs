@@ -249,10 +249,19 @@ pub async fn handle(
             Ok(json!({ "sessionId": session_id }))
         }
         "closeTarget" => {
-            let target_id = params
+            let object = params
+                .as_object()
+                .ok_or("Target.closeTarget params must be an object")?;
+            if object.len() != 1 || !object.contains_key("targetId") {
+                return Err("Target.closeTarget supports only string targetId".to_string());
+            }
+            let target_id = object
                 .get("targetId")
                 .and_then(|v| v.as_str())
-                .ok_or("targetId required")?;
+                .ok_or("Target.closeTarget requires string targetId")?;
+            if ctx.get_page(target_id).is_none() {
+                return Err("Target not found".to_string());
+            }
             let mut sessions = ctx.sessions.iter()
                 .filter(|(_, page_id)| page_id.as_str() == target_id)
                 .map(|(session_id, _)| session_id.clone())
@@ -612,6 +621,32 @@ mod tests {
         assert_eq!(detached, vec![first.as_str(), second.as_str()]);
         let fabricated = format!("{page_id}-session");
         assert!(!detached.contains(&fabricated.as_str()));
+    }
+
+    #[tokio::test]
+    async fn close_target_rejects_ignored_and_unknown_parameters() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+
+        for params in [
+            Value::Null,
+            json!({}),
+            json!({"targetId": page_id.clone(), "invented": true}),
+            json!({"targetId": 7}),
+        ] {
+            handle("closeTarget", &params, &mut ctx, &None)
+                .await
+                .expect_err("malformed closeTarget parameters must fail");
+        }
+        handle(
+            "closeTarget",
+            &json!({"targetId": "missing-target"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("an unknown target must fail");
+        assert!(ctx.get_page(&page_id).is_some());
     }
 
     #[tokio::test]

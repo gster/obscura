@@ -92,6 +92,18 @@
       "evidence": "Official Playwright 1.60 Browser.new_context smoke plus Rust cookie/context isolation and parameter tests. Disconnect disposal remains outside this slice."
     },
     {
+      "method": "Target.closeTarget",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "verified",
+      "params": "Exactly one string targetId, matching the official Page.close request.",
+      "result": "success=true after removing the named page target.",
+      "events": "Target.detachedFromTarget for every actual attached session, followed by Target.targetDestroyed. After the close boundary, releasing a response that was proven server-held before close emits no Runtime.consoleAPICalled from the closed page; all observed console events retain their phase.",
+      "scope": "The named page in its browser context; sibling pages and other contexts remain live.",
+      "errors": "Missing, extra or nonstring targetId values and unknown targets fail.",
+      "evidence": "Playwright 1.60 Chromium CDP and Obscura CDP two-page probes use the same exact closeTarget shape and closed-page error; the surviving Obscura page retains its closure, settled timer promise, remote handle and document. The fixture confirms the closed page request is pending, releases it only after the recorded close boundary, and retains every phase-tagged console event. Rust tests cover events and strict parameters."
+    },
+    {
       "method": "Target.disposeBrowserContext",
       "capability": "LIMITED",
       "implementation": "implemented",
@@ -634,7 +646,7 @@
   ],
   "coverage": {
     "kind": "observed-official-client-slice",
-    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic locator, fixed-viewport screenshot and browser-context smoke with full pw:protocol log",
+    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic locator, fixed-viewport screenshot, two-page close and browser-context smoke with full pw:protocol log",
     "unlisted": "not-qualified",
     "completion": "OB-027 remains open until the scoped automation profile is expanded and reconciled against the migration surface."
   }

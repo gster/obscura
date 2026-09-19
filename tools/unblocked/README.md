@@ -99,13 +99,19 @@ labelled single and multiple options, and clicks a role locator through the
 official client. It fixes the first page viewport at 320 by 240, captures an
 official `Page.screenshot()` PNG, decodes its pixels to prove the image is
 nonblank, and retains the complete PNG as base64 plus its hashes and metadata.
-It creates a second browser context, navigates its page,
-checks same-origin localStorage and global-object isolation, verifies the
-default viewport/screen metrics, closes that context, and confirms that the
-default page remains live. It also reads the DOM through CDP and proves that an
+It creates a second browser context with two pages, checks same-origin
+localStorage and global-object isolation, verifies the default viewport/screen
+metrics, then closes one page. The surviving page must retain its closure,
+settled timer promise, remote handle and document while the closed page rejects
+evaluation. A fixture response remains server-held until after the close
+boundary; the runner records every console event with its phase, releases the
+response, and requires that no event arrive from the closed page. The smoke then closes that
+context and confirms that the default page remains live. It also reads the DOM
+through CDP and proves that an
 unknown method and invalid initializer parameters fail. Its optional JSON
-output retains both complete document responses, the full screenshot, locator
-and context return values and event records, the complete DOM response, and every explicit CDP
+output retains all complete document responses, the full screenshot, locator
+and context return values and event records, the complete DOM response, and
+every explicit CDP
 command, response, and error it collects. `DEBUG=pw:protocol` emits the
 official client's complete raw driver protocol stream without normalization or
 field deletion. The `protocol-log` validator reads that untouched file and

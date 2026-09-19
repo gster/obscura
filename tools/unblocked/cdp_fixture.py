@@ -60,7 +60,52 @@ class FixtureHandler(BaseHTTPRequestHandler):
         return "Sat, 19 Sep 2026 00:00:00 GMT"
 
     def do_GET(self) -> None:
-        if self.path.split("?", 1)[0] != "/fixture":
+        path = self.path.split("?", 1)[0]
+        if path == "/lifecycle-hold":
+            started = getattr(self.server, "lifecycle_hold_started")
+            release = getattr(self.server, "lifecycle_hold_release")
+            finished = getattr(self.server, "lifecycle_hold_finished")
+            started.set()
+            release.wait()
+            body = json.dumps(
+                {"released": True, "token": self.path.split("?", 1)[-1]}
+            ).encode()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            finally:
+                finished.set()
+            return
+        if path == "/lifecycle-hold/status":
+            body = json.dumps(
+                {
+                    "started": getattr(self.server, "lifecycle_hold_started").is_set(),
+                    "released": getattr(self.server, "lifecycle_hold_release").is_set(),
+                    "finished": getattr(self.server, "lifecycle_hold_finished").is_set(),
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/lifecycle-hold/release":
+            getattr(self.server, "lifecycle_hold_release").set()
+            body = b'{"released": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path != "/fixture":
             self.send_error(404)
             return
         body = FIXTURE.read_bytes()
@@ -78,15 +123,57 @@ class FixtureHandler(BaseHTTPRequestHandler):
 @contextmanager
 def fixture_server() -> Iterator[str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+    server.lifecycle_hold_started = threading.Event()  # type: ignore[attr-defined]
+    server.lifecycle_hold_release = threading.Event()  # type: ignore[attr-defined]
+    server.lifecycle_hold_finished = threading.Event()  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         host, port = server.server_address
         yield f"http://{host}:{port}"
     finally:
+        server.lifecycle_hold_release.set()  # type: ignore[attr-defined]
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def fixture_control_get(url: str) -> dict[str, Any]:
+    with urllib.request.urlopen(url, timeout=2) as response:
+        body = response.read()
+        return {
+            "url": response.url,
+            "status": response.status,
+            "headers": list(response.headers.raw_items()),
+            "body": body.decode("utf-8", errors="surrogateescape"),
+        }
+
+
+def wait_for_fixture_hold(
+    origin: str,
+    field: str,
+    observations: list[dict[str, Any]],
+    timeout: float = 5,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    url = f"{origin}/lifecycle-hold/status"
+    while time.monotonic() < deadline:
+        try:
+            response = fixture_control_get(url)
+        except Exception as error:
+            observations.append(
+                {
+                    "url": url,
+                    "error": {"type": type(error).__name__, "message": str(error)},
+                }
+            )
+            raise
+        observations.append(response)
+        state = json.loads(response["body"])
+        if state.get(field) is True:
+            return {"field": field, "state": state}
+        time.sleep(0.01)
+    raise TimeoutError(f"fixture lifecycle hold did not reach {field}: {observations!r}")
 
 
 def free_port() -> int:

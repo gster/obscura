@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.unblocked.cdp_trace import Normalizer, Trace, first_divergence
 from tools.unblocked.cdp_fixture import (
@@ -12,6 +13,7 @@ from tools.unblocked.cdp_fixture import (
     comparison_status,
     process_group_exists,
     terminate_process_group,
+    wait_for_fixture_hold,
 )
 
 
@@ -32,6 +34,52 @@ class FakeSession:
 
 
 class TraceTests(unittest.TestCase):
+    def test_fixture_hold_polling_preserves_observations_and_transport_error(self):
+        response = {
+            "url": "http://fixture/lifecycle-hold/status",
+            "status": 200,
+            "headers": [["Content-Type", "application/json"]],
+            "body": '{"started": false}',
+        }
+        observations = []
+        with patch(
+            "tools.unblocked.cdp_fixture.fixture_control_get",
+            side_effect=[response, OSError("fixture control failed")],
+        ):
+            with self.assertRaisesRegex(OSError, "fixture control failed"):
+                wait_for_fixture_hold(
+                    "http://fixture", "started", observations, timeout=1
+                )
+
+        self.assertEqual(observations[0], response)
+        self.assertEqual(
+            observations[1],
+            {
+                "url": "http://fixture/lifecycle-hold/status",
+                "error": {"type": "OSError", "message": "fixture control failed"},
+            },
+        )
+
+    def test_fixture_hold_polling_preserves_all_observations_on_timeout(self):
+        response = {
+            "url": "http://fixture/lifecycle-hold/status",
+            "status": 200,
+            "headers": [["Content-Type", "application/json"]],
+            "body": '{"finished": false}',
+        }
+        observations = []
+        with patch(
+            "tools.unblocked.cdp_fixture.fixture_control_get",
+            return_value=response,
+        ):
+            with self.assertRaisesRegex(TimeoutError, "did not reach finished"):
+                wait_for_fixture_hold(
+                    "http://fixture", "finished", observations, timeout=0.025
+                )
+
+        self.assertGreaterEqual(len(observations), 2)
+        self.assertTrue(all(item == response for item in observations))
+
     def test_normalizer_aliases_ids_without_dropping_payload_data(self):
         normalizer = Normalizer("http://127.0.0.1:43111")
 

@@ -45,13 +45,13 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 状态：未关闭。`9be460d` 已发布 Playwright Python 1.60.0 首批实际观测方法切片、必需 smoke、profile 校验器和精确 initializer allowlist；当前 smoke 已继续覆盖官方 `get_by_label().fill()`、单选/多选 `get_by_label().select_option()`、`get_by_role().click()`、固定 viewport 的 `Page.screenshot()` 与 `Browser.new_context()` 的显式创建/使用/关闭路径，但尚未覆盖迁移范围内的全部方法、参数组合、事件与生命周期。
 
 依赖：OB-026。入口：crates/obscura-cdp/src/dispatch.rs、domains/、types.rs。
-现状：当前 raw protocol 中的 36 个发送方法均已进入 `tools/unblocked/automation-cdp-profile.json`，CI 会直接读取未改写的完整日志并持续对账；官方 locator 路径新增覆盖 `DOM.getContentQuads`、`DOM.scrollIntoViewIfNeeded`、`Input.dispatchMouseEvent` 与 `Input.insertText`，并通过 `Runtime.callFunctionOn` 执行单选和多选 select option。截图路径固定 320×240 viewport，验证 `Page.getLayoutMetrics` 与 `Page.captureScreenshot`，解码 PNG 像素证明画面非空，并完整保留 PNG 数据。独立 context 路径验证 create/use/dispose、同源 localStorage/全局对象隔离、默认页面存活和默认 1280×720 指标；截图格式/选项全矩阵、代理等 context options、断连清理和完整 context 生命周期尚未取得资格。不存在的 `Log.auditMethodDoesNotExist` 及已限定 initializer 的越界参数会明确失败。utility world 真隔离、完整 actionability/focus/user-activation 语义、未列方法和未逐项验证的非法参数仍标为未完成或 not-qualified，不能从本切片外推。
+现状：当前 raw protocol 中的 37 个发送方法均已进入 `tools/unblocked/automation-cdp-profile.json`，CI 会直接读取未改写的完整日志并持续对账；官方 locator 路径新增覆盖 `DOM.getContentQuads`、`DOM.scrollIntoViewIfNeeded`、`Input.dispatchMouseEvent` 与 `Input.insertText`，并通过 `Runtime.callFunctionOn` 执行单选和多选 select option。截图路径固定 320×240 viewport，验证 `Page.getLayoutMetrics` 与 `Page.captureScreenshot`，解码 PNG 像素证明画面非空，并完整保留 PNG 数据。独立 context 路径验证 create/use/dispose、同源 localStorage/全局对象隔离、默认页面存活和默认 1280×720 指标；同一显式 context 的双页面路径验证 `Target.closeTarget`、关闭页拒绝后续 evaluation，以及存活页的闭包、Promise、remote handle 和 document 不受影响。生命周期探针先由服务端确认 B 页 fetch 仍被挂起，记录 close 边界后才释放响应，并完整保留分阶段 console 事件；本次 close 后事件为空。截图格式/选项全矩阵、代理等 context options、断连清理和完整 context 生命周期尚未取得资格。不存在的 `Log.auditMethodDoesNotExist` 及已限定 initializer 的越界参数会明确失败。utility world 真隔离、完整 actionability/focus/user-activation 语义、未列方法和未逐项验证的非法参数仍标为未完成或 not-qualified，不能从本切片外推。
 动作：逐方法标记 SUPPORTED / LIMITED / VERIFIED_NOOP / UNSUPPORTED，实施/验证状态另存；覆盖参数组合、返回、事件、作用域、错误。审计整域空成功和 Browser 域占位行为。
 完成：最终迁移范围内的未知方法、非法参数明确失败；no-op 仅是有依据的精确允许项；版本号/空对象/初始化成功不能充当资格证据。正式 Python smoke 保持必需测试，profile 与实际 raw protocol 方法集合持续对账。
 
 ### OB-028 · P0 · Target、session 与页面生命周期闭环
 
-状态：未关闭。官方 `Browser.new_context()` 已覆盖显式创建、同源状态隔离、页面使用、关闭及默认页面继续执行；双页面长期并发、自动/显式附加全矩阵、导航失效、断连和事件归属仍未完成。
+状态：未关闭。官方 `Browser.new_context()` 已覆盖显式创建、同源状态隔离、双页面使用、单页关闭、context 关闭及默认页面继续执行；关闭 B 后 A 的闭包、Promise、remote handle 与 document 继续可用，B 拒绝后续 evaluation。服务端挂起响应在 close 后才释放，分阶段记录中没有 close 后 console 事件。长期并发、自动/显式附加全矩阵、导航失效、断连和完整事件归属仍未完成。
 
 依赖：OB-027。入口：CDP dispatch/server、domains/target.rs、domains/page.rs。
 动作：覆盖 flattened session、自动/显式附加、暂停后恢复、create/dispose context、双页面持续执行、导航/关闭/断连及事件归属。保留现有不拆除其他页面 isolate 的实现。
