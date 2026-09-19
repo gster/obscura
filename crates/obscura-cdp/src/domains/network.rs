@@ -68,7 +68,6 @@ pub async fn handle(
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map.clone()).await;
                     page.stealth_client.set_extra_headers(header_map).await;
                 }
             }
@@ -465,6 +464,77 @@ mod tests {
                 .map(String::as_str),
             Some("complete-raw-value")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extra_headers_stay_page_local_and_reach_its_worker() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            for body in ["<html></html>", "<html></html>", "ok", "ok", "ok"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).unwrap();
+                captured.push(String::from_utf8(request).unwrap());
+            }
+            captured
+        });
+        let mut ctx = CdpContext::new();
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("header-context".into(), Some(proxy)));
+        ctx.default_context.http_client.set_extra_headers([
+            ("X-Baseline".into(), "Both Pages".into()),
+            ("X-Shared".into(), "Context Value".into()),
+        ].into_iter().collect()).await;
+        let first = ctx.create_page();
+        let second = ctx.create_page();
+        ctx.get_page_mut(&first).unwrap().navigate("http://headers.test/a").await.unwrap();
+        ctx.get_page_mut(&second).unwrap().navigate("http://headers.test/b").await.unwrap();
+        let session = Some("isolated-headers-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), first.clone());
+        handle("setExtraHTTPHeaders", &json!({"headers": {
+            "Authorization": "Bearer Page.Raw+/=123", "X-Page": "Keep, Case; full=value",
+            "x-shared": "Page Override"
+        }}), &mut ctx, &session).await.unwrap();
+        assert!(ctx.get_page(&second).unwrap().stealth_client.extra_headers.read().await.is_empty());
+        assert_eq!(ctx.default_context.http_client.extra_headers.read().await.get("X-Shared").map(String::as_str), Some("Context Value"));
+        for (page_id, expression) in [
+            (&first, "fetch('/a-data').then(r => r.text())"),
+            (&first, r#"new Promise((resolve, reject) => {
+                const source = "fetch('http://headers.test/worker-data').then(r => r.text()).then(postMessage)";
+                const worker = new Worker(URL.createObjectURL(new Blob([source], {type:'text/javascript'})));
+                worker.onmessage = event => { worker.terminate(); resolve(event.data); };
+                worker.onerror = reject;
+            })"#),
+            (&second, "fetch('/b-data').then(r => r.text())"),
+        ] {
+            let result = ctx.get_page_mut(page_id).unwrap().evaluate_for_cdp(expression, true, true).await;
+            assert!(!result.thrown, "{result:?}");
+            assert_eq!(result.value, Some(json!("ok")));
+        }
+        for (index, request) in server.join().unwrap().iter().enumerate() {
+            let headers: Vec<_> = request.lines().filter_map(|line| line.split_once(':')).collect();
+            let values = |name: &str| headers.iter().filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.trim()).collect::<Vec<_>>();
+            assert_eq!(values("X-Baseline"), ["Both Pages"], "{request}");
+            if index == 2 || index == 3 {
+                assert_eq!(values("Authorization"), ["Bearer Page.Raw+/=123"], "{request}");
+                assert_eq!(values("X-Page"), ["Keep, Case; full=value"], "{request}");
+                assert_eq!(values("X-Shared"), ["Page Override"], "{request}");
+            } else {
+                assert!(values("Authorization").is_empty(), "{request}");
+                assert!(values("X-Page").is_empty(), "{request}");
+                assert_eq!(values("X-Shared"), ["Context Value"], "{request}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

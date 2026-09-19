@@ -912,6 +912,16 @@ impl ObscuraJsRuntime {
         // set_v8_flags call must be refused rather than aborting the process.
         crate::v8_flags::mark_platform_started();
         let state = Rc::new(RefCell::new(ObscuraState::new()));
+        // Allocate standalone policy/cookies now; create its fixed default
+        // persona pool lazily, so Page can bind its own transport first.
+        {
+            let mut state = state.borrow_mut();
+            let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+            state.http_client = Some(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_options(
+                jar.clone(), proxy_url.as_deref(),
+            )));
+            state.cookie_jar = Some(jar);
+        }
         let state_clone = state.clone();
         let import_map = state.borrow().import_map.clone();
 
@@ -1032,6 +1042,15 @@ impl ObscuraJsRuntime {
         unsafe {
             instance.js_runtime.v8_isolate().exit();
         }
+
+        // Use the same fixed persona as the standalone transport, including
+        // high-entropy navigator defaults. Page setup can bind its persona
+        // before any page script or network request runs.
+        let profile = obscura_net::StealthProfile::default();
+        instance.set_user_agent(profile.user_agent());
+        let (platform, ua_platform, version) = profile.platform();
+        instance.set_platform(platform, ua_platform, version);
+        instance.set_user_agent_details(profile.full_version(), "x86");
 
         instance
     }
@@ -1410,7 +1429,8 @@ impl ObscuraJsRuntime {
     /// client, callbacks and the stealth transport. A frame shares these with
     /// its page, exactly as it shares them in a browser.
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
-        let parent = self.state.borrow();
+        let mut parent = self.state.borrow_mut();
+        parent.ensure_persona_transport();
         frame.cookie_jar = parent.cookie_jar.clone();
         frame.local_storage = parent.local_storage.clone();
         frame.session_storage = parent.session_storage.clone();
@@ -1427,7 +1447,7 @@ impl ObscuraJsRuntime {
         // resolves against the main document's renderer state, so frame-scoped
         // background loading is not wired up here.
         #[cfg(feature = "render")]
-        if crate::ops::has_page_transport(&parent) {
+        if crate::ops::has_transport(&parent) {
             frame.render_resources.set_sync_loading_enabled(false);
         }
     }
@@ -1622,7 +1642,17 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
-        self.state.borrow_mut().cookie_jar = Some(jar);
+        let mut state = self.state.borrow_mut();
+        if let Some(policy) = &state.http_client {
+            let mut policy = policy.detached();
+            policy.cookie_jar = jar.clone();
+            let policy = std::sync::Arc::new(policy);
+            state.http_client = Some(policy);
+        }
+        if let Some(client) = &state.stealth_client {
+            state.stealth_client = Some(std::sync::Arc::new(client.with_cookie_binding(jar.clone())));
+        }
+        state.cookie_jar = Some(jar);
     }
 
     pub fn set_web_storage(&self, local: crate::ops::SharedWebStorage, session: crate::ops::SharedWebStorage) {
@@ -1633,6 +1663,10 @@ impl ObscuraJsRuntime {
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         let mut state = self.state.borrow_mut();
+        if let Some(transport) = &state.stealth_client {
+            state.stealth_client = Some(std::sync::Arc::new(transport.with_policy_binding(client.cookie_jar.clone(), client.clone())));
+        }
+        state.cookie_jar = Some(client.cookie_jar.clone());
         state.http_client = Some(client);
         // A page transport makes the renderer cache-only; see
         // `ops::fresh_render_resources` for why layout must not fetch itself.
@@ -1650,9 +1684,31 @@ impl ObscuraJsRuntime {
     /// transport as the owning page (see op_fetch_url / stealth_fetch_all).
     pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
         let mut state = self.state.borrow_mut();
+        state.cookie_jar = Some(client.cookie_jar.clone());
+        state.http_client = Some(client.policy_client());
         state.stealth_client = Some(client);
         #[cfg(feature = "render")]
         state.render_resources.set_sync_loading_enabled(false);
+    }
+
+    /// Attach the owning Page's transport and observation registry. A
+    /// standalone runtime already has a transport, so its presence cannot
+    /// establish Page ownership. Repeated service calls keep the same binding.
+    pub fn bind_page_transport(
+        &self,
+        client: std::sync::Arc<obscura_net::StealthHttpClient>,
+        callbacks: std::sync::Arc<obscura_net::CallbackRegistry>,
+    ) {
+        {
+            let state = self.state.borrow();
+            if state.stealth_client.as_ref().is_some_and(|bound| std::sync::Arc::ptr_eq(bound, &client))
+                && state.callbacks.as_ref().is_some_and(|bound| std::sync::Arc::ptr_eq(bound, &callbacks))
+            {
+                return;
+            }
+        }
+        self.set_stealth_client(client);
+        self.set_callbacks(callbacks);
     }
 
     /// Advance readiness and dispatch each document lifecycle event once.
@@ -4368,10 +4424,10 @@ impl ObscuraJsRuntime {
         state.render_resource_rx = rx;
     }
 
-    /// Whether a page transport (plain or stealth client) is installed.
+    /// Whether a standalone or Page-owned asynchronous transport is installed.
     #[cfg(feature = "render")]
-    pub fn has_page_transport(&self) -> bool {
-        crate::ops::has_page_transport(&self.state.borrow())
+    pub fn has_transport(&self) -> bool {
+        crate::ops::has_transport(&self.state.borrow())
     }
 
     /// Wake-up shared with the background loads: notified after every
@@ -4403,12 +4459,9 @@ impl ObscuraJsRuntime {
             state.render_resource_backlog.extend(requests);
             return 0;
         }
-        // Standalone runtimes may have only the plain client; page runtimes
-        // always install primp (`has_page_transport`).
-        let http_client = state.http_client.clone();
-        let stealth_client = state.stealth_client.clone();
+        let stealth_client = state.ensure_persona_transport();
         let initiator = url::Url::parse(&state.url).ok();
-        if !crate::ops::has_page_transport(&state) || initiator.is_none() {
+        if !crate::ops::has_transport(&state) || initiator.is_none() {
             // No transport or no document URL: nothing can be loaded; forget
             // the in-flight marks so a later scan may retry.
             for request in &requests {
@@ -4427,7 +4480,6 @@ impl ObscuraJsRuntime {
         let task = tokio::spawn(async move {
             use deno_core::futures::StreamExt as _;
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(|(raw, profile, is_font)| {
-                let http_client = http_client.clone();
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
@@ -4467,17 +4519,10 @@ impl ObscuraJsRuntime {
                         }
                         _ => {}
                     }
-                    let response = match (stealth_client, http_client) {
-                        (Some(stealth_client), _) => stealth_client
-                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
-                            .await
-                            .ok(),
-                        (None, Some(http_client)) => http_client
-                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
-                            .await
-                            .ok(),
-                        (None, None) => None,
-                    };
+                    let response = stealth_client
+                        .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                        .await
+                        .ok();
                     crate::ops::RenderResourceLoad {
                         generation,
                         url: raw,
@@ -6632,6 +6677,403 @@ mod tests {
         rt
     }
 
+    // Capture complete header blocks and binary bodies. This proxy fixture
+    // proves the constructor proxy is used without resolving the test origin.
+    fn standalone_proxy(responses: Vec<(String, Vec<u8>)>) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut captured = Vec::new();
+            for (headers, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                    let mut buffer = [0; 4096];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                };
+                let content_length = std::str::from_utf8(&request[..header_end]).unwrap().lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap()).unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let mut buffer = [0; 4096];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n", body.len(), headers).as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+                captured.push(request);
+            }
+            captured
+        });
+        (proxy, thread)
+    }
+
+    fn standalone_proxy_runtime(proxy: &str) -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy("http://standalone.test/page", Some(proxy.into()));
+        rt.set_dom(parse_html("<html><head></head><body></body></html>"));
+        rt.set_url("http://standalone.test/page");
+        rt.run_page_init();
+        rt
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_fetch_xhr_preflight_share_persona_proxy_cookies_and_binary_bodies() {
+        let cors = "Access-Control-Allow-Origin: http://standalone.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: x-proof\r\n";
+        let binary = vec![0, 128, 255, 16];
+        let (proxy, server) = standalone_proxy(vec![
+            ("Set-Cookie: session=raw-secret; Path=/\r\n".into(), binary.clone()),
+            (String::new(), binary.clone()),
+            (cors.into(), Vec::new()),
+            (cors.into(), binary.clone()),
+            (String::new(), b"isolated".to_vec()),
+        ]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let identity = rt.evaluate("JSON.stringify({ua:navigator.userAgent,platform:navigator.platform,uaPlatform:navigator.userAgentData.platform,language:navigator.language})").unwrap();
+        let identity: serde_json::Value = serde_json::from_str(identity.as_str().unwrap()).unwrap();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const bytes = new Uint8Array([0, 128, 255, 16]);
+            const fetched = await fetch('/fetch', {method:'POST', body:bytes, headers:{Authorization:'Bearer raw-secret'}});
+            const xhrBytes = await new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest(); xhr.open('POST', '/xhr'); xhr.responseType = 'arraybuffer';
+                xhr.onload = () => resolve(Array.from(new Uint8Array(xhr.response)));
+                xhr.onerror = reject; xhr.send(bytes);
+            });
+            const cross = await fetch('http://cross.test/cors', {method:'PUT', headers:{'x-proof':'full'}, body:bytes});
+            const hints = await navigator.userAgentData.getHighEntropyValues(['architecture', 'platformVersion', 'uaFullVersion']);
+            return {fetch:Array.from(new Uint8Array(await fetched.arrayBuffer())), xhr:xhrBytes,
+                cross:Array.from(new Uint8Array(await cross.arrayBuffer())), cookie:document.cookie,
+                identity:[hints.architecture, hints.platformVersion, hints.uaFullVersion]};
+        }"#, None, &[], true, true).await.unwrap();
+        assert!(!result.thrown, "{result:?}");
+        assert_eq!(result.value.unwrap(), serde_json::json!({"fetch":binary,"xhr":binary,"cross":binary,"cookie":"session=raw-secret",
+            "identity":["x86",obscura_net::StealthProfile::default().platform().2,obscura_net::StealthProfile::default().full_version()]}));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 3);
+        for event in events {
+            assert_eq!(event.body_size, 4);
+            let body = rt.state.borrow().network_response_bodies[&event.request_id].clone();
+            assert_eq!(body.body, "AID/EA==");
+            assert!(body.base64_encoded);
+        }
+        let mut isolated = standalone_proxy_runtime(&proxy);
+        let result = isolated.call_function_on_for_cdp("async () => (await fetch('/isolated')).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("isolated"));
+        assert!(!std::sync::Arc::ptr_eq(rt.state.borrow().cookie_jar.as_ref().unwrap(), isolated.state.borrow().cookie_jar.as_ref().unwrap()));
+        let captured = server.join().unwrap();
+        for request in &captured {
+            let end = request.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4;
+            let headers = std::str::from_utf8(&request[..end]).unwrap().to_ascii_lowercase();
+            assert!(headers.contains(&format!("\r\nuser-agent: {}\r\n", identity["ua"].as_str().unwrap().to_ascii_lowercase())), "{headers}");
+            if !request.starts_with(b"OPTIONS ") {
+                assert!(headers.contains("\r\nsec-ch-ua-platform: \"windows\"\r\n"), "{headers}");
+            }
+            assert!(headers.contains("\r\naccept-language: en-us,en;q=0.9\r\n"), "{headers}");
+        }
+        assert_eq!(identity["platform"], "Win32");
+        assert_eq!(identity["uaPlatform"], "Windows");
+        assert_eq!(identity["language"], "en-US");
+        for index in [0, 1, 3] { assert!(captured[index].ends_with(&binary)); }
+        let fetch_headers = std::str::from_utf8(&captured[0][..captured[0].len()-binary.len()]).unwrap().to_ascii_lowercase();
+        assert!(fetch_headers.contains("authorization: bearer raw-secret\r\n"));
+        let xhr_headers = std::str::from_utf8(&captured[1][..captured[1].len()-binary.len()]).unwrap().to_ascii_lowercase();
+        assert!(xhr_headers.contains("cookie: session=raw-secret\r\n"));
+        assert!(captured[2].starts_with(b"OPTIONS http://cross.test/cors "));
+        for index in [2, 4] {
+            assert!(!String::from_utf8_lossy(&captured[index]).to_ascii_lowercase().contains("\r\ncookie:"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_binding_replaces_standalone_transport_and_previous_page() {
+        use std::sync::{Arc, Mutex};
+        use obscura_net::{CallbackRegistry, CookieJar, ObscuraHttpClient, StealthHttpClient, StealthProfile};
+        let mut rt = standalone_proxy_runtime("http://127.0.0.1:9");
+        let standalone = rt.state.borrow_mut().ensure_persona_transport();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        for (name, profile) in [("first", StealthProfile::MacChrome152), ("second", StealthProfile::MacChrome153)] {
+            let (proxy, server) = standalone_proxy(vec![(String::new(), name.as_bytes().to_vec())]);
+            let jar = Arc::new(CookieJar::new());
+            jar.set_cookie(&format!("owner={name}; Path=/"), &url::Url::parse("http://standalone.test/").unwrap());
+            let policy = Arc::new(ObscuraHttpClient::with_options(jar.clone(), Some(&proxy)));
+            let transport = Arc::new(StealthHttpClient::with_policy_profile_persona(
+                jar, Some(&proxy), policy, profile, "fr-FR,fr;q=0.9", None,
+            ));
+            let callbacks = Arc::new(CallbackRegistry::new());
+            let seen = observed.clone();
+            callbacks.add_request(Arc::new(move |request| seen.lock().unwrap().push((name, request.url.path().to_string()))));
+            rt.bind_page_transport(transport.clone(), callbacks.clone());
+            rt.bind_page_transport(transport.clone(), callbacks);
+            assert!(Arc::ptr_eq(rt.state.borrow().stealth_client.as_ref().unwrap(), &transport));
+            assert!(!Arc::ptr_eq(rt.state.borrow().stealth_client.as_ref().unwrap(), &standalone));
+            let result = rt.call_function_on_for_cdp(
+                &format!("async () => (await fetch('/{name}')).text()"), None, &[], true, true,
+            ).await.unwrap();
+            assert_eq!(result.value.unwrap(), serde_json::json!(name));
+            let captured = server.join().unwrap();
+            let headers = std::str::from_utf8(&captured[0]).unwrap().to_ascii_lowercase();
+            assert!(headers.contains(&format!("user-agent: {}\r\n", profile.user_agent().to_ascii_lowercase())));
+            assert!(headers.contains(&format!("cookie: owner={name}\r\n")));
+        }
+        assert_eq!(*observed.lock().unwrap(), vec![("first", "/first".into()), ("second", "/second".into())]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_policy_rebinding_preserves_bound_persona_and_new_cookies() {
+        use obscura_net::{CookieJar, ObscuraHttpClient, StealthHttpClient, StealthProfile};
+        let (proxy, server) = standalone_proxy(vec![(String::new(), b"bound".to_vec())]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let policy = rt.state.borrow().http_client.clone().unwrap();
+        let profile = StealthProfile::MacChrome153;
+        rt.set_user_agent(profile.user_agent());
+        let (platform, ua_platform, version) = profile.platform();
+        rt.set_platform(platform, ua_platform, version);
+        rt.set_stealth_client(std::sync::Arc::new(StealthHttpClient::with_policy_profile_persona(
+            policy.cookie_jar.clone(), Some(&proxy), policy, profile, "fr-FR,fr;q=0.9", Some("1"),
+        )));
+        let jar = std::sync::Arc::new(CookieJar::new());
+        jar.set_cookie("replacement=full; Path=/", &url::Url::parse("http://standalone.test/").unwrap());
+        rt.set_http_client(std::sync::Arc::new(ObscuraHttpClient::with_options(jar.clone(), Some(&proxy))));
+        rt.set_cookie_jar(jar.clone());
+        let result = rt.call_function_on_for_cdp("async () => (await fetch('/bound')).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("bound"));
+        assert_eq!(rt.state.borrow().stealth_client.as_ref().unwrap().transport_params().profile, profile);
+        let captured = server.join().unwrap();
+        let headers = std::str::from_utf8(&captured[0]).unwrap().to_ascii_lowercase();
+        assert!(headers.contains(&format!("user-agent: {}\r\n", profile.user_agent().to_ascii_lowercase())));
+        assert!(headers.contains("sec-ch-ua-platform: \"macos\"\r\n"));
+        assert!(headers.contains("accept-language: fr-fr,fr;q=0.9\r\n"));
+        assert!(headers.contains("dnt: 1\r\n"));
+        assert!(headers.contains("cookie: replacement=full\r\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_cookie_rebinding_preserves_explicit_transport_proxy_and_activity() {
+        let (proxy, server) = standalone_proxy(vec![(String::new(), b"private-via-proxy".to_vec())]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        // Start with a conflicting default policy; explicit transport binding
+        // must also replace the pre-send URL gate and retain its proxy.
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let transport = std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(jar, Some(&proxy), true));
+        rt.set_stealth_client(transport.clone());
+        let replacement = std::sync::Arc::new(obscura_net::CookieJar::new());
+        replacement.set_cookie("replacement=private; Path=/", &url::Url::parse("http://127.0.0.1/").unwrap());
+        rt.set_cookie_jar(replacement.clone());
+        rt.set_url("http://127.0.0.1/page");
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp("async () => (await fetch('/private')).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("private-via-proxy"));
+        let state = rt.state.borrow();
+        let rebound = state.stealth_client.as_ref().unwrap();
+        assert_eq!(rebound.transport_params().proxy_url, transport.transport_params().proxy_url);
+        assert!(std::sync::Arc::ptr_eq(&rebound.in_flight, &transport.in_flight));
+        assert!(std::sync::Arc::ptr_eq(&rebound.cookie_jar, &replacement));
+        assert!(std::sync::Arc::ptr_eq(&state.http_client.as_ref().unwrap().cookie_jar, &replacement));
+        assert!(state.http_client.as_ref().unwrap().allow_private_network);
+        let captured = server.join().unwrap();
+        assert!(captured[0].starts_with(b"GET http://127.0.0.1/private "));
+        assert!(std::str::from_utf8(&captured[0]).unwrap().to_ascii_lowercase().contains("cookie: replacement=private\r\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_policy_headers_reach_modules_and_follow_policy_rebinding() {
+        use obscura_net::{CookieJar, ObscuraHttpClient};
+        let (proxy, server) = standalone_proxy(vec![
+            ("Content-Type: application/javascript\r\n".into(), b"globalThis.headerModule = 1;".to_vec()),
+            (String::new(), b"updated".to_vec()),
+            ("Content-Type: application/javascript\r\n".into(), b"globalThis.headerModule += 1;".to_vec()),
+            (String::new(), b"transport-updated".to_vec()),
+        ]);
+        let headers = |authorization: &str, proof: &str| std::collections::HashMap::from([
+            ("Authorization".to_owned(), authorization.to_owned()),
+            ("X-Proof".to_owned(), proof.to_owned()),
+        ]);
+        let first = std::sync::Arc::new(ObscuraHttpClient::with_options(std::sync::Arc::new(CookieJar::new()), Some(&proxy)));
+        first.set_extra_headers(headers("Bearer Keep.Case+/=123", "Initial, Raw; value=Full")).await;
+        let mut rt = standalone_proxy_runtime(&proxy);
+        rt.set_http_client(first.clone());
+        rt.load_module("http://standalone.test/first.js", 1_000).await.unwrap();
+        let transport = rt.state.borrow().stealth_client.clone().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first.extra_headers, &transport.policy_client().extra_headers));
+        let detached = transport.detached();
+        assert!(std::sync::Arc::ptr_eq(&transport.extra_headers, &detached.extra_headers));
+        assert!(std::sync::Arc::ptr_eq(&first.extra_headers, &detached.policy_client().extra_headers));
+        first.set_extra_headers(headers("Bearer Updated.Raw+/=456", "Policy Update")).await;
+        let result = rt.call_function_on_for_cdp("async () => (await fetch('/updated')).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("updated"));
+
+        let replacement = std::sync::Arc::new(ObscuraHttpClient::with_options(std::sync::Arc::new(CookieJar::new()), Some(&proxy)));
+        replacement.set_extra_headers(headers("Bearer Replacement+/=789", "New Policy")).await;
+        rt.set_http_client(replacement.clone());
+        rt.load_module("http://standalone.test/replacement.js", 1_000).await.unwrap();
+        assert_eq!(rt.evaluate("headerModule").unwrap(), serde_json::json!(2.0));
+        let rebound = rt.state.borrow().stealth_client.clone().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&replacement.extra_headers, &rebound.policy_client().extra_headers));
+        rebound.set_extra_headers(headers("Bearer Transport.Raw+/=ABC", "Shared Update")).await;
+        assert_eq!(*replacement.extra_headers.read().await, headers("Bearer Replacement+/=789", "New Policy"));
+        let result = rt.call_function_on_for_cdp("async () => (await fetch('/transport-updated')).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("transport-updated"));
+
+        for (request, expected) in server.join().unwrap().iter().zip([
+            ("Bearer Keep.Case+/=123", "Initial, Raw; value=Full"),
+            ("Bearer Updated.Raw+/=456", "Policy Update"),
+            ("Bearer Replacement+/=789", "New Policy"),
+            ("Bearer Transport.Raw+/=ABC", "Shared Update"),
+        ]) {
+            let raw = std::str::from_utf8(request).unwrap();
+            for (name, value) in [("authorization", expected.0), ("x-proof", expected.1)] {
+                let values = raw.lines().filter_map(|line| line.split_once(':'))
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.trim_start()).collect::<Vec<_>>();
+                assert_eq!(values, vec![value], "complete raw request: {raw}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_fetch_xhr_enforce_body_limit_and_timeout() {
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "3");
+        let (proxy, server) = standalone_proxy(vec![(String::new(), vec![0, 128, 255, 16]); 2]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            let fetchRejected = false;
+            try { await fetch('/oversized'); } catch (_) { fetchRejected = true; }
+            const xhrRejected = await new Promise(resolve => {
+                const xhr = new XMLHttpRequest(); xhr.open('GET', '/oversized-xhr');
+                xhr.onerror = () => resolve(true); xhr.onload = () => resolve(false); xhr.send();
+            });
+            return [fetchRejected, xhrRejected];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([true, true]));
+        assert_eq!(server.join().unwrap().len(), 2);
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buffer = [0; 4096];
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0); request.extend_from_slice(&buffer[..n]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = stream.write_all(b"late");
+            request
+        });
+        std::env::set_var("OBSCURA_FETCH_TIMEOUT_MS", "25");
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp("async () => { try { await fetch('/slow-body'); return false; } catch (_) { return true; } }", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!(true));
+        assert_eq!(rt.active_network_requests(), 0);
+        assert!(server.join().unwrap().starts_with(b"GET http://standalone.test/slow-body "));
+        std::env::remove_var("OBSCURA_FETCH_TIMEOUT_MS");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_invalid_proxy_rejects_without_direct_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut rt = standalone_proxy_runtime("http://[invalid");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), Some("http://[invalid"), true,
+        )));
+        rt.set_url(&format!("http://{address}/page"));
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp("async () => { const errors = []; for (let n = 0; n < 2; n++) { try { await fetch('/direct'); errors.push('sent'); } catch (error) { errors.push(String(error)); } } return errors; }", None, &[], true, true).await.unwrap();
+        let errors = result.value.unwrap();
+        assert!(errors[0].as_str().unwrap().contains("Invalid proxy"));
+        assert_eq!(errors[0], errors[1], "failed transport initialization is retained");
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(rt.active_network_requests(), 0);
+    }
+
+    #[test]
+    fn standalone_frame_first_network_shares_parent_transport_and_cookie_jar() {
+        let rt = ObscuraJsRuntime::with_base_url_and_proxy("http://standalone.test/", Some("http://127.0.0.1:9".into()));
+        assert!(rt.state.borrow().stealth_client.is_none());
+        let mut frame = ObscuraState::new();
+        rt.share_resources_with(&mut frame);
+        let parent = rt.state.borrow();
+        assert!(std::sync::Arc::ptr_eq(parent.cookie_jar.as_ref().unwrap(), frame.cookie_jar.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(parent.http_client.as_ref().unwrap(), frame.http_client.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(parent.stealth_client.as_ref().unwrap(), frame.stealth_client.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(&parent.page_in_flight, &frame.page_in_flight));
+        assert_eq!(frame.stealth_client.as_ref().unwrap().transport_params().proxy_url.as_deref(), Some("http://127.0.0.1:9"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_image_warmup_and_stylesheet_use_default_persona_proxy() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"></svg>"#.to_vec();
+        let (proxy, server) = standalone_proxy(vec![
+            ("Content-Type: image/svg+xml\r\n".into(), svg.clone()),
+            ("Content-Type: image/svg+xml\r\n".into(), svg),
+            ("Content-Type: text/css\r\n".into(), b"body { color: rgb(1, 2, 3); }".to_vec()),
+        ]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let policy = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), Some(&proxy),
+        ));
+        policy.set_extra_headers(std::collections::HashMap::from([
+            ("Authorization".to_owned(), "Bearer Resource.Raw+/=123".to_owned()),
+            ("X-Resource".to_owned(), "Keep, Case; full=value".to_owned()),
+        ])).await;
+        rt.set_http_client(policy);
+        assert!(rt.state.borrow().stealth_client.is_none());
+        let requests = rt.mark_render_resources_in_flight(vec![("http://standalone.test/warmup.svg".into(), None, false)]);
+        assert_eq!(rt.start_render_resource_loads(requests), 1);
+        for _ in 0..200 {
+            rt.apply_render_resource_results();
+            if !rt.has_pending_render_resources() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(rt.render_resource_is_known("http://standalone.test/warmup.svg"));
+        let transport = rt.state.borrow().stealth_client.clone().unwrap();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const image = new Image(); image.src = '/metadata.svg'; document.body.appendChild(image);
+            await image.decode();
+            await new Promise((resolve, reject) => {
+                const link = document.createElement('link'); link.rel = 'stylesheet'; link.href = '/style.css';
+                link.onload = resolve; link.onerror = reject; document.head.appendChild(link);
+            });
+            return [image.naturalWidth, image.naturalHeight, getComputedStyle(document.body).color];
+        }"#, None, &[], true, true).await.unwrap();
+        assert!(!result.thrown, "{result:?}");
+        let value = result.value.unwrap();
+        assert_eq!(value[0].as_f64(), Some(20.0));
+        assert_eq!(value[1].as_f64(), Some(10.0));
+        assert_eq!(value[2], "rgb(1, 2, 3)");
+        assert!(std::sync::Arc::ptr_eq(&transport, rt.state.borrow().stealth_client.as_ref().unwrap()));
+        let captured = server.join().unwrap();
+        for request in captured {
+            let raw = std::str::from_utf8(&request).unwrap();
+            for (name, value) in [("authorization", "Bearer Resource.Raw+/=123"), ("x-resource", "Keep, Case; full=value")] {
+                let values = raw.lines().filter_map(|line| line.split_once(':'))
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.trim_start()).collect::<Vec<_>>();
+                assert_eq!(values, vec![value], "complete raw request: {raw}");
+            }
+            let headers = std::str::from_utf8(&request).unwrap().to_ascii_lowercase();
+            assert!(headers.contains(&format!("user-agent: {}\r\n", obscura_net::StealthProfile::default().user_agent().to_ascii_lowercase())), "{headers}");
+            assert!(headers.contains("sec-ch-ua-platform: \"windows\"\r\n"), "{headers}");
+        }
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn render_resources_remain_cache_only_across_document_resets() {
@@ -6763,8 +7205,8 @@ mod tests {
         assert!(rt.render_resource_is_known(&url));
     }
 
-    /// A runtime with only the stealth client installed has a page transport
-    /// (`has_page_transport`, cache-only renderer) and must load through it.
+    /// A runtime with an explicitly installed primp client has an asynchronous
+    /// transport (`has_transport`, cache-only renderer) and must load through it.
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_only_transport_starts_render_resource_loads() {
@@ -6775,7 +7217,7 @@ mod tests {
             None,
             true,
         )));
-        assert!(rt.has_page_transport());
+        assert!(rt.has_transport());
         assert!(!rt.render_resource_sync_loading_enabled());
         rt.set_dom(parse_html(&format!("<html><body><img src=\"{url}\"></body></html>")));
         rt.set_url("http://127.0.0.1:9/page");
@@ -18590,7 +19032,10 @@ return {before,removed,reinsert,moved,cleared};
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.call_function_on_for_cdp(
+            "async () => { try { await image.decode(); } catch (_) {} }",
+            None, &[], true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
                 .unwrap(),
@@ -18599,7 +19044,10 @@ return {before,removed,reinsert,moved,cleared};
 
         rt.execute_script("require-anonymous-cors", r#"image.crossOrigin = "anonymous";"#)
             .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.call_function_on_for_cdp(
+            "async () => { try { await image.decode(); } catch (_) {} }",
+            None, &[], true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
                 .unwrap(),
@@ -18609,7 +19057,10 @@ return {before,removed,reinsert,moved,cleared};
 
         rt.execute_script("restore-no-cors", "image.removeAttribute('crossorigin');")
             .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.call_function_on_for_cdp(
+            "async () => { try { await image.decode(); } catch (_) {} }",
+            None, &[], true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
                 .unwrap(),
@@ -18622,7 +19073,10 @@ return {before,removed,reinsert,moved,cleared};
             &format!(r#"image.crossOrigin = "anonymous"; image.src = "{base}/cors.png";"#),
         )
         .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.call_function_on_for_cdp(
+            "async () => { try { await image.decode(); } catch (_) {} }",
+            None, &[], true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
                 .unwrap(),
@@ -18634,7 +19088,10 @@ return {before,removed,reinsert,moved,cleared};
             r#"image.crossOrigin = "use-credentials";"#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.call_function_on_for_cdp(
+            "async () => { try { await image.decode(); } catch (_) {} }",
+            None, &[], true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
                 .unwrap(),
@@ -18647,7 +19104,10 @@ return {before,removed,reinsert,moved,cleared};
             r#"image.crossOrigin = "anonymous";"#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.call_function_on_for_cdp(
+            "async () => { try { await image.decode(); } catch (_) {} }",
+            None, &[], true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
                 .unwrap(),
@@ -23037,7 +23497,6 @@ return {before,removed,reinsert,moved,cleared};
             policy.cookie_jar.clone(), policy.proxy_url(), policy.clone(),
             profile, "en-US,en;q=0.9", None,
         ));
-        primp.set_extra_headers(policy.extra_headers.read().await.clone()).await;
         rt.set_user_agent(profile.user_agent());
         let (platform, ua_platform, version) = profile.platform();
         rt.set_platform(platform, ua_platform, version);
@@ -23048,11 +23507,16 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn module_graph_requires_bound_persona_transport() {
-        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
-        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
-        let error = rt.load_module("https://example.com/entry.js", 1_000).await.unwrap_err();
-        assert!(error.contains("No persona-owned primp client wired to module loader"), "{error}");
+    async fn standalone_module_graph_initializes_default_persona_transport() {
+        let base = spawn_one_response_server("200 OK", "globalThis.moduleResult = 7;");
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/"));
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        rt.load_module(&format!("{base}/entry.js"), 1_000).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.moduleResult").unwrap(), serde_json::json!(7.0));
+        assert_eq!(rt.state.borrow().stealth_client.as_ref().unwrap().transport_params().profile,
+            obscura_net::StealthProfile::default());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -23577,8 +24041,7 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     // Issue #139 — proxy_url must thread through to both the ES-module
-    // loader (module_loader.rs) and op_fetch_url's reqwest client
-    // (ops.rs::build_request_client). Pre-fix both built clients with
+    // loader (module_loader.rs) and op_fetch_url. Pre-fix both built clients with
     // `Client::builder().build()` — no proxy — so JS fetch/XHR and
     // dynamic imports silently bypassed BrowserContext.proxy_url.
     //

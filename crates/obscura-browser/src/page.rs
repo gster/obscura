@@ -1813,10 +1813,8 @@ impl Page {
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_web_storage(self.context.local_storage.clone(), self.session_storage.clone());
-        rt.set_http_client(self.http_client.clone());
-        rt.set_callbacks(self.callbacks.clone());
+        rt.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
-        rt.set_stealth_client(self.stealth_client.clone());
 
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
@@ -3892,6 +3890,7 @@ impl Page {
         let Some(js) = self.js.as_mut() else {
             return 0;
         };
+        js.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone());
         let loaded = js.service_render_resources();
         self.record_render_resource_events();
         loaded
@@ -3909,11 +3908,7 @@ impl Page {
         if let Some(js) = &self.js {
             // A runtime attached without `init_js` loads through the page
             // transport all the same.
-            if !js.has_page_transport() {
-                js.set_http_client(self.http_client.clone());
-                js.set_callbacks(self.callbacks.clone());
-                js.set_stealth_client(self.stealth_client.clone());
-            }
+            js.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone());
         }
         let (loadable, rejected) = self.render_resource_candidates();
         let started = match &mut self.js {
@@ -7715,6 +7710,9 @@ mod tests {
             true,
         ));
         let mut page = super::Page::new("render-prefetch".to_string(), context);
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = observed.clone();
+        page.on_request(std::sync::Arc::new(move |request| seen.lock().unwrap().push(request.url.to_string())));
         page.set_viewport((100.0, 80.0));
         let page_url = format!("http://{address}/page");
         let asset_network_url = format!("http://{address}/asset.svg");
@@ -7731,6 +7729,7 @@ mod tests {
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
         assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        assert_eq!(*observed.lock().unwrap(), vec![asset_network_url]);
         assert_eq!(
             page.js
                 .as_mut()
@@ -7827,6 +7826,43 @@ mod tests {
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(page_url).unwrap());
         page
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_resource_service_binds_directly_attached_runtime() {
+        let (address, seen_rx) = spawn_delayed_svg_server(0, 2);
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/service.svg");
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "service-binding".to_string(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("service-binding".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(&format!(r#"<html><body><img src="{asset_url}"></body></html>"#)));
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = observed.clone();
+        page.on_request(std::sync::Arc::new(move |request| seen.lock().unwrap().push(request.url.to_string())));
+
+        // Paint queues cache misses without a warmup; the service entry must
+        // replace the standalone policy before sending those requests.
+        page.screenshot(page.viewport).unwrap();
+        page.queue_pending_render_resources();
+        let mut loaded = 0;
+        for _ in 0..100 {
+            loaded += page.drain_render_resource_results();
+            if loaded > 0 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(loaded, 1);
+        assert_eq!(*observed.lock().unwrap(), vec![asset_url]);
+        assert!(seen_rx.try_recv().unwrap().starts_with("GET /service.svg "));
     }
 
     #[cfg(feature = "render")]

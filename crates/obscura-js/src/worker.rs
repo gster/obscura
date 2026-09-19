@@ -863,7 +863,8 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         scope.rethrow();
         return 0;
     }
-    let parent = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow();
+    let mut parent = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow_mut();
+    parent.ensure_persona_transport();
     if let Some(doc_url) = parent.dom.as_ref().and_then(obscura_dom::DomTree::document_url) {
         if let Ok(parsed) = url::Url::parse(&doc_url) {
             globals.insert("__obscura_creator_origin".into(), serde_json::Value::String(parsed.origin().ascii_serialization()));

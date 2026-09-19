@@ -283,9 +283,7 @@ pub struct ObscuraState {
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
     /// the page that registered it.
     pub callbacks: Option<Arc<CallbackRegistry>>,
-    /// Page runtimes route scripted fetch()/XHR through primp so transport and
-    /// JavaScript expose the same browser identity. Standalone runtimes leave
-    /// this unset because they do not own a page transport.
+    /// Persona-owned transport shared by scripted and resource requests.
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub session_history: SharedSessionHistory,
     pub history_epoch: u64,
@@ -503,6 +501,24 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
+    /// Bind the fixed standalone persona once, unless the owning page already
+    /// installed its transport. Never derive identity from mutable JS values.
+    pub(crate) fn ensure_persona_transport(&mut self) -> Arc<StealthHttpClient> {
+        if let Some(client) = &self.stealth_client {
+            return client.clone();
+        }
+        let jar = self.cookie_jar.get_or_insert_with(|| Arc::new(CookieJar::new())).clone();
+        let policy = self.http_client.get_or_insert_with(|| {
+            Arc::new(ObscuraHttpClient::with_cookie_jar(jar.clone()))
+        }).clone();
+        let client = Arc::new(StealthHttpClient::with_policy_profile_persona(
+            jar, policy.proxy_url(), policy.clone(),
+            obscura_net::StealthProfile::default(), "en-US,en;q=0.9", None,
+        ));
+        self.stealth_client = Some(client.clone());
+        client
+    }
+
     pub fn new() -> Self {
         #[cfg(feature = "render")]
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -754,37 +770,6 @@ fn fetch_max_body_bytes() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100 * 1024 * 1024)
-}
-
-/// Read a response body into memory, refusing bodies larger than `max` bytes —
-/// both when the server advertises an oversized `Content-Length` and when the
-/// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
-/// a multi-GB response from ever being fully allocated.
-async fn read_body_capped(
-    mut response: reqwest::Response,
-    max: usize,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    if let Some(len) = response.content_length() {
-        if len > max as u64 {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "response body of {len} bytes exceeds the maximum of {max}"
-            )));
-        }
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
-    {
-        if buf.len() + chunk.len() > max {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "response body exceeds the maximum of {max} bytes"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
 }
 
 /// Cap on the append-only `fetched_urls` asset list. A page can otherwise loop
@@ -1337,9 +1322,9 @@ pub struct RenderResourceEvent {
     pub response: RenderResourceResponse,
 }
 
-/// Whether this runtime is owned by a page with an asynchronous transport.
+/// Whether this runtime has an asynchronous transport, standalone or Page-owned.
 #[cfg(feature = "render")]
-pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
+pub(crate) fn has_transport(state: &ObscuraState) -> bool {
     state.http_client.is_some() || state.stealth_client.is_some()
 }
 
@@ -1352,7 +1337,7 @@ pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
 #[cfg(feature = "render")]
 pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::RenderResourceCache {
     let mut cache = obscura_render::RenderResourceCache::default();
-    if has_page_transport(state) {
+    if has_transport(state) {
         cache.set_sync_loading_enabled(false);
     }
     cache
@@ -3442,70 +3427,6 @@ fn op_console_msg(
         }));
 }
 
-// Fallback cache for runtimes that have no owning ObscuraHttpClient, such as
-// a standalone module loader. Browser pages use their context-scoped client
-// below so sequential V8 runtimes never share an async network pool (#453).
-static FETCH_CLIENT_CACHE: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<String, reqwest::Client>>,
-> = std::sync::OnceLock::new();
-
-/// Shared HTTP client cache for any code in obscura-js that needs a
-/// reqwest::Client (op_fetch_url for JS-side fetch/XHR, the ES module
-/// loader for dynamic imports). Keyed by proxy URL ("" = direct).
-/// One client per distinct proxy, reused for every request, so the
-/// connection pool actually warms up.
-pub fn cached_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
-    let key = proxy_url.unwrap_or("").to_string();
-    let cache =
-        FETCH_CLIENT_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
-    if let Ok(read) = cache.read() {
-        if let Some(client) = read.get(&key) {
-            return Ok(client.clone());
-        }
-    }
-    let client = build_request_client(proxy_url)?;
-    if let Ok(mut write) = cache.write() {
-        write.entry(key).or_insert_with(|| client.clone());
-    }
-    Ok(client)
-}
-
-fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
-    // Redirects are followed manually below so each hop can be re-validated
-    // against the same SSRF policy as the initial URL (GHSA-8v6v-g4rh-jmcm).
-    // With reqwest's default auto-follow, an attacker-controlled origin can
-    // 302 to http://127.0.0.1 and read the internal-service body.
-    // Per-request timeout so a scripted fetch()/XHR, or a CORS preflight OPTIONS
-    // (issue #251), to a server that accepts the connection but never responds
-    // cannot hang forever. Without it op_fetch_url never returns, the fetch
-    // promise never settles, and the JS XHR is stuck at readyState 1 with no
-    // completion event (which stranded Angular HttpClient). On timeout reqwest's
-    // send().await errors, which op_fetch_url propagates and the fetch shim turns
-    // into an XHR `error`/`loadend`. 30s matches the other clients in the
-    // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(fetch_timeout())
-        // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
-        .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
-            false,
-        )))
-        // Be explicit about pool size: default is unbounded which is fine,
-        // but pool_idle_timeout default (90s) is short for SPA-heavy
-        // workloads where the same origin is hit dozens of times across
-        // a navigation. Keep connections warm longer.
-        .pool_idle_timeout(std::time::Duration::from_secs(300))
-        .tcp_keepalive(std::time::Duration::from_secs(60));
-    if let Some(proxy) = proxy_url {
-        let p = reqwest::Proxy::all(proxy)
-            .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
-        builder = builder.proxy(p);
-    }
-    builder
-        .build()
-        .map_err(|e| format!("failed to build reqwest::Client: {}", e))
-}
-
 fn fetch_timeout() -> std::time::Duration {
     let timeout_ms = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
         .ok()
@@ -3824,7 +3745,7 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client, stealth_client, mut referrer, mut referrer_policy) = {
+    let (page_in_flight, intercept_tx, callbacks, http_client, stealth_client, referrer, referrer_policy) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -3841,18 +3762,9 @@ async fn op_fetch_url(
             }
         }
         // Record the resource the page pulled in via fetch()/XHR so `--dump
-        // assets` can list it (issue #301). URL is already absolute here, since
-        // reqwest needs an absolute URL to send the request.
+        // assets` can list it (issue #301). URL is already absolute here.
         push_capped(&mut gs.fetched_urls, url.clone(), MAX_FETCHED_URLS);
-        let jar = gs.cookie_jar.clone();
-        let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
-        // #139: thread the configured proxy through to the per-request
-        // reqwest::Client. Without this, op_fetch_url silently bypasses
-        // BrowserContext.proxy_url for every JS fetch() / XHR call.
-        let proxy_url = gs
-            .http_client
-            .as_ref()
-            .and_then(|c| c.proxy_url().map(|s| s.to_string()));
+        let stealth_client = gs.ensure_persona_transport();
         tracing::debug!(
             "op_fetch_url: intercept_enabled={}, has_tx={}",
             gs.intercept_enabled,
@@ -3867,14 +3779,11 @@ async fn op_fetch_url(
             None
         };
         (
-            jar,
-            in_flight,
             Arc::clone(&gs.page_in_flight),
             itx,
-            proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
-            gs.stealth_client.clone(),
+            stealth_client,
             gs.dom.as_ref().and_then(DomTree::document_url).and_then(|url| url::Url::parse(&url).ok()),
             gs.referrer_policy,
         )
@@ -3996,13 +3905,6 @@ async fn op_fetch_url(
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
 
-    let client = match &http_client {
-        Some(client) => client.request_client().await,
-        None => {
-            cached_request_client(proxy_url.as_deref()).map_err(deno_error::JsErrorBox::generic)?
-        }
-    };
-
     let initial_request_origin = request_origin(&url).unwrap_or_default();
     let page_origin = if origin.is_empty() {
         initial_request_origin.clone()
@@ -4047,56 +3949,34 @@ async fn op_fetch_url(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
-        let mut preflight_request = client
-            .request(reqwest::Method::OPTIONS, &url)
-            .timeout(fetch_timeout())
-            .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str());
-        if !unsafe_header_names.is_empty() {
-            preflight_request = preflight_request.header(
-                "Access-Control-Request-Headers",
-                unsafe_header_names.join(","),
-            );
-        }
-        if let Some(value) = url::Url::parse(&url).ok()
-            .and_then(|target| referrer_policy.referrer(referrer.as_ref(), &target)) {
-            preflight_request = preflight_request.header("Referer", value.as_str());
-        }
-        let preflight_request = preflight_request.build()
+        let parsed_url = url::Url::parse(&url)
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-        let stealth_preflight = {
-            if let Some(stealth) = stealth_client.clone() {
-                // Handoff from pre-send/CDP interception accounting to the
-                // primp transport counter. The two stages must not overlap or
-                // networkidle2 would count one request twice.
-                drop(page_in_flight_guard.take());
-                let headers = preflight_request.headers().iter()
-                    .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
-                    .collect();
-                // Preflights are credential-free and may not follow redirects.
-                let response = tokio::time::timeout(fetch_timeout(), stealth.send_single(
-                    "OPTIONS", preflight_request.url(), &headers, &[], false, false))
-                    .await.map_err(|_| deno_error::JsErrorBox::generic("CORS preflight timed out"))?
-                    .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
-                let mut headers = reqwest::header::HeaderMap::new();
-                for (name, value) in response.headers {
-                    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                        .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
-                    let value = reqwest::header::HeaderValue::from_str(&value)
-                        .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
-                    headers.append(name, value);
-                }
-                Some((response.status, headers))
-            } else { None }
-        };
-        let (preflight_status, preflight_headers) = match stealth_preflight {
-            Some(response) => response,
-            None => {
-                let response = client.execute(preflight_request).await
-                    .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
-                (response.status().as_u16(), response.headers().clone())
-            }
-        };
+        let mut headers = HashMap::from([
+            ("Origin".to_string(), page_origin.clone()),
+            ("Access-Control-Request-Method".to_string(), method.clone()),
+        ]);
+        if !unsafe_header_names.is_empty() {
+            headers.insert("Access-Control-Request-Headers".into(), unsafe_header_names.join(","));
+        }
+        if let Some(value) = referrer_policy.referrer(referrer.as_ref(), &parsed_url) {
+            headers.insert("Referer".into(), value.to_string());
+        }
+        // Preflights are credential-free and may not follow redirects. Hand
+        // off pre-send accounting before primp starts counting this request.
+        drop(page_in_flight_guard.take());
+        let response = tokio::time::timeout(fetch_timeout(), stealth_client.send_single_with_limit(
+            "OPTIONS", &parsed_url, &headers, &[], false, false, fetch_max_body_bytes(), fetch_timeout()))
+            .await.map_err(|_| deno_error::JsErrorBox::generic("CORS preflight timed out"))?
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+        let preflight_status = response.status;
+        let mut preflight_headers = reqwest::header::HeaderMap::new();
+        for (name, value) in response.headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
+            let value = reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| deno_error::JsErrorBox::generic("invalid CORS preflight header"))?;
+            preflight_headers.append(name, value);
+        }
 
         let allowed_origin = preflight_headers
             .get("access-control-allow-origin")
@@ -4156,326 +4036,13 @@ async fn op_fetch_url(
         }
     }
 
-    // Route scripted requests through the page's primp client after CORS
-    // preflight. stealth_fetch_all applies the credentials decision to each
-    // redirect hop without losing the Chrome TLS/client-hint transport.
-    {
-        if let Some(stealth) = stealth_client {
-            // No preflight took the guard, so hand off immediately before the
-            // first primp request. Redirect hops remain inside primp.
-            drop(page_in_flight_guard.take());
-            return stealth_fetch_all(
-                state.clone(),
-                stealth,
-                url,
-                req_method.as_str().to_string(),
-                custom_headers,
-                body,
-                page_origin,
-                mode,
-                credentials,
-                destination,
-                resource_type,
-                callbacks,
-                allow_private_network,
-                referrer, referrer_policy,
-            )
-            .await;
-        }
-    }
-
-    // Follow redirects manually so the SSRF policy applies to every hop.
-    // reqwest's auto-follow would bypass validate_fetch_url on the redirect
-    // target and let an attacker-allowed origin 302 to http://127.0.0.1
-    // (GHSA-8v6v-g4rh-jmcm).
-    let mut current_url = url.clone();
-    let mut current_method = req_method;
-    let mut current_body = body;
-    let mut redirects_followed: usize = 0;
-    let mut redirected_from = Vec::new();
-    let mut crossed_origin = is_cross_origin;
-    let response = loop {
-        let mut req = client
-            .request(current_method.clone(), &current_url)
-            .timeout(fetch_timeout());
-
-        let current_is_cross_origin = request_origin(&current_url)
-            .map(|request_origin| request_origin != page_origin)
-            .unwrap_or(false);
-        crossed_origin |= current_is_cross_origin;
-        referrer = url::Url::parse(&current_url).ok()
-            .and_then(|target| referrer_policy.referrer(referrer.as_ref(), &target));
-        if let Some(value) = &referrer { req = req.header("Referer", value.as_str()); }
-
-        if let Some(origin) = fetch_origin_header(current_method.as_str(), &page_origin, &current_url, &mode, referrer_policy, destination.as_deref()) {
-            req = req.header("Origin", origin);
-        }
-
-        for (name, value) in scripted_fetch_metadata(&page_origin, &current_url, &mode, resource_type) {
-            req = req.header(name, value);
-        }
-        let credentials_allowed = credentials.allows(&page_origin, &current_url);
-        if credentials_allowed {
-            if let Some(ref jar) = cookie_jar {
-                if let Ok(parsed_url) = url::Url::parse(&current_url) {
-                    let cookie_header = jar.get_cookie_header(&parsed_url);
-                    if !cookie_header.is_empty() {
-                        req = req.header("Cookie", &cookie_header);
-                    }
-                }
-            }
-        }
-
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
-        if !custom_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("user-agent"))
-        {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
-        }
-
-        if !custom_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("accept"))
-        {
-            req = req.header("Accept", "*/*");
-        }
-
-        for (k, v) in &custom_headers {
-            if k.eq_ignore_ascii_case("referer") { continue; }
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        if !current_body.is_empty() {
-            req = req.body(current_body.clone());
-        }
-
-        if let Some(ref counter) = in_flight {
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let resp = req.send().await.map_err(|e| {
-            if let Some(ref counter) = in_flight {
-                counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            deno_error::JsErrorBox::generic(e.to_string())
-        })?;
-
-        if let Some(ref counter) = in_flight {
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        if credentials_allowed {
-            if let Some(ref jar) = cookie_jar {
-                if let Ok(parsed_url) = url::Url::parse(&current_url) {
-                    for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
-                        if let Ok(s) = val.to_str() {
-                            jar.set_cookie(s, &parsed_url);
-                        }
-                    }
-                }
-            }
-        }
-
-        if !resp.status().is_redirection() {
-            break resp;
-        }
-
-        let location_header = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let Some(location) = location_header else {
-            // 3xx without a Location header is not actually a redirect.
-            break resp;
-        };
-
-        let base = match url::Url::parse(&current_url) {
-            Ok(b) => b,
-            Err(_) => break resp,
-        };
-        let next_url = match base.join(&location) {
-            Ok(u) => u,
-            Err(_) => break resp,
-        };
-
-        // Re-validate every redirect target against the SSRF policy.
-        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": next_url.to_string(),
-                "headers": {},
-                "blocked": true,
-                "error": format!("Redirect to forbidden URL blocked: {}", reason),
-            })
-            .to_string());
-        }
-
-        redirects_followed += 1;
-        if redirects_followed > FETCH_REDIRECT_LIMIT {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": next_url.to_string(),
-                "headers": {},
-                "blocked": true,
-                "error": format!("Too many redirects (>{})", FETCH_REDIRECT_LIMIT),
-            })
-            .to_string());
-        }
-
-        // Browser semantics: 301/302/303 downgrade to GET with no body.
-        // 307/308 preserve method and body.
-        let status_code = resp.status().as_u16();
-        if status_code == 301 || status_code == 302 || status_code == 303 {
-            current_method = reqwest::Method::GET;
-            current_body.clear();
-        }
-
-        redirected_from.push(base);
-        if let Some(policy) = resp.headers().get_all("referrer-policy").iter()
-            .filter_map(|v| v.to_str().ok().and_then(ReferrerPolicy::from_header)).last() {
-            referrer_policy = policy;
-        }
-        current_url = next_url.to_string();
-    };
-
-    let redirected = redirects_followed > 0;
-    let status = response.status().as_u16();
-
-    let resp_headers: std::collections::HashMap<String, String> = response
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
-
-    let final_is_cross_origin = request_origin(&current_url)
-        .map(|request_origin| request_origin != page_origin)
-        .unwrap_or(false);
-    if final_is_cross_origin && mode == "cors" {
-        let allowed = resp_headers
-            .get("access-control-allow-origin")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        let allow_credentials = resp_headers
-            .get("access-control-allow-credentials")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": url,
-                "headers": {},
-                "corsBlocked": true,
-                "corsError": if credentials == FetchCredentials::Include {
-                    format!(
-                        "CORS error: credentialed request requires Access-Control-Allow-Origin '{}' and Access-Control-Allow-Credentials 'true'",
-                        page_origin
-                    )
-                } else {
-                    format!("CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'", page_origin, allowed)
-                },
-            })
-            .to_string());
-        }
-    }
-
-    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
-    let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_response_callbacks().await {
-            let resp = fetch_response(
-                current_url.as_str(),
-                status,
-                resp_headers.clone(),
-                resp_bytes.to_vec(),
-                redirected_from,
-            );
-            let info = RequestInfo {
-                body: current_body.clone(),
-                url: resp.url.clone(),
-                method: current_method.as_str().to_string(),
-                headers: custom_headers.clone(),
-                resource_type,
-            };
-            cbs.fire_response(&info, &resp).await;
-        }
-    }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        let id = gs.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let request_id = format!("fetch-{id}");
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                stored_network_response_body(&resp_bytes),
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: current_url.clone(),
-            method: current_method.as_str().to_string(),
-            status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
-
-    crate::worker::flush_observations(&state.borrow());
-
-    tracing::debug!(
-        "op_fetch_url completed: {} {} ({} bytes)",
-        method,
-        url,
-        resp_body.len()
-    );
-
-    Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
-        "requestId": response_request_id,
-        "url": current_url,
-        "redirected": redirected,
-        "opaque": mode == "no-cors" && crossed_origin,
-        "headers": resp_headers,
-    })
-    .to_string())
+    // Redirects and the response body stay inside the persona-owned transport.
+    drop(page_in_flight_guard.take());
+    stealth_fetch_all(
+        state.clone(), stealth_client, url, req_method.as_str().to_string(),
+        custom_headers, body, page_origin, mode, credentials, destination,
+        resource_type, callbacks, allow_private_network, referrer, referrer_policy,
+    ).await
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -4562,16 +4129,19 @@ async fn stealth_fetch_all(
         referrer = referrer_policy.referrer(referrer.as_ref(), &parsed_current);
         if let Some(value) = &referrer { req_headers.insert("referer".into(), value.to_string()); }
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
-        let r = stealth
-            .send_single(
+        let r = tokio::time::timeout(fetch_timeout(), stealth
+            .send_single_with_limit(
                 &current_method,
                 &parsed_current,
                 &req_headers,
                 &current_body,
                 credentials_allowed,
                 credentials_allowed,
-            )
+                fetch_max_body_bytes(),
+                fetch_timeout(),
+            ))
             .await
+            .map_err(|_| deno_error::JsErrorBox::generic("fetch timed out"))?
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
         if !(300..400).contains(&r.status) {
@@ -4775,7 +4345,6 @@ mod tests {
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
-    use super::read_body_capped;
     use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
     use super::intercept_fulfill_response;
     use base64::{engine::general_purpose::STANDARD as FULFILL_BASE64, Engine as _};
@@ -5044,7 +4613,7 @@ mod tests {
 
 
     // SEC-005 / #581 — op_fetch_url must not buffer an unbounded response body.
-    // read_body_capped streams the body and refuses anything larger than the
+    // The primp fetch reader streams the body and refuses anything larger than the
     // cap, covering a server that just keeps sending with no Content-Length.
 
     async fn serve_body_once(body_len: usize, with_content_length: bool) -> std::net::SocketAddr {
@@ -5077,16 +4646,15 @@ mod tests {
     async fn read_body_capped_rejects_oversized_streamed_body() {
         // No Content-Length forces the streaming-cap branch (lying/chunked server).
         let addr = serve_body_once(4 * 1024 * 1024, false).await;
-        let resp = reqwest::Client::new()
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect("request should reach the local server");
-        let err = read_body_capped(resp, 1024 * 1024)
+        let client = obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        );
+        let err = client.send_single_with_limit("GET", &url::Url::parse(&format!("http://{addr}/")).unwrap(),
+            &Default::default(), &[], false, false, 1024 * 1024, std::time::Duration::from_secs(30))
             .await
             .expect_err("a body larger than the cap must be rejected");
         assert!(
-            err.to_string().contains("maximum"),
+            err.to_string().contains("exceeded"),
             "error should mention the cap: {err}"
         );
     }
@@ -5094,15 +4662,14 @@ mod tests {
     #[tokio::test]
     async fn read_body_capped_reads_body_within_cap() {
         let addr = serve_body_once(1024, true).await;
-        let resp = reqwest::Client::new()
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect("request should reach the local server");
-        let body = read_body_capped(resp, 1024 * 1024)
+        let client = obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        );
+        let response = client.send_single_with_limit("GET", &url::Url::parse(&format!("http://{addr}/")).unwrap(),
+            &Default::default(), &[], false, false, 1024 * 1024, std::time::Duration::from_secs(30))
             .await
             .expect("a small body must be read successfully");
-        assert_eq!(body.len(), 1024, "should read the whole small body");
+        assert_eq!(response.body.len(), 1024, "should read the whole small body");
     }
 
     #[test]
@@ -7594,9 +7161,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         selected_url,
         request_profile,
         resource_request,
-        http_client,
         callbacks,
-        page_in_flight,
         blocked,
     ) = {
         let gs = shared.borrow();
@@ -7644,18 +7209,15 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             selected_url,
             profile,
             request,
-            gs.http_client.clone(),
             gs.callbacks.clone(),
-            Arc::clone(&gs.page_in_flight),
             blocked,
         )
     };
 
-    let stealth_client = shared.borrow().stealth_client.clone();
-    let has_page_transport = http_client.is_some() || stealth_client.is_some();
-    if !has_page_transport {
+    if shared.borrow().render_resources.sync_loading_enabled() {
         return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
     }
+    let stealth_client = shared.borrow_mut().ensure_persona_transport();
 
     // Different CORS/credential profiles do not share an in-flight response.
     let request_key = (document_generation, selected_url.clone(), request_profile);
@@ -7681,47 +7243,15 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         );
     }
 
-    struct PageImageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
-    impl Drop for PageImageInFlightGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    let _page_in_flight = if stealth_client.is_none() {
-        page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(PageImageInFlightGuard(page_in_flight))
-    } else {
-        // primp counts native interception through complete response body;
-        // the plain-client fallback still needs this runtime-owned counter.
-        None
-    };
-
     let parsed_url = url::Url::parse(&selected_url).ok();
     let response = if blocked || parsed_url.is_none() {
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
-        if let Some(client) = stealth_client {
-            client
-                .fetch_resource_with_callbacks(
-                    parsed_url,
-                    resource_request.clone(),
-                    callbacks.as_deref(),
-                )
-                .await
-                .ok()
-        } else {
-            http_client
-                .as_ref()
-                .unwrap()
-                .fetch_resource_with_callbacks(
-                    parsed_url,
-                    resource_request,
-                    callbacks.as_deref(),
-                )
-                .await
-                .ok()
-        }
+        stealth_client
+            .fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref())
+            .await
+            .ok()
     };
     let bytes = response.and_then(|response| {
         (200..300)

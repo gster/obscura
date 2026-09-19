@@ -221,13 +221,10 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let state = weak
                     .upgrade()
                     .ok_or_else(|| "Module loader page state was dropped".to_string())?;
-                let state = state
-                    .try_borrow()
+                let mut state = state
+                    .try_borrow_mut()
                     .map_err(|_| "Module loader page state is already borrowed".to_string())?;
-                let client = state
-                    .stealth_client
-                    .clone()
-                    .ok_or_else(|| "No persona-owned primp client wired to module loader".to_string())?;
+                let client = state.ensure_persona_transport();
                 Ok((client, state.callbacks.clone(), state.referrer_policy))
             })(),
             None => self

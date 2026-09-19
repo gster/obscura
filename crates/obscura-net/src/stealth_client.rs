@@ -189,13 +189,20 @@ pub struct StealthHttpClient {
     client: transport::Client,
     allow_private_network: bool,
     pub cookie_jar: Arc<CookieJar>,
-    /// Shared so a detached client created for another runtime keeps observing
-    /// the same header overrides.
+    /// Page overrides layered over the owning policy's context headers.
+    /// Detached workers share this set; sibling pages get independent sets.
     pub extra_headers: Arc<RwLock<HashMap<String, String>>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     policy: Option<Arc<crate::client::ObscuraHttpClient>>,
     transport: TransportParams,
+}
+
+// Header names are case-insensitive. Preserve original names and values
+// within each input map; only the lower-priority layer is replaced.
+fn overlay_headers(headers: &mut HashMap<String, String>, overrides: &HashMap<String, String>) {
+    headers.retain(|name, _| !overrides.keys().any(|key| key.eq_ignore_ascii_case(name)));
+    headers.extend(overrides.iter().map(|(name, value)| (name.clone(), value.clone())));
 }
 
 impl StealthHttpClient {
@@ -270,6 +277,51 @@ impl StealthHttpClient {
         &self.transport
     }
 
+    /// The policy owner for a runtime binding. Transport-only clients still
+    /// need the same URL/private-network gate before scripted interception.
+    pub fn policy_client(&self) -> Arc<crate::client::ObscuraHttpClient> {
+        self.policy.clone().unwrap_or_else(|| {
+            let mut policy = crate::client::ObscuraHttpClient::with_full_options(
+                self.cookie_jar.clone(), self.transport.proxy_url.as_deref(), self.allow_private_network,
+            );
+            policy.block_trackers = self.block_trackers();
+            Arc::new(policy)
+        })
+    }
+
+    /// Change the jar without changing this transport's proxy or policy.
+    pub fn with_cookie_binding(&self, cookie_jar: Arc<CookieJar>) -> Self {
+        let mut client = self.detached();
+        client.cookie_jar = cookie_jar.clone();
+        client.resource_loader = Arc::new(std::sync::Mutex::new(ResourceLoaderState::default()));
+        if let Some(policy) = &self.policy {
+            let mut policy = policy.detached();
+            policy.cookie_jar = cookie_jar;
+            client.policy = Some(Arc::new(policy));
+        }
+        client
+    }
+
+    /// Rebind policy/cookies without changing persona or request accounting.
+    /// Used by standalone runtime setup setters, including after lazy binding.
+    pub fn with_policy_binding(&self, cookie_jar: Arc<CookieJar>, policy: Arc<crate::client::ObscuraHttpClient>) -> Self {
+        let mut transport = self.transport.clone();
+        transport.proxy_url = policy.proxy_url().map(str::to_owned);
+        StealthHttpClient {
+            client: transport::Client::new(
+                transport.profile, transport.proxy_url.as_deref(), policy.allow_private_network,
+                transport.accept_language.as_deref(), transport.do_not_track.as_deref(),
+            ),
+            allow_private_network: policy.allow_private_network,
+            cookie_jar,
+            extra_headers: self.extra_headers.clone(),
+            in_flight: self.in_flight.clone(),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
+            policy: Some(policy),
+            transport,
+        }
+    }
+
     /// A client with this one's identity but its own connection pool.
     ///
     /// A connection pool belongs to the tokio runtime that drives it: a pooled
@@ -298,6 +350,15 @@ impl StealthHttpClient {
             policy: self.policy.clone(),
             transport: params.clone(),
         }
+    }
+
+    async fn request_headers(&self) -> HashMap<String, String> {
+        let mut headers = match &self.policy {
+            Some(policy) => policy.extra_headers.read().await.clone(),
+            None => HashMap::new(),
+        };
+        overlay_headers(&mut headers, &*self.extra_headers.read().await);
+        headers
     }
 
     fn block_trackers(&self) -> bool {
@@ -447,7 +508,7 @@ impl StealthHttpClient {
                 return None;
             }
         }
-        let mut extra_headers = self.extra_headers.read().await.iter()
+        let mut extra_headers = self.request_headers().await.iter()
             .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
             .collect::<Vec<_>>();
         extra_headers.sort();
@@ -489,7 +550,7 @@ impl StealthHttpClient {
             body: Vec::new(),
             url: url.clone(),
             method: http::Method::GET.to_string(),
-            headers: self.extra_headers.read().await.clone(),
+            headers: self.request_headers().await,
             resource_type: request.resource_type,
         };
         callbacks.fire_request(&request_info).await;
@@ -546,7 +607,7 @@ impl StealthHttpClient {
             let mut request_info = RequestInfo {
                 body: Vec::new(),
                 url: current_url.clone(), method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(), resource_type: request.resource_type,
+                headers: self.request_headers().await, resource_type: request.resource_type,
             };
             if let Some(mut response) = self.intercept(&mut request_info, Some(&request_body)).await? {
                 response.request_referrer = request.referrer_policy.referrer(request.referrer.as_ref(), &current_url);
@@ -695,6 +756,21 @@ impl StealthHttpClient {
         send_cookies: bool,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        self.send_single_with_limit(method, url, headers, body, send_cookies, store_cookies, 64 * 1024 * 1024, std::time::Duration::from_secs(30)).await
+    }
+
+    /// Scripted fetch uses its configured streaming body limit on every hop.
+    pub async fn send_single_with_limit(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        send_cookies: bool,
+        store_cookies: bool,
+        max_response_bytes: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Response, ObscuraNetError> {
         let in_flight = InFlightGuard::new(&self.in_flight);
         if let Some(host) = url.host_str() {
             if self.block_trackers() && crate::blocklist::is_blocked(host) {
@@ -710,7 +786,9 @@ impl StealthHttpClient {
             }
         }
 
-        let mut info = RequestInfo {body: Vec::new(), url: url.clone(), method: method.to_string(), headers: headers.clone(), resource_type: crate::client::ResourceType::Fetch};
+        let mut request_headers = self.request_headers().await;
+        overlay_headers(&mut request_headers, headers);
+        let mut info = RequestInfo {body: Vec::new(), url: url.clone(), method: method.to_string(), headers: request_headers, resource_type: crate::client::ResourceType::Fetch};
         if let Some(response) = self.intercept(&mut info, Some(body)).await? { return Ok(response); }
 
         let req_method = method
@@ -724,9 +802,6 @@ impl StealthHttpClient {
                 header(&mut headers, "cookie", &cookie_header)?;
             }
         }
-        for (k, v) in self.extra_headers.read().await.iter() {
-            header(&mut headers, k, v)?;
-        }
         for (k, v) in info.headers.iter() {
             header(&mut headers, k, v)?;
         }
@@ -734,7 +809,7 @@ impl StealthHttpClient {
             .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
             .and_then(|(_, value)| Url::parse(value).ok());
         drop(info);
-        let resp = self.client.send(req_method, url, headers, body).await?;
+        let resp = self.client.send_with_timeout(req_method, url, headers, body, timeout).await?;
 
         let status = resp.status();
         if store_cookies {
@@ -749,7 +824,7 @@ impl StealthHttpClient {
             crate::client::merge_response_header(&mut response_headers,
                 name.as_str().to_lowercase(), value.to_str().unwrap_or("").to_owned());
         }
-        let resp_body = read_stealth_body_limited(resp, url, 64 * 1024 * 1024).await?;
+        let resp_body = read_stealth_body_limited(resp, url, max_response_bytes).await?;
         drop(in_flight);
 
         Ok(Response {
@@ -848,6 +923,43 @@ mod tests {
         assert_eq!(worker.active_requests(), 3);
         assert_eq!(second.active_requests(), 0);
         assert_eq!(policy.active_requests(), 0);
+    }
+
+    struct CaptureHeaders(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>);
+
+    #[async_trait::async_trait]
+    impl crate::interceptor::RequestInterceptor for CaptureHeaders {
+        async fn intercept(&self, request: &crate::client::RequestInfo) -> crate::interceptor::InterceptAction {
+            *self.0.lock().unwrap() = request.headers.clone();
+            crate::interceptor::InterceptAction::Block
+        }
+    }
+
+    #[tokio::test]
+    async fn layered_headers_reach_cache_keys_and_interceptors() {
+        let policy = std::sync::Arc::new(crate::client::ObscuraHttpClient::new());
+        policy.set_extra_headers([("X-Context".into(), "Original Raw".into()), ("X-Shared".into(), "Context".into())].into_iter().collect()).await;
+        let client = super::StealthHttpClient::with_policy(
+            std::sync::Arc::new(crate::cookies::CookieJar::new()), None, policy.clone(),
+        );
+        client.set_extra_headers([("x-shared".into(), "Page Raw".into())].into_iter().collect()).await;
+        let url = url::Url::parse("https://example.com/image").unwrap();
+        let resource = crate::client::ResourceRequest::subresource(crate::client::ResourceType::Image, &url);
+        let original = client.resource_cache_key(&url, &resource).await.unwrap();
+        policy.set_extra_headers([("X-Context".into(), "Updated Raw".into()), ("X-Shared".into(), "Context".into())].into_iter().collect()).await;
+        let updated = client.resource_cache_key(&url, &resource).await.unwrap();
+        assert_ne!(original, updated, "dynamic context headers must partition cached responses");
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        *policy.interceptor.write().await = Some(std::sync::Arc::new(CaptureHeaders(captured.clone())));
+        client.fetch_resource_with_callbacks(&url, resource, None).await.expect_err("interceptor blocks before I/O");
+        assert_eq!(*captured.lock().unwrap(), [
+            ("X-Context".into(), "Updated Raw".into()), ("x-shared".into(), "Page Raw".into()),
+        ].into_iter().collect());
+        client.send_single("GET", &url, &[("X-SHARED".into(), "Request Raw".into())].into_iter().collect(), &[], false, false)
+            .await.expect_err("interceptor blocks before I/O");
+        assert_eq!(*captured.lock().unwrap(), [
+            ("X-Context".into(), "Updated Raw".into()), ("X-SHARED".into(), "Request Raw".into()),
+        ].into_iter().collect());
     }
 
     struct CaptureBody(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
