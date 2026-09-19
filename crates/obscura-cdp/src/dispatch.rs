@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
 use obscura_js::ops::InterceptedRequest;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
@@ -714,6 +714,20 @@ fn is_v8_free_method(method: &str) -> bool {
     )
 }
 
+fn empty_params(params: &Value) -> bool {
+    params.is_null() || params.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+fn limited_initializer(domain: &str, method: &str, params: &Value) -> Result<Value, String> {
+    if method != "enable" {
+        return Err(format!("Unknown {domain} method: {method}"));
+    }
+    if !empty_params(params) {
+        return Err(format!("{domain}.enable supports only empty params"));
+    }
+    Ok(json!({}))
+}
+
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
@@ -805,11 +819,14 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Accessibility" => {
             domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
         }
-        // Accepted but no-op. Puppeteer's FrameManager.initialize calls
-        // Audits.enable on connect — refusing it breaks puppeteer.connect()
-        // before any user code runs.
+        // Exact compatibility initializers. These domains are not implemented;
+        // accepting only their parameter-free enable call lets official clients
+        // initialize without turning every unknown method into false success.
+        // Puppeteer's FrameManager.initialize calls Audits.enable on connect.
         "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector" | "Debugger"
-        | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => Ok(json!({})),
+        | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => {
+            limited_initializer(domain, method, &req.params)
+        }
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 
@@ -1201,6 +1218,41 @@ mod tests {
         let err = resp.error.expect("unknown domain must surface as error");
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("Unknown domain"));
+    }
+
+    #[tokio::test]
+    async fn unknown_methods_in_compatibility_domains_error() {
+        for method in [
+            "Log.auditMethodDoesNotExist",
+            "Performance.auditMethodDoesNotExist",
+            "Security.auditMethodDoesNotExist",
+            "CSS.auditMethodDoesNotExist",
+            "ServiceWorker.auditMethodDoesNotExist",
+            "Inspector.auditMethodDoesNotExist",
+            "Debugger.auditMethodDoesNotExist",
+            "Profiler.auditMethodDoesNotExist",
+            "HeapProfiler.auditMethodDoesNotExist",
+            "Overlay.auditMethodDoesNotExist",
+            "Audits.auditMethodDoesNotExist",
+        ] {
+            let mut ctx = CdpContext::new();
+            let response = dispatch(&req(method), &mut ctx).await;
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("{method} must not return placeholder success"));
+            assert_eq!(error.code, -32601, "{method}");
+            assert!(error.message.contains("Unknown"), "{method}: {}", error.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn limited_initializer_rejects_nonempty_params() {
+        let mut request = req("Log.enable");
+        request.params = json!({"invented": true});
+        let response = dispatch(&request, &mut CdpContext::new()).await;
+        let error = response.error.expect("unsupported parameter combinations must fail");
+        assert_eq!(error.code, -32601);
+        assert!(error.message.contains("empty params"));
     }
 
     #[tokio::test]

@@ -237,7 +237,22 @@ pub async fn handle(
             ctx.remove_page(target_id);
             Ok(json!({ "success": true }))
         }
-        "setAutoAttach" => Ok(json!({})),
+        "setAutoAttach" => {
+            let object = params
+                .as_object()
+                .ok_or("Target.setAutoAttach params must be an object")?;
+            if object.len() != 3
+                || params.get("autoAttach").and_then(Value::as_bool) != Some(true)
+                || params.get("waitForDebuggerOnStart").and_then(Value::as_bool) != Some(true)
+                || params.get("flatten").and_then(Value::as_bool) != Some(true)
+            {
+                return Err(
+                    "Target.setAutoAttach supports only autoAttach=true, waitForDebuggerOnStart=true, flatten=true"
+                        .to_string(),
+                );
+            }
+            Ok(json!({}))
+        }
         // No multi-target lifecycle to manage: obscura runs one page per session.
         // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
@@ -515,6 +530,31 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Target method"));
+    }
+
+    #[tokio::test]
+    async fn auto_attach_accepts_only_the_observed_playwright_initializer() {
+        let valid = json!({
+            "autoAttach": true,
+            "waitForDebuggerOnStart": true,
+            "flatten": true,
+        });
+        handle("setAutoAttach", &valid, &mut CdpContext::new(), &None)
+            .await
+            .expect("observed initializer must remain compatible");
+
+        for params in [
+            json!({}),
+            json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": false}),
+            json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true, "invented": 1}),
+        ] {
+            assert!(
+                handle("setAutoAttach", &params, &mut CdpContext::new(), &None)
+                    .await
+                    .is_err(),
+                "must reject {params}"
+            );
+        }
     }
 
     /// Regression for #122 item 5: every TargetInfo payload must carry the

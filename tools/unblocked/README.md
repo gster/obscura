@@ -18,13 +18,18 @@ package and binary.
   explicit CDP probe through normal Chromium launch, Chromium CDP, and Obscura
   CDP. `cdp-evidence.json` records the current macOS result without committing
   generated raw traces.
+- `automation-cdp-profile.json` publishes the method-level OB-027 status,
+  implementation state, verification state, parameter/result/event/scope/error
+  boundary, and evidence. `automation_smoke.py` is the required unmodified
+  Playwright Python end-to-end connection smoke.
 
 Validate the committed records with the system Python:
 
 ```bash
 python3 tools/unblocked/validate.py baseline tools/unblocked/baseline.json
 python3 tools/unblocked/validate.py client tools/unblocked/client-scope.json
-python3 -m unittest tools.unblocked.tests.test_validate -v
+python3 tools/unblocked/validate.py profile tools/unblocked/automation-cdp-profile.json
+python3 -m unittest tools.unblocked.tests.test_validate tools.unblocked.tests.test_cdp_trace -v
 ```
 
 Create the isolated client environment without resolving newer dependencies:
@@ -69,6 +74,26 @@ frame/loader/request identifiers plus arrival order and the call active when
 they arrived; the recorder does not invent causal links from timing alone.
 Playwright's private driver traffic outside the explicit CDP session is not
 claimed as part of this trace.
+
+## Required automation smoke
+
+Build the render binary and run the pinned official client without installing
+Chromium; the client connects to the host-started Obscura CDP endpoint:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 \
+  cargo build --release -p obscura-cli --bins --features render
+DEBUG=pw:protocol uv run --project tools/unblocked --frozen --python 3.12 \
+  python tools/unblocked/automation_smoke.py \
+    --obscura-bin target/release/obscura
+```
+
+The smoke navigates the fixed local fixture, evaluates page state, reads the
+DOM through CDP, and proves that an unknown method and invalid initializer
+parameters fail. Its optional JSON output retains the complete document
+response, complete DOM response, and every explicit CDP command, response, and
+error it collects. `DEBUG=pw:protocol` emits the official client's complete raw
+driver protocol stream without normalization or field deletion.
 
 Each successful mode writes one trace and `result.json` reports the first exact
 normalized divergence. Exit status is zero only when every selected mode runs

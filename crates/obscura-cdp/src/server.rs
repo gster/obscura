@@ -51,6 +51,7 @@ const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
 use crate::types::CdpRequest;
+use crate::types::CdpResponse;
 
 struct CdpMessage {
     text: String,
@@ -62,6 +63,28 @@ enum ServerMessage {
     NewConnection {
         reply_tx: mpsc::UnboundedSender<String>,
     },
+}
+
+fn browser_close_response(req: &CdpRequest) -> Option<(CdpResponse, bool)> {
+    if req.method != "Browser.close" {
+        return None;
+    }
+    let valid = req.params.is_null()
+        || req
+            .params
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    let response = if valid {
+        CdpResponse::success(req.id, json!({}), req.session_id.clone())
+    } else {
+        CdpResponse::error(
+            req.id,
+            -32601,
+            "Browser.close supports only empty params".to_string(),
+            req.session_id.clone(),
+        )
+    };
+    Some((response, valid))
 }
 
 pub async fn start(port: u16) -> anyhow::Result<()> {
@@ -1707,44 +1730,6 @@ pub(crate) fn decode_base64(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn fast_path_response(text: &str) -> Option<String> {
-    let req: CdpRequest = serde_json::from_str(text).ok()?;
-
-    let result = match req.method.as_str() {
-        "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
-        "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
-        "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setTouchEmulationEnabled" |
-        "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
-        "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
-        "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
-        "Target.setAutoAttach" => {
-            Some(json!({}))
-        }
-        "Browser.getVersion" => {
-            Some(json!({
-                "protocolVersion": "1.3",
-                "product": "Chrome/145.0.0.0",
-                "revision": "@0000000000000000000000000000000000000000",
-                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-                "jsVersion": "14.5.0.0",
-            }))
-        }
-        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
-            Some(json!({}))
-        }
-        _ => None,
-    };
-
-    if let Some(value) = result {
-        let resp = crate::types::CdpResponse::success(req.id, value, req.session_id);
-        serde_json::to_string(&resp).ok()
-    } else {
-        None
-    }
-}
-
 fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String)> {
     let page_id = session_id
         .as_ref()
@@ -1801,24 +1786,22 @@ async fn handle_connection_ws(
 
         match msg {
             Message::Text(text) => {
-                if text.contains("\"Browser.close\"") {
-                    if let Ok(req) = serde_json::from_str::<CdpRequest>(&text) {
-                        let resp = crate::types::CdpResponse::success(req.id, json!({}), None);
+                if let Ok(req) = serde_json::from_str::<CdpRequest>(&text) {
+                    if let Some((resp, close_connection)) = browser_close_response(&req) {
                         if let Ok(json) = serde_json::to_string(&resp) {
                             let _ = reply_tx.send(json);
                         }
+                        if close_connection {
+                            break;
+                        }
+                        continue;
                     }
-                    break;
                 }
 
-                if let Some(resp) = fast_path_response(&text) {
-                    let _ = reply_tx.send(resp);
-                } else {
-                    let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {
-                        text: text.to_string(),
-                        reply_tx: reply_tx.clone(),
-                    }));
-                }
+                let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: text.to_string(),
+                    reply_tx: reply_tx.clone(),
+                }));
             }
             Message::Close(_) => {
                 info!("WS closed by client");
@@ -1835,14 +1818,47 @@ async fn handle_connection_ws(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
-        websocket_authority,
+        browser_close_response, handle_fetch_resolution, is_navigate_method, merge_cookie_delta,
+        parse_cdp_headers, websocket_authority,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn invalid_browser_close_is_an_error_and_keeps_the_connection_open() {
+        let invalid: crate::types::CdpRequest = serde_json::from_value(json!({
+            "id": 7,
+            "method": "Browser.close",
+            "params": {"invented": true},
+        }))
+        .unwrap();
+        let (response, close_connection) =
+            browser_close_response(&invalid).expect("Browser.close is intercepted");
+        assert!(!close_connection);
+        assert!(response.result.is_none());
+        assert_eq!(
+            response.error.as_ref().map(|error| error.message.as_str()),
+            Some("Browser.close supports only empty params")
+        );
+
+        let valid: crate::types::CdpRequest = serde_json::from_value(json!({
+            "id": 8,
+            "method": "Browser.close",
+            "params": {},
+        }))
+        .unwrap();
+        assert!(browser_close_response(&valid).unwrap().1);
+
+        let other: crate::types::CdpRequest = serde_json::from_value(json!({
+            "id": 9,
+            "method": "Browser.getVersion",
+        }))
+        .unwrap();
+        assert!(browser_close_response(&other).is_none());
+    }
 
     #[test]
     fn discovery_uses_the_client_facing_http_authority() {

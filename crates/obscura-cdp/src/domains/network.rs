@@ -31,7 +31,14 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            if !(params.is_null()
+                || params.as_object().is_some_and(serde_json::Map::is_empty))
+            {
+                return Err("Network.enable supports only empty params".to_string());
+            }
+            Ok(json!({}))
+        }
         "disable" => {
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.clear_response_bodies();
@@ -400,6 +407,20 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("No response body found"));
+    }
+
+    #[tokio::test]
+    async fn enable_accepts_only_empty_params() {
+        for params in [Value::Null, json!({})] {
+            handle("enable", &params, &mut CdpContext::new(), &None)
+                .await
+                .expect("omitted and empty params are equivalent");
+        }
+        assert!(
+            handle("enable", &json!({"maxTotalBufferSize": 1}), &mut CdpContext::new(), &None)
+                .await
+                .is_err()
+        );
     }
 }
 

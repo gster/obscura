@@ -58,6 +58,61 @@ fn default_background_color(params: &Value) -> Result<Option<[u8; 4]>, String> {
     ]))
 }
 
+fn required_bool(params: &Value, method: &str, name: &str) -> Result<bool, String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| format!("Emulation.{method} params must be an object"))?;
+    if object.len() != 1 || !object.contains_key(name) {
+        return Err(format!("Emulation.{method} supports only boolean {name}"));
+    }
+    params
+        .get(name)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("Emulation.{method} requires boolean {name}"))
+}
+
+fn is_default_media(params: &Value) -> bool {
+    let Some(object) = params.as_object() else {
+        return false;
+    };
+    if object.len() != 2 || !object.contains_key("media") || !object.contains_key("features") {
+        return false;
+    }
+    if params.get("media").and_then(Value::as_str) != Some("") {
+        return false;
+    }
+    let Some(features) = params.get("features").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut actual: Vec<(&str, &str)> = features
+        .iter()
+        .filter_map(|feature| {
+            let feature = feature.as_object()?;
+            if feature.len() != 2
+                || !feature.contains_key("name")
+                || !feature.contains_key("value")
+            {
+                return None;
+            }
+            Some((
+                feature.get("name")?.as_str()?,
+                feature.get("value")?.as_str()?,
+            ))
+        })
+        .collect();
+    if actual.len() != features.len() {
+        return false;
+    }
+    actual.sort_unstable();
+    actual
+        == [
+            ("forced-colors", "none"),
+            ("prefers-color-scheme", "light"),
+            ("prefers-contrast", "no-preference"),
+            ("prefers-reduced-motion", "no-preference"),
+        ]
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -121,10 +176,28 @@ pub async fn handle(
             page.set_default_background_color_override(color);
             Ok(json!({}))
         }
-        // Touch emulation does not affect layout yet, but acknowledging it is
-        // compatible with clients that pair it with a metrics override.
-        "setTouchEmulationEnabled" => Ok(json!({})),
-        _ => Ok(json!({})),
+        // These exact values describe Obscura's fixed current defaults. Reject
+        // overrides instead of claiming that an unsupported setting was applied.
+        "setTouchEmulationEnabled" => {
+            if required_bool(params, method, "enabled")? {
+                Err("Emulation.setTouchEmulationEnabled enabled=true is unsupported".to_string())
+            } else {
+                Ok(json!({}))
+            }
+        }
+        "setFocusEmulationEnabled" => {
+            if required_bool(params, method, "enabled")? {
+                Ok(json!({}))
+            } else {
+                Err("Emulation.setFocusEmulationEnabled enabled=false is unsupported".to_string())
+            }
+        }
+        "setEmulatedMedia" if is_default_media(params) => Ok(json!({})),
+        "setEmulatedMedia" => Err(
+            "Emulation.setEmulatedMedia supports only the documented default media profile"
+                .to_string(),
+        ),
+        _ => Err(format!("Unknown Emulation method: {method}")),
     }
 }
 
@@ -452,5 +525,106 @@ mod tests {
                 "must reject {params}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_emulation_method_errors() {
+        let error = handle(
+            "auditMethodDoesNotExist",
+            &json!({}),
+            &mut CdpContext::new(),
+            &None,
+        )
+        .await
+        .expect_err("unknown Emulation methods must fail explicitly");
+        assert!(error.contains("Unknown Emulation method"));
+    }
+
+    #[tokio::test]
+    async fn focus_emulation_requires_boolean_enabled() {
+        for params in [
+            json!({}),
+            json!({"enabled": "true"}),
+            json!({"enabled": false}),
+            json!({"enabled": true, "invented": true}),
+        ] {
+            assert!(
+                handle("setFocusEmulationEnabled", &params, &mut CdpContext::new(), &None)
+                    .await
+                    .is_err(),
+                "must reject {params}"
+            );
+        }
+        handle(
+            "setFocusEmulationEnabled",
+            &json!({"enabled": true}),
+            &mut CdpContext::new(),
+            &None,
+        )
+        .await
+        .expect("the fixed focused state is an exact no-op");
+    }
+
+    #[tokio::test]
+    async fn touch_emulation_accepts_only_the_disabled_default() {
+        handle(
+            "setTouchEmulationEnabled",
+            &json!({"enabled": false}),
+            &mut CdpContext::new(),
+            &None,
+        )
+        .await
+        .expect("disabled touch emulation is the fixed default");
+        for params in [
+            json!({}),
+            json!({"enabled": "false"}),
+            json!({"enabled": true}),
+            json!({"enabled": false, "maxTouchPoints": 0}),
+        ] {
+            assert!(
+                handle("setTouchEmulationEnabled", &params, &mut CdpContext::new(), &None)
+                    .await
+                    .is_err(),
+                "must reject {params}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn media_emulation_accepts_only_the_playwright_default_bundle() {
+        let defaults = json!({
+            "media": "",
+            "features": [
+                {"name": "prefers-color-scheme", "value": "light"},
+                {"name": "prefers-reduced-motion", "value": "no-preference"},
+                {"name": "forced-colors", "value": "none"},
+                {"name": "prefers-contrast", "value": "no-preference"}
+            ]
+        });
+        handle("setEmulatedMedia", &defaults, &mut CdpContext::new(), &None)
+            .await
+            .expect("the fixed default bundle should be accepted");
+
+        let mut dark = defaults.clone();
+        dark["features"][0]["value"] = json!("dark");
+        assert!(
+            handle("setEmulatedMedia", &dark, &mut CdpContext::new(), &None)
+                .await
+                .is_err()
+        );
+        let mut extra_top_level = defaults.clone();
+        extra_top_level["invented"] = json!(true);
+        assert!(
+            handle("setEmulatedMedia", &extra_top_level, &mut CdpContext::new(), &None)
+                .await
+                .is_err()
+        );
+        let mut extra_feature_field = defaults;
+        extra_feature_field["features"][0]["invented"] = json!(true);
+        assert!(
+            handle("setEmulatedMedia", &extra_feature_field, &mut CdpContext::new(), &None)
+                .await
+                .is_err()
+        );
     }
 }

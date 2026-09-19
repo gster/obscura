@@ -89,6 +89,11 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
+            if !(params.is_null()
+                || params.as_object().is_some_and(serde_json::Map::is_empty))
+            {
+                return Err("Runtime.enable supports only empty params".to_string());
+            }
             // puppeteer-extra's FrameManager.initialize calls Runtime.enable on
             // the browser-level connection BEFORE any page target exists. Real
             // Chrome replies with `{}` and emits executionContextCreated when
@@ -444,7 +449,16 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "runIfWaitingForDebugger" => Ok(json!({})),
+        "runIfWaitingForDebugger" => {
+            if !(params.is_null()
+                || params.as_object().is_some_and(serde_json::Map::is_empty))
+            {
+                return Err(
+                    "Runtime.runIfWaitingForDebugger supports only empty params".to_string(),
+                );
+            }
+            Ok(json!({}))
+        }
         "getExceptionDetails" => Ok(json!({ "exceptionDetails": null })),
         "discardConsoleEntries" => Ok(json!({})),
         _ => Err(format!("Unknown Runtime method: {}", method)),
@@ -780,6 +794,18 @@ mod tests {
             .await
             .expect("Runtime.enable must succeed even with no session");
         assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn observed_runtime_initializers_reject_ignored_params() {
+        for method in ["enable", "runIfWaitingForDebugger"] {
+            assert!(
+                handle(method, &json!({"invented": true}), &mut CdpContext::new(), &None)
+                    .await
+                    .is_err(),
+                "{method} must not ignore parameters"
+            );
+        }
     }
 
     /// SEC-002 / #578 — Runtime.removeBinding must validate the binding name the

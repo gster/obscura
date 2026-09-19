@@ -33,6 +33,9 @@ CLIENT_CATEGORIES = {
 }
 CLIENT_PRIORITIES = {"required", "deferred", "unsupported"}
 CLIENT_EXECUTION_PATHS = {"cdp", "driver", "host"}
+CDP_CAPABILITY_STATUSES = {"SUPPORTED", "LIMITED", "VERIFIED_NOOP", "UNSUPPORTED"}
+CDP_IMPLEMENTATION_STATES = {"implemented", "compatibility-ack", "fixed-value", "rejected"}
+CDP_VERIFICATION_STATES = {"verified", "partial", "not-run"}
 
 
 def require(condition: bool, message: str) -> None:
@@ -214,6 +217,117 @@ def validate_client_scope(path: Path) -> None:
     require("Route.fetch" in api_names, "client scope must include route.fetch")
 
 
+def validate_automation_profile(path: Path) -> None:
+    value = load_json(path)
+    require(value.get("schema_version") == 1, "unsupported automation profile schema_version")
+    require(value.get("task") == "OB-027", "automation profile task must be OB-027")
+
+    client = value.get("client")
+    require(isinstance(client, dict), "automation profile client must be an object")
+    require(client.get("package") == "playwright", "automation profile client must be playwright")
+    require(client.get("version") == "1.60.0", "automation profile client version must be pinned")
+    require(
+        client.get("connection") == "BrowserType.connect_over_cdp",
+        "automation profile must use connect_over_cdp",
+    )
+
+    coverage = value.get("coverage")
+    require(isinstance(coverage, dict), "automation profile coverage must be an object")
+    require(
+        coverage.get("kind") == "observed-official-client-slice",
+        "automation profile must declare its observed slice",
+    )
+    require(bool(coverage.get("source")), "automation profile coverage needs a source")
+    require(
+        coverage.get("unlisted") == "not-qualified",
+        "unlisted automation methods must remain not-qualified",
+    )
+    require(bool(coverage.get("completion")), "automation profile coverage needs completion state")
+
+    methods = value.get("methods")
+    require(isinstance(methods, list) and methods, "automation profile methods cannot be empty")
+    names = set()
+    statuses = set()
+    for index, method in enumerate(methods):
+        location = f"methods[{index}]"
+        require(isinstance(method, dict), f"{location} must be an object")
+        name = method.get("method")
+        require(
+            isinstance(name, str) and re.fullmatch(r"[A-Za-z]+\.[A-Za-z]+", name) is not None,
+            f"{location} needs a qualified method name",
+        )
+        require(name not in names, f"duplicate automation profile method: {name}")
+        status = method.get("capability")
+        require(status in CDP_CAPABILITY_STATUSES, f"{location} has invalid capability")
+        require(
+            method.get("implementation") in CDP_IMPLEMENTATION_STATES,
+            f"{location} has invalid implementation state",
+        )
+        require(
+            method.get("verification") in CDP_VERIFICATION_STATES,
+            f"{location} has invalid verification state",
+        )
+        for field in ("params", "result", "events", "scope", "errors", "evidence"):
+            require(
+                isinstance(method.get(field), str) and bool(method[field].strip()),
+                f"{location} needs {field}",
+            )
+        names.add(name)
+        statuses.add(status)
+
+    require(
+        {"LIMITED", "VERIFIED_NOOP", "UNSUPPORTED"} <= statuses,
+        "automation profile must distinguish limited, verified no-op, and unsupported methods",
+    )
+    required = {
+        "Browser.getVersion",
+        "Browser.setDownloadBehavior",
+        "DOM.getDocument",
+        "Emulation.setEmulatedMedia",
+        "Emulation.setFocusEmulationEnabled",
+        "Log.auditMethodDoesNotExist",
+        "Log.enable",
+        "Network.enable",
+        "Network.getResponseBody",
+        "Page.addScriptToEvaluateOnNewDocument",
+        "Page.createIsolatedWorld",
+        "Page.enable",
+        "Page.getFrameTree",
+        "Page.navigate",
+        "Page.setLifecycleEventsEnabled",
+        "Runtime.callFunctionOn",
+        "Runtime.enable",
+        "Runtime.evaluate",
+        "Runtime.releaseObject",
+        "Runtime.runIfWaitingForDebugger",
+        "Target.attachToBrowserTarget",
+        "Target.attachToTarget",
+        "Target.createTarget",
+        "Target.getTargetInfo",
+        "Target.setAutoAttach",
+    }
+    require(required <= names, "automation profile is missing official smoke methods")
+
+    negative = value.get("negative_contract")
+    require(isinstance(negative, dict), "automation profile needs negative_contract")
+    require(
+        negative.get("observed_unknown_method_probe") == "error",
+        "the observed unknown-method probe must error",
+    )
+    require(
+        negative.get("exact_initializer_outside_allowlist") == "error",
+        "exact initializers outside their allowlist must error",
+    )
+    require(
+        negative.get("other_invalid_params") == "not-qualified",
+        "unvalidated invalid params must remain not-qualified",
+    )
+    require(
+        negative.get("unlisted") == "not-qualified",
+        "unlisted negative behavior must remain not-qualified",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -221,15 +335,20 @@ def main() -> None:
     baseline.add_argument("path", type=Path)
     client = subparsers.add_parser("client")
     client.add_argument("path", type=Path)
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("path", type=Path)
     args = parser.parse_args()
 
     try:
         if args.command == "baseline":
             validate_baseline(args.path)
             message = "OB-001 baseline manifest is valid"
-        else:
+        elif args.command == "client":
             validate_client_scope(args.path)
             message = "OB-025 client scope is valid"
+        else:
+            validate_automation_profile(args.path)
+            message = "OB-027 automation profile is valid"
     except (OSError, json.JSONDecodeError, ValueError) as error:
         parser.exit(1, f"error: {error}\n")
     print(message)

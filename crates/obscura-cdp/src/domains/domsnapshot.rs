@@ -40,12 +40,19 @@ const MAX_NODES: usize = 20_000;
 
 pub async fn handle(
     method: &str,
-    _params: &Value,
+    params: &Value,
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" | "disable" => Ok(json!({})),
+        "enable" | "disable"
+            if params.is_null() || params.as_object().is_some_and(serde_json::Map::is_empty) =>
+        {
+            Ok(json!({}))
+        }
+        "enable" | "disable" => {
+            Err(format!("DOMSnapshot.{method} supports only empty params"))
+        }
         "captureSnapshot" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let url = page.url_string();
@@ -53,9 +60,7 @@ pub async fn handle(
             page.with_dom(|dom| build_capture_snapshot(dom, &url, &title))
                 .ok_or_else(|| "No DOM loaded".to_string())
         }
-        // Permissive no-op for the rest of the domain (e.g. getSnapshot) so a
-        // client that probes it does not abort on an Unknown-method error.
-        _ => Ok(json!({})),
+        _ => Err(format!("Unknown DOMSnapshot method: {method}")),
     }
 }
 
@@ -404,13 +409,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_domsnapshot_method_is_permissive_noop() {
-        // Probing the domain (e.g. getSnapshot) must not abort with an
-        // Unknown-method error the way an unhandled domain would.
+    async fn unknown_domsnapshot_method_errors() {
         let mut ctx = CdpContext::new();
-        let r = handle("getSnapshot", &json!({}), &mut ctx, &None)
+        let error = handle("getSnapshot", &json!({}), &mut ctx, &None)
             .await
-            .expect("unknown DOMSnapshot methods are a permissive no-op");
-        assert!(r.is_object());
+            .expect_err("unknown DOMSnapshot methods must fail explicitly");
+        assert!(error.contains("Unknown DOMSnapshot method"));
     }
 }

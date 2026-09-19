@@ -1242,6 +1242,11 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
+            if !(params.is_null()
+                || params.as_object().is_some_and(serde_json::Map::is_empty))
+            {
+                return Err("Page.enable supports only empty params".to_string());
+            }
             // Chrome loads a new target's initial about:blank right after
             // createTarget, so by the time a client attaches and calls
             // Page.enable the page has already produced its load events.
@@ -1360,7 +1365,17 @@ pub async fn handle(
 
             Ok(json!({ "executionContextId": context.id }))
         }
-        "setLifecycleEventsEnabled" => Ok(json!({})),
+        "setLifecycleEventsEnabled" => {
+            let object = params
+                .as_object()
+                .ok_or("Page.setLifecycleEventsEnabled params must be an object")?;
+            if object.len() != 1 || params.get("enabled").and_then(Value::as_bool) != Some(true) {
+                return Err(
+                    "Page.setLifecycleEventsEnabled supports only enabled=true".to_string(),
+                );
+            }
+            Ok(json!({}))
+        }
         "addScriptToEvaluateOnNewDocument" => {
             let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
             ctx.preload_counter += 1;
@@ -3147,6 +3162,35 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Page method"));
+    }
+
+    #[tokio::test]
+    async fn observed_page_initializers_reject_unimplemented_shapes() {
+        assert!(
+            handle("enable", &json!({"invented": true}), &mut CdpContext::new(), &None)
+                .await
+                .is_err()
+        );
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": true}),
+            &mut CdpContext::new(),
+            &None,
+        )
+        .await
+        .expect("the observed fixed-on lifecycle shape must remain compatible");
+        for params in [
+            json!({}),
+            json!({"enabled": false}),
+            json!({"enabled": true, "invented": true}),
+        ] {
+            assert!(
+                handle("setLifecycleEventsEnabled", &params, &mut CdpContext::new(), &None)
+                    .await
+                    .is_err(),
+                "must reject {params}"
+            );
+        }
     }
 
     #[tokio::test]

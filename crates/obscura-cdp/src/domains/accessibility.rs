@@ -25,12 +25,15 @@ fn ax_value_integer(i: u32) -> Value {
 
 pub async fn handle(
     method: &str,
-    _params: &Value,
+    params: &Value,
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" if params.is_null() || params.as_object().is_some_and(serde_json::Map::is_empty) => {
+            Ok(json!({}))
+        }
+        "enable" => Err("Accessibility.enable supports only empty params".to_string()),
         "getFullAXTree" => {
             let page = ctx
                 .get_session_page(session_id)
@@ -40,7 +43,7 @@ pub async fn handle(
                 .unwrap_or_default();
             Ok(json!({ "nodes": nodes }))
         }
-        _ => Ok(json!({})),
+        _ => Err(format!("Unknown Accessibility method: {method}")),
     }
 }
 
@@ -520,5 +523,18 @@ mod tests {
         assert_ax_value(&nodes, &dom, "invalid-disabled", None);
         assert_ax_value(&nodes, &dom, "reenabled", Some("reenabled child"));
         assert_ax_value(&nodes, &dom, "reenabled-child", None);
+    }
+
+    #[tokio::test]
+    async fn unknown_accessibility_method_errors() {
+        let error = handle(
+            "auditMethodDoesNotExist",
+            &json!({}),
+            &mut CdpContext::new(),
+            &None,
+        )
+        .await
+        .expect_err("unknown Accessibility methods must fail explicitly");
+        assert!(error.contains("Unknown Accessibility method"));
     }
 }

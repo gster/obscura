@@ -53,6 +53,15 @@ class ManifestValidationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "OB-025 client scope is valid\n")
 
+    def test_automation_profile_separates_capability_from_evidence(self) -> None:
+        result = self.run_validator(
+            "profile",
+            str(TOOL_ROOT / "automation-cdp-profile.json"),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OB-027 automation profile is valid\n")
+
     def test_baseline_rejects_a_lock_digest_that_does_not_match_the_repository(self) -> None:
         result = self.validate_mutation(
             "baseline",
@@ -107,6 +116,39 @@ class ManifestValidationTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("client version does not match its lockfile", result.stderr)
+
+    def test_automation_profile_rejects_duplicate_methods(self) -> None:
+        def duplicate_method(value: dict) -> None:
+            value["methods"].append(dict(value["methods"][0]))
+
+        result = self.validate_mutation(
+            "profile",
+            "automation-cdp-profile.json",
+            duplicate_method,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("duplicate automation profile method", result.stderr)
+
+    def test_automation_profile_rejects_missing_negative_contract(self) -> None:
+        result = self.validate_mutation(
+            "profile",
+            "automation-cdp-profile.json",
+            lambda value: value["negative_contract"].update(other_invalid_params="error"),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unvalidated invalid params must remain not-qualified", result.stderr)
+
+    def test_automation_profile_rejects_global_claims_for_unlisted_methods(self) -> None:
+        result = self.validate_mutation(
+            "profile",
+            "automation-cdp-profile.json",
+            lambda value: value["coverage"].update(unlisted="supported"),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unlisted automation methods must remain not-qualified", result.stderr)
 
 
 if __name__ == "__main__":
