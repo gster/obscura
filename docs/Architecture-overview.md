@@ -1,135 +1,39 @@
-Obscura has a root workspace of nine crates and a separate isolated runtime workspace.
+# 当前架构
 
-```
-obscura-cli       CLI entry point. fetch, serve, scrape, mcp.
-obscura-cdp       Chrome DevTools Protocol server. WebSocket, dispatch, domain handlers.
-obscura-browser   Page type, navigation, lifecycle events.
-obscura-js        V8 runtime via deno_core. bootstrap.js + Rust ops.
-obscura-dom       DOM tree implementation.
-obscura-net       HTTP client, stealth client, cookie jar, robots cache, tracker blocklist.
-obscura-mcp       Model Context Protocol server.
-obscura-render    CSS cascade, retained layout, text shaping, and CPU paint.
-obscura           Embeddable Rust library API (Browser, Page, Element, CookieStore).
-```
+核验基线及运行结果见 [SUMMARY](SUMMARY.md)。这是当前结构；目标迁移见 [New_ACH](New_ACH.md)。
 
-## Request flow
+| 模块 | 当前职责 |
+| --- | --- |
+| obscura-cli | fetch/serve/scrape/mcp；另有 obscura-worker 批量抓取进程 |
+| obscura-cdp | WebSocket、连接调度、Target/session 和协议域处理 |
+| obscura-browser | BrowserContext/Page、导航、frame、资源、输入与捕获 |
+| obscura-js | deno_core/V8、bootstrap、Rust ops、frame/Worker |
+| obscura-dom | DOM 树及防环约束 |
+| obscura-net | reqwest、primp、Cookie、URL/DNS 策略、tracker 规则 |
+| obscura-render | CSS、布局、字体、CPU 绘制、几何/命中 |
+| obscura-mcp | 当前 CLI 的非 optional 依赖，保留并复用共享能力 |
+| obscura | 底层 Rust facade |
+| runtime/ | 独立 Cargo workspace；直接嵌入引擎，默认 render+stealth，NDJSON |
+| bindings/python/ | 自有 Python 客户端，连接上述 runtime，不走 CDP |
 
-A `Page.navigate` from a CDP client:
+## 执行与会话
 
-```
-CDP client (Puppeteer)
-        │ WebSocket frame
-        ▼
-obscura-cdp/server.rs           accept, route by sessionId
-        │
-        ▼
-obscura-cdp/dispatch.rs         method router on the owning connection thread
-        │
-        ▼
-obscura-cdp/domains/page.rs     Page.navigate handler
-        │
-        ▼
-obscura-browser/page.rs         navigate_with_wait
-        │
-        ├──► obscura-net/client.rs        HTTP fetch
-        │
-        ├──► obscura-dom/tree.rs          parse HTML into the tree
-        │
-        └──► obscura-js/runtime.rs        run inline scripts
-                  │
-                  └──► bootstrap.js + ops.rs    DOM bindings
-```
+CDP `server.rs::run_connection` 为连接创建 OS 线程、current-thread Tokio runtime 和 LocalSet。各 Page 的 JsRuntime 拥有自己的 V8 isolate；构造串行化和 isolate 进入约束仍须遵守。同一连接内同步 JS 可以阻塞调度，不等于多页面共用一个 isolate。
 
-The dispatcher emits CDP events (`Network.requestWillBeSent`, `Page.frameNavigated`, `Page.lifecycleEvent`) back to the client through the same WebSocket.
+Worker 在 `obscura-js/src/worker.rs` 的独立线程/Tokio runtime/V8 isolate 执行。普通与 stealth transport 均通过 detached 客户端获得独立连接池；配置、Cookie 和必要观察状态按现有策略共享。队列预算与 structured clone 有回归，不能据此声称完整 Worker 标准支持。
 
-## Rendering flow
+managed page session 通常为 `{targetId}-session`；显式 flattened attach 返回独立 session ID，客户端必须使用返回值。连接关闭会 abort 其 processor 并销毁 LocalSet/runtime 和页面，不能跨新连接恢复原 target，也不能让独立 viewer 观察另一连接的页面。
 
-`obscura-render` consumes the shared DOM and computed style state. Taffy
-provides the flex/grid foundation; Obscura adds browser formatting behavior,
-text shaping, intrinsic replaced-element sizing, retained geometry, scrolling,
-and CPU-backed paint. `obscura-js` exposes renderer-owned geometry to DOM APIs,
-`obscura-browser` prepares resources and owns capture, and `obscura-cdp` maps
-screenshots, screencast frames, and raster PDF output onto CDP.
+## 调用与渲染
 
-Layout is retained between captures and invalidated by relevant DOM, style,
-viewport, scroll, animation, font, and resource changes. The same geometry
-therefore drives browser APIs and paint instead of maintaining separate
-measurement and screenshot models.
+CDP handler → Page → 网络/DOM/JS；JS 通过 ops 进入原生能力。网络事件、拦截和导航生命周期由多层共同处理，不能仅从 handler 名称断言协议语义完整。若干域目前整域返回 `{}`，见 TODO OB-027。
 
-## V8 ownership
+render 消费共享 DOM/样式状态，以 Taffy 和原生浏览器布局逻辑、文本 shaping 和 CPU 绘制生成几何与图像。Page 负责资源和捕获，CDP 提供截图、screencast 与 raster PDF。图像输出存在不等于 Chromium 保真度认证。
 
-Each page runtime owns a V8 isolate. The CDP server warms V8 on its main thread,
-then gives each connection an OS thread with a current-thread Tokio runtime and
-LocalSet. A connection owns its pages, cookie jar, and HTTP client. Isolate
-construction is serialized by `ISOLATE_CREATE_LOCK`; execution is confined to
-the owner thread and uses scoped isolate entry/exit, not a process-wide async lock.
-Long operations are serviced through `process_with_interception` in `server.rs`.
+## 状态与保护
 
-The separate [isolated runtime](Use-the-isolated-runtime.md) embeds the same
-engine and exposes bounded NDJSON to `obscura_runtime.BrowserSession`. Its
-browser loop owns the pages on one thread; it does not run the CDP server.
-Application scheduling, business workflows, and Attempt cleanup remain with the
-consumer. Use release-mode `cargo nextest` for process-isolated test execution.
+BrowserContext 维护内存 localStorage，Page 维护相应 sessionStorage。当前 `storage_dir` 只加载/保存 Cookie，不能保证完整浏览器状态恢复。Cookie 磁盘格式丢失 host-only 元数据，详见 [存储说明](Persist-cookies-and-storage.md)。
 
-## Robustness
+V8 watchdog、CLI 硬截止时间、panic=unwind、ops 防 panic、DOM 防环和 URL/DNS 校验均是要保留的保护，不是永不崩溃或 OS sandbox 保证。见 [SECURITY](../SECURITY.md)。
 
-One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. The complete script phase is bounded by `OBSCURA_SCRIPT_DEADLINE_MS`; enhancement modules have a shorter per-module graph-loading/evaluation budget controlled by `OBSCURA_MODULE_BUDGET_MS`, while modules mounting an empty SPA shell receive the full script deadline. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot indefinitely block the owning connection (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module network requests are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
-
-## JS bridge
-
-`obscura-js/js/bootstrap.js` provides the browser globals: `document`, `window`, `navigator`, `location`, observers, fetch, indexedDB, etc.
-
-`obscura-js/src/ops.rs` registers Rust ops that the bootstrap calls into:
-
-```js
-Deno.core.ops.op_dom('insert_before', parentNid, refNid, newNid);
-```
-
-Adding a Web API usually means:
-
-1. JS shim in `bootstrap.js` that exposes the API surface.
-2. Rust op in `ops.rs` that performs the side effect (DOM mutation, fetch, crypto).
-3. Register the op in `build_extension()`.
-
-Worked example: [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md).
-
-## Classic Web Workers
-
-The JavaScript shim executes each classic Worker source once and retains its
-message handlers and lexical state. Bare `onmessage` assignments target the
-worker scope, and messages posted before the source loads are queued until
-initialization finishes. Terminating a worker discards pending messages.
-
-Workers remain emulated within the page runtime, not separate V8 isolates or
-OS threads. This is not a complete WorkerGlobalScope implementation.
-
-## CDP session model
-
-Each CDP client connection gets attached to one or more targets.
-Session IDs are `"{targetId}-session"`. The dispatcher routes by `sessionId` in the incoming frame to the right `Page`.
-
-Targets are created by `Target.createTarget`. Closing the WebSocket detaches all sessions but leaves the pages running.
-
-## Lifecycle
-
-Lifecycle events are emitted by `obscura-browser/lifecycle.rs` as the page transitions:
-
-```
-init → commit → domcontentloaded → load → networkidle2 → networkidle0
-```
-
-`waitUntil` on `Page.navigate` blocks until the requested level is reached. The Puppeteer / Playwright `goto` resolves on the matching `Page.lifecycleEvent` client-side.
-
-## Storage
-
-`--storage-dir` persists cookies (`cookies.json`) and localStorage (`localStorage/<origin>.json`). Reads on process start, writes on every navigation and on graceful shutdown.
-
-## Stealth
-
-`--stealth` swaps the default `reqwest` client for `obscura-net/stealth_client.rs`, which uses primp to emulate browser TLS ClientHello, ALPN, and cipher order (a consistent Chrome fingerprint, not a randomized one) so the TLS layer matches the User-Agent and JS surfaces. It also applies the bundled tracker blocklist before any request leaves the process. Scripted `fetch()`/XHR go through the same stealth client, so subresource requests carry the same fingerprint as the navigation. `--stealth` is a global CLI flag that applies to `fetch`, `serve`, `scrape`, and `mcp`.
-
-## Workspace conventions
-
-- One crate per layer. Cross-crate calls go through the layer above, not sideways.
-- All async is `tokio` with a `LocalSet` because V8 is `!Send`.
-- All DOM ops go through `op_dom` to keep the JS/Rust boundary narrow.
+源码入口：[workspace](../Cargo.toml)、[CDP server](../crates/obscura-cdp/src/server.rs)、[JS runtime](../crates/obscura-js/src/runtime.rs)、[Worker](../crates/obscura-js/src/worker.rs)、[BrowserContext](../crates/obscura-browser/src/context.rs)。

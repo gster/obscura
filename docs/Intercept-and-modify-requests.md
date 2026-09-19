@@ -1,4 +1,6 @@
-CDP `Fetch.enable` lets you inspect, block, or modify every request the page makes.
+> 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
+
+CDP `Fetch.enable` provides request interception. Coverage must be tested per request type, frame/Worker, phase and parameter combination; this guide does not establish universal interception coverage.
 
 ## Block by resource type
 

@@ -1,3 +1,5 @@
+> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+
 `obscura fetch` loads a URL, runs its JavaScript, and prints the result.
 
 ## Load a page
@@ -53,14 +55,14 @@ obscura fetch https://my-spa.example --wait-until domcontentloaded --eval "docum
 | `networkidle2`     | ≤2 network connections active for 500ms       |
 | `networkidle0`     | 0 network connections active for 500ms        |
 
-(When driving obscura via Puppeteer or Playwright the default is `domcontentloaded` to match client expectations.)
+Client navigation defaults come from the pinned client version; use an explicit `waitUntil` when comparing engines. Playwright uses `networkidle`, not Puppeteer's `networkidle0/2`.
 
 ## Common flags
 
 ```
 --user-agent "..."        Override the User-Agent
 --timeout 30                Navigation timeout in seconds (default 30)
---wait 5                    Extra wait after the page settles, in seconds (default 5)
+--wait 5                    Fixed settle window; omitted uses adaptive settle (5s cap)
 --selector ".main"          CSS selector to narrow output to
 --proxy http://host:port    Route through a proxy
 --stealth                   Stealth client (TLS fingerprint, tracker blocking)

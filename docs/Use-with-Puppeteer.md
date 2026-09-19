@@ -1,3 +1,5 @@
+> 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
+
 ## Setup
 
 ```bash
@@ -26,7 +28,7 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle0', timeout: 60000 });
 ```
 
-Default `waitUntil` is `domcontentloaded`. Other values: `load`, `networkidle2`, `networkidle0`.
+Puppeteer navigation defaults to `load` ([official options](https://pptr.dev/api/puppeteer.waitforoptions)). Set `waitUntil` explicitly; supported client values include `domcontentloaded`, `load`, `networkidle2`, and `networkidle0`.
 
 ## Evaluate
 
@@ -46,7 +48,7 @@ const items = await page.evaluate(() => {
 ```js
 await page.click('#login-button');
 await page.type('#username', 'alice');
-await page.fill('#password', 'secret');  // alias of .type for compat
+await page.type('#password', 'secret');
 
 await page.waitForSelector('#dashboard');
 await page.waitForFunction(() => window.appReady === true);
@@ -109,7 +111,7 @@ await Promise.all([
 ]);
 ```
 
-Pages share one V8 isolate. Concurrent JS execution serializes through a lock. CPU-bound JS on one page blocks the others.
+Each page owns a V8 isolate. Pages on one CDP connection share its owner thread, so synchronous work can delay that connection; separate isolates do not imply arbitrary parallel execution.
 
 ## Screenshots, scrolling, and PDF
 
@@ -166,5 +168,5 @@ await browser.disconnect();  // leaves obscura serve running
 
 - Some device emulation, service-worker, native media, long-tail CSS, and
   compositor behavior remains incomplete relative to Chromium.
-- Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
+- Pages own separate V8 isolates; synchronous work still occupies the owning connection thread.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.

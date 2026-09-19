@@ -1,3 +1,5 @@
+> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+
 `--dump markdown` converts the rendered page to markdown.
 
 ```bash
@@ -21,7 +23,8 @@ obscura fetch https://example.com --dump markdown
 - `<script>`, `<style>`, `<noscript>`
 - Inline styles
 - ARIA attributes
-- Tracking pixels and beacons
+
+This conversion is not a tracker detector and does not prevent requests already made during navigation.
 
 ## Save to file
 

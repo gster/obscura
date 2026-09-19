@@ -1,17 +1,19 @@
+> 目标变更：stealth 将成为不可关闭的基线，所有产品出站 HTTP(S) 统一使用校准后的 primp（OB-012/044）。本页保留当前源码所需的 feature/开关用法，不能将计划当作已实现。
+
 ## Requirements
 
 - Rust 1.98.1 (validated toolchain; [rustup.rs](https://rustup.rs))
 - C compiler (gcc or clang)
-- ~5 GB free disk space (V8 compiles from source on first build)
+- Sufficient disk and memory for Rust, V8 artifacts, native dependencies and linking; measure on the target host.
 
-First build takes about 5 minutes. Incremental builds are seconds.
+The `v8` dependency normally downloads a prebuilt archive; `V8_FROM_SOURCE` selects its source build. Obscura itself generates a bootstrap snapshot during native builds. Build time depends on caches and platform, so there is no fixed five-minute guarantee. The root workspace and `runtime/` both pin Rust 1.98.1 in their own toolchain files.
 
 ## Build
 
 ```bash
 git clone git@github.com:gster/obscura.git
 cd obscura
-cargo build --release -p obscura-cli --bins --features render
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --features render
 ```
 
 Binary is at `./target/release/obscura` unless `CARGO_TARGET_DIR` overrides it.
@@ -24,7 +26,7 @@ and PDF export.
 ## Rendering and stealth
 
 ```bash
-cargo build --release -p obscura-cli --bins --features render,stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --features render,stealth
 ```
 
 This is the complete rendering build with the stealth primp/Rustls transport,
@@ -34,8 +36,8 @@ blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 ## Without rendering
 
 ```bash
-cargo build --release -p obscura-cli --bins --no-default-features
-cargo build --release -p obscura-cli --bins --no-default-features --features stealth
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
 The second command keeps stealth while excluding layout, screenshots,
@@ -49,8 +51,7 @@ development libraries. On Ubuntu/Debian:
 sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 ```
 
-On macOS, install the Xcode Command Line Tools and CMake. On Windows, install
-the Visual Studio C++ Build Tools, CMake, and LLVM/Clang. Ensure the directory
+On macOS, install the Xcode Command Line Tools and CMake. Ensure the directory
 containing `libclang` is available through `LIBCLANG_PATH` if bindgen cannot
 locate it automatically.
 
@@ -73,11 +74,7 @@ cargo install --path crates/obscura-cli --features render
 cargo nextest run --release --features render --no-fail-fast
 ```
 
-Integration suite:
-
-```bash
-python3 tests/test_all.py
-```
+The previously documented `tests/test_all.py` does not exist in this checkout. Use the tracked crate tests and the independent runtime tests described in [Testing and debugging](Testing-and-debugging.md).
 
 Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
-because the engine owns a single V8 isolate per process.
+under the project's V8 test-isolation requirements; production pages can own separate isolates.

@@ -1,154 +1,27 @@
-Two recipes for the two most common extensions: a new CDP method, and a new JS Web API.
+# 新增 CDP 方法或 Web API
 
-## Adding a CDP method
+先确定可复现的契约和错误行为，再改实现；开发方向及范围见 [TODO](TODO.md)。不要以空对象或固定 true 让调用方误以为能力已支持。
 
-Worked example: `MyDomain.doThing` that takes `{ name }` and returns `{ ok }`.
+## CDP
 
-### 1. Add the handler
+1. 在 `crates/obscura-cdp/src/domains/` 增加或扩展域处理器，并在 `domains/mod.rs` 声明模块。
+2. `dispatch.rs` 先拆分 `Domain.method`，再按 **domain** 路由到处理器。新增 match arm 应匹配域名，不能把 `MyDomain.doThing` 放进域名分支。
+3. 校验参数、session/context/realm 归属、句柄寿命；明确 result、协议错误、页面异常与事件顺序。
+4. 在该 crate 的 tests 中复用真实 dispatch/HTTP fixture，覆盖成功、非法输入和生命周期边界。
+5. 更新方法级支持表及固定客户端回归；当前整域 no-op 是待修缺口，不是新增方法模板。
 
-Create or edit a file under `crates/obscura-cdp/src/domains/`:
-
-```rust
-// crates/obscura-cdp/src/domains/my_domain.rs
-use serde_json::{json, Value};
-use crate::dispatch::CdpContext;
-
-pub async fn do_thing(
-    params: &Value,
-    _ctx: &mut CdpContext,
-    _session_id: &Option<String>,
-) -> Result<Value, String> {
-    let name = params.get("name")
-        .and_then(|v| v.as_str())
-        .ok_or("missing name")?;
-
-    // do the work
-
-    Ok(json!({ "ok": true, "name": name }))
-}
-```
-
-### 2. Register in the dispatcher
-
-In `crates/obscura-cdp/src/dispatch.rs`, add a match arm:
-
-```rust
-"MyDomain.doThing" => domains::my_domain::do_thing(&req.params, ctx, &req.session_id).await,
-```
-
-### 3. Test it
-
-`crates/obscura-cdp/tests/cdp_my_domain.rs`:
-
-```rust
-use obscura_cdp::dispatch::{dispatch, CdpContext};
-use obscura_cdp::types::CdpRequest;
-use serde_json::json;
-
-#[tokio::test(flavor = "current_thread")]
-async fn my_domain_do_thing_returns_ok() {
-    let mut ctx = CdpContext::new();
-    let resp = dispatch(&CdpRequest {
-        id: 1,
-        method: "MyDomain.doThing".into(),
-        params: json!({ "name": "test" }),
-        session_id: None,
-    }, &mut ctx).await;
-
-    assert!(resp.error.is_none());
-    assert_eq!(resp.result.unwrap()["ok"], true);
-}
-```
-
-Run:
+参考：[dispatch](../crates/obscura-cdp/src/dispatch.rs)、[Page](../crates/obscura-cdp/src/domains/page.rs)、[CDP tests](../crates/obscura-cdp/tests/)。
 
 ```bash
-cargo nextest run --release --features render -p obscura-cdp my_domain
+cargo nextest run --locked --release --features render -p obscura-cdp
 ```
 
-## Adding a Web API
+## Web API
 
-Worked example: `crypto.subtle.digest`, real implementation backed by a Rust hash op.
+JS 表面在 `obscura-js/js/bootstrap.js`，原生边界在 `src/ops.rs`，扩展注册与 runtime 在同 crate 内。只有真实副作用或需要原生状态的部分才下沉 ops；先检查已有入口，避免重复实现。
 
-### 1. Add the Rust op
+测试应覆盖描述符/brand、参数转换、成功与错误、异步事件时序及适用的 window/frame/Worker。Promise 包装不能修复错误时序，`[native code]` 外观也不能代替实现。未知 crypto 算法应按 Web API 契约拒绝，不能像旧示例那样默默降为 SHA-256。
 
-In `crates/obscura-js/src/ops.rs`:
+ops 不得 unwind 进入 V8。遵守 watchdog、SSRF、DOM 防环与 release unwind 约束。新增测试使用 release nextest；bootstrap 修改会在构建期快照生成中执行，但快照构建成功只证明初始化通过。
 
-```rust
-#[op2]
-#[buffer]
-fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8> {
-    use sha1::Digest as _;
-    match algorithm.to_ascii_uppercase().as_str() {
-        "SHA-1"   => sha1::Sha1::digest(data).to_vec(),
-        "SHA-256" => sha2::Sha256::digest(data).to_vec(),
-        "SHA-384" => sha2::Sha384::digest(data).to_vec(),
-        "SHA-512" => sha2::Sha512::digest(data).to_vec(),
-        _         => sha2::Sha256::digest(data).to_vec(),
-    }
-}
-```
-
-### 2. Register the op
-
-In the same file, `build_extension()`:
-
-```rust
-ops: std::borrow::Cow::Owned(vec![
-    op_dom(),
-    op_console_msg(),
-    // ...
-    op_subtle_digest(),
-]),
-```
-
-### 3. Add the JS shim
-
-In `crates/obscura-js/js/bootstrap.js`:
-
-```js
-globalThis.crypto = globalThis.crypto || {};
-globalThis.crypto.subtle = globalThis.crypto.subtle || {};
-globalThis.crypto.subtle.digest = function digest(algorithm, data) {
-  const algName = typeof algorithm === 'string' ? algorithm : algorithm.name;
-  const bytes = data instanceof ArrayBuffer
-    ? new Uint8Array(data)
-    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  const out = Deno.core.ops.op_subtle_digest(algName, bytes);
-  return Promise.resolve(out.buffer);
-};
-```
-
-### 4. Add a dependency if needed
-
-`crates/obscura-js/Cargo.toml`:
-
-```toml
-sha1 = "0.10"
-sha2 = "0.10"
-```
-
-### 5. Smoke test
-
-```bash
-cargo build --release --features render
-./target/release/obscura fetch https://example.com --eval "
-  crypto.subtle.digest('SHA-256', new TextEncoder().encode('hi'))
-    .then(buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join(''))
-"
-```
-
-## Tips
-
-- Keep the JS shim thin. All side effects go through ops.
-- Use `Promise.resolve` to keep async-shaped APIs callable from sync ops.
-- Match the spec: Web API names and shapes are checked by Puppeteer / Playwright wrappers.
-- DOM mutations go through `op_dom`, not new ops.
-- For events that need to fire across handlers, use the existing `_makeListenerBox` helper in `bootstrap.js`.
-
-## Worked examples in the tree
-
-- CDP method with intercept: `crates/obscura-cdp/src/domains/page.rs` `do_navigate`.
-- Web API with op + JS shim: `crypto.subtle.digest` (above).
-- Web API in pure JS (no op): `DOMParser` in `bootstrap.js`.
-- Web API with async event firing: `WebSocket`, `IntersectionObserver` in `bootstrap.js`.
+完成标准及完整门禁见 [AGENTS](../AGENTS.md) 与 [测试指南](Testing-and-debugging.md)。不要全仓库 cargo fmt。

@@ -4,7 +4,7 @@
 
 Allow fetches to loopback (`127.0.0.0/8`), RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and link-local (`169.254.0.0/16`, including the `169.254.169.254` cloud-metadata endpoint) addresses. The deny-set also covers the unspecified address (`0.0.0.0` / `::`), IPv6 unique-local (`fc00::/7`), and any IPv4-mapped form of the above. Off by default to block SSRF.
 
-The guard validates at DNS-resolution time as well as on literal hosts, so a public hostname that resolves to a forbidden address is rejected at connect time (DNS-rebinding safe), not just hosts written as raw IPs.
+The guard validates at DNS-resolution time as well as on literal hosts, for direct destination resolution. With HTTP CONNECT or remote-DNS SOCKS, the proxy resolves the destination; local DNS filtering alone does not establish the proxy's final destination IP policy. Literal URL and redirect checks still apply.
 
 Truthy values: `1`, `true`, `yes`, `on`.
 
@@ -54,7 +54,7 @@ This shorter budget applies when the document body already contains more than 50
 
 ### `OBSCURA_CDP_COMMAND_TIMEOUT_MS`
 
-Per-command deadline for the CDP server. A hung page (a runaway `Runtime.evaluate`, a synchronous DOM op) is terminated after this budget so one bad session cannot hold the shared V8 lock and stall the others. Default 60000 (60 seconds); `0` disables it. Navigation self-bounds via `OBSCURA_NAV_TIMEOUT_MS` well under this.
+Per-command deadline for the CDP server. The dispatcher arms the V8 watchdog around commands. This bounds synchronous V8 work on the owning connection; it is not a universal cancellation guarantee for arbitrary native work. Default 60000 (60 seconds); `0` disables it. Navigation self-bounds via `OBSCURA_NAV_TIMEOUT_MS` well under this.
 
 ```bash
 OBSCURA_CDP_COMMAND_TIMEOUT_MS=30000 obscura serve

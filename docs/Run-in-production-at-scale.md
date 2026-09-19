@@ -1,52 +1,14 @@
-## Docker
+> 目标变更：stealth 将成为不可关闭的基线，所有产品出站 HTTP(S) 统一使用校准后的 primp（OB-012/044）。本页保留当前源码所需的 feature/开关用法，不能将计划当作已实现。
 
-```bash
-# The container runs as uid 65532, so a mounted storage dir must be writable
-# by it. Without this the cookie jar silently fails to persist.
-sudo install -d -o 65532 -g 65532 /srv/obscura/data
+# 当前部署边界
 
-docker run -d \
-  --name obscura \
-  --restart unless-stopped \
-  -p 127.0.0.1:9222:9222 \
-  -v /srv/obscura/data:/data \
-  h4ckf0r0day/obscura \
-  serve --host 0.0.0.0 --storage-dir /data --stealth
-```
+这里描述现有 serve 的运维要求，不构成生产资格。新宿主、安全边界和双平台发布仍在 [TODO](TODO.md) 中。
 
-The image runs `obscura serve` by default. Override with arguments after the image name.
+## Container build status
 
-### The container does not run as root
+The tracked Dockerfile copies vendored dependencies and builds the root CLI with `--features render`, then uses a nonroot distroless runtime (uid/gid 65532). It does not enable `stealth`, so a deployment recipe requiring that feature needs a separately built and tested artifact. The registry image is an upstream artifact and does not identify this fork's build. No Docker build was run in this audit.
 
-The image is built on `gcr.io/distroless/cc-debian12:nonroot` and runs as
-uid/gid **65532**. Obscura executes untrusted page JavaScript in-process through
-V8, so a V8 exploit lands with the process's privileges — there is no reason for
-those to be root's.
-
-Two consequences worth knowing:
-
-- **A mounted `--storage-dir` must be writable by uid 65532**, as above. This is
-  the one thing that breaks quietly rather than loudly. Verified: with an
-  unwritable storage dir Obscura completes the run, exits `0`, and prints no
-  warning — the cookie jar simply never persists. Check that
-  `{storage-dir}/cookies.json` exists after your first run rather than assuming
-  it does.
-- **Nothing in the image needs a privileged operation.** It binds an
-  unprivileged port, reads the CA bundle, and writes only to the storage dir and
-  a temp dir. Verified in the non-root image: an HTTPS fetch succeeds, so the CA
-  bundle is readable, and a writable storage dir is populated.
-
-### Why the in-container bind is `0.0.0.0`
-
-A container-loopback bind is unreachable through `-p`, so `--host 0.0.0.0` is
-required for the published port to work at all. Publish to **host loopback**
-(`-p 127.0.0.1:9222:9222`, as above) rather than `-p 9222:9222`: the latter
-exposes the port on every host interface, and Docker's iptables rules bypass
-most host firewalls.
-
-The CDP control plane has no authentication of its own: anything that can reach
-the port can drive the browser. See [Authentication](#authentication) for the
-controls that actually gate it.
+Before deployment, select and test a pinned build, bind published ports to host loopback, set writable private storage and explicit resource limits. The current cookie save path can ignore write errors; inspect persisted files and restored behavior.
 
 ## Systemd
 
@@ -82,7 +44,7 @@ journalctl -fu obscura
 obscura serve --workers 4
 ```
 
-Use one worker per CPU core. Each worker handles its own pool of pages. Sessions are sticky to a worker.
+Select worker count using measured workload and resource budgets. Each accepted CDP connection owns its pages; reconnecting does not restore its targets.
 
 ## V8 heap
 
@@ -178,7 +140,7 @@ RUST_LOG=obscura=debug obscura serve
 
 ## Reliability and timeouts
 
-The engine is hardened so one page cannot hang, crash, or wedge a worker. A V8 watchdog terminates runaway scripts and microtask storms, DOM ops are panic-safe, cyclic DOM mutations are rejected, and the CDP server terminates any single command that overruns its budget so a hung session cannot stall the others. Scripted `fetch()`/XHR and navigation are timeout-bounded. You can point the server at arbitrary or heavy pages without a stuck worker.
+The engine includes V8 termination, panic guards, DOM cycle rejection and several request deadlines. These reduce specific failure modes; they do not guarantee arbitrary pages cannot crash or exhaust a process, and do not replace OS isolation or supervision.
 
 Tune the bounds with environment variables (see [Environment variables](Environment-variables.md)):
 

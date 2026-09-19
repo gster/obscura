@@ -20,7 +20,7 @@ cargo nextest run --release --features render runtime_click_submit_prevent_defau
 ```
 
 Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
-because the engine owns one V8 isolate per process. Render tests must run in
+under the project's V8 isolation requirements; production pages can own separate isolates. Render tests must run in
 release mode; debug builds are not a fidelity or performance gate.
 
 ### CDP parity tests
@@ -70,29 +70,21 @@ In another shell:
 wscat -c ws://127.0.0.1:9222
 > {"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}
 > {"id":2,"method":"Target.attachToTarget","params":{"targetId":"...","flatten":true}}
-> {"id":3,"sessionId":"...-session","method":"Page.navigate","params":{"url":"https://example.com"}}
-> {"id":4,"sessionId":"...-session","method":"Runtime.evaluate","params":{"expression":"document.title"}}
+> {"id":3,"sessionId":"<sessionId returned by attachToTarget>","method":"Page.navigate","params":{"url":"https://example.com"}}
+> {"id":4,"sessionId":"<sessionId returned by attachToTarget>","method":"Runtime.evaluate","params":{"expression":"document.title"}}
 ```
 
 Useful for reproducing what Puppeteer or Playwright is doing without their abstraction.
 
 ## Common failure modes
 
-### `Target.createTarget timed out`
+### Target or context failures
 
-Lock contention in the dispatcher. Should not happen on current main. If it does, run with `RUST_LOG=obscura_cdp=trace`, look for handlers that hold `v8_lock` across long awaits.
+Inspect owning connection/session, target lifetime and execution-context events. Context IDs currently validate routing but do not establish true utility-world isolation. Do not assume every timeout is a global V8-lock bug.
 
-### `page.goto()` returns `null` from Puppeteer
+### V8 isolate failures
 
-Means `Network.requestWillBeSent` for the main document did not arrive with `requestId == loaderId`. Check `do_navigate` in `crates/obscura-cdp/src/domains/page.rs`.
-
-### `Cannot find context with specified id`
-
-Playwright's local context counter diverged from the server's `valid_context_ids`. Each navigation must allocate a fresh `executionContextId`. Check `ctx.next_isolated_context()` is called on every nav.
-
-### `V8_Fatal: heap->isolate() == Isolate::TryGetCurrent()`
-
-Two pages tried to use V8 concurrently. The `v8_lock` was bypassed, or a handler suspended a JS runtime while another isolate was entered. Search for direct `JsRuntime` access outside the lock.
+Check owner-thread access, isolate entry/exit, creation serialization and suspension across awaits. Pages and Workers have separate isolates; do not debug from the obsolete single-isolate model.
 
 ### Test hangs
 
@@ -100,9 +92,7 @@ A handler is awaiting something that never resolves. Run with `RUST_LOG=obscura=
 
 ## Reproducing user bug reports
 
-The integration suite in `tests/test_all.py` is the fastest path from a one-line repro to a regression test. Add the failing case as a new test function, get it failing, then fix.
-
-For Puppeteer / Playwright bug reports, the user's repro script usually drops straight in. Save it as `tests/repro_<issue>.js`, run with `node`, fix until it passes.
+Use existing crate integration fixtures or an external disposable repro. There is no root `tests/test_all.py` in this checkout. A client repro must record its exact client/driver and engine build; direct dispatch coverage alone is not a full WebSocket/client test.
 
 The reduced airline protection collector is documented in
 [Protection script regression case](Protection-script-regression-case.md). Use
@@ -133,7 +123,7 @@ fixture. Do not add hostname-specific render branches.
 CPU with `perf` and a flamegraph:
 
 ```bash
-cargo build --release --features render
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
 perf record -F 99 -g -- ./target/release/obscura fetch https://heavy-spa.example
 perf script | flamegraph.pl > flame.svg
 ```
@@ -144,13 +134,18 @@ Memory with heaptrack:
 heaptrack ./target/release/obscura serve
 ```
 
-Tokio task inspection:
+## Independent runtime and obstacle course
 
 ```bash
-RUSTFLAGS="--cfg tokio_unstable" cargo build --release --features render
-./target/release/obscura serve
-# in another shell
-tokio-console
+(cd runtime && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --no-fail-fast)
 ```
 
-Requires the workspace `tokio` dependency to be built with the `tracing` feature; not enabled by default, add it in the relevant `Cargo.toml` before profiling.
+The companion `obscura-benchmark` repository is separate. Check out a fixed revision, then execute from that repository with an absolute candidate path:
+
+```bash
+OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
+```
+
+The current CI pin is `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` in the `gster/obscura-benchmark` fork. That revision repairs the observer fixture so its first real intersection drains the bounded initial page; reference Chrome and Obscura were both re-run, and the full Obscura course reached 33/33. Keep failed/skipped/not-run separate and do not replace a failed fixture's expected value to obtain 33/33. WPT results use subtest denominators. Current audit results are in [SUMMARY](SUMMARY.md).
+
+Profiling requires tooling that actually exists in the selected build; `tokio-console` needs application instrumentation as well as dependency features. No instrumented console subscriber is asserted by this guide.

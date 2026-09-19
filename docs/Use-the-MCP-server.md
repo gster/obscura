@@ -1,3 +1,5 @@
+> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+
 `obscura mcp` exposes obscura as a Model Context Protocol server so MCP-capable clients (Claude Desktop, Claude Code, etc.) can drive it.
 
 ## Run
@@ -91,39 +93,3 @@ a fresh snapshot or interactive-element listing before acting again.
 
 MCP exposes still-image and PDF output. It does not stream video frames; use
 CDP `Page.startScreencast` for activity-driven screencasting.
-
-## Claude Desktop
-
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "obscura": {
-      "command": "/path/to/obscura",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-Restart Claude Desktop. The obscura tools appear in the tool list.
-
-## Claude Code
-
-```bash
-claude mcp add obscura /path/to/obscura mcp
-```
-
-## With stealth in config
-
-```json
-{
-  "mcpServers": {
-    "obscura": {
-      "command": "/path/to/obscura",
-      "args": ["mcp", "--stealth"]
-    }
-  }
-}
-```

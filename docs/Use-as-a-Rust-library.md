@@ -1,19 +1,15 @@
-The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page` / `Element` API plus a cookie store, no CDP round-trips. It builds V8 from source, so it is a git dependency rather than a crates.io release.
+The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page` / `Element` API plus a cookie store, no CDP round-trips. Use this fork at a fixed git revision. V8 artifact acquisition follows the dependency build configuration; it is not necessarily compiled from source.
 
 ## Add the dependency
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura" }
+obscura = { git = "https://github.com/gster/obscura", rev = "e67e67b11eb265f097942055962622e43fcb9a16", features = ["render", "stealth"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```
 
-The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a tag for reproducible builds:
-
-```toml
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
-```
+The revision above is the documentation audit baseline, not a release recommendation. Use your tested revision and lockfile. Requirements are in [Build from source](Build-from-source.md).
 
 ## Quickstart
 
@@ -21,7 +17,7 @@ obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
 use obscura::Browser;
 use std::time::Duration;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let browser = Browser::builder()
         .stealth(true)

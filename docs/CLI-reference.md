@@ -1,6 +1,8 @@
+> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+
 ## `obscura`
 
-Top-level flags apply to every subcommand.
+Global flags can appear before or after the subcommand. Their effect depends on the command; `--obey-robots` applies to fetch and scrape.
 
 ```
 -v, --verbose                Enable info logging
@@ -9,7 +11,7 @@ Top-level flags apply to every subcommand.
     --stealth                Consistent browser fingerprint + tracker blocking
     --obey-robots            Respect robots.txt
     --user-agent <UA>        Override the User-Agent
-    --storage-dir <DIR>      Persistent cookies and localStorage
+    --storage-dir <DIR>      Cookie persistence only; see storage limitations
     --allow-private-network  Permit loopback / RFC1918 / link-local
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
 -h, --help                   Help
@@ -70,9 +72,10 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
+    --max-connections <N>    Maximum simultaneous CDP connections (default 128)
     --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
-    --storage-dir <DIR>      Persistent cookies and localStorage
+    --storage-dir <DIR>      Cookie persistence only; see storage limitations
     --allow-private-network  Permit loopback / RFC1918 / link-local
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable info logging

@@ -1,3 +1,5 @@
+> 目标变更：stealth 将成为不可关闭的基线，所有产品出站 HTTP(S) 统一使用校准后的 primp（OB-012/044）。本页保留当前源码所需的 feature/开关用法，不能将计划当作已实现。
+
 ## Stealth mode
 
 ```bash
@@ -13,11 +15,9 @@ What `--stealth` changes:
 
 - Uses the primp HTTP client with Chrome TLS profiles (ClientHello, ALPN, cipher order). See [known fidelity gaps](Primp-and-wreq-comparison.md).
 - Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
-- Bundles webpki roots instead of relying on the system store.
+- Uses bundled webpki roots and supports explicitly configured certificate roots; see [certificate configuration](Environment-variables.md).
 
-Requires a build that includes the stealth feature. Use a `-stealth` archive
-with rendering or a `-no-render-stealth` archive without it. To build the
-rendering variant yourself:
+The primp transport requires a build that includes the stealth feature. Fix the source revision and build features in the artifact manifest. To build the rendering variant:
 
 ```bash
 cargo build --release -p obscura-cli --bins --features render,stealth
@@ -25,17 +25,9 @@ cargo build --release -p obscura-cli --bins --features render,stealth
 
 Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-features --features stealth`.
 
-## What stealth handles
+## Verification boundary
 
-- Basic bot detection that checks TLS fingerprint or User-Agent.
-- Sites that rely on third-party analytics being reachable.
-
-## What stealth does not handle
-
-- Cloudflare interactive challenges.
-- Datadome and Akamai bot manager active challenges.
-- CAPTCHAs.
-- IP-based rate limiting (use proxies).
+Transport presets and resource blocking do not guarantee website acceptance or full Chrome identity. Blocking functional third-party resources may break a page. Validate the actual request path, realm, effective persona and response; do not infer correctness from a JA3/JA4 match or a single HTTP 200.
 
 ## Proxies
 
@@ -65,13 +57,13 @@ obscura fetch https://example.com --user-agent "Mozilla/5.0 (...) ..."
 obscura serve --user-agent "Mozilla/5.0 (...) ..."
 ```
 
-Default UA matches a recent Chrome on the build platform.
+A custom UA does not automatically change the TLS, Client Hints, JavaScript, font or graphics configuration. Current primp presets include Windows Chrome 145 and macOS Chrome 152/153; these are implementation choices, not certified Linux/macOS personas.
 
 ## Browser profile, timezone, and geolocation
 
-The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. There is no GPU renderer among them: `canvas.getContext('webgl')` returns `null`, so a page cannot read a renderer string at all.
+The CLI's environment-selected profile and the isolated runtime's Persona are different configuration paths. Do not transfer a setting between them without checking its consumer. WebGL has a limited shim and renderer metadata; the old statement that every `getContext('webgl')` returns null is obsolete. Neither metadata nor a working clear/readPixels subset establishes complete GPU emulation.
 
-A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
+A single stable profile is used by default. Rotation is opt-in:
 
 ```bash
 OBSCURA_PROFILE=2 obscura serve          # pin a specific profile by index
@@ -97,6 +89,5 @@ Keep these aligned. A rotated or mismatched profile carries no matching TLS or t
 ```bash
 obscura serve \
   --stealth \
-  --proxy http://user:pass@proxy.example.com:8080 \
-  --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ..."
+  --proxy http://user:pass@proxy.example.com:8080
 ```

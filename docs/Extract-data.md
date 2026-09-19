@@ -1,3 +1,5 @@
+> 当前用法：MCP 与有用的 CLI 保留，用于自动化和 agent 接入。下列命令对应现有代码；目标是统一 persona、强制 stealth 和唯一 primp 出口，见 [TODO](TODO.md)，这些迁移尚未实现。
+
 `--dump` formats the page output without writing JavaScript.
 
 ```bash
@@ -23,7 +25,7 @@ obscura fetch https://news.ycombinator.com --dump html > hn.html
 Plain text. No markup.
 
 ```bash
-obscura fetch https://en.wikipedia.org/wiki/Rust_(programming_language) --dump text
+obscura fetch 'https://en.wikipedia.org/wiki/Rust_(programming_language)' --dump text
 ```
 
 ## `markdown`
@@ -52,7 +54,7 @@ obscura fetch https://example.com --dump assets
 
 ## `original`
 
-The raw HTML the server sent, before JavaScript ran.
+The raw response body, bypassing the engine. It may be binary and is not limited to HTML.
 
 ```bash
 obscura fetch https://my-spa.example --dump original > before.html
@@ -62,7 +64,7 @@ diff before.html after.html
 
 ## `cookies`
 
-Every cookie in the jar as a JSON array, including HttpOnly cookies that `document.cookie` cannot see. Useful for capturing session tokens set by anti-bot challenges.
+Every cookie in the jar as a JSON array, including HttpOnly cookies that `document.cookie` cannot see. This output can contain sensitive session data; it is not a complete or lossless browser profile.
 
 ```bash
 obscura fetch https://example.com --dump cookies

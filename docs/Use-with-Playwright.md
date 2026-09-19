@@ -1,3 +1,5 @@
+> 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
+
 ## Setup
 
 ```bash
@@ -25,7 +27,7 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle' });
 ```
 
-Default is `domcontentloaded`. Other values: `load`, `networkidle`.
+Set `waitUntil` explicitly for repeatable comparisons. Playwright navigation defaults to `load` ([official navigation API](https://playwright.dev/python/docs/api/class-page#page-goto)); its API uses `networkidle`, not `networkidle0/2`.
 
 ## Evaluate
 
@@ -94,7 +96,7 @@ await Promise.all([
 ]);
 ```
 
-Pages share one V8 isolate. CPU-bound JS on one page blocks the others.
+Each page owns a V8 isolate. Pages on one CDP connection share its owner thread, so synchronous work can delay that connection; separate isolates do not imply arbitrary parallel execution.
 
 ## Screenshots, scrolling, and PDF
 

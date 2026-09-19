@@ -1,62 +1,8 @@
-Obscura is an open-source headless browser engine written in Rust. It runs JavaScript via V8, speaks the Chrome DevTools Protocol, and works as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
+# 文档入口
 
-## Versus headless Chrome
+- [项目 README](../README.md)：定位、构建与当前使用入口。
+- [SUMMARY](SUMMARY.md)：核验后的现状、测试边界和完整文档索引。
+- [TODO](TODO.md)：唯一开发执行清单。
+- [New_ACH](New_ACH.md)：未来架构与迁移门槛。
 
-| Metric      | Obscura  | Headless Chrome |
-| ----------- | -------- | --------------- |
-| Memory      | 30 MB    | 200+ MB         |
-| Binary size | ~70 MiB  | 300+ MB         |
-| Startup     | Instant  | ~2s             |
-| Page load   | 85 ms    | ~500 ms         |
-| Anti-detect | Built-in | None            |
-| Puppeteer   | Yes      | Yes             |
-| Playwright  | Yes      | Yes             |
-
-Rendering and stealth are both first-class capabilities. Release builds
-support screenshots, scroll-aware layout, activity-driven CDP screencasting,
-and raster PDF export; stealth builds retain all of those surfaces while adding
-the primp/Rustls transport and browser-identity protections.
-
-## Quickstart
-
-- [Installation](Installation.md)
-- [Your first fetch](Your-first-fetch.md)
-- [Extract data](Extract-data.md)
-- [Connect Puppeteer or Playwright](Connect-Puppeteer-or-Playwright.md)
-
-## Guides
-
-- [Build from source](Build-from-source.md)
-- [Configure stealth and proxies](Configure-stealth-and-proxies.md)
-- [Markdown extraction](Markdown-extraction.md)
-- [Use with Puppeteer](Use-with-Puppeteer.md)
-- [Use with Playwright](Use-with-Playwright.md)
-- [Use the MCP server](Use-the-MCP-server.md)
-- [Use as a Rust library](Use-as-a-Rust-library.md)
-- [Use the isolated runtime](Use-the-isolated-runtime.md)
-- [Obscura 修复日志](Obscura-fix-changelog.md)
-- [Persist cookies and storage](Persist-cookies-and-storage.md)
-- [Intercept and modify requests](Intercept-and-modify-requests.md)
-- [Run in production at scale](Run-in-production-at-scale.md)
-
-## Reference
-
-- [CLI reference](CLI-reference.md)
-- [Environment variables](Environment-variables.md)
-
-## Contributing
-
-- [Architecture overview](Architecture-overview.md)
-- [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
-- [Testing and debugging](Testing-and-debugging.md)
-- [Southwest 修复与审查记录](Southwest-fix-record.md)
-- [Protection script regression case](Protection-script-regression-case.md)
-
-## Links
-
-- Fork source: https://github.com/gster/obscura
-- Upstream source: https://github.com/h4ckf0r0day/obscura
-- Releases: https://github.com/h4ckf0r0day/obscura/releases
-- Issues: https://github.com/h4ckf0r0day/obscura/issues
-
-License: Apache-2.0.
+MCP 和有用 CLI 保留；自有 Python SDK/私有 runtime 是下一步清理对象。统一 persona、强制 stealth、唯一 primp 出口与 Chrome 差异修补是重点，Southwest shopping 不再 403 是重要业务验收。各操作指南区分当前用法与尚未实现的目标。上游发行包、旧现场成功和历史测试记录不构成本 fork 当前版本的发布资格。

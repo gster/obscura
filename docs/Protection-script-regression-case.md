@@ -101,7 +101,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release \
 Record a successful Chrome session as HAR and compare these layers in order:
 
 1. request URL, method, body bytes, redirect chain, HTTP version, proxy route,
-   and static headers, including the fetch/XHR `priority: u=1, i` value;
+   and static headers, including the actual request-class-dependent headers;
 2. effective startup persona and the JavaScript surfaces listed above;
 3. worker bootstrap messages and whether private messages reach application
    handlers;
@@ -117,10 +117,6 @@ complete.
 
 ## Verification boundary
 
-The reduced tests document the specific browser contracts above. The current
-Worker implementation has separate realm support, but the September 16 review
-found regressions in structured message cloning and Worker termination. Passing
-the protection-protocol fixture does not establish complete Worker conformance.
-See the [final Southwest repair and review record](Southwest-fix-record.md) for
-current findings, reproduced failures, historical business samples, and gates
-that have not passed. This fixture alone does not explain a live shopping 403.
+Current Workers execute on separate threads and V8 isolates and use structured serialization and termination control. The September 16 JSON-cloning and queued-timer findings are historical, not current conclusions. Implementation limits and regression entry points are in [Worker compatibility](Worker-compatibility.md).
+
+The fixture proves only its explicit assertions. It does not establish complete WebIDL, rendering, identity or Worker conformance, and does not explain a live shopping 403. Source-level surface inventories are not certified browser personas. Current tests and historical-site evidence are separated in [SUMMARY](SUMMARY.md) and [Southwest handoff](Southwest-handoff.md).

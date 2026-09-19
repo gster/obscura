@@ -1,3 +1,5 @@
+> 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
+
 Obscura speaks the Chrome DevTools Protocol over WebSocket. Puppeteer and
 Playwright can connect to its CDP endpoint for the supported workflows below.
 
@@ -56,35 +58,13 @@ Use `connectOverCDP`, not `connect`. Playwright's `connect` speaks Playwright's 
 
 ## `waitUntil`
 
-Default is `domcontentloaded`. For full subresource load:
+Specify the client wait condition explicitly. Both client navigation APIs default to `load`; Puppeteer accepts `networkidle0/2`, while Playwright uses `networkidle`. Obscura's CLI wait levels are a separate interface.
 
-```js
-await page.goto('https://example.com', { waitUntil: 'load' });
-```
+## Compatibility boundary
 
-| Value              | Returns when                            |
-| ------------------ | --------------------------------------- |
-| `domcontentloaded` | HTML parsed, scripts ran (default)      |
-| `load`             | All subresources finished               |
-| `networkidle2`     | ≤2 network connections active for 500ms |
-| `networkidle0`     | 0 network connections active for 500ms  |
+The handlers cover navigation, evaluation, DOM/input, networking, cookies and render output, but method presence does not certify every parameter or event contract. Current utility-world IDs do not create independent globals, and several domains acknowledge all methods without implementing them. Use the fixed-client results and backlog in [SUMMARY](SUMMARY.md) and [TODO](TODO.md).
 
-## Supported
-
-- `page.goto`, `page.reload`, `page.goBack`, `page.goForward`
-- `page.evaluate`, `page.evaluateHandle`
-- `page.click`, `page.type`, `page.fill`, `page.focus`
-- `page.waitForSelector`, `page.waitForFunction`, `page.waitForNavigation`
-- `page.cookies`, `page.setCookie`, `context.cookies`
-- `page.setRequestInterception`, block / modify
-- `page.exposeFunction`
-- `page.content`, `page.title`, `page.url`
-- `page.screenshot` for viewport, clipped, and full-page capture
-- `page.pdf` for raster-backed print output
-- raw CDP `Page.startScreencast` with frame acknowledgements (`page.createCDPSession()`
-  in Puppeteer; `context.newCDPSession(page)` in Playwright)
-
-DOM-agent frameworks such as browser-use also connect: obscura implements `DOMSnapshot.captureSnapshot` and `Target.targetInfoChanged` for perception, and `DOM.focus` so a focused field receives `Input.dispatchKeyEvent` keystrokes.
+The following capture example uses Puppeteer APIs; Playwright equivalents are in its separate guide.
 
 ## Capture example
 
@@ -101,7 +81,7 @@ screencasting, and current output limits.
 
 ## Current limits
 
-- Pages share one V8 isolate. CPU-bound JavaScript on one page can delay others.
+Each page owns a V8 isolate. Pages on one CDP connection share its owner thread, so synchronous work can delay that connection; separate isolates do not imply arbitrary parallel execution.
 - PDF output is raster-backed; text is not selectable and tagged PDF,
   headers/footers, outlines, and full CSS paged media are not implemented.
 - Service workers, native media playback, some Web APIs, and long-tail CSS or
