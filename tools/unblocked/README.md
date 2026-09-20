@@ -29,7 +29,7 @@ Validate the committed records with the system Python:
 python3 tools/unblocked/validate.py baseline tools/unblocked/baseline.json
 python3 tools/unblocked/validate.py client tools/unblocked/client-scope.json
 python3 tools/unblocked/validate.py profile tools/unblocked/automation-cdp-profile.json
-python3 -m unittest tools.unblocked.tests.test_validate tools.unblocked.tests.test_cdp_trace -v
+python3 -m unittest discover -s tools/unblocked/tests -v
 ```
 
 Create the isolated client environment without resolving newer dependencies:
@@ -74,6 +74,21 @@ frame/loader/request identifiers plus arrival order and the call active when
 they arrived; the recorder does not invent causal links from timing alone.
 Playwright's private driver traffic outside the explicit CDP session is not
 claimed as part of this trace.
+
+For externally launched Chromium CDP and Obscura CDP processes, `processCapture`
+records the command, PID, exit status, and paths to separate `stdout.bin` and
+`stderr.bin` files. These files retain emitted bytes without decoding, redaction,
+truncation, or an in-memory pipe budget. Spawn and endpoint-readiness failures
+retain their capture metadata too. With `--output`, per-process directories stay
+under the output directory (the smoke uses its JSON file's parent); direct Python
+calls without an output root use retained OS temporary directories. The caller
+owns cleanup after inspecting the evidence. The Playwright-managed normal launch
+mode does not use this external-process capture path.
+
+CI uploads the complete smoke directory on success or failure, including the raw
+Playwright protocol log, JSON result, and browser stdout/stderr files, with a
+seven-day artifact retention period. Local runs keep files until the operator
+removes them.
 
 ## Required automation smoke
 

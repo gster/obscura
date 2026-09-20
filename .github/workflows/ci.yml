@@ -108,7 +108,7 @@ jobs:
           python3 tools/unblocked/validate.py baseline tools/unblocked/baseline.json
           python3 tools/unblocked/validate.py client tools/unblocked/client-scope.json
           python3 tools/unblocked/validate.py profile tools/unblocked/automation-cdp-profile.json
-          python3 -m unittest tools.unblocked.tests.test_validate tools.unblocked.tests.test_cdp_trace -v
+          python3 -m unittest discover -s tools/unblocked/tests -v
 
       - name: Check dependency advisories, licenses, bans, and sources
         if: steps.changes.outputs.audit == 'true'
@@ -183,6 +183,15 @@ jobs:
           python3 tools/unblocked/validate.py protocol-log \
             tools/unblocked/automation-cdp-profile.json \
             "$smoke_root/playwright-protocol.log"
+
+      - name: Upload official client smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cdp-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/obscura-cdp-smoke
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Test render configuration
         run: cargo nextest run --release --features render --no-fail-fast

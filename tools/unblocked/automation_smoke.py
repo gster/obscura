@@ -131,7 +131,7 @@ def inspect_png(data: bytes) -> dict[str, Any]:
     }
 
 
-def run(obscura_bin: Path) -> dict[str, Any]:
+def run(obscura_bin: Path, *, log_root: Path | None = None) -> dict[str, Any]:
     from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
     result: dict[str, Any] = {
@@ -139,6 +139,7 @@ def run(obscura_bin: Path) -> dict[str, Any]:
         "playwrightVersion": importlib.metadata.version("playwright"),
         "connection": "BrowserType.connect_over_cdp",
         "status": "running",
+        "processCapture": {},
     }
     trace: Trace | None = None
     port = free_port()
@@ -153,7 +154,12 @@ def run(obscura_bin: Path) -> dict[str, Any]:
         str(port),
     ]
     try:
-        with fixture_server() as fixture_origin, external_process(command, endpoint):
+        with fixture_server() as fixture_origin, external_process(
+            command,
+            endpoint,
+            capture=result["processCapture"],
+            log_root=log_root,
+        ):
             trace = Trace("obscura-cdp-smoke", fixture_origin)
             with sync_playwright() as playwright:
                 browser = playwright.chromium.connect_over_cdp(endpoint)
@@ -656,7 +662,10 @@ def main() -> int:
     parser.add_argument("--obscura-bin", type=Path, default=Path("target/release/obscura"))
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = run(args.obscura_bin)
+    result = run(
+        args.obscura_bin,
+        log_root=args.output.parent.resolve() if args.output is not None else None,
+    )
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

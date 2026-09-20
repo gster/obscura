@@ -51,6 +51,10 @@ class ProbeFailure(RuntimeError):
         self.original = error
 
 
+def error_record(error: BaseException) -> dict[str, str]:
+    return {"type": type(error).__name__, "message": str(error)}
+
+
 class FixtureHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ObscuraFixture/1"
@@ -210,6 +214,7 @@ def process_group_exists(process_group: int) -> bool:
 
 def terminate_process_group(process: subprocess.Popen[Any], timeout: float = 5) -> None:
     process_group = process.pid
+    process.poll()
     if process_group_exists(process_group):
         try:
             os.killpg(process_group, signal.SIGTERM)
@@ -238,19 +243,83 @@ def terminate_process_group(process: subprocess.Popen[Any], timeout: float = 5) 
 
 
 @contextmanager
-def external_process(command: list[str], endpoint: str) -> Iterator[None]:
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+def external_process(
+    command: list[str],
+    endpoint: str,
+    *,
+    capture: dict[str, Any] | None = None,
+    log_root: Path | None = None,
+) -> Iterator[dict[str, Any]]:
+    metadata = capture if capture is not None else {}
+    if log_root is None:
+        capture_dir = Path(tempfile.mkdtemp(prefix="obscura-process-"))
+    else:
+        log_root.mkdir(parents=True, exist_ok=True)
+        capture_dir = Path(
+            tempfile.mkdtemp(prefix="obscura-process-", dir=str(log_root))
+        )
+    stdout_path = capture_dir / "stdout.bin"
+    stderr_path = capture_dir / "stderr.bin"
+    metadata.update(
+        {
+            "command": list(command),
+            "captureDir": str(capture_dir),
+            "stdoutPath": str(stdout_path),
+            "stderrPath": str(stderr_path),
+            "state": "starting",
+        }
     )
+    process: subprocess.Popen[Any] | None = None
+    stdout = None
+    stderr = None
+    active_error: BaseException | None = None
     try:
-        wait_for_endpoint(endpoint, process)
-        yield
+        stdout = stdout_path.open("wb")
+        stderr = stderr_path.open("wb")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+            )
+        except BaseException as error:
+            metadata["state"] = "spawn-failed"
+            metadata["spawnError"] = error_record(error)
+            metadata["returncode"] = None
+            active_error = error
+            raise
+
+        metadata["pid"] = process.pid
+        metadata["state"] = "started"
+        try:
+            wait_for_endpoint(endpoint, process)
+            metadata["state"] = "ready"
+            yield metadata
+        except BaseException as error:
+            metadata["state"] = "failed"
+            metadata["error"] = error_record(error)
+            active_error = error
+            raise
     finally:
-        terminate_process_group(process)
+        cleanup_error: BaseException | None = None
+        try:
+            if process is not None:
+                terminate_process_group(process)
+        except BaseException as error:
+            cleanup_error = error
+            metadata["cleanupError"] = error_record(error)
+        finally:
+            if process is not None:
+                metadata["returncode"] = process.poll()
+                metadata["state"] = "stopped" if cleanup_error is None else "cleanup-failed"
+            if stdout is not None:
+                stdout.close()
+            if stderr is not None:
+                stderr.close()
+        if cleanup_error is not None and active_error is None:
+            raise cleanup_error
 
 
 def page_for(browser: Any) -> Any:
@@ -313,7 +382,14 @@ def record_probe(mode: str, browser: Any, fixture_origin: str) -> dict[str, Any]
         raise ProbeFailure(trace.document(), error) from error
 
 
-def run_mode(playwright: Any, mode: str, fixture_origin: str, obscura_bin: Path) -> dict[str, Any]:
+def run_mode(
+    playwright: Any,
+    mode: str,
+    fixture_origin: str,
+    obscura_bin: Path,
+    process_capture: dict[str, Any] | None = None,
+    log_root: Path | None = None,
+) -> dict[str, Any]:
     if mode == "chromium-launch":
         browser = playwright.chromium.launch(headless=True)
         try:
@@ -324,6 +400,7 @@ def run_mode(playwright: Any, mode: str, fixture_origin: str, obscura_bin: Path)
     port = free_port()
     endpoint = f"http://127.0.0.1:{port}"
     if mode == "chromium-cdp":
+        process_capture = process_capture if process_capture is not None else {}
         with tempfile.TemporaryDirectory(prefix="obscura-chrome-") as profile:
             command = [
                 playwright.chromium.executable_path,
@@ -335,14 +412,23 @@ def run_mode(playwright: Any, mode: str, fixture_origin: str, obscura_bin: Path)
                 f"--user-data-dir={profile}",
                 "about:blank",
             ]
-            with external_process(command, endpoint):
-                browser = playwright.chromium.connect_over_cdp(endpoint)
-                try:
-                    return record_probe(mode, browser, fixture_origin)
-                finally:
-                    browser.close()
+            try:
+                with external_process(
+                    command, endpoint, capture=process_capture, log_root=log_root
+                ):
+                    browser = playwright.chromium.connect_over_cdp(endpoint)
+                    try:
+                        document = record_probe(mode, browser, fixture_origin)
+                    finally:
+                        browser.close()
+                document["processCapture"] = process_capture
+                return document
+            except ProbeFailure as error:
+                error.document["processCapture"] = process_capture
+                raise
 
     if mode == "obscura-cdp":
+        process_capture = process_capture if process_capture is not None else {}
         command = [
             str(obscura_bin),
             "--allow-private-network",
@@ -352,12 +438,20 @@ def run_mode(playwright: Any, mode: str, fixture_origin: str, obscura_bin: Path)
             "--port",
             str(port),
         ]
-        with external_process(command, endpoint):
-            browser = playwright.chromium.connect_over_cdp(endpoint)
-            try:
-                return record_probe(mode, browser, fixture_origin)
-            finally:
-                browser.close()
+        try:
+            with external_process(
+                command, endpoint, capture=process_capture, log_root=log_root
+            ):
+                browser = playwright.chromium.connect_over_cdp(endpoint)
+                try:
+                    document = record_probe(mode, browser, fixture_origin)
+                finally:
+                    browser.close()
+            document["processCapture"] = process_capture
+            return document
+        except ProbeFailure as error:
+            error.document["processCapture"] = process_capture
+            raise
 
     raise ValueError(f"unknown mode: {mode}")
 
@@ -417,10 +511,20 @@ def main() -> int:
     runs: dict[str, dict[str, Any]] = {}
     traces: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
+    process_captures: dict[str, dict[str, Any]] = {}
     with fixture_server() as fixture_origin, sync_playwright() as playwright:
         for mode in modes:
+            process_capture: dict[str, Any] = {}
+            process_captures[mode] = process_capture
             try:
-                document = run_mode(playwright, mode, fixture_origin, args.obscura_bin.resolve())
+                document = run_mode(
+                    playwright,
+                    mode,
+                    fixture_origin,
+                    args.obscura_bin.resolve(),
+                    process_capture,
+                    output,
+                )
                 runs[mode] = document
                 traces[mode] = document
                 (output / f"{mode}.json").write_text(
@@ -446,6 +550,7 @@ def main() -> int:
                 "status": "passed" if mode in runs else "failed",
                 "trace": f"{mode}.json" if mode in traces else None,
                 "error": failures.get(mode),
+                "processCapture": process_captures.get(mode) or None,
             }
             for mode in modes
         },
