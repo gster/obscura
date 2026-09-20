@@ -1,5 +1,7 @@
 # 项目现状与文档核验摘要
 
+Cookie 排序切片验证（基线 `8ddaa15`，macOS arm64，Owner: Codex）：根 release nextest **1937/1937**，4 skipped；Cookie 与真实 primp 请求回归在 render/no-render 均为 **62/62**。两种 exact CLI release build 成功，CI 固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 障碍课 **33/33**，官方 Playwright Python 1.60.0 smoke 与 37-method 画像通过。相同本地 HTTP fixture 设置多 Path Cookie 后，旧二进制四个独立恢复进程均发出错误顺序，候选四次均为 `first=updated; session=scoped; session=root`。候选二进制 SHA-256：`63e87004d15d7ca720fdae41dca8b86da269c36bf4b139ff44e6d4681c1c7deb`。Astra light Spec 审查 0 blockers，Standards 无硬性违规；测试中直接修改过期状态仅为非阻塞可读性建议。完整原始日志保存在执行机 `/tmp/ob011-order-*.log`，CLI 原始请求及进程输出在执行机临时目录 `ob011-order-baseline-yc5vzxtd` 与 `ob011-order-candidate-spd84a6i`，均不进入产品或仓库。该结果不代表完整 SameSite、分区或跨平台资格。
+
 核验日期：2026-09-20。OB-044 本轮修改基于 `56ac4b284b1a554dc3ab66638200b2b0c2ef0c98`；更早的引擎行为核验基线为 `e67e67b11eb265f097942055962622e43fcb9a16`。随后提交 `741f40a97ce2a0672be4c85b24aa4bef85faccae` 增加开发侧基线资产、固定工具链和 CI benchmark pin；`9be460d` 交付首批 Automation CDP Profile、精确 initializer 契约和必需官方客户端 smoke。
 
 ## 根本目标与当前阶段

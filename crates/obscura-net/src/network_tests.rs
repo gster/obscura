@@ -361,6 +361,31 @@ fn redirect_to_self() -> String {
         .to_string()
 }
 
+#[tokio::test]
+async fn primp_sends_cookies_in_path_and_creation_order_after_restore() {
+    let (mut target, mut received) = http_fixture(vec![ok_response("", "ordered")]).await;
+    target.set_path("/account/details");
+    let original = CookieJar::new();
+    original.set_cookie("session=root; Path=/", &target);
+    original.set_cookie("first=old; Path=/account", &target);
+    original.set_cookie("session=scoped; Path=/account", &target);
+    original.set_cookie("first=updated; Path=/account", &target);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cookies.json");
+    original.save_to_file(&file).unwrap();
+    let restored = Arc::new(CookieJar::new());
+    restored.load_from_file(&file).unwrap();
+    let client = primp_client(restored, None, true);
+
+    assert_eq!(client.fetch(&target).await.unwrap().body, b"ordered");
+    let request = received.recv().await.unwrap();
+    let cookie = request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("cookie").then(|| value.trim())
+    });
+    assert_eq!(cookie, Some("first=updated; session=scoped; session=root"));
+}
+
 // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be
 // followed, the 21st must fail. Guards the `0..=max_redirects` boundary in
 // fetch_with_profile_uncached; `0..max_redirects` regressed this to 19.

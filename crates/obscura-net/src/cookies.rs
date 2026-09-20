@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use url::Url;
 
@@ -31,6 +32,8 @@ pub struct CookieJar {
     /// carries name+path so same-name cookies on different paths coexist
     /// instead of clobbering each other.
     cookies: RwLock<HashMap<String, HashMap<(String, String), CookieEntry>>>,
+    /// Allocated while holding the cookies write lock, shared across domains.
+    next_creation_order: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,6 +49,9 @@ struct CookieEntry {
     http_only: bool,
     expires: Option<u64>,
     same_site: String,
+    /// Zero means an older version 1 file did not record creation order.
+    #[serde(default)]
+    creation_order: u64,
 }
 
 type CookieKey = (String, String, String);
@@ -81,6 +87,18 @@ fn cookie_key(entry: &CookieEntry) -> CookieKey {
     )
 }
 
+/// RFC 6265 section 5.4: longer paths first, then earlier creation time.
+fn serialize_cookie_header(mut entries: Vec<&CookieEntry>) -> String {
+    entries.sort_by(|a, b| {
+        b.path.len().cmp(&a.path.len())
+            .then_with(|| a.creation_order.cmp(&b.creation_order))
+    });
+    entries.into_iter()
+        .map(|entry| format!("{}={}", entry.name, entry.value))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn unix_time_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -105,6 +123,7 @@ impl CookieJar {
     pub fn new() -> Self {
         CookieJar {
             cookies: RwLock::new(HashMap::new()),
+            next_creation_order: AtomicU64::new(1),
         }
     }
 
@@ -201,10 +220,11 @@ impl CookieJar {
             http_only,
             expires,
             same_site,
+            creation_order: 0,
         };
 
         let mut cookies = self.cookies.write().unwrap();
-        cookies.entry(domain).or_default().insert((name, path), entry);
+        self.insert_entry(&mut cookies, entry);
     }
 
     pub fn get_cookie_header(&self, url: &Url) -> String {
@@ -213,7 +233,7 @@ impl CookieJar {
         let is_secure = url.scheme() == "https";
         let cookies = self.cookies.read().unwrap();
 
-        let mut matching: Vec<String> = Vec::new();
+        let mut matching: Vec<&CookieEntry> = Vec::new();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -239,38 +259,33 @@ impl CookieJar {
                 if !path_matches(path, &entry.path) {
                     continue;
                 }
-                matching.push(format!("{}={}", entry.name, entry.value));
+                matching.push(entry);
             }
         }
 
-        matching.join("; ")
+        serialize_cookie_header(matching)
     }
 
     pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
         let cookies = self.cookies.read().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut result = Vec::new();
-        for domain_cookies in cookies.values() {
-            for entry in domain_cookies.values() {
-                if entry.expires.is_some_and(|expires| expires <= now) {
-                    continue;
-                }
-                result.push(CookieInfo {
-                    name: entry.name.clone(),
-                    value: entry.value.clone(),
-                    domain: entry.domain.clone(),
-                    path: entry.path.clone(),
-                    secure: entry.secure,
-                    http_only: entry.http_only,
-                    same_site: entry.same_site.clone(),
-                    expires: entry.expires.map(|e| e as i64),
-                });
-            }
-        }
-        result
+        let now = unix_time_secs();
+        let mut entries: Vec<_> = cookies.values()
+            .flat_map(|domain_cookies| domain_cookies.values())
+            .filter(|entry| !cookie_is_expired(entry, now))
+            .collect();
+        // CookieInfo has no creation metadata, so preserve it in array order
+        // for callers that later import this projection through CDP.
+        entries.sort_by_key(|entry| entry.creation_order);
+        entries.into_iter().map(|entry| CookieInfo {
+            name: entry.name.clone(),
+            value: entry.value.clone(),
+            domain: entry.domain.clone(),
+            path: entry.path.clone(),
+            secure: entry.secure,
+            http_only: entry.http_only,
+            same_site: entry.same_site.clone(),
+            expires: entry.expires.map(|e| e as i64),
+        }).collect()
     }
 
     /// Capture every stored entry without projecting it through the lossy CDP
@@ -316,31 +331,73 @@ impl CookieJar {
             }
         }
 
-        for (key, entry) in &current.entries {
-            if cookie_is_expired(entry, now) || initial.entries.get(key) == Some(entry) {
-                continue;
+        let mut changes: Vec<_> = current.entries.iter()
+            .filter(|(key, entry)| {
+                !cookie_is_expired(entry, now) && initial.entries.get(*key) != Some(*entry)
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        changes.sort_by_key(|entry| entry.creation_order);
+        for entry in changes {
+            // A changed creation order means the source deleted/expired and
+            // recreated this key, rather than replacing its value in place.
+            if initial.entries.get(&cookie_key(&entry))
+                .is_some_and(|previous| previous.creation_order != entry.creation_order)
+            {
+                if let Some(domain_cookies) = jar.get_mut(&entry.domain) {
+                    domain_cookies.remove(&(entry.name.clone(), entry.path.clone()));
+                }
             }
-            jar.entry(entry.domain.clone())
-                .or_default()
-                .insert((entry.name.clone(), entry.path.clone()), entry.clone());
+            self.insert_entry(&mut jar, entry);
         }
     }
 
     fn merge_entries(&self, entries: impl IntoIterator<Item = CookieEntry>) {
         let now = unix_time_secs();
         let mut jar = self.cookies.write().unwrap();
+        let mut entries: Vec<_> = entries.into_iter().collect();
+        // Stable sorting gives old files without metadata their array order.
+        entries.sort_by_key(|entry| entry.creation_order);
         for mut entry in entries {
             let domain = canonical_domain(&entry.domain);
             entry.domain = domain.clone();
             let key = (entry.name.clone(), entry.path.clone());
             if cookie_is_expired(&entry, now) {
+                // Snapshots retain expired entries. Do not reuse their order
+                // when a copied jar recreates one of these keys.
+                self.next_creation_order.fetch_max(
+                    entry.creation_order.saturating_add(1), Ordering::Relaxed,
+                );
                 if let Some(domain_cookies) = jar.get_mut(&domain) {
                     domain_cookies.remove(&key);
                 }
                 continue;
             }
-            jar.entry(domain).or_default().insert(key, entry);
+            self.insert_entry(&mut jar, entry);
         }
+    }
+
+    /// A replacement keeps its original position. Imported creation orders are
+    /// retained when possible; new entries from another jar follow destination
+    /// entries, even when their independently allocated numbers overlap.
+    fn insert_entry(
+        &self,
+        cookies: &mut HashMap<String, HashMap<(String, String), CookieEntry>>,
+        mut entry: CookieEntry,
+    ) {
+        let key = (entry.name.clone(), entry.path.clone());
+        let domain_cookies = cookies.entry(entry.domain.clone()).or_default();
+        if let Some(previous) = domain_cookies.get(&key)
+            .filter(|previous| !cookie_is_expired(previous, unix_time_secs()))
+        {
+            entry.creation_order = previous.creation_order;
+        } else {
+            let order = self.next_creation_order.load(Ordering::Relaxed)
+                .max(entry.creation_order);
+            entry.creation_order = order;
+            self.next_creation_order.store(order.saturating_add(1), Ordering::Relaxed);
+        }
+        domain_cookies.insert(key, entry);
     }
 
     pub fn set_cookies_from_cdp(&self, cookies: Vec<CookieInfo>) {
@@ -381,8 +438,9 @@ impl CookieJar {
                 http_only: cookie.http_only,
                 expires,
                 same_site,
+                creation_order: 0,
             };
-            jar.entry(domain).or_default().insert((cookie.name, cookie.path), entry);
+            self.insert_entry(&mut jar, entry);
         }
     }
 
@@ -397,7 +455,7 @@ impl CookieJar {
             .unwrap_or_default()
             .as_secs();
 
-        let mut matching: Vec<String> = Vec::new();
+        let mut matching: Vec<&CookieEntry> = Vec::new();
 
         for (domain, domain_cookies) in cookies.iter() {
             if !domain_matches(host, domain) {
@@ -421,11 +479,11 @@ impl CookieJar {
                 if !path_matches(path, &entry.path) {
                     continue;
                 }
-                matching.push(format!("{}={}", entry.name, entry.value));
+                matching.push(entry);
             }
         }
 
-        matching.join("; ")
+        serialize_cookie_header(matching)
     }
 
     pub fn set_cookie_from_js(&self, cookie_str: &str, url: &Url) {
@@ -522,6 +580,7 @@ impl CookieJar {
             http_only: false,
             expires,
             same_site,
+            creation_order: 0,
         };
 
         let mut cookies = self.cookies.write().unwrap();
@@ -534,7 +593,7 @@ impl CookieJar {
         {
             return;
         }
-        domain_cookies.insert((name, path), entry);
+        self.insert_entry(&mut cookies, entry);
     }
 
     pub fn delete_cookie(&self, name: &str, domain: &str) {
@@ -574,7 +633,7 @@ impl CookieJar {
 
         let snapshot = self.snapshot();
         let now = unix_time_secs();
-        let store = PersistedCookieStore {
+        let mut store = PersistedCookieStore {
             version: COOKIE_STORE_VERSION,
             cookies: snapshot
                 .entries
@@ -582,6 +641,7 @@ impl CookieJar {
                 .filter(|entry| !cookie_is_expired(entry, now))
                 .collect(),
         };
+        store.cookies.sort_by_key(|entry| entry.creation_order);
         let json = serde_json::to_string_pretty(&store).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
@@ -917,6 +977,74 @@ mod tests {
         assert!(header_b.contains("id=2"), "/b must see the Path=/b cookie, got: {header_b:?}");
         assert!(!header_a.contains("id=2"), "Path=/b cookie leaked to /a: {header_a:?}");
         assert!(!header_b.contains("id=1"), "Path=/a cookie leaked to /b: {header_b:?}");
+    }
+
+    #[test]
+    fn cookie_headers_sort_by_path_then_creation_across_domains() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://www.example.com/account/detail/page").unwrap();
+        jar.set_cookie("session=root; Path=/", &url);
+        jar.set_cookie("first=old; Domain=example.com; Path=/account", &url);
+        jar.set_cookie("session=scoped; Path=/account", &url);
+        jar.set_cookie("deep=value; Path=/account/detail", &url);
+        jar.set_cookie("private=value; Path=/account; HttpOnly", &url);
+        jar.set_cookie("first=updated; Domain=example.com; Path=/account", &url);
+
+        assert_eq!(jar.get_cookie_header(&url),
+            "deep=value; first=updated; session=scoped; private=value; session=root");
+        assert_eq!(jar.get_js_visible_cookies(&url),
+            "deep=value; first=updated; session=scoped; session=root");
+    }
+
+    #[test]
+    fn replacements_keep_creation_order_across_http_js_and_cdp() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/account/page").unwrap();
+        jar.set_cookie("first=server; Path=/account", &url);
+        jar.set_cookie("second=server; Path=/account", &url);
+        jar.set_cookie_from_js("first=script; Path=/account", &url);
+        assert_eq!(jar.get_cookie_header(&url), "first=script; second=server");
+        let mut imported = jar.get_all_cookies().into_iter()
+            .find(|cookie| cookie.name == "first").unwrap();
+        imported.value = "cdp".to_string();
+        imported.domain = ".EXAMPLE.com".to_string();
+        jar.set_cookies_from_cdp(vec![imported]);
+        assert_eq!(jar.get_cookie_header(&url), "first=cdp; second=server");
+        jar.set_cookie("first=updated; Path=/account", &url);
+        assert_eq!(jar.get_cookie_header(&url), "first=updated; second=server");
+    }
+
+    #[test]
+    fn cdp_projection_reimport_preserves_creation_order() {
+        let source = CookieJar::new();
+        let url = Url::parse("https://www.example.com/account/page").unwrap();
+        source.set_cookie("root=value; Path=/", &url);
+        source.set_cookie("first=one; Domain=example.com; Path=/account", &url);
+        source.set_cookie("second=two; Path=/account", &url);
+        source.set_cookie("first=updated; Domain=example.com; Path=/account", &url);
+        let projected = source.get_all_cookies();
+        assert_eq!(projected.iter().map(|cookie| cookie.name.as_str()).collect::<Vec<_>>(),
+            vec!["root", "first", "second"]);
+        let restored = CookieJar::new();
+        restored.set_cookies_from_cdp(projected);
+        assert_eq!(restored.get_cookie_header(&url), "first=updated; second=two; root=value");
+    }
+
+    #[test]
+    fn deleted_and_expired_cookies_get_fresh_creation_order() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("first=one; Path=/", &url);
+        jar.set_cookie("second=two; Path=/", &url);
+        jar.set_cookie("first=gone; Path=/; Max-Age=0", &url);
+        jar.set_cookie("first=three; Path=/", &url);
+        assert_eq!(jar.get_cookie_header(&url), "second=two; first=three");
+
+        // Mark the stored entry expired without depending on wall-clock sleeps.
+        jar.cookies.write().unwrap().get_mut("example.com").unwrap()
+            .get_mut(&("second".to_string(), "/".to_string())).unwrap().expires = Some(0);
+        jar.set_cookie_from_js("second=four; Path=/", &url);
+        assert_eq!(jar.get_cookie_header(&url), "first=three; second=four");
     }
 
     #[test]
@@ -1392,6 +1520,88 @@ mod tests {
     }
 
     #[test]
+    fn saved_creation_order_survives_reordered_file_and_future_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        let url = Url::parse("https://example.com/account/page").unwrap();
+        let source = CookieJar::new();
+        source.set_cookie("deleted=value; Path=/", &url);
+        source.set_cookie("root=value; Path=/", &url);
+        source.set_cookie("first=old; Path=/account", &url);
+        source.set_cookie("second=value; Path=/account", &url);
+        source.set_cookie("first=opaque==updated; Path=/account", &url);
+        source.delete_cookie("deleted", "example.com");
+        source.save_to_file(&path).unwrap();
+
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let entries = json["cookies"].as_array_mut().unwrap();
+        assert_eq!(entries.iter().map(|entry| entry["creation_order"].as_u64().unwrap())
+            .collect::<Vec<_>>(), vec![2, 3, 4]);
+        entries.reverse();
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let restored = CookieJar::new();
+        restored.load_from_file(&path).unwrap();
+        assert_eq!(restored.snapshot().entries, source.snapshot().entries);
+        assert_eq!(restored.get_cookie_header(&url),
+            "first=opaque==updated; second=value; root=value");
+        restored.set_cookie("third=value; Path=/account", &url);
+        restored.set_cookie("first=again; Path=/account", &url);
+        assert_eq!(restored.get_cookie_header(&url),
+            "first=again; second=value; third=value; root=value");
+    }
+
+    #[test]
+    fn older_cookie_files_use_array_order_for_missing_creation_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        let url = Url::parse("https://example.com/").unwrap();
+        let source = CookieJar::new();
+        source.set_cookie("first=opaque==one; Path=/", &url);
+        source.set_cookie("second=two; Path=/", &url);
+        source.save_to_file(&path).unwrap();
+        let mut versioned: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for entry in versioned["cookies"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("creation_order");
+        }
+        let legacy = serde_json::json!([
+            {"name": "first", "value": "opaque==one", "domain": "example.com",
+             "path": "/", "secure": false, "httpOnly": false},
+            {"name": "second", "value": "two", "domain": "example.com",
+             "path": "/", "secure": false, "httpOnly": false}
+        ]);
+        for file in [versioned, legacy] {
+            std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+            let restored = CookieJar::new();
+            assert_eq!(restored.load_from_file(&path).unwrap(), 2);
+            restored.set_cookie("first=updated; Path=/", &url);
+            restored.set_cookie("third=three; Path=/", &url);
+            assert_eq!(restored.get_cookie_header(&url),
+                "first=updated; second=two; third=three");
+        }
+    }
+
+    #[test]
+    fn file_merge_preserves_destination_positions_and_source_relative_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        let url = Url::parse("https://example.com/").unwrap();
+        let source = CookieJar::new();
+        source.set_cookie("new_first=one; Path=/", &url);
+        source.set_cookie("existing=updated; Path=/", &url);
+        source.set_cookie("new_second=two; Path=/", &url);
+        source.save_to_file(&path).unwrap();
+        let destination = CookieJar::new();
+        destination.set_cookie("existing=old; Path=/", &url);
+        destination.set_cookie("concurrent=value; Path=/", &url);
+        destination.load_from_file(&path).unwrap();
+        assert_eq!(destination.get_cookie_header(&url),
+            "existing=updated; concurrent=value; new_first=one; new_second=two");
+    }
+
+    #[test]
     fn legacy_cookie_array_keeps_domain_scoped_import_semantics() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cookies.json");
@@ -1488,6 +1698,7 @@ mod tests {
                 http_only: false,
                 expires: Some(0),
                 same_site: "Lax".to_string(),
+                creation_order: 0,
             }],
         };
         std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
@@ -1514,6 +1725,55 @@ mod tests {
         copied.set_cookie("host=copied; Path=/", &origin);
         assert!(copied.get_cookie_header(&origin).contains("host=copied"));
         assert!(source.get_cookie_header(&origin).contains("host=source"));
+    }
+
+    #[test]
+    fn snapshot_delta_orders_new_entries_after_destination_and_keeps_replacements() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let destination = CookieJar::new();
+        destination.set_cookie("discard=value; Path=/", &url);
+        destination.set_cookie("existing=old; Path=/", &url);
+        destination.delete_cookie("discard", "example.com");
+        let initial = destination.snapshot();
+        let connection = CookieJar::from_snapshot(&initial);
+        assert_eq!(connection.snapshot().entries, initial.entries);
+        destination.set_cookie("concurrent=value; Path=/", &url);
+        connection.set_cookie("new_first=one; Path=/", &url);
+        connection.set_cookie("existing=updated; Path=/", &url);
+        connection.set_cookie("new_second=two; Path=/", &url);
+        destination.apply_snapshot_delta(&initial, &connection.snapshot());
+        assert_eq!(destination.get_cookie_header(&url),
+            "existing=updated; concurrent=value; new_first=one; new_second=two");
+    }
+
+    #[test]
+    fn snapshot_clone_does_not_reuse_expired_creation_order() {
+        let source = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        source.set_cookie("first=one; Path=/", &url);
+        source.set_cookie("expired=two; Path=/", &url);
+        source.cookies.write().unwrap().get_mut("example.com").unwrap()
+            .get_mut(&("expired".to_string(), "/".to_string())).unwrap().expires = Some(0);
+        let initial = source.snapshot();
+        let copy = CookieJar::from_snapshot(&initial);
+        copy.set_cookie("expired=two; Path=/", &url);
+        let key = ("example.com".to_string(), "expired".to_string(), "/".to_string());
+        assert!(copy.snapshot().entries[&key].creation_order > initial.entries[&key].creation_order);
+    }
+
+    #[test]
+    fn snapshot_delta_recognizes_delete_and_recreate_of_same_key() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let destination = CookieJar::new();
+        destination.set_cookie("first=one; Path=/", &url);
+        destination.set_cookie("second=two; Path=/", &url);
+        let initial = destination.snapshot();
+        let connection = CookieJar::from_snapshot(&initial);
+        connection.delete_cookie("first", "example.com");
+        connection.set_cookie("third=three; Path=/", &url);
+        connection.set_cookie("first=one; Path=/", &url);
+        destination.apply_snapshot_delta(&initial, &connection.snapshot());
+        assert_eq!(destination.get_cookie_header(&url), "second=two; third=three; first=one");
     }
 
     #[test]
@@ -1556,6 +1816,7 @@ mod tests {
             http_only: false,
             expires: Some(0),
             same_site: "Lax".to_string(),
+            creation_order: 0,
         };
         connection
             .cookies
