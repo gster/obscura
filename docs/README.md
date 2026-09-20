@@ -3,6 +3,7 @@
 - [项目 README](../README.md)：定位、构建与当前使用入口。
 - [SUMMARY](SUMMARY.md)：核验后的现状、测试边界和完整文档索引。
 - [TODO](TODO.md)：唯一开发执行清单。
+- [当前 TODO goal 交接](Goal-handoff.md)：当前实现基线、验证证据和下一阶段执行入口。
 - [New_ACH](New_ACH.md)：未来架构与迁移门槛。
 - [Persona 修复实施记录](Persona-fix-plan.md)：persona 必配、注入、冻结与一致性修复的设计、实现范围和验收记录。
 

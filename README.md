@@ -46,6 +46,7 @@ CDP 是高权限控制接口，当前没有内建鉴权；默认保持 loopback�
 
 - [SUMMARY：当前事实、测试与文档索引](docs/SUMMARY.md)
 - [TODO：唯一开发执行清单](docs/TODO.md)
+- [当前 TODO goal 交接：实现基线、验证证据与后续顺序](docs/Goal-handoff.md)
 - [新架构：目标边界与迁移门槛](docs/New_ACH.md)
 - [现有架构](docs/Architecture-overview.md) · [Playwright 接入](docs/Use-with-Playwright.md)
 - [Southwest shopping 验收](docs/Southwest-handoff.md)
