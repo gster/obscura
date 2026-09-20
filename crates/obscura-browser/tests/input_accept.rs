@@ -5,9 +5,7 @@ use obscura_browser::{BrowserContext, Page};
 #[tokio::test(flavor = "current_thread")]
 async fn input_accept_reflects_the_content_attribute() {
     let context = Arc::new(BrowserContext::with_storage_and_network(
-        "input-accept".to_owned(),
-        None,
-        false,
+        "input-accept".to_owned(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
         None,
         None,
         true,

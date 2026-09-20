@@ -1,5 +1,20 @@
 ## Runtime
 
+Unless an example is specifically demonstrating `OBSCURA_PERSONA`, shell
+examples below assume `export OBSCURA_PERSONA=windows_chrome145` is already set.
+
+### `OBSCURA_PERSONA`
+
+Required startup identity when `--persona` is not supplied. The value is either
+a built-in preset (`windows_chrome145`, `macos_chrome152`, or
+`macos_chrome153`) or a path to a versioned PersonaSpec JSON file. The CLI
+option wins when both are present. Missing or invalid persona input stops before
+the command creates a browser context, worker, or listening service.
+
+```bash
+OBSCURA_PERSONA=windows_chrome145 obscura fetch https://example.com
+```
+
 ### `OBSCURA_ALLOW_PRIVATE_NETWORK`
 
 Allow fetches to loopback (`127.0.0.0/8`), RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and link-local (`169.254.0.0/16`, including the `169.254.169.254` cloud-metadata endpoint) addresses. The deny-set also covers the unspecified address (`0.0.0.0` / `::`), IPv6 unique-local (`fc00::/7`), and any IPv4-mapped form of the above. Off by default to block SSRF.
@@ -76,29 +91,16 @@ Default proxy URL used by `obscura-worker` for the parallel `scrape` command whe
 OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
 ```
 
-## Stealth and identity
+## Identity configuration
 
-These tune the browser identity the engine presents so it stays internally consistent. See [Configure stealth and proxies](Configure-stealth-and-proxies.md) for the full picture.
+Timezone, geolocation, locale, viewport and the transport profile belong to the
+single PersonaSpec selected with `--persona` or `OBSCURA_PERSONA`. The legacy
+`OBSCURA_PROFILE`, `OBSCURA_ROTATE_PROFILE`, `OBSCURA_TIMEZONE`, and
+`OBSCURA_GEOLOCATION` variables are not read as product identity inputs. See
+[Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
-### `OBSCURA_TIMEZONE`
-
-Pins the process timezone before V8/ICU reads it, so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report one consistent zone. Default `Europe/Berlin`. Set it to match the exit IP's region.
-
-```bash
-OBSCURA_TIMEZONE=America/New_York obscura serve
-```
-
-### `OBSCURA_GEOLOCATION`
-
-Override the coordinates the `navigator.geolocation` shim reports, as `lat,lon`. Without it the shim reports a fixed default. Keep it consistent with `OBSCURA_TIMEZONE` and the proxy region.
-
-```bash
-OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
-```
-
-`OBSCURA_PROFILE` and `OBSCURA_ROTATE_PROFILE` are no longer product
-configuration. Product entry points use one calibrated primp/JavaScript persona
-until the unified persona configuration tracked by OB-015/016 replaces it.
+The built-in preset's timezone is part of that preset. Override it in an
+external PersonaSpec, not with a separate environment variable.
 
 ## MCP
 

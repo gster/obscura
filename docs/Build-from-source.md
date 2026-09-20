@@ -50,7 +50,7 @@ locate it automatically.
 
 ```bash
 ./target/release/obscura --version
-./target/release/obscura fetch https://example.com --eval "document.title"
+./target/release/obscura --persona windows_chrome145 fetch https://example.com --eval "document.title"
 ```
 
 Install system-wide:

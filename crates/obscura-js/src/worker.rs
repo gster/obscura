@@ -196,6 +196,7 @@ impl WorkerObservations {
 }
 
 struct WorkerConfig {
+    persona: obscura_net::EffectivePersona,
     document_generation: u64,
     document_url: String,
     teardown_events: std::sync::Arc<std::sync::Mutex<Vec<crate::ops::JsNetworkEvent>>>,
@@ -899,6 +900,7 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         std::sync::Arc::new(obscura_net::StealthHttpClient::detached(client))
     });
     let config = WorkerConfig {
+        persona: parent.persona.clone(),
         document_generation: parent.network_document_generation,
         document_url: parent.network_document_url.clone(), teardown_events: parent.network_teardown_events.clone(),
         teardown_notify: parent.network_teardown_notify.clone(),
@@ -939,8 +941,11 @@ async fn run_worker(id: u32, config: WorkerConfig,
     mut commands: queue::Receiver<WorkerCommand>,
     events: queue::Sender<WorkerEvent>, control: std::sync::Arc<WorkerControl>) {
     if control.stopped() { return; }
-    let locale = config.globals.get("__obscura_language").and_then(|v| v.as_str()).unwrap_or("en-US");
-    let mut rt = crate::runtime::ObscuraJsRuntime::with_base_url_proxy_and_locale(&config.url, None, locale);
+    let mut rt = crate::runtime::ObscuraJsRuntime::with_base_url_and_proxy(
+        &config.url,
+        None,
+        config.persona.clone(),
+    );
     {
         let mut handle = control.isolate.lock().unwrap();
         *handle = Some(rt.isolate_handle());

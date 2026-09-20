@@ -169,6 +169,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 状态：未关闭。
 
+本轮实现：`obscura-net` 提供版本化 `PersonaSpec`、内置预设、外部 JSON、统一字段/能力校验、不可变 `EffectivePersona` 和稳定摘要；产品入口缺少 persona 时 fail closed。OB-014 的跨平台参考资格尚未完成，因此本项不因编译器存在而关闭。
+
 依赖：OB-014。入口：统一 persona 模块、开发侧 compile-persona、共享配置加载。
 完成：建立唯一权威 persona 模块，迁入仍有价值的 runtime Persona/CLI profile 逻辑，消除平行身份配置；PersonaSpec 到 EffectivePersona 的字段关系、schema、摘要和能力校验可复现；生产仅轻量加载校验；缺失或矛盾配置明确拒绝，不默默选另一个 profile。
 
@@ -176,12 +178,16 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 状态：未关闭。
 
+本轮实现：CLI、CDP、MCP、Rust facade、scrape worker、页面、frame、Worker、module loader、网络和存续独立 runtime 均消费同一快照；时区与 ICU 主语言按进程冻结，冲突 context 在登记前拒绝。具名 profile 仍不等于完整 wire、字体、图形或跨平台资格。
+
 依赖：OB-012、OB-015。入口：页面/frame/Worker 配置、net、CDP Browser/Emulation。
 完成：CLI/MCP/CDP/Rust 嵌入均消费同一 EffectivePersona；JS、HTTP、TLS/H2、时区/屏幕、frame/Worker 与 transport 声明来自同一有效值集；CDP 固定版本返回与有效配置不再各自漂移；未做到的 wire 差异显式列出，不声称仅凭名称完全匹配 Chrome。
 
 ### OB-031 · P0 · 客户端 override 冲突规则
 
 状态：未关闭。
+
+本轮实现：继续拒绝 UA/身份 header override；`Target.createBrowserContext.obscuraPersona` 只能注入与启动进程时区和主语言兼容的快照，其他 context-local 字段可隔离；`Browser.getPersona` 返回实际 persona 摘要。仍需纳入完整客户端 connection options 资格清单。
 
 依赖：OB-027、OB-015，与 OB-016 协作。入口：CDP Network/Emulation/BrowserContext。
 完成：locale/timezone/UA/viewport 等实际客户端参数可验证应用或明确拒绝；页面/frame/Worker/HTTP 保持一致；认证清单记录 connection options。

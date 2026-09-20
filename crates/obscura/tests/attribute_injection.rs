@@ -8,7 +8,7 @@ use obscura::Browser;
 
 #[tokio::test]
 async fn attribute_name_cannot_inject_js() {
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto("data:text/html,<div id=x data-safe=ok></div>")
         .await
@@ -35,7 +35,7 @@ async fn attribute_name_cannot_inject_js() {
 
 #[tokio::test]
 async fn attribute_reads_ordinary_names() {
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto("data:text/html,<div id=x data-safe=ok></div>")
         .await

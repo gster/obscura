@@ -83,9 +83,7 @@ async fn assert_binary_fetch_body() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let (base_url, body_rx) = spawn_echo_server();
     let context = Arc::new(BrowserContext::with_storage_and_network(
-        "binary-fetch".to_string(),
-        None,
-        true,
+        "binary-fetch".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
         None,
         None,
         true,

@@ -69,7 +69,7 @@ fn events<'a>(ctx: &'a CdpContext, method: &str) -> Vec<(Option<&'a str>, &'a Va
 
 #[tokio::test(flavor = "current_thread")]
 async fn navigation_emits_console_arguments_and_uncaught_exception_details() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (_, session) = create_and_attach(&mut ctx).await;
     cdp(&mut ctx, 1, "Runtime.enable", json!({}), Some(&session)).await;
     ctx.pending_events.clear();
@@ -166,7 +166,7 @@ async fn navigation_emits_console_arguments_and_uncaught_exception_details() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_events_only_reach_sessions_while_runtime_is_enabled() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (target_id, first) = create_and_attach(&mut ctx).await;
     let second = attach(&mut ctx, &target_id, 902).await;
 

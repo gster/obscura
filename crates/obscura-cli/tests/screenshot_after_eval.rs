@@ -32,6 +32,7 @@ fn screenshot_is_captured_after_eval_scrolls_the_live_page() {
             .args(["fetch", url, "--screenshot"])
             .arg(path)
             .args(["--wait", "0", "--timeout", "5", "--quiet"])
+            .env("OBSCURA_PERSONA", "windows_chrome145")
             .env("OBSCURA_SHOT_W", "100")
             .env("OBSCURA_SHOT_H", "80");
         if let Some(expression) = eval {
@@ -93,6 +94,7 @@ fn screenshots_use_live_animation_time_unless_harness_pins_a_sample() {
             .args(["fetch", url, "--screenshot"])
             .arg(path)
             .args(["--wait", "1", "--timeout", "5", "--quiet"])
+            .env("OBSCURA_PERSONA", "windows_chrome145")
             .env("OBSCURA_SHOT_W", "80")
             .env("OBSCURA_SHOT_H", "60")
             .env_remove("OBSCURA_SHOT_ANIMATION_TIME_MS");
@@ -146,6 +148,7 @@ fn paired_capture_reasserts_scroll_after_the_post_eval_settle() {
             "5",
             "--quiet",
         ])
+        .env("OBSCURA_PERSONA", "windows_chrome145")
         .env("OBSCURA_SHOT_W", "100")
         .env("OBSCURA_SHOT_H", "80")
         .env("OBSCURA_SHOT_SCROLL_X", "0")
@@ -201,6 +204,7 @@ fn paired_capture_evaluates_state_after_final_scroll_reassert() {
             "5",
             "--quiet",
         ])
+        .env("OBSCURA_PERSONA", "windows_chrome145")
         .env("OBSCURA_SHOT_W", "100")
         .env("OBSCURA_SHOT_H", "80")
         .env("OBSCURA_SHOT_SCROLL_X", "0")

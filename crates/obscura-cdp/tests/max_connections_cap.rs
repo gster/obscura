@@ -109,6 +109,9 @@ fn max_connections_refuses_then_recovers() {
                 None,
                 true,
                 LIMIT,
+                obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
             )
             .await;
         });

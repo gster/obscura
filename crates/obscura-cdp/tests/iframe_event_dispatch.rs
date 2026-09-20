@@ -69,7 +69,7 @@ async fn eval(ctx: &mut CdpContext, id: u64, expr: &str, session_id: &str) -> Va
 async fn setup() -> (CdpContext, String) {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());

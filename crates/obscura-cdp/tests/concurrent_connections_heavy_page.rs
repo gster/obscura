@@ -219,6 +219,9 @@ async fn concurrent_connections_heavy_page_do_not_abort_v8() {
                     false,
                     None,
                     true,
+                    obscura_net::EffectivePersona::builtin(
+                        obscura_net::StealthProfile::WindowsChrome145,
+                    ),
                 )
                 .await;
             });

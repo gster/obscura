@@ -102,7 +102,7 @@ fn assert_frame_contract(frame: &Value) {
 #[tokio::test(flavor = "current_thread")]
 async fn every_page_frame_path_uses_the_current_cdp_contract() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
     let created = cdp(
         &mut ctx,

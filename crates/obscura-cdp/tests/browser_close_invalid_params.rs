@@ -50,6 +50,9 @@ fn invalid_browser_close_does_not_close_the_websocket() {
                 None,
                 true,
                 1,
+                obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
             )
             .await;
         });

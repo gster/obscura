@@ -84,7 +84,7 @@ async fn cdp(
 async fn runtime_click_submit_prevent_default_navigation_updates_page() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_once().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());

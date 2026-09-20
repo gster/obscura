@@ -72,7 +72,7 @@ async fn navigate(ctx: &mut CdpContext, url: &str, session_id: &str) {
 async fn submit_method_navigates_despite_prevent_default_listener() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_form().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -103,7 +103,7 @@ async fn submit_method_navigates_despite_prevent_default_listener() {
 async fn request_submit_is_vetoed_by_prevent_default_listener() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_form().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-2";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -157,7 +157,7 @@ async fn request_submit_is_vetoed_by_prevent_default_listener() {
 async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_form().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-3";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -201,7 +201,7 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
 async fn request_submit_validates_its_submitter_argument() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_form().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-4";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());

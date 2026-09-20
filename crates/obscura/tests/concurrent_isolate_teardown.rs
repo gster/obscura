@@ -41,11 +41,11 @@ async fn a_second_browser_can_be_dropped_without_aborting() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
 
-    let first = Browser::new().unwrap();
+    let first = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page_one = first.new_page().await.unwrap();
     page_one.goto(&base).await.unwrap();
 
-    let second = Browser::new().unwrap();
+    let second = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page_two = second.new_page().await.unwrap();
     page_two.goto(&base).await.unwrap();
 
@@ -66,7 +66,7 @@ async fn a_second_browser_can_be_dropped_without_aborting() {
 async fn one_browser_one_page_drops_cleanly() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     assert_eq!(
@@ -80,7 +80,7 @@ async fn one_browser_one_page_drops_cleanly() {
 async fn two_pages_on_one_browser_drop_cleanly() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut one = browser.new_page().await.unwrap();
     one.goto(&base).await.unwrap();
     let mut two = browser.new_page().await.unwrap();
@@ -95,7 +95,7 @@ async fn two_pages_on_one_browser_drop_cleanly() {
 async fn a_page_in_the_middle_can_be_dropped_and_the_rest_keep_working() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
 
     let mut first = browser.new_page().await.unwrap();
     first.goto(&base).await.unwrap();
@@ -147,7 +147,7 @@ async fn a_page_in_the_middle_can_be_dropped_and_the_rest_keep_working() {
 async fn an_older_page_still_runs_script_while_a_newer_one_is_alive() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
 
     let mut first = browser.new_page().await.unwrap();
     first.goto(&base).await.unwrap();

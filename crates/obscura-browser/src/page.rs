@@ -13,22 +13,6 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
-/// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
-/// Returns None when unset or malformed, leaving the built-in default in place.
-/// Lets a deployment align the reported coordinates with the region its exit IP
-/// resolves to, so timezone and location stay consistent (issue #228).
-fn env_geolocation() -> Option<(f64, f64)> {
-    let raw = std::env::var("OBSCURA_GEOLOCATION").ok()?;
-    let (lat, lon) = raw.split_once(',')?;
-    let lat: f64 = lat.trim().parse().ok()?;
-    let lon: f64 = lon.trim().parse().ok()?;
-    let valid = lat.is_finite()
-        && lon.is_finite()
-        && (-90.0..=90.0).contains(&lat)
-        && (-180.0..=180.0).contains(&lon);
-    valid.then_some((lat, lon))
-}
-
 fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     let rest = uri.strip_prefix("data:")?;
     let comma = rest.find(',')?;
@@ -204,7 +188,6 @@ pub struct StoredResponseBody {
 #[derive(Clone, Copy)]
 struct DeviceMetricsBaseline {
     viewport: (f32, f32),
-    device_scale_factor: f32,
 }
 
 enum PendingFrameWork {
@@ -257,10 +240,6 @@ pub struct Page {
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
-    /// Optional CDP physical-screen override. This is separate from the CSS
-    /// viewport and survives navigation, matching device-metrics emulation.
-    screen_size_override: Option<(f32, f32)>,
-    screen_metrics_emulated: bool,
     /// Metrics captured when CDP device emulation is first enabled. Chromium
     /// keeps this baseline across subsequent override calls and restores it
     /// only when the override is cleared.
@@ -268,7 +247,7 @@ pub struct Page {
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
-    pub device_scale_factor: f32,
+    device_scale_factor: f32,
     /// DevTools override for the compositor's base surface. It is page-owned,
     /// so it survives document navigation without leaking to other targets.
     default_background_color_override: Option<[u8; 4]>,
@@ -1108,6 +1087,11 @@ fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImp
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
         let http_client = context.http_client.clone();
+        let persona_viewport = (
+            context.persona().viewport().width as f32,
+            context.persona().viewport().height as f32,
+        );
+        let persona_device_scale_factor = context.persona().device_scale_factor() as f32;
         // Chromium convention: the main frame's frameId == the targetId.
         // Playwright's frame manager looks up the main frame by targetId
         // (via target._targetInfo.targetId), so any divergence here makes
@@ -1116,13 +1100,11 @@ impl Page {
         let frame_id = id.clone();
         // Preserve the explicitly configured proxy scheme and endpoint. Every
         // page uses primp; there is no plain-transport product path.
-        let stealth_client = Arc::new(StealthHttpClient::with_policy_profile_persona(
+        let stealth_client = Arc::new(StealthHttpClient::with_policy_persona(
             context.cookie_jar.clone(),
             context.proxy_url.as_deref(),
             context.http_client.clone(),
-            context.stealth_profile,
-            &context.accept_language,
-            context.do_not_track.as_deref(),
+            context.persona(),
         ));
 
         Page {
@@ -1138,11 +1120,9 @@ impl Page {
             title: String::new(),
             referrer: String::new(),
             referrer_policy: ReferrerPolicy::default(),
-            viewport: (1280.0, 720.0),
-            screen_size_override: None,
-            screen_metrics_emulated: false,
+            viewport: persona_viewport,
             device_metrics_baseline: None,
-            device_scale_factor: 1.0,
+            device_scale_factor: persona_device_scale_factor,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
@@ -1678,49 +1658,28 @@ impl Page {
         }
     }
 
-    /// Set or clear the CDP physical-screen override independently of layout.
-    pub fn set_screen_size_override(&mut self, size: Option<(f32, f32)>, emulated: bool) {
-        self.screen_size_override = size.filter(|(width, height)| {
-            width.is_finite() && height.is_finite() && *width > 0.0 && *height > 0.0
-        });
-        self.screen_metrics_emulated = emulated;
-        if let Some(js) = &mut self.js {
-            js.set_screen_size_override(
-                self.screen_size_override
-                    .map(|(width, height)| (width as f64, height as f64)),
-                self.screen_metrics_emulated,
-            );
-        }
+    pub fn device_scale_factor(&self) -> f32 {
+        self.device_scale_factor
     }
 
-    /// Apply CDP device metrics relative to the metrics that were active when
-    /// emulation was first enabled. A zero protocol dimension/scale is passed
-    /// as `None` and therefore restores that axis from the retained baseline.
+    /// Apply the viewport portion of CDP device metrics. Physical screen,
+    /// scale factor, and mobile identity are frozen by the context persona and
+    /// are validated by the protocol layer before this method is called.
     pub fn apply_device_metrics_override(
         &mut self,
         width: Option<f32>,
         height: Option<f32>,
-        device_scale_factor: Option<f32>,
-        screen_size: Option<(f32, f32)>,
-        mobile: bool,
     ) {
         let baseline = *self
             .device_metrics_baseline
             .get_or_insert(DeviceMetricsBaseline {
                 viewport: self.viewport,
-                device_scale_factor: self.device_scale_factor,
             });
         let viewport = (
             width.unwrap_or(baseline.viewport.0),
             height.unwrap_or(baseline.viewport.1),
         );
         self.set_viewport(viewport);
-
-        // Blink uses the effective widget size as the screen size for mobile
-        // emulation when no complete explicit screen size was supplied.
-        let effective_screen_size = screen_size.or_else(|| mobile.then_some(viewport));
-        self.set_screen_size_override(effective_screen_size, true);
-        self.set_device_scale_factor(device_scale_factor.unwrap_or(baseline.device_scale_factor));
     }
 
     /// Disable CDP device metrics and restore the state captured by the first
@@ -1730,28 +1689,6 @@ impl Page {
             return;
         };
         self.set_viewport(baseline.viewport);
-        self.set_screen_size_override(None, false);
-        self.set_device_scale_factor(baseline.device_scale_factor);
-    }
-
-    /// Set the screenshot surface density without changing CSS layout. CDP
-    /// uses zero to disable its override, which restores the native 1x surface
-    /// in Obscura's headless-only model.
-    pub fn set_device_scale_factor(&mut self, device_scale_factor: f32) {
-        if !device_scale_factor.is_finite() || device_scale_factor < 0.0 {
-            return;
-        }
-        self.device_scale_factor = if device_scale_factor == 0.0 {
-            1.0
-        } else {
-            device_scale_factor
-        };
-        if let Some(js) = &mut self.js {
-            let _ = js.execute_script(
-                "<device-metrics>",
-                &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
-            );
-        }
     }
 
     pub fn set_default_background_color_override(&mut self, color: Option<[u8; 4]>) {
@@ -1798,10 +1735,10 @@ impl Page {
         // and op_fetch_url so dynamic imports and JS fetch() honour the
         // configured upstream proxy (#139). When proxy_url is None this is
         // equivalent to with_base_url() (direct connection).
-        let mut rt = ObscuraJsRuntime::with_base_url_proxy_and_locale(
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
             &self.url_string(),
             self.context.proxy_url.clone(),
-            &self.context.language,
+            self.context.persona().clone(),
         );
         self.network_document_generation += 1;
         rt.set_network_observation_context(self.network_document_generation, self.url_string(), self.network_teardown_events.clone(), self.network_teardown_notify.clone());
@@ -1812,35 +1749,11 @@ impl Page {
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
         rt.set_referrer_policy(self.referrer_policy);
-        rt.set_device_identity(self.context.device_identity.clone());
-        rt.set_locale(&self.context.language, &self.context.languages);
-        rt.set_do_not_track(self.context.do_not_track.as_deref());
-        rt.set_webgl_identity(&self.context.webgl_vendor, &self.context.webgl_renderer);
-
-        rt.set_stealth(true);
-        let profile = self.context.stealth_profile;
-        rt.set_user_agent(profile.user_agent());
-        let (platform, ua_platform, version) = profile.platform();
-        rt.set_platform(platform, ua_platform, version);
-        if matches!(
-            profile,
-            obscura_net::StealthProfile::MacChrome152 | obscura_net::StealthProfile::MacChrome153
-        ) {
-            rt.set_user_agent_details(profile.full_version(), "arm");
-        }
-        if let Some((lat, lon)) = env_geolocation() {
-            rt.set_geolocation(lat, lon);
-        }
         rt.set_viewport(self.viewport.0 as f64, self.viewport.1 as f64);
-        rt.set_screen_size_override(
-            self.screen_size_override
-                .map(|(width, height)| (width as f64, height as f64)),
-            self.screen_metrics_emulated,
-        );
-
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_web_storage(self.context.local_storage.clone(), self.session_storage.clone());
-        rt.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone());
+        rt.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone())
+            .expect("page transport must match its frozen context persona");
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
 
         if let Some(tx) = &self.intercept_tx {
@@ -1863,10 +1776,6 @@ impl Page {
         }
 
         rt.run_page_init();
-        let _ = rt.execute_script(
-            "<device-metrics>",
-            &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
-        );
 
         self.js = Some(rt);
     }
@@ -3371,7 +3280,7 @@ impl Page {
                     self.context.robots_cache.parse_and_store(
                         &origin,
                         &body,
-                        &self.context.user_agent,
+                        self.context.persona().user_agent(),
                     );
                 }
 
@@ -3936,7 +3845,8 @@ impl Page {
         let Some(js) = self.js.as_mut() else {
             return 0;
         };
-        js.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone());
+        js.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone())
+            .expect("page transport must match its frozen context persona");
         let loaded = js.service_render_resources();
         self.record_render_resource_events();
         loaded
@@ -3954,7 +3864,8 @@ impl Page {
         if let Some(js) = &self.js {
             // A runtime attached without `init_js` loads through the page
             // transport all the same.
-            js.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone());
+            js.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone())
+                .expect("page transport must match its frozen context persona");
         }
         let (loadable, rejected) = self.render_resource_candidates();
         let started = match &mut self.js {
@@ -4932,13 +4843,13 @@ mod tests {
     fn page_always_constructs_primp_transport() {
         let context = std::sync::Arc::new(super::BrowserContext::with_options(
             "always-primp".into(),
-            None,
-            false,
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
         ));
         let page = super::Page::new("always-primp".into(), context);
         assert_eq!(
             page.stealth_client.transport_params().profile,
-            obscura_net::StealthProfile::default(),
+            obscura_net::StealthProfile::WindowsChrome145,
         );
     }
 
@@ -4946,8 +4857,8 @@ mod tests {
     fn pages_in_one_context_keep_network_idle_accounting_isolated() {
         let context = std::sync::Arc::new(super::BrowserContext::with_options(
             "page-idle-isolation".into(),
-            None,
-            false,
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
         ));
         let first = super::Page::new("page-a".into(), context.clone());
         let second = super::Page::new("page-b".into(), context);
@@ -4986,7 +4897,7 @@ mod tests {
             String::from_utf8(data).unwrap()
         });
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "form-transport".into(), None, true, None, None, true,
+            "form-transport".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,
         ));
         let mut page = super::Page::new("form-transport".into(), context);
         page.stealth_client.set_extra_headers(
@@ -5332,9 +5243,7 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "referrer-redirect".to_string(),
-            None,
-            false,
+            "referrer-redirect".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -5405,9 +5314,7 @@ mod tests {
     /// Without a limit set the getter reaches its fallback to the environment.
     fn page_without_chain_limit(name: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            name.to_string(),
-            None,
-            false,
+            name.to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -5442,9 +5349,7 @@ mod tests {
     /// tests fail through no fault of the code.
     fn chain_page(name: &str, limit: usize) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            name.to_string(),
-            None,
-            false,
+            name.to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -5516,9 +5421,7 @@ mod tests {
 
         let (origin, requests) = spawn_stylesheet_graph_server(4);
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "stylesheet-graph".to_string(),
-            None,
-            false,
+            "stylesheet-graph".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -5605,9 +5508,7 @@ mod tests {
     async fn inline_imports_fetch_in_order_and_materialize_before_source_style() {
         let (origin, requests) = spawn_inline_import_server();
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "inline-imports".to_string(),
-            None,
-            false,
+            "inline-imports".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -5709,9 +5610,7 @@ mod tests {
 
     fn client_replacement_page(name: &str, deferred: bool) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            name.to_string(),
-            None,
-            false,
+            name.to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -5928,9 +5827,7 @@ mod tests {
 
         let (url, script_requests) = spawn_script_resource_cache_server(false);
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "duplicate-script-cache".to_string(),
-            None,
-            false,
+            "duplicate-script-cache".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -5957,9 +5854,7 @@ mod tests {
 
         let (url, script_requests) = spawn_script_resource_cache_server(true);
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "distinct-script-cache".to_string(),
-            None,
-            false,
+            "distinct-script-cache".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -6412,9 +6307,7 @@ mod tests {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let base = spawn_shadow_frame_server().await;
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "suspend-frames".to_string(),
-            None,
-            false,
+            "suspend-frames".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -6443,9 +6336,7 @@ mod tests {
 
     fn frame_page(name: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            name.to_string(),
-            None,
-            false,
+            name.to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -6559,9 +6450,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn suspend_resume_preserves_document_script_start_state() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "script-state-suspend".to_string(),
-            None,
-            false,
+            "script-state-suspend".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -6635,9 +6524,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn suspend_resume_preserves_cdp_evaluation_handles() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "cdp-handle-suspend".to_string(),
-            None,
-            false,
+            "cdp-handle-suspend".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -6673,9 +6560,7 @@ mod tests {
     #[test]
     fn new_document_does_not_inherit_suspended_script_ids() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "script-state-navigation".to_string(),
-            None,
-            false,
+            "script-state-navigation".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -6713,9 +6598,7 @@ mod tests {
 
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            name.to_string(),
-            None,
-            false,
+            name.to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -7786,9 +7669,7 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "render-prefetch".to_string(),
-            None,
-            false,
+            "render-prefetch".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -7804,7 +7685,7 @@ mod tests {
         let dom = parse_html(&format!(
             r#"<html><body><img src="{asset_url}" style="width:20px;height:10px"></body></html>"#
         ));
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.set_url(&page_url);
         runtime.set_viewport(100.0, 80.0);
@@ -7888,9 +7769,7 @@ mod tests {
     #[cfg(feature = "render")]
     fn page_with_transport_and_image(id: &str, page_url: &str, image_url: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            id.to_string(),
-            None,
-            false,
+            id.to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -7900,7 +7779,7 @@ mod tests {
         let dom = parse_html(&format!(
             r#"<html><body><img id="i" src="{image_url}"></body></html>"#
         ));
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.set_url(page_url);
         runtime.set_viewport(100.0, 80.0);
@@ -7919,11 +7798,11 @@ mod tests {
         let page_url = format!("http://{address}/page");
         let asset_url = format!("http://{address}/service.svg");
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "service-binding".to_string(), None, false, None, None, true,
+            "service-binding".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,
         ));
         let mut page = super::Page::new("service-binding".to_string(), context);
         page.set_viewport((100.0, 80.0));
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html(&format!(r#"<html><body><img src="{asset_url}"></body></html>"#)));
         runtime.set_url(&page_url);
         runtime.set_viewport(100.0, 80.0);
@@ -7953,9 +7832,7 @@ mod tests {
     #[test]
     fn render_resource_warmup_keeps_the_existing_candidate_bound() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "warmup-bound".to_string(),
-            None,
-            false,
+            "warmup-bound".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -7966,7 +7843,7 @@ mod tests {
             html.push_str(&format!("<img src=\"https://assets.test/{index}.png\">"));
         }
         html.push_str("</body></html>");
-        let runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html(&html));
         runtime.set_url("https://example.test/page");
         page.js = Some(runtime);
@@ -8196,16 +8073,14 @@ mod tests {
     #[cfg(feature = "render")]
     fn page_with_transport_and_body(id: &str, page_url: &str, body: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            id.to_string(),
-            None,
-            false,
+            id.to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
         ));
         let mut page = super::Page::new(id.to_string(), context);
         page.set_viewport((400.0, 300.0));
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html(&format!("<html><body>{body}</body></html>")));
         runtime.set_url(page_url);
         runtime.set_viewport(400.0, 300.0);
@@ -8711,7 +8586,7 @@ mod tests {
         // navigate_single does before loading the next document).
         page.retire_render_resources();
         assert!(!page.has_pending_render_resources());
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html(&format!(
             r#"<html><body><img id="i" src="{asset_url}"></body></html>"#
         )));
@@ -8773,9 +8648,7 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "render-deadline".to_string(),
-            None,
-            false,
+            "render-deadline".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -8787,7 +8660,7 @@ mod tests {
         let dom = parse_html(&format!(
             r#"<html><body><img src="{asset_url}"></body></html>"#
         ));
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.set_url(&page_url);
         runtime.set_viewport(100.0, 80.0);
@@ -8855,9 +8728,7 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "dynamic-render-warmup".to_string(),
-            None,
-            false,
+            "dynamic-render-warmup".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -8928,9 +8799,7 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "external-font-no-flood".to_string(),
-            None,
-            false,
+            "external-font-no-flood".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -8994,9 +8863,7 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "link-preload-font".to_string(),
-            None,
-            false,
+            "link-preload-font".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -9057,9 +8924,7 @@ mod tests {
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "dcl-no-subresource-block".to_string(),
-            None,
-            false,
+            "dcl-no-subresource-block".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -9085,7 +8950,10 @@ mod tests {
     #[cfg(feature = "render")]
     #[test]
     fn page_screenshot_uses_the_live_window_scroll_offset() {
-        let context = std::sync::Arc::new(crate::BrowserContext::new("scroll-test".to_string()));
+        let context = std::sync::Arc::new(crate::BrowserContext::new(
+            "scroll-test".to_string(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+        ));
         let mut page = super::Page::new("scroll-page".to_string(), context);
         page.set_viewport((100.0, 80.0));
 
@@ -9096,7 +8964,7 @@ mod tests {
                 <div style="position:fixed;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
             </body></html>"#,
         );
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.set_url("https://example.test/scroll");
         runtime.set_viewport(100.0, 80.0);
@@ -9313,7 +9181,7 @@ mod tests {
                       onload="this.media='all';this.setAttribute('data-loaded','yes')">
             </head><body></body></html>"#,
         );
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.run_page_init();
         runtime
@@ -9360,7 +9228,7 @@ mod tests {
                       onload="this.setAttribute('data-loaded','yes')">
             </head><body></body></html>"#,
         );
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.run_page_init();
         runtime
@@ -9410,7 +9278,7 @@ mod tests {
                 <link id="cross" rel="stylesheet" href="https://cdn.example.test/theme.css">
             </head><body></body></html>"#,
         );
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.set_url("https://example.test/products/widget");
         runtime.run_page_init();
@@ -9510,7 +9378,7 @@ mod tests {
                 <link rel="preload stylesheet" href="second.css">
             </head><body></body></html>"#,
         );
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.run_page_init();
         runtime
@@ -9645,9 +9513,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn navigate_to_blob_url_renders_blob_content() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "blob-nav-test".to_string(),
-            None,
-            false,
+            "blob-nav-test".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,

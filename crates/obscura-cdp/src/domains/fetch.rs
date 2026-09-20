@@ -346,7 +346,7 @@ mod tests {
         let large: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
         let invalid = vec![0xff, 0xe9, 0];
         let bodies = vec![large.clone(), invalid.clone(), Vec::new(), b"internal-text".to_vec(), b"redirect-body".to_vec()];
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -545,8 +545,8 @@ mod tests {
                 socket.write_all(&body).unwrap();
             }
         });
-        let mut ctx = CdpContext::new();
-        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("raw-body".into(), Some(proxy)));
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("raw-body".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), Some(proxy)));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -612,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn response_body_stream_spool_is_once_and_survives_page_drop() {
         use base64::Engine as _;
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -652,7 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_body_stream_handle_exhaustion_does_not_consume_body() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -671,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_body_stream_budget_failure_does_not_consume_page_body() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -687,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_response_body_requires_completed_capture_and_preserves_request_pause() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -717,7 +717,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn response_body_reads_and_streams_are_session_scoped_with_overlapping_ids() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let mut sessions = Vec::new();
         let mut ids = Vec::new();
         for text in ["first", "second"] {
@@ -756,7 +756,7 @@ mod tests {
     // drop them. See #919.
     #[tokio::test]
     async fn continue_request_forwards_header_overrides() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let rx = pause(&mut ctx, "req-1");
         handle(
             "continueRequest",
@@ -778,7 +778,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_protocol_validation_is_strict_and_retryable() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
         let page_id = ctx.create_page();
         let session = Some("strict-session".to_string());
         ctx.sessions.insert(session.clone().unwrap(), page_id);
@@ -813,7 +815,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn continue_headers_domain_preserves_order_case_values_and_retry() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         for supplied in [crate::server::tests::continue_header_fields(), json!([])] {
             let mut rx = pause(&mut ctx, "continued");
             for invalid in crate::server::tests::malformed_continue_headers() {
@@ -836,7 +838,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn continue_post_data_domain_preserves_bytes_and_retryable_errors() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         for (value, expected) in [(Some(json!("AP8A/w==")), Some(vec![0, 255, 0, 255])),
             (Some(json!("")), Some(vec![])), (None, None)] {
             let mut rx = pause(&mut ctx, "continued");
@@ -865,7 +867,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fulfilled_domain_retains_binary_headers_and_retryable_parse_errors() {
         use base64::Engine as _;
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let rx = pause(&mut ctx, "binary-headers");
         for params in [json!({"requestId":"binary-headers","responseCode":200,"binaryResponseHeaders":"%"}), json!({"requestId":"binary-headers","responseCode":200,"body":"%"})] {
             let result = handle("fulfillRequest", &params, &mut ctx, &None).await;
@@ -888,7 +890,7 @@ mod tests {
     // and must be decoded, not passed through as raw base64 text. See #919/#912.
     #[tokio::test]
     async fn fulfill_request_base64_decodes_body() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let rx = pause(&mut ctx, "req-2");
         handle(
             "fulfillRequest",

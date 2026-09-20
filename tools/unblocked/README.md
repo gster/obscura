@@ -84,7 +84,8 @@ Chromium; the client connects to the host-started Obscura CDP endpoint:
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 \
   cargo build --release -p obscura-cli --bins --features render
 RUN_ROOT="$(mktemp -d)"
-DEBUG=pw:protocol uv run --project tools/unblocked --frozen --python 3.12 \
+DEBUG=pw:protocol OBSCURA_PERSONA=windows_chrome145 \
+  uv run --project tools/unblocked --frozen --python 3.12 \
   python tools/unblocked/automation_smoke.py \
     --obscura-bin target/release/obscura \
     --output "$RUN_ROOT/smoke.json" \

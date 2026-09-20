@@ -17,8 +17,8 @@ async fn set_user_agent(ctx: &mut CdpContext, id: u64, params: Value) -> CdpResp
 
 #[tokio::test(flavor = "current_thread")]
 async fn set_user_agent_override_is_unsupported_for_an_initialized_context() {
-    let mut ctx = CdpContext::new();
-    let calibrated = ctx.default_context.user_agent.clone();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+    let calibrated = ctx.default_context.persona().user_agent().to_string();
 
     for (id, params) in [
         (1, json!({})),

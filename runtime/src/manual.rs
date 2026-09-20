@@ -341,7 +341,7 @@ impl BrowserRuntime {
             return;
         }
         s.frame_sequence += 1;
-        let viewport = &self.persona.as_ref().unwrap().viewport;
+        let viewport = self.persona.as_ref().unwrap().viewport();
         let f = Frame {
             page_id: page_id.clone(),
             navigation_generation: entry.generation,

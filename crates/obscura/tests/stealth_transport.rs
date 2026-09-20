@@ -45,7 +45,7 @@ fn spawn_server() -> (String, mpsc::Receiver<String>) {
 async fn navigate_user_agents() -> (String, String) {
     let (url, request_rx) = spawn_server();
 
-    let browser = Browser::builder().build().unwrap();
+    let browser = Browser::builder(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).build().unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&url).await.unwrap();
     let js_user_agent = page
@@ -67,9 +67,8 @@ async fn navigate_user_agents() -> (String, String) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn primp_transport_is_the_default_api_transport() {
+async fn selected_persona_drives_the_primp_api_transport() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-    std::env::set_var("OBSCURA_PROFILE", "0");
 
     let (network, javascript) = navigate_user_agents().await;
     assert_eq!(network, STEALTH_USER_AGENT);

@@ -38,9 +38,7 @@ fn spawn_page() -> String {
 async fn rejected_background_promise_does_not_stop_the_page_event_loop() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let context = Arc::new(BrowserContext::with_storage_and_network(
-        "unhandled-rejection".to_owned(),
-        None,
-        false,
+        "unhandled-rejection".to_owned(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
         None,
         None,
         true,

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let browser = Browser::builder()
+    let browser = Browser::builder(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145))
         .storage_dir("/tmp/obscura-api-test")
         .build()?;
 

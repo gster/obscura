@@ -2,12 +2,13 @@
 
 ## `obscura`
 
-Global flags can appear before or after the subcommand. Their effect depends on the command; `--obey-robots` applies to fetch and scrape.
+Global flags can appear before or after the subcommand. Their effect depends on the command; `--obey-robots` applies to fetch and scrape. Every product command requires `--persona` or `OBSCURA_PERSONA`; there is no implicit identity.
 
 ```
 -v, --verbose                Enable info logging
 -p, --port <PORT>            CDP port (default 9222)
     --proxy <URL>            HTTP or SOCKS5 proxy
+    --persona <VALUE>        Built-in preset name or PersonaSpec JSON path (required)
     --obey-robots            Respect robots.txt
     --storage-dir <DIR>      Cookie persistence only; see storage limitations
     --allow-private-network  Permit loopback / RFC1918 / link-local
@@ -97,7 +98,7 @@ Run a JS expression across many URLs in parallel.
 Read URLs from stdin with `-`:
 
 ```bash
-cat urls.txt | obscura scrape - --eval "document.title" --concurrency 20
+cat urls.txt | obscura --persona windows_chrome145 scrape - --eval "document.title" --concurrency 20
 ```
 
 Requires `obscura-worker` next to `obscura` in `PATH`.

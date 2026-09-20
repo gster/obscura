@@ -344,6 +344,7 @@ pub struct DeviceIdentity {
 pub type SharedWebStorage = Arc<std::sync::Mutex<HashMap<String, Vec<(String, String)>>>>;
 
 pub struct ObscuraState {
+    pub persona: obscura_net::EffectivePersona,
     pub dom: Option<DomTree>,
     pub url: String,
     /// WHATWG canonical name of the document's character encoding (e.g.
@@ -593,8 +594,8 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
-    /// Bind the fixed standalone persona once, unless the owning page already
-    /// installed its transport. Never derive identity from mutable JS values.
+    /// Bind the injected persona once, unless the owning page already installed
+    /// its transport. Never derive identity from mutable JS values.
     pub(crate) fn ensure_persona_transport(&mut self) -> Arc<StealthHttpClient> {
         if let Some(client) = &self.stealth_client {
             return client.clone();
@@ -603,18 +604,18 @@ impl ObscuraState {
         let policy = self.http_client.get_or_insert_with(|| {
             Arc::new(ObscuraHttpClient::with_cookie_jar(jar.clone()))
         }).clone();
-        let client = Arc::new(StealthHttpClient::with_policy_profile_persona(
-            jar, policy.proxy_url(), policy.clone(),
-            obscura_net::StealthProfile::default(), "en-US,en;q=0.9", None,
+        let client = Arc::new(StealthHttpClient::with_policy_persona(
+            jar, policy.proxy_url(), policy.clone(), &self.persona,
         ));
         self.stealth_client = Some(client.clone());
         client
     }
 
-    pub fn new() -> Self {
+    pub fn new(persona: obscura_net::EffectivePersona) -> Self {
         #[cfg(feature = "render")]
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
+            persona,
             dom: None,
             url: "about:blank".to_string(),
             encoding: "UTF-8".to_string(),
@@ -5206,6 +5207,7 @@ mod tests {
         let addr = serve_body_once(4 * 1024 * 1024, false).await;
         let client = obscura_net::StealthHttpClient::with_proxy(
             std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+            &obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
         );
         let err = client.send_single_with_limit("GET", &url::Url::parse(&format!("http://{addr}/")).unwrap(),
             &Default::default(), &[], false, false, 1024 * 1024, std::time::Duration::from_secs(30))
@@ -5222,6 +5224,7 @@ mod tests {
         let addr = serve_body_once(1024, true).await;
         let client = obscura_net::StealthHttpClient::with_proxy(
             std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+            &obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
         );
         let response = client.send_single_with_limit("GET", &url::Url::parse(&format!("http://{addr}/")).unwrap(),
             &Default::default(), &[], false, false, 1024 * 1024, std::time::Duration::from_secs(30))
@@ -5325,7 +5328,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn posted_task_chains_complete_without_zero_delay_timer_floor() {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html("<html><body></body></html>"));
         runtime.set_url("http://example.com/posted-task-test");
         runtime.run_page_init();
@@ -5398,7 +5401,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shared_posted_task_queue_preserves_priority_fifo_and_microtasks() {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html("<html><body></body></html>"));
         runtime.set_url("http://example.com/posted-task-order");
         runtime.run_page_init();
@@ -5453,7 +5456,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bulk_posted_task_batch_completes() {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html("<html><body></body></html>"));
         runtime.set_url("http://example.com/posted-task-bulk");
         runtime.run_page_init();
@@ -5481,7 +5484,7 @@ mod tests {
     /// recursively submit another async op through that borrowed driver.
     #[tokio::test(flavor = "current_thread")]
     async fn posted_task_from_async_op_resolution_avoids_driver_submission() {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html("<html><body></body></html>"));
         runtime.set_url("http://example.com/posted-task-from-async-op");
         runtime.run_page_init();
@@ -5510,7 +5513,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn posted_task_is_cancelled_when_its_document_is_replaced() {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
         runtime.set_url("http://example.com/posted-task-old-document");
         runtime.run_page_init();
@@ -5555,7 +5558,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn delayed_posted_task_keeps_its_creation_document_generation() {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
         runtime.set_url("http://example.com/delayed-posted-task-old-document");
         runtime.run_page_init();
@@ -5581,7 +5584,7 @@ mod tests {
 
     #[test]
     fn posted_task_owner_contention_is_panic_safe() {
-        let owner = Rc::new(RefCell::new(ObscuraState::new()));
+        let owner = Rc::new(RefCell::new(ObscuraState::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145))));
         let weak = Rc::downgrade(&owner);
         let generation = owner.borrow().document_generation;
 
@@ -5792,7 +5795,7 @@ mod tests {
             </style><div id="box"></div>"#,
         );
         let box_node = dom.get_element_by_id("box").unwrap();
-        let mut state = ObscuraState::new();
+        let mut state = ObscuraState::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state.dom = Some(dom);
         state.animation_sample = obscura_render::AnimationSample::document(0.0);
         ensure_prepared_render(&mut state).expect("initial render");
@@ -5824,7 +5827,7 @@ mod tests {
             </style><div id="box"></div>"#,
         );
         let box_node = dom.get_element_by_id("box").unwrap();
-        let mut state = ObscuraState::new();
+        let mut state = ObscuraState::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state.dom = Some(dom);
         state.animation_sample = obscura_render::AnimationSample::document(0.0);
         ensure_prepared_render(&mut state).expect("initial render");

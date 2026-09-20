@@ -139,15 +139,32 @@ async fn read_stealth_body_limited(
 /// brand order), so the profile must track a real build rather than a generic
 /// "Chrome" persona.
 /// ALPS and trust-anchor contents still differ from the reference Chrome.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum StealthProfile {
-    #[default]
     WindowsChrome145,
     MacChrome152,
     MacChrome153,
 }
 
 impl StealthProfile {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::WindowsChrome145 => "windows_chrome145",
+            Self::MacChrome152 => "macos_chrome152",
+            Self::MacChrome153 => "macos_chrome153",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "windows_chrome145" => Some(Self::WindowsChrome145),
+            "macos_chrome152" => Some(Self::MacChrome152),
+            "macos_chrome153" => Some(Self::MacChrome153),
+            _ => None,
+        }
+    }
+
     pub fn user_agent(self) -> &'static str {
         match self {
             Self::WindowsChrome145 => STEALTH_USER_AGENT,
@@ -207,36 +224,39 @@ fn overlay_headers(headers: &mut HashMap<String, String>, overrides: &HashMap<St
 }
 
 impl StealthHttpClient {
-    pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None, false)
+    pub fn new(cookie_jar: Arc<CookieJar>, persona: &crate::EffectivePersona) -> Self {
+        Self::with_proxy(cookie_jar, None, false, persona)
     }
 
-    pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>, allow_private_network: bool) -> Self {
-        Self::with_options(cookie_jar, proxy_url, None, allow_private_network, StealthProfile::default())
+    pub fn with_proxy(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+        persona: &crate::EffectivePersona,
+    ) -> Self {
+        Self::with_options(cookie_jar, proxy_url, None, allow_private_network, persona)
     }
 
-    pub fn with_policy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>, policy: Arc<crate::client::ObscuraHttpClient>) -> Self {
-        let allow_private_network = policy.allow_private_network;
-        Self::with_options(cookie_jar, proxy_url, Some(policy), allow_private_network, StealthProfile::default())
-    }
-
-    pub fn with_policy_profile(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>, policy: Arc<crate::client::ObscuraHttpClient>, profile: StealthProfile) -> Self {
-        let allow_private_network = policy.allow_private_network;
-        Self::with_options(cookie_jar, proxy_url, Some(policy), allow_private_network, profile)
-    }
-
-    pub fn with_policy_profile_persona(
+    pub fn with_policy(
         cookie_jar: Arc<CookieJar>,
         proxy_url: Option<&str>,
         policy: Arc<crate::client::ObscuraHttpClient>,
-        profile: StealthProfile,
-        accept_language: &str,
-        do_not_track: Option<&str>,
+        persona: &crate::EffectivePersona,
+    ) -> Self {
+        let allow_private_network = policy.allow_private_network;
+        Self::with_options(cookie_jar, proxy_url, Some(policy), allow_private_network, persona)
+    }
+
+    pub fn with_policy_persona(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        policy: Arc<crate::client::ObscuraHttpClient>,
+        persona: &crate::EffectivePersona,
     ) -> Self {
         let allow_private_network = policy.allow_private_network;
         let client = transport::Client::new(
-            profile, proxy_url, allow_private_network,
-            Some(accept_language), do_not_track,
+            persona.profile(), proxy_url, allow_private_network,
+            Some(persona.accept_language()), persona.do_not_track(),
         );
         StealthHttpClient {
             client,
@@ -247,16 +267,25 @@ impl StealthHttpClient {
             resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             policy: Some(policy),
             transport: TransportParams {
-                profile,
+                profile: persona.profile(),
                 proxy_url: proxy_url.map(str::to_owned),
-                accept_language: Some(accept_language.to_owned()),
-                do_not_track: do_not_track.map(str::to_owned),
+                accept_language: Some(persona.accept_language().to_owned()),
+                do_not_track: persona.do_not_track().map(str::to_owned),
             },
         }
     }
 
-    fn with_options(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>, policy: Option<Arc<crate::client::ObscuraHttpClient>>, allow_private_network: bool, profile: StealthProfile) -> Self {
-        let client = transport::Client::new(profile, proxy_url, allow_private_network, None, None);
+    fn with_options(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        policy: Option<Arc<crate::client::ObscuraHttpClient>>,
+        allow_private_network: bool,
+        persona: &crate::EffectivePersona,
+    ) -> Self {
+        let client = transport::Client::new(
+            persona.profile(), proxy_url, allow_private_network,
+            Some(persona.accept_language()), persona.do_not_track(),
+        );
         StealthHttpClient {
             client,
             allow_private_network,
@@ -266,16 +295,24 @@ impl StealthHttpClient {
             resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             policy,
             transport: TransportParams {
-                profile,
+                profile: persona.profile(),
                 proxy_url: proxy_url.map(str::to_owned),
-                accept_language: None,
-                do_not_track: None,
+                accept_language: Some(persona.accept_language().to_owned()),
+                do_not_track: persona.do_not_track().map(str::to_owned),
             },
         }
     }
 
     pub fn transport_params(&self) -> &TransportParams {
         &self.transport
+    }
+
+    /// Cookie and policy bindings may change, but wire identity is fixed by
+    /// the runtime's compiled persona.
+    pub fn matches_persona(&self, persona: &crate::EffectivePersona) -> bool {
+        self.transport.profile == persona.profile()
+            && self.transport.accept_language.as_deref() == Some(persona.accept_language())
+            && self.transport.do_not_track.as_deref() == persona.do_not_track()
     }
 
     /// The policy owner for a runtime binding. Transport-only clients still
@@ -957,6 +994,24 @@ impl StealthHttpClient {
 
 #[cfg(test)]
 mod tests {
+    fn default_persona() -> crate::EffectivePersona {
+        crate::EffectivePersona::builtin(super::StealthProfile::WindowsChrome145)
+    }
+
+    fn persona(
+        profile: super::StealthProfile,
+        accept_language: &str,
+        do_not_track: Option<&str>,
+    ) -> crate::EffectivePersona {
+        let mut spec = crate::PersonaSpec::preset(profile);
+        let language = accept_language.split(',').next().unwrap().to_string();
+        spec.language = Some(language.clone());
+        spec.languages = Some(vec![language]);
+        spec.accept_language = Some(accept_language.to_string());
+        spec.do_not_track = do_not_track.map(str::to_string);
+        spec.compile().unwrap()
+    }
+
     /// A detached client exists so a worker on its own tokio runtime does not
     /// reuse the page's connection pool: a pooled connection is driven by the
     /// runtime that created it, and the first reuse from another runtime fails
@@ -970,9 +1025,9 @@ mod tests {
         let policy = StdArc::new(crate::client::ObscuraHttpClient::new());
         let jar = StdArc::new(crate::cookies::CookieJar::new());
         let proxy = "http://127.0.0.1:9";
-        let original = super::StealthHttpClient::with_policy_profile_persona(
-            jar.clone(), Some(proxy), policy, super::StealthProfile::MacChrome153,
-            "en-US,en;q=0.9", Some("0"),
+        let persona = persona(super::StealthProfile::MacChrome153, "en-US,en;q=0.9", Some("0"));
+        let original = super::StealthHttpClient::with_policy_persona(
+            jar.clone(), Some(proxy), policy, &persona,
         );
         original.extra_headers.blocking_write().insert("x-probe".into(), "1".into());
 
@@ -1000,21 +1055,18 @@ mod tests {
     fn pages_keep_separate_in_flight_counters_while_detached_workers_share() {
         use std::sync::Arc as StdArc;
         let policy = StdArc::new(crate::client::ObscuraHttpClient::new());
-        let first = super::StealthHttpClient::with_policy_profile_persona(
+        let persona = persona(super::StealthProfile::MacChrome153, "en-US,en;q=0.9", None);
+        let first = super::StealthHttpClient::with_policy_persona(
             StdArc::new(crate::cookies::CookieJar::new()),
             None,
             policy.clone(),
-            super::StealthProfile::MacChrome153,
-            "en-US,en;q=0.9",
-            None,
+            &persona,
         );
-        let second = super::StealthHttpClient::with_policy_profile_persona(
+        let second = super::StealthHttpClient::with_policy_persona(
             first.cookie_jar.clone(),
             None,
             policy.clone(),
-            super::StealthProfile::MacChrome153,
-            "en-US,en;q=0.9",
-            None,
+            &persona,
         );
         let worker = first.detached();
 
@@ -1046,6 +1098,7 @@ mod tests {
         policy.set_extra_headers([("X-Context".into(), "Original Raw".into()), ("X-Shared".into(), "Context".into())].into_iter().collect()).await;
         let client = super::StealthHttpClient::with_policy(
             std::sync::Arc::new(crate::cookies::CookieJar::new()), None, policy.clone(),
+            &default_persona(),
         );
         client.set_extra_headers([("x-shared".into(), "Page Raw".into())].into_iter().collect()).await;
         let url = url::Url::parse("https://example.com/image").unwrap();
@@ -1107,7 +1160,9 @@ mod tests {
             ("X-Context".into(), "retained".into()), ("x-test".into(), "context".into()),
         ])).await;
         *policy.interceptor.write().await = Some(Arc::new(CaptureOrderedHeaders));
-        let client = StealthHttpClient::with_policy(Arc::new(CookieJar::new()), Some(&proxy), policy);
+        let client = StealthHttpClient::with_policy(
+            Arc::new(CookieJar::new()), Some(&proxy), policy, &default_persona(),
+        );
         client.set_extra_headers(HashMap::from([("X-TEST".into(), "page".into())])).await;
         let fields = [("X-Test", "one"), ("x-test", "two"), ("X-Policy", "old"), ("x-policy", "also-old")]
             .map(|(name, value)| (name.into(), value.into()));
@@ -1148,6 +1203,7 @@ mod tests {
             std::sync::Arc::new(crate::cookies::CookieJar::new()),
             None,
             policy,
+            &default_persona(),
         );
         let payload = b"complete raw request body\0\x80\xff";
 
@@ -1193,7 +1249,9 @@ mod tests {
                 });
                 let policy = Arc::new(crate::client::ObscuraHttpClient::new());
                 *policy.interceptor.write().await = Some(interceptor.clone());
-                let client = StealthHttpClient::with_policy(Arc::new(CookieJar::new()), None, policy);
+                let client = StealthHttpClient::with_policy(
+                    Arc::new(CookieJar::new()), None, policy, &default_persona(),
+                );
                 let url = Url::parse("https://example.com/paused").unwrap();
                 let mut request = Box::pin(async {
                     if scripted {
@@ -1224,7 +1282,9 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let policy = Arc::new(crate::client::ObscuraHttpClient::new());
         *policy.interceptor.write().await = Some(Arc::new(CaptureBody(captured.clone())));
-        let client = StealthHttpClient::with_policy(Arc::new(CookieJar::new()), None, policy);
+        let client = StealthHttpClient::with_policy(
+            Arc::new(CookieJar::new()), None, policy, &default_persona(),
+        );
         let payload = b"raw\0\x80\xff";
         let mut info = crate::client::RequestInfo {
             raw_headers: None,
@@ -1259,7 +1319,9 @@ mod tests {
             String::from_utf8(bytes).unwrap().to_ascii_lowercase()
         });
         let url = Url::parse(&format!("http://{address}/api")).unwrap();
-        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let client = StealthHttpClient::with_proxy(
+            Arc::new(CookieJar::new()), None, true, &default_persona(),
+        );
         client.set_extra_headers([
             ("accept".into(), "application/json".into()),
             ("content-type".into(), "application/json".into()),
@@ -1300,7 +1362,9 @@ mod tests {
             requests
         });
         let url = Url::parse(&format!("http://{address}/data")).unwrap();
-        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let client = StealthHttpClient::with_proxy(
+            Arc::new(CookieJar::new()), None, true, &default_persona(),
+        );
 
         // First request: no explicit accept header. Must send `accept: */*`.
         let empty_headers = std::collections::HashMap::new();
@@ -1354,7 +1418,9 @@ mod tests {
             let mut profile = crate::client::ResourceRequest::navigation();
             profile.initiator = Some(url.clone());
             profile.referrer = Some(url.clone());
-            let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+            let client = StealthHttpClient::with_proxy(
+                Arc::new(CookieJar::new()), None, true, &default_persona(),
+            );
             let result = client.post_form_resource_with_callbacks(&url, "name=value", profile, None).await.unwrap();
             assert_eq!(result.status, 200);
             let requests = server.join().unwrap();
@@ -1541,7 +1607,10 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), exchange).await.unwrap();
         let jar = Arc::new(CookieJar::new());
         let policy = Arc::new(crate::client::ObscuraHttpClient::with_full_options(jar.clone(), Some(&proxy), false));
-        let guarded = StealthHttpClient::with_policy_profile(jar, Some(&proxy), policy, super::StealthProfile::MacChrome152);
+        let guarded = StealthHttpClient::with_policy(
+            jar, Some(&proxy), policy,
+            &crate::EffectivePersona::builtin(super::StealthProfile::MacChrome152),
+        );
         assert!(guarded.fetch(&Url::parse("http://127.0.0.1:1/").unwrap()).await.is_err());
         assert!(tokio::time::timeout(std::time::Duration::from_millis(20), server.accept()).await.is_err());
     }
@@ -1630,7 +1699,7 @@ mod tests {
         let policy = Arc::new(crate::client::ObscuraHttpClient::with_full_options(
             cookie_jar.clone(), None, true,
         ));
-        let client = StealthHttpClient::with_policy(cookie_jar, None, policy);
+        let client = StealthHttpClient::with_policy(cookie_jar, None, policy, &default_persona());
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
@@ -1647,7 +1716,9 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_honors_allow_private_network_for_loopback_hostnames() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let client = StealthHttpClient::with_proxy(
+            Arc::new(CookieJar::new()), None, true, &default_persona(),
+        );
         let url = Url::parse(&format!("http://localhost:{port}/")).unwrap();
 
         let resp = client

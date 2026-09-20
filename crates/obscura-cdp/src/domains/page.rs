@@ -1735,7 +1735,7 @@ pub async fn handle(
                 prepare_capture_resources_if_requested(page).await;
                 let animation_sample = page.live_animation_sample();
                 let viewport = page.viewport;
-                let device_scale_factor = f64::from(page.device_scale_factor);
+                let device_scale_factor = f64::from(page.device_scale_factor());
                 let trusted_scroll = page.screenshot_scroll_offset();
                 let scroll = (f64::from(trusted_scroll.0), f64::from(trusted_scroll.1));
                 let full_page_size = if options.capture_beyond_viewport && options.clip.is_none() {
@@ -1760,15 +1760,15 @@ pub async fn handle(
                         0.0,
                         content_size.0,
                         content_size.1,
-                        page.device_scale_factor,
+                        page.device_scale_factor(),
                     ))
-                } else if page.device_scale_factor != 1.0 {
+                } else if page.device_scale_factor() != 1.0 {
                     Some(obscura_browser::CaptureRegion::new(
                         scroll.0 as f32,
                         scroll.1 as f32,
                         viewport.0,
                         viewport.1,
-                        page.device_scale_factor,
+                        page.device_scale_factor(),
                     ))
                 } else {
                     None
@@ -1789,7 +1789,7 @@ pub async fn handle(
                                     page,
                                     full_page_size
                                         .expect("full-page route has retained dimensions"),
-                                    page.device_scale_factor,
+                                    page.device_scale_factor(),
                                     animation_sample,
                                     options.optimize_for_speed,
                                 )?,
@@ -1891,8 +1891,8 @@ mod tests {
             }
             requests
         });
-        let mut ctx = CdpContext::new();
-        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("raw-headers".into(), Some(proxy)));
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("raw-headers".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), Some(proxy)));
         ctx.default_context.http_client.set_extra_headers([
             ("Authorization".into(), "Bearer Raw+/=123".into()),
             ("Cookie".into(), "explicit=Raw+/=123".into()),
@@ -2038,8 +2038,8 @@ mod tests {
             }
             requests
         });
-        let mut ctx = CdpContext::new();
-        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("worker-headers".into(), Some(proxy)));
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("worker-headers".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), Some(proxy)));
         ctx.default_context.http_client.set_extra_headers([
             ("Authorization".into(), "Bearer Raw+/=123".into()),
             ("Cookie".into(), "explicit=Raw+/=123".into()),
@@ -2148,7 +2148,7 @@ mod tests {
     // getNavigationHistory must still report where it really is.
     #[tokio::test(flavor = "current_thread")]
     async fn failed_history_navigation_leaves_current_index_unchanged() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);
@@ -2185,7 +2185,7 @@ mod tests {
     // moves currentIndex to the target entry and preserves the history list.
     #[tokio::test(flavor = "current_thread")]
     async fn history_navigation_moves_current_index_on_success() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);
@@ -2221,7 +2221,7 @@ mod tests {
     // schema-complete frame, and must not replay it on a second enable.
     #[tokio::test(flavor = "current_thread")]
     async fn page_enable_emits_the_initial_load_events_once() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);
@@ -2268,7 +2268,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn failure_observation_worker_teardown_stays_with_original_loader_across_navigation() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -2325,7 +2325,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn failure_observation_retired_runtime_keeps_old_loader_and_no_success_terminal() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -2364,7 +2364,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn failure_observation_suspend_then_failed_navigation_keeps_old_terminal() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -2396,7 +2396,7 @@ mod tests {
 
     #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some(format!("{page_id}-session"));
         ctx.sessions
@@ -2450,7 +2450,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_layout_metrics_returns_chrome_default_viewport() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         for params in [Value::Null, json!({})] {
             handle("getLayoutMetrics", &params, &mut ctx, &None)
                 .await
@@ -2515,7 +2515,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn cdp_metrics_and_capture_follow_the_scrolled_viewport() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -2582,8 +2582,17 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    async fn screenshot_fixture() -> (CdpContext, Option<String>) {
-        let mut ctx = CdpContext::new();
+    fn persona_with_device_scale_factor(value: f64) -> obscura_net::EffectivePersona {
+        let mut spec = obscura_net::PersonaSpec::preset(
+            obscura_net::StealthProfile::WindowsChrome145,
+        );
+        spec.device_scale_factor = Some(value);
+        spec.compile().unwrap()
+    }
+
+    #[cfg(feature = "render")]
+    async fn screenshot_fixture_with_dpr(dpr: f64) -> (CdpContext, Option<String>) {
+        let mut ctx = CdpContext::new(persona_with_device_scale_factor(dpr));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -2606,10 +2615,16 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    async fn transparent_surface_fixture(
+    async fn screenshot_fixture() -> (CdpContext, Option<String>) {
+        screenshot_fixture_with_dpr(1.0).await
+    }
+
+    #[cfg(feature = "render")]
+    async fn transparent_surface_fixture_with_dpr(
         height: u32,
+        dpr: f64,
     ) -> (CdpContext, Option<String>) {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(persona_with_device_scale_factor(dpr));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -2632,9 +2647,14 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    async fn transparent_surface_fixture(height: u32) -> (CdpContext, Option<String>) {
+        transparent_surface_fixture_with_dpr(height, 1.0).await
+    }
+
+    #[cfg(feature = "render")]
     #[tokio::test]
     async fn default_background_override_matches_chromium_across_capture_state() {
-        let (mut ctx, session) = transparent_surface_fixture(160).await;
+        let (mut ctx, session) = transparent_surface_fixture_with_dpr(160, 2.0).await;
 
         let (_, default_raster) = decode_capture(
             &handle("captureScreenshot", &json!({}), &mut ctx, &session)
@@ -2936,7 +2956,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn css_animation_drives_autonomous_screencast_frames_until_completion() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -3143,9 +3163,7 @@ mod tests {
 
         let context = std::sync::Arc::new(
             obscura_browser::BrowserContext::with_storage_and_network(
-                "capture-without-warmup".to_string(),
-                None,
-                false,
+                "capture-without-warmup".to_string(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
                 None,
                 None,
                 true,
@@ -3322,7 +3340,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn long_full_page_png_is_contiguous_and_preserves_live_scroll_and_fixed_geometry() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -3404,7 +3422,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn long_full_page_png_uses_global_device_pixel_boundaries_at_dpr_two() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(persona_with_device_scale_factor(2.0));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -3461,7 +3479,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn long_full_page_png_rejects_more_than_thirty_two_megapixels_before_striping() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -3650,7 +3668,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test]
     async fn capture_screenshot_combines_device_and_clip_scale_without_relayout() {
-        let (mut ctx, session) = screenshot_fixture().await;
+        let (mut ctx, session) = screenshot_fixture_with_dpr(2.0).await;
         crate::domains::emulation::handle(
             "setDeviceMetricsOverride",
             &json!({
@@ -3692,12 +3710,12 @@ mod tests {
 
         let page = ctx.get_session_page(&session).expect("page");
         assert_eq!(page.viewport, (100.0, 80.0));
-        assert_eq!(page.device_scale_factor, 2.0);
+        assert_eq!(page.device_scale_factor(), 2.0);
     }
 
     #[tokio::test]
     async fn unknown_page_method_still_errors() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let err = handle("notARealMethod", &json!({}), &mut ctx, &None)
             .await
             .expect_err("unknown methods must surface as errors");
@@ -3707,14 +3725,14 @@ mod tests {
     #[tokio::test]
     async fn observed_page_initializers_reject_unimplemented_shapes() {
         assert!(
-            handle("enable", &json!({"invented": true}), &mut CdpContext::new(), &None)
+            handle("enable", &json!({"invented": true}), &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                 .await
                 .is_err()
         );
         handle(
             "setLifecycleEventsEnabled",
             &json!({"enabled": true}),
-            &mut CdpContext::new(),
+            &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)),
             &None,
         )
         .await
@@ -3725,7 +3743,7 @@ mod tests {
             json!({"enabled": true, "invented": true}),
         ] {
             assert!(
-                handle("setLifecycleEventsEnabled", &params, &mut CdpContext::new(), &None)
+                handle("setLifecycleEventsEnabled", &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                     .await
                     .is_err(),
                 "must reject {params}"
@@ -3738,7 +3756,7 @@ mod tests {
         // Regression for #53: Page.printToPDF must be handled explicitly so
         // Playwright clients receive a descriptive error rather than the
         // generic "Unknown Page method" fallback.
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let err = handle("printToPDF", &json!({}), &mut ctx, &None)
             .await
             .expect_err("printToPDF without a page session must error");
@@ -3761,7 +3779,7 @@ mod tests {
     /// no idea why their screenshot request failed.
     #[tokio::test]
     async fn capture_screenshot_returns_descriptive_unsupported_error() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let err = handle("captureScreenshot", &json!({}), &mut ctx, &None)
             .await
             .expect_err("captureScreenshot must error until a real paint exists");
@@ -3790,7 +3808,7 @@ mod tests {
         // refresh a target's url/title only on Target.targetInfoChanged. A
         // navigation must emit it with the post-nav url/title, otherwise those
         // clients stay stuck on the pre-nav about:blank.
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{}-session", page_id);
         ctx.sessions.insert(session_id.clone(), page_id.clone());

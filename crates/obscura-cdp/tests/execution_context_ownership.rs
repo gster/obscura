@@ -44,7 +44,7 @@ fn latest_default_context(ctx: &CdpContext, session: &str) -> (i64, String, Stri
 
 #[tokio::test(flavor = "current_thread")]
 async fn nonblank_create_target_exposes_only_the_committed_document_context() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (_, session) = create_and_attach(
         &mut ctx, "data:text/html,<title>committed</title>", 1,
     ).await;
@@ -62,7 +62,7 @@ async fn nonblank_create_target_exposes_only_the_committed_document_context() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn default_context_identity_is_page_owned_for_id_and_unique_id() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (_, first) = create_and_attach(&mut ctx, "about:blank", 1).await;
     let (_, second) = create_and_attach(&mut ctx, "about:blank", 10).await;
     cdp(&mut ctx, 20, "Runtime.enable", json!({}), Some(&first)).await;
@@ -111,7 +111,7 @@ async fn default_context_identity_is_page_owned_for_id_and_unique_id() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn navigating_one_page_preserves_the_other_pages_isolated_context() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (_, first) = create_and_attach(&mut ctx, "about:blank", 1).await;
     let (_, second) = create_and_attach(&mut ctx, "about:blank", 10).await;
     for (id, session) in [(20, &first), (21, &second)] {
@@ -146,7 +146,7 @@ async fn navigating_one_page_preserves_the_other_pages_isolated_context() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn attached_isolated_context_ids_share_the_current_page_global_for_now() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (_, session) = create_and_attach(&mut ctx, "about:blank", 1).await;
     cdp(
         &mut ctx, 3, "Runtime.evaluate",
@@ -178,7 +178,7 @@ async fn attached_isolated_context_ids_share_the_current_page_global_for_now() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn navigation_context_events_preserve_order_for_every_runtime_attachment() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (target, first) = create_and_attach(&mut ctx, "about:blank", 1).await;
     let attached = cdp(
         &mut ctx, 3, "Target.attachToTarget",
@@ -235,7 +235,7 @@ async fn navigation_context_events_preserve_order_for_every_runtime_attachment()
 
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_and_binding_events_use_the_owning_pages_default_context() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (_, first) = create_and_attach(&mut ctx, "about:blank", 1).await;
     let (_, second) = create_and_attach(&mut ctx, "about:blank", 10).await;
     for (id, session) in [(20, &first), (21, &second)] {

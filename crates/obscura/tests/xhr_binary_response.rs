@@ -59,7 +59,7 @@ async fn xhr_arraybuffer_returns_the_response_bytes_unchanged() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&format!("{base}/page")).await.unwrap();
 

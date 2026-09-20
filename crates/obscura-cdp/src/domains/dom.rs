@@ -535,7 +535,7 @@ mod tests {
     // return the wrong node. See #917.
     #[tokio::test]
     async fn describe_node_errors_on_unresolvable_object_id() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -564,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_node_errors_on_unresolvable_object_id() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -596,7 +596,7 @@ mod tests {
         // CDP clients (browser-use) focus an input via DOM.focus before typing;
         // dispatchKeyEvent then targets document.activeElement. DOM.focus must
         // actually move focus or keystrokes land on nothing.
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -633,7 +633,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_node_preserves_identity_and_specialized_wrappers() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);
@@ -702,7 +702,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn scroll_into_view_if_needed_resolves_all_node_identifiers() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);
@@ -765,7 +765,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn scroll_into_view_if_needed_requires_a_node_identifier() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);
@@ -852,7 +852,7 @@ mod tests {
     /// as Page.navigate to `file://`, which defaults to off.
     #[tokio::test(flavor = "current_thread")]
     async fn set_file_input_files_refuses_without_allow_file_access() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);

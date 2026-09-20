@@ -2,28 +2,24 @@ use std::path::PathBuf;
 
 /// Configuration for launching a Browser instance.
 pub struct BrowserConfig {
+    /// Validated immutable browser identity.
+    pub persona: obscura_net::EffectivePersona,
     /// Proxy URL (e.g., "socks5://127.0.0.1:1080")
     pub proxy: Option<String>,
     /// Directory for persistent cookie storage
     pub storage_dir: Option<PathBuf>,
 }
 
-impl Default for BrowserConfig {
-    fn default() -> Self {
-        Self {
-            proxy: None,
-            storage_dir: None,
-        }
-    }
-}
-
 impl BrowserConfig {
-    pub fn builder() -> BrowserConfigBuilder {
-        BrowserConfigBuilder::default()
+    pub fn new(persona: obscura_net::EffectivePersona) -> Self {
+        Self { persona, proxy: None, storage_dir: None }
+    }
+
+    pub fn builder(persona: obscura_net::EffectivePersona) -> BrowserConfigBuilder {
+        BrowserConfigBuilder { config: Self::new(persona) }
     }
 }
 
-#[derive(Default)]
 pub struct BrowserConfigBuilder {
     config: BrowserConfig,
 }

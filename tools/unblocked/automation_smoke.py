@@ -535,7 +535,7 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                             "storage": None,
                             "defaultSentinel": None,
                             "viewport": [1280, 720, 1280, 720],
-                            "screen": [1280, 720, 1280, 720],
+                            "screen": [1920, 1080, 1920, 1040],
                             "devicePixelRatio": 1,
                         },
                         "defaultWhileOpen": {
@@ -576,7 +576,7 @@ def run(obscura_bin: Path) -> dict[str, Any]:
                     for name, expected in expected_context.items():
                         if context_result.get(name) != expected:
                             raise AssertionError(
-                                f"browser context {name} differs from Chrome: {context_result!r}"
+                                f"browser context {name} differs from the qualified persona/context contract: {context_result!r}"
                             )
                     if "closed" not in context_result.get("closedPageError", "").lower():
                         raise AssertionError(

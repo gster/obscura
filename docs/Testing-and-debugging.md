@@ -1,5 +1,9 @@
 ## Test suites
 
+Commands that launch the product binary must pass `--persona` or set
+`OBSCURA_PERSONA=windows_chrome145`. Rust unit tests inject an EffectivePersona
+directly and do not rely on a process default.
+
 ### Rust unit and integration
 
 ```bash

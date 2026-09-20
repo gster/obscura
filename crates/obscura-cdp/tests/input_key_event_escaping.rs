@@ -58,7 +58,7 @@ async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session
 async fn dispatch_key_event_escapes_backslash_in_key_and_code() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_page().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -118,7 +118,7 @@ async fn dispatch_key_event_escapes_backslash_in_key_and_code() {
 async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_page().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -173,7 +173,7 @@ async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
 async fn insert_text_types_into_the_focused_field() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_page().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());

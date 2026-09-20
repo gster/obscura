@@ -88,7 +88,8 @@ impl FrameRealm {
             parent.share_security_token_with_realm(&context);
         }
 
-        let mut state = ObscuraState::new();
+        let persona = parent.persona();
+        let mut state = ObscuraState::new(persona.clone());
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.dom.as_ref().unwrap().set_document_url(url);
@@ -123,7 +124,8 @@ impl FrameRealm {
                 &format!(
                     "globalThis.__obscura_frameId = {frame_id};\
                      globalThis.__obscura_parentFrameId = {parent_frame_id};\
-                     globalThis.__obscura_init();"
+                     globalThis.__obscura_init();{}",
+                    persona.preload_script(),
                 ),
             )
             .ok()?;
@@ -391,7 +393,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn page(url: &str, html: &str) -> ObscuraJsRuntime {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(parse_html(html));
         runtime.set_url(url);
         runtime.run_page_init();
@@ -416,6 +418,11 @@ mod tests {
             "<html><body><h1>Child</h1></body></html>",
         )
         .expect("frame realm");
+
+        assert_eq!(
+            frame.state.borrow().persona.digest(),
+            parent.persona().digest(),
+        );
 
         frame
             .execute_script(&mut parent, "globalThis.marker = 'child';")
@@ -487,7 +494,7 @@ mod tests {
     #[test]
     fn frame_inherits_the_parent_browser_identity() {
         let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TestAgent/150.0.0.0";
-        let mut parent = ObscuraJsRuntime::new();
+        let mut parent = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         parent.set_user_agent(user_agent);
         parent.set_platform("Win32", "Windows", "19.0.0");
         parent.set_dom(parse_html("<html><body></body></html>"));

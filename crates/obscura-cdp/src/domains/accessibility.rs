@@ -530,7 +530,7 @@ mod tests {
         let error = handle(
             "auditMethodDoesNotExist",
             &json!({}),
-            &mut CdpContext::new(),
+            &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)),
             &None,
         )
         .await

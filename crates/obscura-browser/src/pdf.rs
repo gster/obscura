@@ -772,7 +772,10 @@ mod tests {
 
     #[test]
     fn raster_pdf_repeats_fixed_content_and_advances_flow_on_every_selected_page() {
-        let context = std::sync::Arc::new(crate::BrowserContext::new("pdf-fixed".to_string()));
+        let context = std::sync::Arc::new(crate::BrowserContext::new(
+            "pdf-fixed".to_string(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+        ));
         let mut page = crate::Page::new("pdf-fixed-page".to_string(), context);
         page.set_viewport((100.0, 80.0));
         let dom = obscura_dom::parse_html(
@@ -783,7 +786,7 @@ mod tests {
                 <div style="height:40px;background:#2050e0"></div>
             </body></html>"#,
         );
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.set_url("https://example.test/pdf-fixed");
         runtime.set_viewport(100.0, 80.0);
@@ -854,7 +857,10 @@ mod tests {
 
     #[test]
     fn raster_pdf_selects_print_media_and_restores_screen_render_state() {
-        let context = std::sync::Arc::new(crate::BrowserContext::new("pdf-media".to_string()));
+        let context = std::sync::Arc::new(crate::BrowserContext::new(
+            "pdf-media".to_string(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+        ));
         let mut page = crate::Page::new("pdf-media-page".to_string(), context);
         page.set_viewport((100.0, 80.0));
         let dom = obscura_dom::parse_html(
@@ -879,7 +885,7 @@ mod tests {
                 </style>
             </head><body><div id="print-marker"></div><div id="screen-marker"></div></body></html>"#,
         );
-        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         runtime.set_dom(dom);
         runtime.set_url("https://example.test/pdf-media");
         runtime.set_viewport(100.0, 80.0);

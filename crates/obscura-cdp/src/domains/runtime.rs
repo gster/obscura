@@ -585,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_rejects_unknown_context_id() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let err = handle(
             "evaluate",
             &json!({ "expression": "1 + 1", "contextId": 9999 }),
@@ -603,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_function_on_rejects_unknown_execution_context_id() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let err = handle(
             "callFunctionOn",
             &json!({
@@ -624,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn evaluate_rejects_unadvertised_compatibility_context_ids() {
         for context_id in [1, 2] {
-            let mut ctx = CdpContext::new();
+            let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
             let error = handle(
                 "evaluate",
                 &json!({ "expression": "1 + 1", "contextId": context_id }),
@@ -639,7 +639,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_reports_a_rejection_through_exception_details() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = "evaluate-rejection".to_string();
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -681,7 +681,7 @@ mod tests {
         // This is the path Puppeteer's page.evaluate(fn) takes. It used to
         // answer successfully with `{}` for a rejected Error, so the caller
         // could not tell a failure from an empty object.
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = "call-rejection".to_string();
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -709,7 +709,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_resolved_evaluation_carries_no_exception_details() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = "evaluate-resolved".to_string();
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -732,7 +732,7 @@ mod tests {
     }
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_await_promise_reports_the_requested_timeout() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = "await-timeout-session".to_string();
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -761,7 +761,7 @@ mod tests {
         // Round-trip: Page.createIsolatedWorld returns contextId N, and a
         // subsequent Runtime.evaluate targeting that contextId must NOT be
         // rejected.
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         // Bypass the page-attached path of createIsolatedWorld by direct
         // insert — mirrors the same effect as calling the page handler with
         // a real session.
@@ -789,7 +789,7 @@ mod tests {
     /// puppeteer connect flow died.
     #[tokio::test]
     async fn enable_succeeds_when_no_session_attached() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let result = handle("enable", &json!({}), &mut ctx, &None)
             .await
             .expect("Runtime.enable must succeed even with no session");
@@ -800,7 +800,7 @@ mod tests {
     async fn observed_runtime_initializers_reject_ignored_params() {
         for method in ["enable", "runIfWaitingForDebugger"] {
             assert!(
-                handle(method, &json!({"invented": true}), &mut CdpContext::new(), &None)
+                handle(method, &json!({"invented": true}), &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                     .await
                     .is_err(),
                 "{method} must not ignore parameters"
@@ -816,7 +816,7 @@ mod tests {
     /// never executes.
     #[tokio::test(flavor = "current_thread")]
     async fn remove_binding_rejects_injection_in_name() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);

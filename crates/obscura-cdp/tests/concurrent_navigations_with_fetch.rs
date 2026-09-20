@@ -220,7 +220,7 @@ async fn fetch_intercept_concurrency_5_does_not_abort_v8() {
     local
         .run_until(async {
             tokio::task::spawn_local(async move {
-                let _ = obscura_cdp::server::start(port).await;
+                let _ = obscura_cdp::server::start(port, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)).await;
             });
             tokio::task::spawn_local(async move {
                 serve_fixture(fixture).await;

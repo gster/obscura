@@ -97,4 +97,6 @@ if (( $# == 2 )); then
   args+=(--scroll-y "$2")
 fi
 
-exec env PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "${args[@]}"
+exec env PYTHONDONTWRITEBYTECODE=1 \
+  OBSCURA_PERSONA="${OBSCURA_PERSONA:-windows_chrome145}" \
+  "$PYTHON" "${args[@]}"

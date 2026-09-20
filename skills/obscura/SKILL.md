@@ -10,6 +10,10 @@ automation. It embeds V8, owns the DOM and rendering pipeline, and exposes
 Chrome DevTools Protocol workflows without launching Chromium. Treat rendering
 as optional and the primp/browser-identity baseline as an invariant.
 
+Before invoking any product command, select an explicit persona. Use
+`OBSCURA_PERSONA=windows_chrome145` for generic fixtures unless the task names a
+different versioned PersonaSpec; never rely on an implicit identity.
+
 ## Build variants
 
 Official release archives and Docker images include rendering. For a source

@@ -4,16 +4,22 @@ use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
-fn validate_create_browser_context(params: &Value) -> Result<(), String> {
+fn validate_create_browser_context(
+    params: &Value,
+) -> Result<Option<obscura_net::EffectivePersona>, String> {
     if params.is_null() {
-        return Ok(());
+        return Ok(None);
     }
     let object = params
         .as_object()
         .ok_or("Target.createBrowserContext params must be an object")?;
-    if object.keys().any(|name| name != "disposeOnDetach") {
+    if object
+        .keys()
+        .any(|name| !matches!(name.as_str(), "disposeOnDetach" | "obscuraPersona"))
+    {
         return Err(
-            "Target.createBrowserContext supports only optional disposeOnDetach=true".to_string(),
+            "Target.createBrowserContext supports only disposeOnDetach=true and obscuraPersona"
+                .to_string(),
         );
     }
     if params
@@ -24,7 +30,14 @@ fn validate_create_browser_context(params: &Value) -> Result<(), String> {
             "Target.createBrowserContext supports only optional disposeOnDetach=true".to_string(),
         );
     }
-    Ok(())
+    params
+        .get("obscuraPersona")
+        .map(|value| {
+            let spec: obscura_net::PersonaSpec = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid obscuraPersona: {error}"))?;
+            spec.compile().map_err(|error| error.to_string())
+        })
+        .transpose()
 }
 
 fn browser_context_id<'a>(method: &str, params: &'a Value) -> Result<&'a str, String> {
@@ -322,8 +335,8 @@ pub async fn handle(
             Ok(json!({ "browserContextIds": ids }))
         }
         "createBrowserContext" => {
-            validate_create_browser_context(params)?;
-            let id = ctx.create_browser_context();
+            let persona = validate_create_browser_context(params)?;
+            let id = ctx.create_browser_context(persona)?;
             Ok(json!({ "browserContextId": id }))
         }
         "disposeBrowserContext" => {
@@ -396,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_contexts_are_real_and_do_not_clear_default_cookies() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         ctx.default_context.cookie_jar.set_cookie(
             "sid=default",
             &url::Url::parse("https://example.com").unwrap(),
@@ -423,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn playwright_browser_context_shapes_are_explicit() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         for params in [Value::Null, json!({})] {
             let created = handle("createBrowserContext", &params, &mut ctx, &None)
                 .await
@@ -477,9 +490,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injected_persona_is_compiled_before_context_registration() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let custom = json!({
+            "schema_version": "1",
+            "persona_id": "customer_macos",
+            "revision": "7",
+            "profile": "macos_chrome153",
+            "timezone": "Europe/Berlin",
+            "language": "en-US",
+            "languages": ["en-US", "en"],
+            "accept_language": "en-US,en;q=0.9",
+            "do_not_track": "0"
+        });
+        let created = handle(
+            "createBrowserContext",
+            &json!({"obscuraPersona": custom}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap();
+        let id = created["browserContextId"].as_str().unwrap();
+        assert_eq!(ctx.browser_context(id).unwrap().persona().persona_id(), "customer_macos");
+        assert_eq!(
+            ctx.browser_context(id).unwrap().persona().do_not_track(),
+            Some("0")
+        );
+
+        let count = ctx.browser_contexts.len();
+        let incompatible = json!({
+            "schema_version": "1",
+            "persona_id": "wrong_timezone",
+            "revision": "1",
+            "profile": "macos_chrome153",
+            "timezone": "Asia/Shanghai"
+        });
+        let error = handle(
+            "createBrowserContext",
+            &json!({"obscuraPersona": incompatible}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("unsupported in this process"), "{error}");
+        assert_eq!(ctx.browser_contexts.len(), count);
+    }
+
+    #[tokio::test]
     async fn disposing_context_removes_only_its_pages() {
-        let mut ctx = CdpContext::new();
-        let context_id = ctx.create_browser_context();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let context_id = ctx.create_browser_context(None).unwrap();
         let isolated_page = ctx.create_page_in_context(Some(&context_id)).unwrap();
         let default_page = ctx.create_page();
 
@@ -499,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_to_browser_target_returns_session_id() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let result = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None)
             .await
             .expect("attachToBrowserTarget should succeed");
@@ -524,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_page_attachment_is_unique_and_scoped_to_its_parent_session() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let managed_session = format!("{page_id}-session");
         ctx.sessions
@@ -564,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn detaching_explicit_session_removes_its_page_route() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let parent_session = Some("browser-session".to_string());
         let attached = handle(
@@ -590,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_target_detaches_every_actual_page_session() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let parent_session = Some("browser-session".to_string());
         let first = handle(
@@ -625,7 +689,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_target_rejects_ignored_and_unknown_parameters() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
 
         for params in [
@@ -651,7 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_target_method_still_errors() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let err = handle("notARealMethod", &json!({}), &mut ctx, &None)
             .await
             .expect_err("unknown methods must surface as errors");
@@ -665,7 +729,7 @@ mod tests {
             "waitForDebuggerOnStart": true,
             "flatten": true,
         });
-        handle("setAutoAttach", &valid, &mut CdpContext::new(), &None)
+        handle("setAutoAttach", &valid, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
             .await
             .expect("observed initializer must remain compatible");
 
@@ -675,7 +739,7 @@ mod tests {
             json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true, "invented": 1}),
         ] {
             assert!(
-                handle("setAutoAttach", &params, &mut CdpContext::new(), &None)
+                handle("setAutoAttach", &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                     .await
                     .is_err(),
                 "must reject {params}"
@@ -689,7 +753,7 @@ mod tests {
     /// like chromiumoxide panic when the field is missing.
     #[tokio::test]
     async fn get_target_info_browser_target_includes_can_access_opener() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         // No targetId → falls through to the browser-target branch.
         let result = handle("getTargetInfo", &json!({}), &mut ctx, &None)
             .await

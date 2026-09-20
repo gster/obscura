@@ -22,7 +22,7 @@ async fn cdp(
 
 #[tokio::test(flavor = "current_thread")]
 async fn navigation_prunes_only_the_navigated_pages_stale_context_ids() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let first_page = ctx.create_page();
     let second_page = ctx.create_page();
     ctx.sessions.insert("first".to_string(), first_page);

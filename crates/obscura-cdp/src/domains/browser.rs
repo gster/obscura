@@ -89,16 +89,49 @@ fn validate_download_behavior(params: &Value) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn handle(method: &str, params: &Value) -> Result<Value, String> {
+pub async fn handle(
+    method: &str,
+    params: &Value,
+    ctx: &crate::dispatch::CdpContext,
+) -> Result<Value, String> {
     match method {
         "getVersion" => {
             empty(method, params)?;
+            let persona = ctx.default_context.persona();
             Ok(json!({
                 "protocolVersion": "1.3",
-                "product": "Chrome/145.0.0.0",
+                "product": format!("Chrome/{}", persona.full_version()),
                 "revision": "@0000000000000000000000000000000000000000",
-                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                "userAgent": persona.user_agent(),
                 "jsVersion": "14.5.0.0",
+            }))
+        }
+        "getPersona" => {
+            let object = params
+                .as_object()
+                .ok_or("Browser.getPersona params must be an object")?;
+            if object.keys().any(|name| name != "browserContextId") {
+                return Err("Browser.getPersona supports only browserContextId".to_string());
+            }
+            let context = match object.get("browserContextId") {
+                Some(value) => {
+                    let id = value
+                        .as_str()
+                        .ok_or("Browser.getPersona browserContextId must be a string")?;
+                    ctx.browser_context(id)
+                        .ok_or_else(|| format!("Browser context not found: {id}"))?
+                }
+                None => &ctx.default_context,
+            };
+            let persona = context.persona();
+            Ok(json!({
+                "schemaVersion": persona.schema_version(),
+                "personaId": persona.persona_id(),
+                "revision": persona.revision(),
+                "profile": persona.profile().name(),
+                "digest": persona.digest(),
+                "timezone": persona.timezone(),
+                "userAgent": persona.user_agent(),
             }))
         }
         "close" => {
@@ -142,14 +175,21 @@ pub async fn handle(method: &str, params: &Value) -> Result<Value, String> {
 mod tests {
     use super::*;
 
+    fn context() -> crate::dispatch::CdpContext {
+        crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ))
+    }
+
     #[tokio::test]
     async fn fixed_browser_methods_reject_ignored_parameters() {
+        let ctx = context();
         for (method, params) in [
             ("getVersion", json!({"invented": true})),
             ("getWindowBounds", json!({})),
             ("setDownloadBehavior", json!({"behavior": "allow"})),
         ] {
-            let error = handle(method, &params)
+            let error = handle(method, &params, &ctx)
                 .await
                 .expect_err("invalid params must not return placeholder success");
             assert!(error.starts_with("Browser."), "{method}: {error}");
@@ -158,8 +198,9 @@ mod tests {
 
     #[tokio::test]
     async fn unimplemented_browser_mutations_error_instead_of_acknowledging() {
+        let ctx = context();
         for method in ["grantPermissions", "resetPermissions"] {
-            let error = handle(method, &json!({}))
+            let error = handle(method, &json!({}), &ctx)
                 .await
                 .expect_err("unimplemented Browser mutation must fail");
             assert!(error.contains("Unknown Browser method"), "{method}: {error}");
@@ -168,9 +209,11 @@ mod tests {
 
     #[tokio::test]
     async fn playwright_headless_window_bounds_shape_is_explicit() {
+        let ctx = context();
         handle(
             "setWindowBounds",
             &json!({"windowId": 1, "bounds": {"width": 1282, "height": 800}}),
+            &ctx,
         )
         .await
         .expect("the observed Playwright headless bounds should be accepted");
@@ -180,7 +223,7 @@ mod tests {
             json!({"windowId": 1, "bounds": {"width": 0, "height": 800}}),
             json!({"windowId": 1, "bounds": {"width": 1282, "height": 800, "left": 0}}),
         ] {
-            handle("setWindowBounds", &params)
+            handle("setWindowBounds", &params, &ctx)
                 .await
                 .expect_err("unqualified window bounds must fail");
         }
@@ -188,15 +231,27 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_and_empty_params_are_equivalent_for_parameterless_methods() {
+        let ctx = context();
         for params in [Value::Null, json!({})] {
-            handle("getVersion", &params)
+            handle("getVersion", &params, &ctx)
                 .await
                 .expect("CDP permits omitted params for a parameterless command");
         }
     }
 
     #[tokio::test]
+    async fn persona_diagnostic_reports_the_frozen_snapshot() {
+        let ctx = context();
+        let result = handle("getPersona", &json!({}), &ctx).await.unwrap();
+        assert_eq!(result["profile"], "windows_chrome145");
+        assert_eq!(result["personaId"], "windows_chrome145");
+        assert_eq!(result["digest"].as_str().unwrap().len(), 64);
+        assert_eq!(result["userAgent"], ctx.default_context.persona().user_agent());
+    }
+
+    #[tokio::test]
     async fn playwright_download_initializer_has_an_explicit_limited_shape() {
+        let ctx = context();
         handle(
             "setDownloadBehavior",
             &json!({
@@ -204,6 +259,7 @@ mod tests {
                 "downloadPath": "/tmp/obscura-downloads",
                 "eventsEnabled": true,
             }),
+            &ctx,
         )
         .await
         .expect("the documented Playwright initializer shape should be accepted");

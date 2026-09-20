@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_rejects_negative_or_non_integer_ranges() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let handle_id = ctx.io_streams.insert(b"data".to_vec()).unwrap();
         for params in [
             json!({"handle": handle_id.clone(), "offset": -1}),

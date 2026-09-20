@@ -2,6 +2,8 @@
 
 当前 `--storage-dir` **只持久化 Cookie**，不保存 localStorage、sessionStorage、IndexedDB 或活跃 JS 状态。旧文档声称存在 `localStorage/<origin>.json`，与当前 [BrowserContext](../crates/obscura-browser/src/context.rs) 不符。
 
+下列命令假定已设置 `export OBSCURA_PERSONA=windows_chrome145`。
+
 ```bash
 obscura serve --host 127.0.0.1 --storage-dir ./obscura-data
 obscura fetch https://example.com --storage-dir ./obscura-data --dump text

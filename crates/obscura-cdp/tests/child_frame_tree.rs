@@ -94,7 +94,7 @@ async fn attached_session(ctx: &mut CdpContext) -> String {
 async fn get_frame_tree_reports_nested_child_frames() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let session = &attached_session(&mut ctx).await;
 
     // Deliberately no `waitUntil`: that is what Puppeteer and Playwright send,
@@ -188,7 +188,7 @@ async fn get_frame_tree_reports_nested_child_frames() {
 async fn isolated_worlds_are_owned_by_their_exact_frame() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let session = attached_session(&mut ctx).await;
 
     cdp(&mut ctx, 1, "Page.navigate", json!({"url": url}), &session).await;

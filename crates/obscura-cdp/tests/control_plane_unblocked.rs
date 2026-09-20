@@ -45,7 +45,7 @@ async fn http_control_plane_unblocked_during_long_js() {
     local
         .run_until(async {
             tokio::task::spawn_local(async move {
-                let _ = obscura_cdp::server::start(port).await;
+                let _ = obscura_cdp::server::start(port, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)).await;
             });
             // Give the listener + accept thread time to bind.
             tokio::time::sleep(Duration::from_millis(200)).await;

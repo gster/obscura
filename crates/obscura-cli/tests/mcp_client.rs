@@ -104,6 +104,7 @@ impl McpClient {
     fn spawn() -> Self {
         let mut child = Command::new(OBSCURA)
             .args(["mcp"])
+            .env("OBSCURA_PERSONA", "windows_chrome145")
             .env("OBSCURA_ALLOW_PRIVATE_NETWORK", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

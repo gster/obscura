@@ -566,9 +566,12 @@ async fn accept_language_override_reaches_the_wire() {
     let (target, mut received) = http_fixture(vec![ok_response("", "ok")]).await;
     let jar = Arc::new(CookieJar::new());
     let policy = Arc::new(ObscuraHttpClient::with_full_options(jar.clone(), None, true));
-    let client = StealthHttpClient::with_policy_profile_persona(
-        jar, None, policy, super::StealthProfile::default(), "de-DE,de;q=0.9", None,
-    );
+    let mut spec = crate::PersonaSpec::preset(super::StealthProfile::WindowsChrome145);
+    spec.language = Some("de-DE".to_string());
+    spec.languages = Some(vec!["de-DE".to_string(), "de".to_string()]);
+    spec.accept_language = Some("de-DE,de;q=0.9".to_string());
+    let persona = spec.compile().unwrap();
+    let client = StealthHttpClient::with_policy_persona(jar, None, policy, &persona);
 
     client.fetch(&target).await.unwrap();
 
@@ -1160,5 +1163,10 @@ async fn private_ca_is_still_rejected_without_ssl_cert_file() {
 
 fn primp_client(jar: Arc<CookieJar>, proxy: Option<&str>, allow_private: bool) -> StealthHttpClient {
     let policy = Arc::new(ObscuraHttpClient::with_full_options(jar.clone(), proxy, allow_private));
-    StealthHttpClient::with_policy(jar, proxy, policy)
+    StealthHttpClient::with_policy(
+        jar,
+        proxy,
+        policy,
+        &crate::EffectivePersona::builtin(super::StealthProfile::WindowsChrome145),
+    )
 }

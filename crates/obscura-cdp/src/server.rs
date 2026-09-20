@@ -87,23 +87,25 @@ fn browser_close_response(req: &CdpRequest) -> Option<(CdpResponse, bool)> {
     Some((response, valid))
 }
 
-pub async fn start(port: u16) -> anyhow::Result<()> {
-    start_with_options(port, None).await
+pub async fn start(port: u16, persona: obscura_net::EffectivePersona) -> anyhow::Result<()> {
+    start_with_options(port, None, persona).await
 }
 
 pub async fn start_with_options(
     port: u16,
     proxy: Option<String>,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
-    start_with_full_options(port, proxy, None).await
+    start_with_full_options(port, proxy, None, persona).await
 }
 
 pub async fn start_with_full_options(
     port: u16,
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
-    start_with_host(port, "127.0.0.1", proxy, storage_dir).await
+    start_with_host(port, "127.0.0.1", proxy, storage_dir, persona).await
 }
 
 pub async fn start_with_host(
@@ -111,8 +113,9 @@ pub async fn start_with_host(
     host: &str,
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
-    start_with_host_and_security(port, host, proxy, false, storage_dir).await
+    start_with_host_and_security(port, host, proxy, false, storage_dir, persona).await
 }
 
 pub async fn start_with_host_and_security(
@@ -121,9 +124,10 @@ pub async fn start_with_host_and_security(
     proxy: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     start_with_full_serve_options(
-        port, host, proxy, allow_file_access, storage_dir, false,
+        port, host, proxy, allow_file_access, storage_dir, false, persona,
     )
     .await
 }
@@ -134,9 +138,10 @@ pub async fn start_with_host_security_and_storage(
     proxy: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     start_with_full_serve_options(
-        port, host, proxy, allow_file_access, storage_dir, false,
+        port, host, proxy, allow_file_access, storage_dir, false, persona,
     )
     .await
 }
@@ -151,6 +156,7 @@ pub async fn start_with_full_serve_options(
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     start_with_serve_options_and_limit(
         port,
@@ -160,6 +166,7 @@ pub async fn start_with_full_serve_options(
         storage_dir,
         allow_private_network,
         DEFAULT_MAX_CONNECTIONS,
+        persona,
     )
     .await
 }
@@ -176,7 +183,9 @@ pub async fn start_with_serve_options_and_limit(
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
     max_connections: usize,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
+    obscura_net::activate_process_persona(&persona)?;
     let ip: std::net::IpAddr = host
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
@@ -234,6 +243,7 @@ pub async fn start_with_serve_options_and_limit(
     // above any real connect rate, so the kernel backlog cannot overflow
     // under a connection burst.
     let accept_flag = shutdown_flag.clone();
+    let accept_persona = persona.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -290,7 +300,7 @@ pub async fn start_with_serve_options_and_limit(
                         PeekStatus::NotReady => pending.push((stream, since)),
                         PeekStatus::Closed => {}
                         PeekStatus::Head(head) => {
-                            if let Err(e) = accept_dispatch(stream, port, &ws_tx, &head) {
+                            if let Err(e) = accept_dispatch(stream, port, &ws_tx, &head, &accept_persona) {
                                 if !format!("{}", e).contains("close") {
                                     error!("Accept dispatch error: {}", e);
                                 }
@@ -308,15 +318,17 @@ pub async fn start_with_serve_options_and_limit(
     // gets an isolated copy with its own cookie jar and HTTP client (#449),
     // while the thread-per-connection layout from #430 still confines that
     // connection's V8 isolates to one OS thread.
-    let mut bctx = obscura_browser::BrowserContext::with_storage_and_network(
+    let bctx = obscura_browser::BrowserContext::with_options(
         "default".to_string(),
-        proxy,
-        true,
-        None,
-        storage_dir,
-        allow_private_network,
+        persona.clone(),
+        obscura_browser::BrowserContextOptions {
+            proxy_url: proxy,
+            storage_dir,
+            allow_file_access,
+            allow_private_network,
+            ..Default::default()
+        },
     );
-    bctx.allow_file_access = allow_file_access;
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
     // Cookie deltas are merged here, but new connections always clone the
@@ -374,7 +386,7 @@ pub async fn start_with_serve_options_and_limit(
     // first isolate off the main thread segfaults inside
     // InitializeBuiltinJSDispatchTable (#430 thread-per-connection). Building and
     // dropping one runtime here does the one-time setup single-threaded.
-    drop(obscura_js::runtime::ObscuraJsRuntime::new());
+    drop(obscura_js::runtime::ObscuraJsRuntime::new(persona));
 
     cap_malloc_arenas();
 
@@ -728,6 +740,7 @@ fn accept_dispatch(
     port: u16,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     head: &str,
+    persona: &obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     let endpoint = if head.contains("/json/version") {
         Some("version")
@@ -743,7 +756,7 @@ fn accept_dispatch(
         // The request head is already sitting in the kernel receive buffer;
         // switch back to blocking mode for the synchronous /json serve.
         let _ = stream.set_nonblocking(false);
-        return handle_http_json_blocking(stream, port, ep, head);
+        return handle_http_json_blocking(stream, port, ep, head, persona);
     }
     // Fall through: GET request that isn't a /json endpoint → treat as
     // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -772,6 +785,7 @@ fn handle_http_json_blocking(
     port: u16,
     endpoint: &str,
     request_head: &str,
+    persona: &obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
@@ -781,9 +795,9 @@ fn handle_http_json_blocking(
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Chrome/145.0.0.0",
+            "Browser": format!("Chrome/{}", persona.full_version()),
             "Protocol-Version": "1.3",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "User-Agent": persona.user_agent(),
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
@@ -2234,7 +2248,7 @@ pub(crate) mod tests {
                 let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let default_context = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)).default_context;
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
                     default_context,
@@ -2450,7 +2464,7 @@ pub(crate) mod tests {
 
     #[test]
     fn continue_headers_server_preserves_order_case_values_and_retry() {
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         for supplied in [continue_header_fields(), json!([])] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
@@ -2478,7 +2492,7 @@ pub(crate) mod tests {
 
     #[test]
     fn continue_post_data_server_preserves_bytes_and_retryable_errors() {
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         for (value, expected) in [(Some(json!("AP8A/w==")), Some(vec![0, 255, 0, 255])),
             (Some(json!("")), Some(vec![])), (None, None)] {
@@ -2582,8 +2596,8 @@ pub(crate) mod tests {
                 assert_eq!(seen.iter().filter(|url| url.ends_with(path)).count(), 2);
             }
         });
-        let mut page_ctx = crate::dispatch::CdpContext::new();
-        page_ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("continue-body".into(), Some(proxy)));
+        let mut page_ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        page_ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("continue-body".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), Some(proxy)));
         let page_id = page_ctx.create_page();
         let page = page_ctx.get_page_mut(&page_id).unwrap();
         page.stealth_client.set_extra_headers(HashMap::from([
@@ -2591,7 +2605,7 @@ pub(crate) mod tests {
         ])).await;
         page.navigate("http://continue.test/").await.unwrap();
         let mut requests = page.enable_interception();
-        let mut resolver_ctx = crate::dispatch::CdpContext::new();
+        let mut resolver_ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let respond = async {
             for _ in 0..6 {
@@ -2653,7 +2667,7 @@ pub(crate) mod tests {
     #[test]
     fn fulfilled_headers_preserve_duplicates_binary_values_and_capture_source() {
         use base64::Engine as _;
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let binary = b"Set-Cookie: session=first-secret\0sEt-CoOkIe: session=second-secret\0X-Bytes: \xff\xfe\0";
         for params in [
@@ -2691,7 +2705,7 @@ pub(crate) mod tests {
     #[test]
     fn fulfilled_invalid_headers_keep_request_paused_for_retry() {
         use base64::Engine as _;
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([((None, "fulfilled".to_string()), request_pause(resolver))]);
@@ -2716,7 +2730,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fetch_body_read_during_request_pause_errors_without_dropping_resolver() {
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([((None, "paused".to_string()), request_pause(resolver))]);
@@ -2743,7 +2757,7 @@ pub(crate) mod tests {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([((None, "request-1".to_string()), request_pause(resolution_tx))]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
         assert!(handle_fetch_resolution(
             r#"{"id":17,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
@@ -2764,7 +2778,7 @@ pub(crate) mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn autonomous_screencast_pumps_timers_and_retains_backpressured_damage() {
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
@@ -2853,7 +2867,7 @@ pub(crate) mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn autonomous_screencast_observes_raf_visual_mutations() {
-        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);

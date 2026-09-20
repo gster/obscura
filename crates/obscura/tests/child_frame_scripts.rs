@@ -118,7 +118,7 @@ async fn a_child_frame_runs_its_own_script() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -152,7 +152,7 @@ async fn a_child_frame_set_by_attribute_runs_its_own_script() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(ATTRIBUTE_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -173,7 +173,7 @@ async fn a_shadow_dom_child_frame_stays_alive_and_runs_its_script() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(SHADOW_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -196,7 +196,7 @@ async fn a_child_frame_reaches_its_parent_with_post_message() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(MESSAGING_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -224,7 +224,7 @@ async fn a_parent_reaches_its_child_with_post_message() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(MESSAGING_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -254,7 +254,7 @@ async fn window_post_message_delivers_to_the_same_window() {
 </script></body></html>"#,
     );
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(1000).await;
@@ -283,7 +283,7 @@ async fn window_post_message_honours_target_origin() {
 </script></body></html>"#,
     );
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(1000).await;
@@ -302,7 +302,7 @@ async fn a_static_child_frame_runs_its_own_script() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(STATIC_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -324,7 +324,7 @@ async fn a_rejected_child_frame_does_not_leave_js_references() {
     std::env::set_var("OBSCURA_MAX_LIVE_FRAMES", "0");
     let base = spawn_server(STATIC_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -349,7 +349,7 @@ async fn navigating_blank_releases_child_realms() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(STATIC_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(2000).await;
@@ -364,7 +364,7 @@ async fn changing_iframe_src_releases_the_previous_realm() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server(RESET_PARENT_HTML);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     page.settle(1000).await;

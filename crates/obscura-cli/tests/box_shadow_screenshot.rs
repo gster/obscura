@@ -20,6 +20,7 @@ fn screenshot_keeps_outset_shadow_outside_transparent_border_box() {
         .args(["fetch", url, "--screenshot"])
         .arg(&path)
         .args(["--wait", "0", "--timeout", "5", "--quiet"])
+        .env("OBSCURA_PERSONA", "windows_chrome145")
         .env("OBSCURA_SHOT_W", "160")
         .env("OBSCURA_SHOT_H", "80")
         .output()
