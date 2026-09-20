@@ -253,6 +253,42 @@ pub struct WheelInput {
     pub modifiers: u8,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardInputPhase {
+    #[default]
+    KeyDown,
+    RawKeyDown,
+    Char,
+    KeyUp,
+}
+
+/// One protocol keyboard phase. Key codes are supplied by the caller, never
+/// inferred from the printable key name.
+#[derive(Clone, Debug, Default)]
+pub struct KeyboardInput {
+    pub phase: KeyboardInputPhase,
+    pub key: String,
+    pub code: String,
+    pub text: String,
+    pub unmodified_text: String,
+    pub windows_virtual_key_code: i32,
+    pub native_virtual_key_code: i32,
+    pub modifiers: u32,
+    pub auto_repeat: bool,
+    pub location: u32,
+    pub is_keypad: bool,
+    pub is_system_key: bool,
+    pub commands: Vec<String>,
+}
+
+#[cfg(feature = "render")]
+#[derive(Clone, Copy)]
+enum KeyboardEdit {
+    Insert,
+    Backward,
+    LineBreak,
+}
+
 fn mouse_button_mask(button: i16) -> Option<u8> {
     match button {
         0 => Some(1),
@@ -630,6 +666,7 @@ pub struct ObscuraJsRuntime {
     native_scroll: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_focus: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_text: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_keyboard: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_submit: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_fragment: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_lifecycle: Option<deno_core::v8::Global<deno_core::v8::Function>>,
@@ -1098,6 +1135,7 @@ impl ObscuraJsRuntime {
             native_scroll: None,
             native_focus: None,
             native_text: None,
+            native_keyboard: None,
             native_submit: None,
             native_fragment: None,
             native_lifecycle: None,
@@ -1146,6 +1184,7 @@ impl ObscuraJsRuntime {
                 .expect("native focus handoff"),
         );
         instance.native_text = Some(instance.take_native_input("__obscura_native_text_handoff").expect("native text handoff"));
+        instance.native_keyboard = Some(instance.take_native_input("__obscura_native_keyboard_handoff").expect("native keyboard handoff"));
         instance.native_submit = Some(instance.take_native_input("__obscura_native_submit_handoff").expect("native submit handoff"));
         instance.native_fragment = Some(instance.take_native_input("__obscura_native_fragment_handoff").expect("native fragment handoff"));
         instance.native_lifecycle = Some(instance.take_native_input("__obscura_native_lifecycle_handoff").expect("native lifecycle handoff"));
@@ -1452,7 +1491,7 @@ impl ObscuraJsRuntime {
             }
         }
         // Child realms cannot expose native input authority either.
-        for name in ["__obscura_native_mouse_handoff", "__obscura_native_wheel_handoff", "__obscura_native_scroll_handoff", "__obscura_native_focus_handoff", "__obscura_native_text_handoff", "__obscura_native_submit_handoff", "__obscura_native_fragment_handoff", "__obscura_native_lifecycle_handoff"] {
+        for name in ["__obscura_native_mouse_handoff", "__obscura_native_wheel_handoff", "__obscura_native_scroll_handoff", "__obscura_native_focus_handoff", "__obscura_native_text_handoff", "__obscura_native_keyboard_handoff", "__obscura_native_submit_handoff", "__obscura_native_fragment_handoff", "__obscura_native_lifecycle_handoff"] {
             let Some(input_key) = v8::String::new(scope, name) else {
                 return false;
             };
@@ -4191,6 +4230,16 @@ impl ObscuraJsRuntime {
         button: NodeId,
         input_document_epoch: Option<u64>,
     ) -> Result<(), &'static str> {
+        self.submit_native_form_with_submitter(form, Some(button), input_document_epoch)
+    }
+
+    #[cfg(feature = "render")]
+    fn submit_native_form_with_submitter(
+        &mut self,
+        form: NodeId,
+        button: Option<NodeId>,
+        input_document_epoch: Option<u64>,
+    ) -> Result<(), &'static str> {
         use deno_core::v8;
         let function = self.native_submit.clone().ok_or("INPUT_UNAVAILABLE")?;
         self.begin_javascript_task();
@@ -4203,7 +4252,10 @@ impl ObscuraJsRuntime {
         let function = v8::Local::new(scope, function);
         let arguments = [
             v8::Integer::new_from_unsigned(scope, form.raw()).into(),
-            v8::Integer::new_from_unsigned(scope, button.raw()).into(),
+            match button {
+                Some(button) => v8::Integer::new_from_unsigned(scope, button.raw()).into(),
+                None => v8::null(scope).into(),
+            },
             v8::Number::new(
                 scope,
                 input_document_epoch.map_or(-1.0, |epoch| epoch as f64),
@@ -4492,6 +4544,232 @@ impl ObscuraJsRuntime {
             return Err(("INPUT_VALUE_LIMIT", "NOT_SENT"));
         }
         self.native_manual_edit(text, None)
+    }
+
+    /// Insert CDP text through the browser-owned editor and protected event
+    /// bridge. Unlike the bounded manual helper, an empty string is meaningful:
+    /// Chromium replaces a non-collapsed selection with it.
+    pub fn dispatch_insert_text(&mut self, text: &str) -> Result<(), String> {
+        if text.len() > 4096 {
+            return Err("INPUT_VALUE_LIMIT:NOT_SENT".into());
+        }
+        #[cfg(feature = "render")]
+        {
+            return self
+                .dispatch_keyboard_edit(text, KeyboardEdit::Insert)
+                .map_err(str::to_owned);
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            let _ = text;
+            Err("INPUT_UNSUPPORTED_WITHOUT_RENDER".into())
+        }
+    }
+
+    pub fn dispatch_keyboard_input(&mut self, input: KeyboardInput) -> Result<(), String> {
+        if input.commands.iter().any(|command| command != "deleteBackward") {
+            return Err("INPUT_KEY_COMMAND_UNSUPPORTED".into());
+        }
+        if input.text.len() > 4096 {
+            return Err("INPUT_VALUE_LIMIT".into());
+        }
+        #[cfg(feature = "render")]
+        {
+            self.dispatch_keyboard_input_render(&input).map_err(str::to_owned)
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            Err("INPUT_UNSUPPORTED_WITHOUT_RENDER".into())
+        }
+    }
+
+    #[cfg(feature = "render")]
+    fn keyboard_target(&self) -> Option<NodeId> {
+        let state = self.state.borrow();
+        // document.open replaces the live tree synchronously. Only an actual
+        // pending navigation stops this command from addressing that live tree.
+        if state.pending_navigation.is_some() { return None; }
+        let dom = state.dom.as_ref()?;
+        dom.input_state().focused.filter(|node| dom.is_connected(*node))
+            .or_else(|| dom.query_selector_all("body").ok()?.first().copied())
+            .or(Some(dom.document()))
+    }
+
+    #[cfg(feature = "render")]
+    fn keyboard_text_target(
+        &self,
+    ) -> Result<Option<(NodeId, obscura_dom::tree::TextControlState, bool)>, &'static str> {
+        let Some(node) = self.keyboard_target() else { return Ok(None); };
+        self.with_dom(|dom| {
+            for id in std::iter::once(node).chain(dom.ancestors(node)) {
+                if dom.get_node(id).is_some_and(|element| element.get_attribute("contenteditable")
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("false"))) {
+                    return Err("INPUT_CONTENTEDITABLE_UNSUPPORTED");
+                }
+            }
+            let Some(control) = dom.text_control(node) else { return Ok(None); };
+            if !dom.can_focus(node) { return Ok(None); }
+            if !control.kind.supports_selection() {
+                return Err("INPUT_ELEMENT_UNSUPPORTED");
+            }
+            let readonly = dom.get_node(node).is_some_and(|element| element.get_attribute("readonly").is_some());
+            Ok(Some((node, control, readonly)))
+        }).ok_or("NO_DOCUMENT")?
+    }
+
+    #[cfg(feature = "render")]
+    fn dispatch_keyboard_input_render(&mut self, input: &KeyboardInput) -> Result<(), &'static str> {
+        use KeyboardInputPhase::*;
+        let Some(_) = self.keyboard_target() else { return Ok(()); };
+        if input.phase == KeyUp {
+            self.native_keyboard_event("keyup", input)?;
+            return self.native_input_checkpoint();
+        }
+        if matches!(input.phase, KeyDown | RawKeyDown) {
+            let allowed = self.native_keyboard_event("keydown", input)?;
+            self.native_input_checkpoint()?;
+            if !allowed || self.keyboard_target().is_none() { return Ok(()); }
+        }
+        if let Some(node) = self.keyboard_target() {
+            let unsupported = self.with_dom(|dom| {
+                (input.windows_virtual_key_code == 13 && (dom.is_html_element(node, "button")
+                    || matches!(dom.input_type(node).as_deref(), Some("button" | "submit" | "reset"))))
+                    || (input.windows_virtual_key_code == 32
+                        && matches!(dom.input_type(node).as_deref(), Some("checkbox" | "radio")))
+            }).unwrap_or(false);
+            if unsupported { return Err("INPUT_KEY_DEFAULT_UNSUPPORTED"); }
+        }
+        if matches!(input.phase, KeyDown | RawKeyDown)
+            && (input.windows_virtual_key_code == 8 || !input.commands.is_empty()) {
+            return self.dispatch_keyboard_edit("", KeyboardEdit::Backward);
+        }
+        if input.phase == RawKeyDown || input.text.is_empty() { return Ok(()); }
+        let allowed = self.native_keyboard_event("keypress", input)?;
+        self.native_input_checkpoint()?;
+        if !allowed || self.keyboard_target().is_none() { return Ok(()); }
+        let edit = if input.text == "\r" && input.windows_virtual_key_code == 13 {
+            KeyboardEdit::LineBreak
+        } else {
+            KeyboardEdit::Insert
+        };
+        self.dispatch_keyboard_edit(&input.text, edit)
+    }
+
+    #[cfg(feature = "render")]
+    fn dispatch_keyboard_edit(&mut self, text: &str, edit: KeyboardEdit) -> Result<(), &'static str> {
+        let Some(node) = self.keyboard_target() else { return Ok(()); };
+        // Resolve once before delivery so explicitly unsupported editors fail
+        // without partial dispatch. A focused non-editable target is still a
+        // valid beforeinput target in Chromium; it simply has no edit or input
+        // event after the cancelable beforeinput phase.
+        let _ = self.keyboard_text_target()?;
+        let kind = match edit {
+            KeyboardEdit::Insert => 8,
+            KeyboardEdit::Backward => 10,
+            KeyboardEdit::LineBreak => 18,
+        };
+        let allowed = self.native_text_event(kind, node, text)?;
+        self.native_input_checkpoint()?;
+        if !allowed { return Ok(()); }
+        // A beforeinput listener can replace the document, move focus or alter
+        // value/selection. Resolve all of them again before calculating the edit.
+        let Some((node, control, readonly)) = self.keyboard_text_target()? else { return Ok(()); };
+        if readonly { return Ok(()); }
+        if matches!(edit, KeyboardEdit::LineBreak)
+            && control.kind != obscura_dom::tree::TextControlKind::TextArea {
+            return self.keyboard_implicit_submit(node);
+        }
+        if control.value.len() > 65536 { return Err("INPUT_VALUE_LIMIT"); }
+        let mut offsets = vec![0usize];
+        let mut units = vec![0u32];
+        for (offset, ch) in control.value.char_indices() {
+            offsets.push(offset + ch.len_utf8());
+            units.push(units.last().unwrap() + ch.len_utf16() as u32);
+        }
+        let mut start = units.binary_search(&control.start).map_err(|_| "INPUT_SELECTION_UNSUPPORTED")?;
+        let end = units.binary_search(&control.end).map_err(|_| "INPUT_SELECTION_UNSUPPORTED")?;
+        if matches!(edit, KeyboardEdit::Backward) && start == end { start = start.saturating_sub(1); }
+        let text = match edit {
+            KeyboardEdit::Insert => text,
+            KeyboardEdit::Backward => "",
+            KeyboardEdit::LineBreak => "\n",
+        };
+        let mut value = control.value.clone();
+        value.replace_range(offsets[start]..offsets[end], text);
+        let prefix = &value[..offsets[start] + text.len()];
+        let prefix = if control.kind == obscura_dom::tree::TextControlKind::TextArea {
+            control.kind.normalize(prefix)
+        } else {
+            let prefix = prefix.replace(['\r', '\n'], "");
+            if control.kind == obscura_dom::tree::TextControlKind::Url {
+                prefix.trim_start_matches(|c| matches!(c, ' ' | '\t' | '\x0c')).to_owned()
+            } else {
+                prefix
+            }
+        };
+        value = control.kind.normalize(&value);
+        let caret = (prefix.encode_utf16().count() as u32).min(value.encode_utf16().count() as u32);
+        if value == control.value && control.start == control.end { return Ok(()); }
+        self.editable_text(node, &value)?;
+        let mut state = self.state.borrow_mut();
+        let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+        dom.set_user_text_value(node, &value).ok_or("INPUT_TARGET_CHANGED")?;
+        dom.set_text_selection(node, caret, caret, "none").ok_or("INPUT_TARGET_CHANGED")?;
+        invalidate_input_render(&mut state);
+        drop(state);
+        self.native_text_event(kind + 1, node, text)?;
+        self.native_input_checkpoint()
+    }
+
+    #[cfg(feature = "render")]
+    fn keyboard_implicit_submit(&mut self, node: NodeId) -> Result<(), &'static str> {
+        let form = self.with_dom(|dom| {
+            let Some(form) = dom.form_owner(node) else { return Ok(None); };
+            // Qualify the single text-field form. Default buttons and multiple
+            // blocking fields need the full implicit-submission algorithm.
+            let controls: Vec<_> = dom.descendants(dom.document()).into_iter()
+                .filter(|id| dom.form_owner(*id) == Some(form)
+                    && (dom.is_html_element(*id, "input") || dom.is_html_element(*id, "button")))
+                .collect();
+            if controls != [node] { return Err("INPUT_KEY_DEFAULT_UNSUPPORTED"); }
+            Ok(Some(form))
+        }).ok_or("NO_DOCUMENT")??;
+        if let Some(form) = form {
+            let epoch = self.state.borrow().input_document_epoch.get();
+            self.submit_native_form_with_submitter(form, None, Some(epoch))?;
+            self.native_input_checkpoint()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    fn native_keyboard_event(&mut self, event_type: &str, input: &KeyboardInput) -> Result<bool, &'static str> {
+        use deno_core::v8;
+        let Some(node) = self.keyboard_target() else { return Ok(false); };
+        let function = self.native_keyboard.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let arguments = [
+            v8::String::new(scope, event_type).ok_or("INPUT_DISPATCH_FAILED")?.into(),
+            v8::Integer::new_from_unsigned(scope, node.raw()).into(),
+            v8::String::new(scope, &input.key).ok_or("INPUT_DISPATCH_FAILED")?.into(),
+            v8::String::new(scope, &input.code).ok_or("INPUT_DISPATCH_FAILED")?.into(),
+            v8::Integer::new(scope, input.windows_virtual_key_code).into(),
+            v8::Integer::new_from_unsigned(scope, input.text.encode_utf16().next().unwrap_or(0) as u32).into(),
+            v8::Integer::new_from_unsigned(scope, input.modifiers).into(),
+            v8::Boolean::new(scope, input.auto_repeat).into(),
+            v8::Integer::new_from_unsigned(scope, if input.is_keypad { 3 } else { input.location }).into(),
+        ];
+        let receiver = v8::undefined(scope).into();
+        let result = function.call(scope, receiver, &arguments).ok_or("INPUT_DISPATCH_FAILED")?;
+        if !result.is_boolean() { return Err("INPUT_DISPATCH_FAILED"); }
+        Ok(result.boolean_value(scope))
     }
 
     #[cfg(feature = "render")]
@@ -7533,6 +7811,117 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_keyboard_protocol_phases_keep_metadata_and_protected_dispatch() {
+        let mut rt = setup_runtime("<input id=i value=abcd>");
+        rt.evaluate(r#"(() => {
+            const i = document.getElementById('i');
+            i.focus(); i.setSelectionRange(1, 3);
+            globalThis.keyEvents = []; globalThis.keyMetadata = [];
+            for (const type of ['keydown','keypress','keyup','beforeinput','input']) {
+                document.addEventListener(type, e => {
+                    keyEvents.push(e.type);
+                    if (e.type.startsWith('key')) keyMetadata.push([
+                        e.type,e.keyCode,e.charCode,e.which,e.location,e.repeat,
+                        e.altKey,e.ctrlKey,e.metaKey,e.shiftKey,e.isTrusted,e.composed,e.cancelable
+                    ]);
+                });
+            }
+            globalThis.Event = globalThis.KeyboardEvent = globalThis.InputEvent =
+                function() { throw Error('public constructor used'); };
+            EventTarget.prototype.dispatchEvent = function() { throw Error('public dispatcher used'); };
+        })()"#).unwrap();
+        let mut input = KeyboardInput {
+            phase: KeyboardInputPhase::KeyDown,
+            key: "x".into(), code: "KeyX".into(), text: "x".into(),
+            windows_virtual_key_code: 88, modifiers: 9, auto_repeat: true,
+            location: 1, is_keypad: true,
+            ..KeyboardInput::default()
+        };
+        rt.dispatch_keyboard_input(input.clone()).unwrap();
+        assert_eq!(rt.evaluate("document.getElementById('i').value").unwrap(), serde_json::json!("axd"));
+        input.phase = KeyboardInputPhase::RawKeyDown;
+        input.text = "ignored".into();
+        rt.dispatch_keyboard_input(input.clone()).unwrap();
+        assert_eq!(rt.evaluate("document.getElementById('i').value").unwrap(), serde_json::json!("axd"));
+        input.phase = KeyboardInputPhase::Char;
+        input.text = "y".into();
+        rt.dispatch_keyboard_input(input.clone()).unwrap();
+        input.phase = KeyboardInputPhase::KeyUp;
+        rt.dispatch_keyboard_input(input).unwrap();
+        assert_eq!(rt.evaluate("[document.getElementById('i').value,document.getElementById('i').selectionStart]").unwrap(), serde_json::json!(["axyd",3]));
+        assert_eq!(rt.evaluate("keyEvents").unwrap(), serde_json::json!([
+            "keydown","keypress","beforeinput","input","keydown","keypress","beforeinput","input","keyup"
+        ]));
+        assert_eq!(rt.evaluate("keyMetadata").unwrap(), serde_json::json!([
+            ["keydown",88,0,88,3,true,true,false,false,true,true,true,true],
+            ["keypress",120,120,120,3,true,true,false,false,true,true,true,true],
+            ["keydown",88,0,88,3,true,true,false,false,true,true,true,true],
+            ["keypress",121,121,121,3,true,true,false,false,true,true,true,true],
+            ["keyup",88,0,88,3,true,true,false,false,true,true,true,true]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_insert_text_delivers_beforeinput_to_a_noneditable_focus_target() {
+        let mut rt = setup_runtime("<button id=b>button</button>");
+        rt.evaluate(r#"(() => {
+            const b = document.getElementById('b'); b.focus();
+            globalThis.observed = [];
+            for (const type of ['beforeinput','input']) {
+                b.addEventListener(type, event => observed.push([
+                    event.type,event.constructor.name,event.data,event.inputType,event.isTrusted,
+                    event.bubbles,event.cancelable,event.composed
+                ]));
+            }
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Q").unwrap();
+        assert_eq!(rt.evaluate("[document.activeElement.id,observed]").unwrap(), serde_json::json!([
+            "b", [["beforeinput","InputEvent","Q","insertText",true,true,true,true]]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_keyboard_reloads_document_focus_and_selection_between_phases() {
+        let mut rt = setup_runtime("<input id=i value=old>");
+        rt.evaluate(r#"(() => {
+            const i = document.getElementById('i'); i.focus();
+            i.addEventListener('beforeinput', () => {
+                document.open(); document.write('<input id=n value=new>'); document.close();
+                const n = document.getElementById('n'); n.focus();
+                n.value = 'wxyz'; n.setSelectionRange(1, 3);
+                n.addEventListener('input', e => { globalThis.inputAfterOpen = [e.target.id,e.data,e.isTrusted]; });
+            }, {once:true});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("XY").unwrap();
+        assert_eq!(rt.evaluate("[document.getElementById('n').value,document.getElementById('n').selectionStart,inputAfterOpen]").unwrap(),
+            serde_json::json!(["wXYz",3,["n","XY",true]]));
+        rt.evaluate(r#"(() => {
+            document.getElementById('n').addEventListener('keydown', () => {
+                document.open(); document.write('<textarea id=t>abcd</textarea>'); document.close();
+                const t = document.getElementById('t'); t.focus(); t.setSelectionRange(1,3);
+                t.addEventListener('keypress', () => { t.value = '12345'; t.setSelectionRange(2,4); });
+                t.addEventListener('beforeinput', () => { t.setSelectionRange(1,4); });
+            }, {once:true});
+        })()"#).unwrap();
+        rt.dispatch_keyboard_input(KeyboardInput {
+            key: "z".into(), code: "KeyZ".into(), text: "Z".into(),
+            windows_virtual_key_code: 90, ..KeyboardInput::default()
+        }).unwrap();
+        assert_eq!(rt.evaluate("[document.getElementById('t').value,document.getElementById('t').selectionStart]").unwrap(),
+            serde_json::json!(["1Z5",2]));
+        rt.evaluate(r#"(() => {
+            const t = document.getElementById('t');
+            t.addEventListener('beforeinput', () => { location.href = 'https://example.com/next'; }, {once:true});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("stale").unwrap();
+        assert!(rt.pending_navigation_url().is_some());
+        assert_eq!(rt.evaluate("document.getElementById('t').value").unwrap(), serde_json::json!("1Z5"));
     }
 
     #[test]

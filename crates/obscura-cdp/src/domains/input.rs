@@ -2,76 +2,6 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
-/// Embed a string as a JS string literal (double-quoted, with backslash,
-/// quotes, and control characters escaped) for interpolation into generated
-/// KeyboardEvent scripts. A plain `replace('\'', ...)` misses newline / NUL /
-/// U+2028-29, which terminate the literal and silently drop the event.
-fn js_str(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
-}
-
-// Insert `text` at the caret, replacing any non-collapsed selection the way a
-// real browser does when you type over selected text (for example after a
-// triple-click select-all). selectionStart is null during ordinary typing, so
-// the legacy append path is kept when no selection is tracked.
-//
-// The text is embedded as a JSON string literal rather than escaped by hand
-// into single quotes. JSON string syntax is a subset of JavaScript's, so this
-// covers the quote and the backslash of issue #433 and the control characters
-// they left out: a newline inside a single-quoted literal is a syntax error,
-// so the whole snippet was dropped and nothing was inserted. obscura-mcp
-// already builds its typing snippet this way.
-fn insert_text_js(text: &str) -> String {
-    let literal = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
-    format!(
-        "(function() {{\
-            var t = document.activeElement;\
-            if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
-            var ins = {text};\
-            var v = t.value || '';\
-            var s = t.selectionStart, e = t.selectionEnd;\
-            if (s == null) {{\
-                globalThis.__obscura_setFieldValue(t, 'value', v + ins);\
-            }} else {{\
-                s = Math.max(0, Math.min(s, v.length));\
-                e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
-                var lo = Math.min(s, e), hi = Math.max(s, e);\
-                globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + ins + v.slice(hi));\
-                var caret = lo + ins.length;\
-                t.setSelectionRange(caret, caret);\
-            }}\
-            t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
-        }})()",
-        text = literal,
-    )
-}
-
-// Backspace deletes the selected range when there is one, so the common
-// "triple-click to select-all, then Backspace to clear" pattern works. With a
-// collapsed caret it removes the character before the caret, and with no
-// selection tracked it falls back to trimming the last character (legacy).
-const BACKSPACE_JS: &str = "(function() {\
-    var t = document.activeElement;\
-    if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
-    var v = t.value || '';\
-    var s = t.selectionStart, e = t.selectionEnd;\
-    if (s == null) {\
-        globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, -1));\
-    } else {\
-        s = Math.max(0, Math.min(s, v.length));\
-        e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
-        if (s !== e) {\
-            var lo = Math.min(s, e), hi = Math.max(s, e);\
-            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + v.slice(hi));\
-            t.setSelectionRange(lo, lo);\
-        } else if (s > 0) {\
-            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, s - 1) + v.slice(s));\
-            t.setSelectionRange(s - 1, s - 1);\
-        }\
-    }\
-    t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
-})()";
-
 enum CoordinateInput {
     Mouse(obscura_browser::MouseInput),
     Wheel(obscura_browser::WheelInput),
@@ -165,6 +95,112 @@ fn coordinate_input(params: &Value) -> Result<CoordinateInput, String> {
     }
 }
 
+fn keyboard_input(params: &Value) -> Result<obscura_browser::KeyboardInput, String> {
+    use obscura_browser::{KeyboardInput, KeyboardInputPhase};
+    let phase = match params.get("type").and_then(Value::as_str) {
+        Some("keyDown") => KeyboardInputPhase::KeyDown,
+        Some("rawKeyDown") => KeyboardInputPhase::RawKeyDown,
+        Some("char") => KeyboardInputPhase::Char,
+        Some("keyUp") => KeyboardInputPhase::KeyUp,
+        _ => return Err("Invalid keyboard type".into()),
+    };
+    let string = |name: &str| -> Result<String, String> {
+        match params.get(name) {
+            None => Ok(String::new()),
+            Some(value) => value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("Invalid keyboard {name}: expected a string")),
+        }
+    };
+    let boolean = |name: &str| -> Result<bool, String> {
+        match params.get(name) {
+            None => Ok(false),
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| format!("Invalid keyboard {name}: expected a boolean")),
+        }
+    };
+    let integer = |name: &str, min: i64, max: i64| -> Result<i64, String> {
+        match params.get(name) {
+            None => Ok(0),
+            Some(value) => value
+                .as_i64()
+                .filter(|value| (min..=max).contains(value))
+                .ok_or_else(|| format!("Invalid keyboard {name}: expected an integer")),
+        }
+    };
+    if let Some(value) = params.get("timestamp") {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| "Invalid keyboard timestamp: expected a finite number".to_string())?;
+    }
+    let commands = match params.get("commands") {
+        None => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    "Invalid keyboard commands: expected an array of strings".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err("Invalid keyboard commands: expected an array of strings".into())
+        }
+    };
+    Ok(KeyboardInput {
+        phase,
+        key: string("key")?,
+        code: string("code")?,
+        text: string("text")?,
+        unmodified_text: string("unmodifiedText")?,
+        windows_virtual_key_code: integer("windowsVirtualKeyCode", 0, i32::MAX as i64)? as i32,
+        native_virtual_key_code: integer("nativeVirtualKeyCode", i32::MIN as i64, i32::MAX as i64)? as i32,
+        modifiers: integer("modifiers", 0, 15)? as u32,
+        auto_repeat: boolean("autoRepeat")?,
+        location: integer("location", 0, 3)? as u32,
+        is_keypad: boolean("isKeypad")?,
+        is_system_key: boolean("isSystemKey")?,
+        commands,
+    })
+}
+
+async fn process_input_navigation(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+) -> Result<(), String> {
+    let moved_frame = {
+        let page = ctx
+            .get_session_page_mut(session_id)
+            .ok_or_else(|| "Input requires an attached page session".to_string())?;
+        let moved = page
+            .process_pending_navigation()
+            .await
+            .map_err(|error| error.to_string())?;
+        moved.then(|| (page.id.clone(), page.frame_id.clone(), page.url_string()))
+    };
+    if let Some((page_id, frame_id, url)) = moved_frame {
+        let loader_id = ctx
+            .current_loader_ids
+            .get(&page_id)
+            .cloned()
+            .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+        ctx.pending_events.push(crate::types::CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({
+                "frame": crate::domains::page::frame_value(
+                    &frame_id, None, &loader_id, &url, "text/html",
+                ),
+                "type": "Navigation",
+            }),
+            session_id: session_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -180,134 +216,35 @@ pub async fn handle(
                 CoordinateInput::Mouse(input) => page.dispatch_mouse_input(input)?,
                 CoordinateInput::Wheel(input) => page.dispatch_wheel_input(input)?,
             }
-            let moved = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
-            let moved_frame = moved.then(|| (page.id.clone(), page.frame_id.clone(), page.url_string()));
-            if let Some((page_id, frame_id, url)) = moved_frame {
-                let loader_id = ctx.current_loader_ids.get(&page_id).cloned()
-                    .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-                ctx.pending_events.push(crate::types::CdpEvent {
-                    method: "Page.frameNavigated".into(),
-                    params: json!({
-                        "frame": crate::domains::page::frame_value(
-                            &frame_id, None, &loader_id, &url, "text/html",
-                        ),
-                        "type": "Navigation",
-                    }),
-                    session_id: session_id.clone(),
-                });
-            }
+            process_input_navigation(ctx, session_id).await?;
 
             Ok(json!({}))
         }
         // Chrome's Input.insertText: Playwright's fill() focuses the field in
         // page and then types the whole value through this one call (#577).
         "insertText" => {
-            let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.evaluate(&insert_text_js(text));
-            }
+            let text = params
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Invalid insertText text: expected a string".to_string())?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or_else(|| "Input requires an attached page session".to_string())?;
+            page.insert_text(text)?;
+            process_input_navigation(ctx, session_id).await?;
             Ok(json!({}))
         }
         "dispatchKeyEvent" => {
-            let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
-            let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                match event_type {
-                    "keyDown" | "rawKeyDown" => {
-                        let js = format!(
-                            "(function() {{\
-                                var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
-                                target.dispatchEvent(evt);\
-                            }})()",
-                            // Escape backslash BEFORE single-quote (as the text
-                            // path below does) so a key like "\" — Chrome's
-                            // backslash key — doesn't escape the closing quote
-                            // and produce a syntax error that drops the event.
-                            key = js_str(key),
-                            code = js_str(code),
-                        );
-                        page.evaluate(&js);
-
-                        if !text.is_empty() && text != "\r" && text != "\n" {
-                            page.evaluate(&insert_text_js(text));
-                        }
-
-                        if key == "Enter" {
-                            // In a textarea Enter inserts a newline; in input fields
-                            // it submits the containing form. Real Chrome distinguishes
-                            // these two and we should too: previously every Enter tried
-                            // to submit the nearest form even from a textarea.
-                            let js = "(function() {\
-                                var target = document.activeElement;\
-                                if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'})));\
-                                if (target.localName === 'textarea') {\
-                                    globalThis.__obscura_setFieldValue(target, 'value', (target.value || '') + '\\n');\
-                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
-                                } else {\
-                                    var form = target.form || (target.closest && target.closest('form'));\
-                                    if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
-                                }\
-                            })()";
-                            page.evaluate(js);
-                        }
-
-                        if key == "Backspace" {
-                            page.evaluate(BACKSPACE_JS);
-                        }
-                    }
-                    "keyUp" => {
-                        let js = format!(
-                            "(function() {{\
-                                var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code}}}));\
-                                target.dispatchEvent(evt);\
-                            }})()",
-                            key = js_str(key),
-                            code = js_str(code),
-                        );
-                        page.evaluate(&js);
-                    }
-                    "char" => {
-                        if !text.is_empty() {
-                            page.evaluate(&insert_text_js(text));
-                            // Pump event loop so Angular change detection picks up the input
-                            page.settle(50).await;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
+            let input = keyboard_input(params)?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or_else(|| "Input requires an attached page session".to_string())?;
+            page.dispatch_keyboard_input(input)?;
+            process_input_navigation(ctx, session_id).await?;
             Ok(json!({}))
         }
         "dispatchTouchEvent" => Ok(json!({})),
         "setIgnoreInputEvents" => Ok(json!({})),
         _ => Err(format!("Unknown Input method: {}", method)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::js_str;
-
-    // SEC-501 / #819 — key/code are embedded via js_str; it must escape control
-    // characters (newline/CR/tab/NUL/U+2028-29), not just backslash and quote,
-    // so a control char cannot terminate the literal and drop the event.
-    #[test]
-    fn js_str_escapes_control_characters() {
-        let lit = js_str("a\nb\r\t'c\\d\"e");
-        assert!(
-            !lit.contains('\n') && !lit.contains('\r') && !lit.contains('\t'),
-            "control characters must be escaped, not left raw: {lit:?}"
-        );
-        // The result must be a valid JS/JSON string literal that round-trips.
-        let decoded: String =
-            serde_json::from_str(&lit).expect("the literal must be valid JSON");
-        assert_eq!(decoded, "a\nb\r\t'c\\d\"e");
     }
 }

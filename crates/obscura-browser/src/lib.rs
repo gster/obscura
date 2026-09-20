@@ -9,7 +9,9 @@ pub use context::{BrowserContext, BrowserContextOptions};
 pub use obscura_js::ops::DeviceIdentity;
 pub use lifecycle::{LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
-pub use obscura_js::runtime::{MouseInput, MouseInputPhase, WheelInput};
+pub use obscura_js::runtime::{
+    KeyboardInput, KeyboardInputPhase, MouseInput, MouseInputPhase, WheelInput,
+};
 #[cfg(feature = "render")]
 pub use obscura_js::{
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,

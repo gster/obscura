@@ -164,6 +164,18 @@
       "evidence": "Official Python smoke and CDP fixture. Full navigation parity is not claimed."
     },
     {
+      "method": "Page.reload",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "partial",
+      "params": "The observed Playwright page.reload call omits params. The handler also accepts its implemented waitUntil option; ignoreCache, scriptToEvaluateOnLoad and other Chrome options are not qualified.",
+      "result": "The same frame and loader result shape as the implemented navigation path after loading the current URL again.",
+      "events": "Frame, lifecycle and network events for the reload.",
+      "scope": "Attached page session and its current top-level URL.",
+      "errors": "Missing page sessions and failed reload navigation return errors. Strict rejection of unqualified extra parameters is not yet implemented.",
+      "evidence": "Playwright 1.60 native_keyboard_smoke.py uses the omitted-parameter shape to isolate selection, cancellation and document-reentry cases; complete protocol and fixture bytes are retained."
+    },
+    {
       "method": "Page.getLayoutMetrics",
       "capability": "LIMITED",
       "implementation": "implemented",
@@ -287,13 +299,25 @@
       "method": "Input.insertText",
       "capability": "LIMITED",
       "implementation": "implemented",
-      "verification": "partial",
-      "params": "The observed text string used by Playwright fill is qualified.",
-      "result": "Empty object after replacing the focused input selection with the supplied text.",
-      "events": "A trusted bubbling input event is emitted on the focused input.",
-      "scope": "Page session and current active input or textarea.",
-      "errors": "Missing or nonstring text and missing active targets are not yet rejected uniformly.",
-      "evidence": "Playwright 1.60 get_by_label fill with retained event records plus Rust escaping and focused-field coverage."
+      "verification": "verified",
+      "params": "A required text string, including an empty string. The qualified path replaces the current UTF-16 selection; an empty string deletes a non-collapsed selection.",
+      "result": "Empty object after protected beforeinput delivery, any allowed edit, pending-navigation processing and frame event emission.",
+      "events": "A trusted bubbling, cancelable, composed InputEvent beforeinput is followed by a trusted non-cancelable input event after a mutable text edit. Cancellation, readonly targets and non-editable focus targets suppress mutation and input; readonly and non-editable targets still receive beforeinput as measured in Chrome.",
+      "scope": "Render build, attached page session and the live focused target. Focus changes and document.open during an input phase re-resolve the current document and target. Actual navigation stops stale-node mutation and is processed before the CDP result.",
+      "errors": "Missing or nonstring text returns -32602. No-render, contenteditable, selection boundaries inside a UTF-16 surrogate and values beyond the qualified implementation limits fail explicitly. Maxlength truncation, rich editing, IME and arbitrary editor commands are not qualified.",
+      "evidence": "Playwright 1.60 CDPSession native_keyboard_smoke.py seven-case Chrome 148 comparison with complete protocol and fixture wire captures, plus Rust protected-dispatch, selection, document/focus reentry, navigation and parameter regressions."
+    },
+    {
+      "method": "Input.dispatchKeyEvent",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "verified",
+      "params": "The qualified subset accepts keyDown, rawKeyDown, char and keyUp; string key/code/text/unmodifiedText; finite timestamp; integer virtual-key codes; modifiers 0..15; location 0..3; boolean repeat/keypad/system flags; and no command or deleteBackward. nativeVirtualKeyCode, unmodifiedText and isSystemKey are validated and carried by the typed request but have no separately qualified event projection. Other commands are rejected.",
+      "result": "Empty object after protected phase delivery, any qualified default text edit or single-field form submission, and pending-navigation processing.",
+      "events": "keyDown with text qualifies trusted keydown, keypress, beforeinput and input; rawKeyDown emits keydown without text insertion; char emits keypress and the text phases; keyUp emits keyup. The measured metadata includes key/code, DOM keyCode/which derived from windowsVirtualKeyCode, location/keypad, repeat and modifier flags. Canceling keydown, keypress or beforeinput stops downstream delivery and editing.",
+      "scope": "Render build, attached page session and the live focused target. Every phase re-resolves focus and the current document; page replacement may retarget the remaining phases while actual navigation prevents stale edits.",
+      "errors": "Malformed qualified fields return -32602. No-render, contenteditable, unsupported commands and unqualified default actions fail with -32000. IME/composition, grapheme or word editing, arbitrary commands, platform shortcut defaults, button/checkbox activation, complex implicit form submission and maxlength truncation are not qualified.",
+      "evidence": "Playwright 1.60 CDPSession native_keyboard_smoke.py exact Chrome 148 comparison for phase order, cancellation, metadata, public-API poisoning, focus/document reentry and protocol negatives, plus focused Rust runtime and CDP regressions."
     },
     {
       "method": "Input.dispatchMouseEvent",
@@ -694,7 +718,7 @@
   ],
   "coverage": {
     "kind": "observed-official-client-slice",
-    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic locator, fixed-viewport screenshot, two-page close and browser-context smoke with full pw:protocol log",
+    "source": "Playwright 1.60.0 BrowserType.connect_over_cdp deterministic locator, native input, fixed-viewport screenshot, two-page close and browser-context smoke with full pw:protocol logs",
     "unlisted": "not-qualified",
     "completion": "OB-027 remains open until the scoped automation profile is expanded and reconciled against the migration surface."
   }

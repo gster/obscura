@@ -10847,7 +10847,7 @@ class UIEvent extends Event {
   }
 }
 globalThis.UIEvent = UIEvent;
-globalThis.InputEvent = class extends UIEvent {
+globalThis.InputEvent = class InputEvent extends UIEvent {
   constructor(type,options={}) {
     super(type,options);this.data=options.data==null?null:_domString(options.data);
     this.inputType=options.inputType||'';this.isComposing=!!options.isComposing;
@@ -19002,6 +19002,9 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   };
 
   function textEvent(kind,path,value) {
+    if (kind === 18 || kind === 19) return dispatch(kind === 18 ? 'beforeinput' : 'input',path,
+      {bubbles:true,cancelable:kind===18,composed:true,data:null,inputType:'insertLineBreak',
+        isComposing:false,dataTransfer:null,getTargetRanges(){return []}},NativeInputEvent);
     if (kind === 16) return dispatch('submit',path,{bubbles:true,cancelable:true,composed:false,
       submitter:value === '' ? null : _wrap(NativeNumber(value))},NativeSubmitEvent);
     if (kind === 14 || kind === 15) {
@@ -19295,10 +19298,19 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }
   };
   define(globalThis,'__obscura_native_submit_handoff',{configurable:true,value(form,button,inputEpoch) {
-    try { _requestSubmitForm(form,_domString(button),inputEpoch);return null; }
+    try { _requestSubmitForm(form,button === null ? '' : _domString(button),inputEpoch);return null; }
     catch(error) { return error?.message || 'INPUT_DISPATCH_FAILED'; }
   }});
   const nativeSelectValue = Object.getOwnPropertyDescriptor(Element.prototype, 'value').set;
+  define(globalThis,'__obscura_native_keyboard_handoff',{configurable:true,value(type,node,key,code,keyCode,charCode,modifiers,repeat,location) {
+    const path=pathFor(node);
+    if (!path.length) return false;
+    const press=type==='keypress';
+    return dispatch(type,path,{bubbles:true,cancelable:true,composed:true,view:globalThis,
+      detail:0,key,code,keyCode:press?charCode:keyCode,which:press?charCode:keyCode,
+      charCode:press?charCode:0,isComposing:false,repeat,location,
+      altKey:!!(modifiers&1),ctrlKey:!!(modifiers&2),metaKey:!!(modifiers&4),shiftKey:!!(modifiers&8)},NativeKeyboardEvent);
+  }});
   define(globalThis,'__obscura_native_text_handoff',{configurable:true,value(kind,nodes,value) {
     const path=[];for(const node of nodes) path.push(_wrap(node));
     if (nodes.length && _domParse('node_type',nodes[nodes.length-1]) === 9) path.push(globalThis);

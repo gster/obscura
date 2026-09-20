@@ -256,3 +256,38 @@ Event timestamps and scroll-event counts are retained but are not exact paired
 assertions. This gate does not qualify gesture latching, inertia, scroll snap,
 zoom, complete CSSOM overflow strings or a full wheel implementation on all
 platforms. Native coordinate input requires the render build.
+
+## Native keyboard and text qualification
+
+`native_keyboard_smoke.py` uses Playwright's raw CDP session against seven
+isolated local cases. It checks `Input.insertText` selection replacement and
+empty deletion, keyDown/rawKeyDown/char/keyUp phase order, cancellation,
+keyboard metadata, browser-owned dispatch despite poisoned public APIs,
+focus/document reentry, and malformed protocol parameters.
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+uv run --project tools/unblocked --frozen --python 3.12 \
+  python tools/unblocked/native_keyboard_smoke.py \
+    --obscura-bin target/release/obscura \
+    --persona windows_chrome145 \
+    --with-chrome \
+    --output "$RUN_ROOT/native-keyboard.json"
+```
+
+`--with-chrome` requires every bounded observation to match the Chromium
+bundled with the locked client. `--chrome-only` validates the reference
+contract, while the default CI mode checks Obscura against the embedded stable
+contract. `--reference-json` accepts either a worker result or a complete prior
+runner result. Every browser runs in a separate process under a 45-second
+worker deadline. Complete browser/worker byte streams, `pw:protocol`, fixture
+request/response bytes, HTML, checkpoints and failed comparisons remain in the
+result directory without field removal.
+
+This gate qualifies ordinary input/textarea selection edits, readonly and
+non-editable beforeinput behavior, the listed event phases and metadata, and
+the measured focus/document reentry. It does not qualify contenteditable,
+IME/composition, grapheme or word editing, arbitrary editor commands,
+platform-shortcut defaults, complex implicit form submission, button/checkbox
+activation, or maxlength truncation. Keyboard and text native input currently
+requires the render build; no-render reports it as unsupported.

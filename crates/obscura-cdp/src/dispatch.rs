@@ -914,7 +914,10 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
             tracing::warn!("CDP error for {}: {}", req.method, msg);
             let code = if req.method == "Fetch.continueRequest" {
                 -32602
-            } else if req.method == "Input.dispatchMouseEvent" {
+            } else if matches!(
+                req.method.as_str(),
+                "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" | "Input.insertText"
+            ) {
                 if msg.starts_with("Invalid ") { -32602 } else { -32000 }
             } else {
                 -32601

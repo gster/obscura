@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | 坐标鼠标输入 | `runtime/src/manual.rs`、`runtime/src/automation.rs`，CDP 自有页面脚本 | `obscura-browser::Page::dispatch_mouse_input` → JS runtime 私有事件桥与 renderer hit-test | move/press/release 已迁移并有 Chrome 对照；完整 pointer capture、hover、多按钮与 user activation 未资格化 |
 | Wheel | `crates/obscura-cdp/src/domains/input.rs` 页面脚本 | `Page::dispatch_wheel_input` → 私有事件桥与 renderer 滚动状态 | 已接入；九组 Chrome 对照通过，独立覆盖 metadata、嵌套边界、取消、页面覆盖、零增量和缺少 delta。完整手势锁定/惯性、scroll snap 和缩放未资格化 |
-| 键盘与文本 | 历史 manual/automation 输入；CDP `dispatchKeyEvent`、`insertText` 脚本 | runtime 已有原生文本编辑和焦点机制 | CDP 仍需归口并覆盖键盘取消、选择区、组合输入边界 |
+| 键盘与文本 | 历史 manual/automation 输入；CDP `dispatchKeyEvent`、`insertText` 页面脚本 | `Page::dispatch_keyboard_input` / `Page::insert_text` → runtime 受保护事件与原生编辑 | 已归口；七组 Chrome 对照覆盖阶段、选择区、取消、元数据、公开 API 覆盖、focus/document 重入和参数错误；真实待处理导航另由 Rust 回归覆盖。contenteditable、IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作、复杂表单默认动作和 maxlength 截断未资格化 |
 | 导航等待 | `runtime/src/browser.rs` 的 v1/v2 等待策略 | `obscura-browser/src/lifecycle.rs`、`Page::navigate_with_wait` | 底层已共享；记录旧 Load/DOMContentLoaded 差异由官方导航参数选择，不恢复版本专属等待器 |
 | 元素与文本等待 | 历史 browser `wait` 和 automation locator 循环 | 官方 Locator；共享推进为 `Page::advance_automation` | CLI `wait_for_selector`、MCP `tool_wait_for`/`tool_wait_for_text` 仍有独立轮询。需要统一底层推进、deadline/取消与原生读取，保留入口返回格式 |
 | 异步推进 | 历史 network tick、automation settle | Page `advance_automation`/`settle`/`settle_for_duration` 与 runtime event loop | CDP server、CLI、MCP 的调度入口不同。需要明确固定延迟、quiescence、load/network idle 的不同契约，不应合并为一个含混的“等待完成” |
@@ -18,6 +18,6 @@
 | 私有握手与运行模式 | workspace/hash/version 握手、RUNNING/PAUSED、takeover | 私有包装已删除 | 不恢复第二产品协议；构建/部署校验、调用方职责或有意删除的终态尚需逐条记录，不能称作等价迁移 |
 | CDP 服务暴露 | 父进程拥有的 stdio 私有 RPC | `obscura-cdp/src/server.rs` bind/listen 与 CLI serve 参数 | 与 OB-034 协作，明确监听和访问边界；不以旧 stdio 隔离或 allowlist 握手冒充当前网络服务保护 |
 
-后续交付顺序：wheel 有界资格完成后，优先处理键盘/文本归口；然后明确执行推进与等待契约、观察与限额资格、旧启动保护逐项终态。上述清单全部获得实现或明确终态及相应证据之前，OB-021 保持未关闭。
+后续交付顺序：mouse、wheel、键盘/文本有界资格完成后，明确执行推进与等待契约、观察与限额资格、旧启动保护逐项终态。上述清单全部获得实现或明确终态及相应证据之前，OB-021 保持未关闭。
 
 原始采集数据与工具日志完整保存，不脱敏、不删字段。产品响应 body 的容量失败与工具证据采集不是同一契约，不应通过静默删减原始证据来满足产品限额。

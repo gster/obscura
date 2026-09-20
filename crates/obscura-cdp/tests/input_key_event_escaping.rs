@@ -1,10 +1,7 @@
-//! `Input.dispatchKeyEvent` interpolates the `key`/`code` params into a
-//! generated `KeyboardEvent(...)` snippet. They must be escaped for BOTH
-//! backslash and single-quote (issue #433): Chrome sends `key: "\\"` (U+005C)
-//! when the backslash key is pressed, and quote-only escaping turns that into
-//! `key:'\'` — the backslash escapes the closing quote, the literal runs on,
-//! and the whole `page.evaluate` is a syntax error, so the `keydown` is
-//! silently never dispatched. Regression test: the backslash key must arrive.
+//! CDP keyboard and text input must preserve arbitrary protocol strings while
+//! routing them through the browser-owned native input path. These regressions
+//! retain the escaping cases that previously broke generated page scripts and
+//! also cover protected event delivery, focus/document reentry and validation.
 
 use obscura_cdp::dispatch::{dispatch, CdpContext};
 use obscura_cdp::types::CdpRequest;
@@ -104,16 +101,7 @@ async fn dispatch_key_event_escapes_backslash_in_key_and_code() {
     );
 }
 
-// The same hazard one layer over: on the inserted *text* rather than on the key
-// name. `insert_text_js` interpolates the text into the same kind of
-// single-quoted literal. #433 escaped the backslash and the quote and stopped
-// there, but a raw newline ends a JS string literal just as a stray quote does,
-// so the snippet is a syntax error and the character is silently dropped.
-//
-// The `char` type is the path that reaches it with a newline: the `keyDown`
-// branch skips insertion for "\r" and "\n" because `key == "Enter"` handles
-// those, and `char` has no such guard, so a client entering a line break in a
-// textarea this way loses it with no error reported anywhere.
+// Keep the control-character case that used to be dropped by generated JS.
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -165,10 +153,7 @@ async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
     );
 }
 
-// #577: Playwright's fill() focuses the field in page and then types the whole
-// value with one Input.insertText call. The method must exist and drive the
-// same snippet the key-event text path uses, so quotes, backslashes, and
-// newlines survive intact.
+// #577: Playwright's fill() focuses the field and sends one Input.insertText.
 #[tokio::test(flavor = "current_thread")]
 async fn insert_text_types_into_the_focused_field() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -212,4 +197,294 @@ async fn insert_text_types_into_the_focused_field() {
         r#""he'll\\obye""#,
         "text inputs preserve quotes and backslashes but strip newlines"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_uses_the_native_text_path_and_real_input_events() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": url, "waitUntil": "load"}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({
+            "expression": r#"(() => {
+                const target = document.getElementById('i');
+                target.value = 'A😀B';
+                target.focus();
+                target.setSelectionRange(1, 3);
+                globalThis.__textEvents = [];
+                for (const type of ['beforeinput', 'input']) {
+                    target.addEventListener(type, event => __textEvents.push([
+                        event.type, event.inputType, event.data, event.isTrusted,
+                        event.bubbles, event.cancelable, target.value,
+                    ]));
+                }
+                globalThis.InputEvent = function () { throw Error('public InputEvent called'); };
+                Element.prototype.dispatchEvent = function () { throw Error('public dispatchEvent called'); };
+                globalThis.__obscura_native_text_handoff = function () { throw Error('public handoff called'); };
+            })()"#,
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.insertText",
+        json!({"text": "中🚀"}),
+        session_id,
+    )
+    .await;
+
+    let result = cdp(
+        &mut ctx,
+        4,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify([i.value,i.selectionStart,i.selectionEnd,__textEvents])",
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    let actual: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        actual,
+        json!([
+            "A中🚀B",
+            4,
+            4,
+            [
+                ["beforeinput", "insertText", "中🚀", true, true, true, "A😀B"],
+                ["input", "insertText", "中🚀", true, true, false, "A中🚀B"]
+            ]
+        ])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_re_resolves_focus_after_beforeinput() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": url, "waitUntil": "load"}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({
+            "expression": r#"(() => {
+                const first = document.getElementById('i');
+                const second = document.getElementById('a');
+                first.value = 'abcd';
+                second.value = '';
+                first.focus();
+                first.setSelectionRange(1, 3);
+                globalThis.__targets = [];
+                document.addEventListener('beforeinput', event => {
+                    __targets.push(event.target.id);
+                    second.focus();
+                    second.setSelectionRange(0, 0);
+                });
+                document.addEventListener('input', event => __targets.push(event.target.id));
+            })()"#,
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.insertText",
+        json!({"text": "XY"}),
+        session_id,
+    )
+    .await;
+    let result = cdp(
+        &mut ctx,
+        4,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify([i.value,a.value,document.activeElement.id,__targets])",
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(result["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["abcd", "XY", "a", ["i", "a"]])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_processes_same_document_navigation_and_emits_frame_event() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": url, "waitUntil": "load"}),
+        session_id,
+    )
+    .await;
+    ctx.pending_events.clear();
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({
+            "expression": r#"(() => {
+                const target = document.getElementById('i');
+                target.value = 'unchanged';
+                target.focus();
+                target.addEventListener('beforeinput', () => { location.hash = 'typed'; }, { once: true });
+            })()"#,
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.insertText",
+        json!({"text": "X"}),
+        session_id,
+    )
+    .await;
+
+    let frame = ctx
+        .pending_events
+        .iter()
+        .find(|event| event.method == "Page.frameNavigated")
+        .expect("input-triggered same-document navigation must emit Page.frameNavigated");
+    assert_eq!(frame.session_id.as_deref(), Some(session_id));
+    assert_eq!(frame.params["frame"]["id"], page_id);
+    assert!(
+        frame.params["frame"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("#typed")),
+        "unexpected frame event: {frame:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn keyboard_and_text_reject_invalid_protocol_parameters_without_delivery() {
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+
+    for (id, method, params) in [
+        (1, "Input.insertText", json!({})),
+        (2, "Input.insertText", json!({"text": null})),
+        (3, "Input.insertText", json!({"text": 3})),
+        (4, "Input.dispatchKeyEvent", json!({})),
+        (5, "Input.dispatchKeyEvent", json!({"type": "invalid"})),
+        (6, "Input.dispatchKeyEvent", json!({"type": "keyDown", "modifiers": "bad"})),
+        (7, "Input.dispatchKeyEvent", json!({"type": "keyDown", "commands": [1]})),
+    ] {
+        let response = dispatch(
+            &CdpRequest {
+                id,
+                method: method.to_string(),
+                params,
+                session_id: Some(session_id.to_string()),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(-32602),
+            "{method}: {:?}",
+            response.error
+        );
+    }
+}
+
+#[cfg(not(feature = "render"))]
+#[tokio::test(flavor = "current_thread")]
+async fn keyboard_and_text_explicitly_require_the_render_input_runtime() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": url, "waitUntil": "load"}),
+        session_id,
+    )
+    .await;
+
+    for (id, method, params) in [
+        (2, "Input.insertText", json!({"text": "x"})),
+        (
+            3,
+            "Input.dispatchKeyEvent",
+            json!({"type": "keyDown", "key": "x", "code": "KeyX", "text": "x"}),
+        ),
+    ] {
+        let response = dispatch(
+            &CdpRequest {
+                id,
+                method: method.to_string(),
+                params,
+                session_id: Some(session_id.to_string()),
+            },
+            &mut ctx,
+        )
+        .await;
+        let error = response
+            .error
+            .expect("no-render keyboard/text input must fail explicitly");
+        assert_eq!(error.code, -32000, "{method}: {error:?}");
+        assert!(error.message.contains("UNSUPPORTED"), "{method}: {error:?}");
+    }
 }
