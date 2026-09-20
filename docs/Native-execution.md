@@ -13,7 +13,7 @@
 | 资源事实与响应 body | `runtime/src/network.rs` 自有事件与 body 容器 | `obscura_net::observation::RequestTrace`、`obscura_net::response_body::ResponseBodyStore`；Page request/response callbacks、JS network events | 旧第二套 body 容器已删除。CDP event routing 与 MCP network projection 需验证不丢失、不重复、导航与多页面归属及消费/保留边界 |
 | Body 保存限额 | 私有单 body 8 MiB、每页 32 MiB、256 条 | `obscura-net/src/response_body.rs` 的共享 `ResponseBodyLimits` | 由内存阈值/spool/总容量限制替代，不是等值搬迁。需补各入口容量失败契约，不恢复旧容器 |
 | 执行预算与硬终止 | 私有协议 timeout、automation deadline/watchdog | Page 导航预算、runtime watchdog、CDP command watchdog、CLI process deadline | 多层 backstop 必须保留；统一预算来源、传播、取消与失败结果语义。已部分执行的官方 locator 动作可能因协议错误重试，不承诺 at-most-once |
-| 传输与其他容量 | 私有 64 KiB 行、队列、4 页与 capture 计数上限 | CDP 连接/队列/write buffer 限制，MCP HTTP body/read timeout，截图维度限制 | framing/queue 留适配层；页面/body/计算预算归共享层。旧包装专属数量限制不自动施加到 CDP，逐项裁决并补验收 |
+| 传输与其他容量 | 私有 64 KiB 行、队列、4 页与 capture 计数上限 | CDP 每连接 outbound reservation（1024 条、128 MiB 总 bytes、80 MiB 单消息、单次写 10 秒）、MCP HTTP body/read timeout，截图维度限制 | reservation 覆盖完整 socket send；overflow、I/O、timeout、connection shutdown sticky close 并停止后续命令排队，不通过静默丢弃/截断/脱敏继续服务；`Browser.close` 在同一 10 秒总预算内封闭新入队并尝试 flush 已接受消息，写失败或超时则断开。尚未覆盖序列化瞬时内存、inbound `ServerMessage`、`pending_events`、Host/Origin/auth 及同步 V8 中立即断连；页面/body/计算预算归共享层 |
 | 启动身份与网络 | 私有 persona 编译/激活、proxy 检查、origin allowlist | 共享 `activate_process_persona`、BrowserContext options、网络 SSRF gate | Persona/传输机制已共享；旧 origin allowlist 不等价于 SSRF gate，需单独记录是否保留及责任方 |
 | 私有握手与运行模式 | workspace/hash/version 握手、RUNNING/PAUSED、takeover | 私有包装已删除 | 不恢复第二产品协议；构建/部署校验、调用方职责或有意删除的终态尚需逐条记录，不能称作等价迁移 |
 | CDP 服务暴露 | 父进程拥有的 stdio 私有 RPC | `obscura-cdp/src/server.rs` bind/listen 与 CLI serve 参数 | 与 OB-034 协作，明确监听和访问边界；不以旧 stdio 隔离或 allowlist 握手冒充当前网络服务保护 |
@@ -23,3 +23,5 @@
 原始采集数据与工具日志完整保存，不脱敏、不删字段。产品响应 body 的容量失败与工具证据采集不是同一契约，不应通过静默删减原始证据来满足产品限额。
 
 MCP 资源观察投影切片：`NetworkEvent::phase` 在共享 browser 层区分 started、redirect、completed、failed；`browser_network_requests` 改为 pretty JSON 的 `events` 数组，空记录仍返回同一结构。此输出格式有意替换旧文本行。投影保留当前事件的全部字段、原始 header bytes 和关联 ID，不消费事件或响应正文。它只表示 active Page buffer：导航替换 static 记录但 scripted 记录可以保留，上游 JS/Worker 队列超过 4096 条仍丢弃最旧记录。未因此完成 persistent history、queue overflow、请求正文保留、callback 并发注册或 CDP 多 session 观察资格。
+
+CDP outbound reservation 切片边界：每连接保留 1024 条、128 MiB 总 UTF-8 bytes，单消息 80 MiB，reservation 在正常路径延续至 envelope 完成 socket send；单次写 deadline 为 10 秒。overflow、writer I/O、writer timeout、connection shutdown 首次发生即 sticky close，后续命令停止排队；服务不会靠静默丢弃、截断或脱敏消息维持连接。合法 `Browser.close` 先封闭新消息，再以 10 秒总预算尝试 flush 已接受 envelope；写失败或超时则断开，reservation 释放本身不作为送达确认。该切片未覆盖序列化瞬时内存、inbound `ServerMessage`、`pending_events`、Host/Origin/auth 及任意同步 V8 执行期间的立即断连。

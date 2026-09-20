@@ -1,12 +1,13 @@
 use super::*;
+use crate::outbound::{OutboundReceiver, OutboundSender};
 use base64::Engine as _;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Client {
     tx: mpsc::UnboundedSender<ServerMessage>,
-    replies: mpsc::UnboundedReceiver<String>,
-    reply_tx: mpsc::UnboundedSender<String>,
+    replies: OutboundReceiver,
+    reply_tx: OutboundSender,
     events: Vec<Value>,
     id: u64,
 }
@@ -15,7 +16,7 @@ impl Client {
     async fn recv(&mut self) -> Value {
         let text = tokio::time::timeout(std::time::Duration::from_secs(10), self.replies.recv())
             .await.expect("CDP message timeout").expect("processor stopped");
-        serde_json::from_str(&text).unwrap()
+        serde_json::from_str(text.as_str()).unwrap()
     }
 
     async fn command(&mut self, session: Option<&str>, method: &str, params: Value) -> Value {
@@ -109,7 +110,7 @@ async fn fixture_with_requests() -> (String, tokio::task::JoinHandle<()>, Arc<st
 
 async fn client() -> (Client, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let (reply_tx, replies) = mpsc::unbounded_channel();
+    let (reply_tx, replies, _) = crate::outbound::channel();
     let context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
         "multi-page-pause".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,
     ));
@@ -623,7 +624,7 @@ async fn queued_fetches_abort_before_disconnect_without_transport() {
         tokio::time::timeout(std::time::Duration::from_secs(3), processor).await.expect("queued close must complete").unwrap();
         let mut replies = replies;
         while let Ok(reply) = replies.try_recv() {
-            let value: Value = serde_json::from_str(&reply).unwrap();
+            let value: Value = serde_json::from_str(reply.as_str()).unwrap();
             assert_ne!(value["method"], "Fetch.requestPaused", "close preceded pause emission");
         }
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -657,7 +658,7 @@ async fn closed_pause_relay_aborts_real_fetch_without_transport() {
 
 #[test]
 fn closed_reply_channel_aborts_instead_of_registering_a_pause() {
-    let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+    let (reply_tx, reply_rx, _) = crate::outbound::channel();
     drop(reply_rx);
     let (resolver, mut resolved) = tokio::sync::oneshot::channel();
     let request = obscura_js::ops::InterceptedRequest {
@@ -700,7 +701,7 @@ fn closed_routed_pause_does_not_restore_a_retired_network_owner() {
     let routed = crate::domains::fetch::RoutedInterceptedRequest {
         page_id: page_id.clone(), frame_id: "frame".into(), session_id: session, request,
     };
-    let (reply_tx, mut replies) = mpsc::unbounded_channel();
+    let (reply_tx, mut replies, _) = crate::outbound::channel();
     let mut paused = InterceptedPauses::new();
     emit_routed_intercepted_request(routed, &mut ctx, &reply_tx, &mut paused);
     assert!(paused.is_empty());

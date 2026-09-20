@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+use crate::outbound::{CloseReason as OutboundCloseReason, OutboundSender};
 
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
@@ -44,6 +45,16 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 // the cookie jar. Well under the 10s `docker stop` gives us before SIGKILL.
 const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 
+// A slow or disconnected DevTools client must not retain an unbounded writer
+// future. The outbound queue has independent count and byte budgets; this
+// deadline bounds the one envelope currently held by the websocket sink.
+const OUTBOUND_SEND_TIMEOUT_MS: u64 = 10_000;
+
+// Give a processor whose input side just closed a short opportunity to abort
+// Fetch pauses and drop its owned pages before the connection thread tears
+// down the LocalSet. Synchronous V8 work remains bounded by its own watchdog.
+const CONNECTION_PROCESSOR_DRAIN_MS: u64 = 1_000;
+
 // Sent to a client that arrives while the server is at `max_connections`, in
 // place of dropping the socket unexplained. The client sees a refusal it can
 // retry rather than a bare connection reset.
@@ -55,13 +66,13 @@ use crate::types::CdpResponse;
 
 struct CdpMessage {
     text: String,
-    reply_tx: mpsc::UnboundedSender<String>,
+    reply_tx: OutboundSender,
 }
 
 enum ServerMessage {
     Cdp(CdpMessage),
     NewConnection {
-        reply_tx: mpsc::UnboundedSender<String>,
+        reply_tx: OutboundSender,
     },
 }
 
@@ -596,7 +607,7 @@ fn run_connection(
                     }
                 };
                 let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
-                let processor = tokio::task::spawn_local(cdp_processor(
+                let mut processor = tokio::task::spawn_local(cdp_processor(
                     msg_rx,
                     default_context,
                     shutdown_notify,
@@ -604,10 +615,19 @@ fn run_connection(
                 if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
                     error!("WebSocket connection error: {}", e);
                 }
-                // Connection closed (or shutting down): stop this connection's
-                // processor so the thread can exit.
-                processor.abort();
-                let _ = processor.await;
+                // Dropping the handler's input sender closes the processor
+                // channel. Let it run its Fetch-pause cleanup before using
+                // abort as a bounded backstop for an in-flight operation.
+                if tokio::time::timeout(
+                    tokio::time::Duration::from_millis(CONNECTION_PROCESSOR_DRAIN_MS),
+                    &mut processor,
+                )
+                .await
+                .is_err()
+                {
+                    processor.abort();
+                    let _ = processor.await;
+                }
             });
 
             // `LocalSet` owns any detached local navigation tasks, and the
@@ -891,7 +911,7 @@ async fn cdp_processor(
     // a bounded 30 Hz opportunity on this connection's owning LocalSet.
     let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
     screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut connection_reply_tx: Option<mpsc::UnboundedSender<String>> = None;
+    let mut connection_reply_tx: Option<OutboundSender> = None;
     // A real browser renderer continues servicing timers, networking, posted
     // tasks, and animation callbacks while its DevTools client is silent. Keep
     // one wake-driven deno_core turn armed after work may have been scheduled;
@@ -902,6 +922,15 @@ async fn cdp_processor(
     let mut runtime_pump_error_streak = 0_u8;
 
     loop {
+        // Outbound overflow and writer failure are connection-fatal. Do not
+        // keep executing queued commands whose responses can no longer reach
+        // the client; dropping them also prevents an implicit replay contract.
+        if connection_reply_tx
+            .as_ref()
+            .is_some_and(OutboundSender::is_closed)
+        {
+            break;
+        }
         intercepted_paused.retain(|_, pause| !pause.resolver.is_closed());
         cleanup_detached_fetch_owners(&mut ctx, &mut intercepted_paused);
         // Drain any deferred messages from the previous interception window
@@ -1002,6 +1031,16 @@ async fn cdp_processor(
         let Some(msg) = msg else {
             continue;
         };
+
+        // The outbound writer can fail while this task is parked in select.
+        // Recheck after wakeup before any queued command can mutate page or
+        // Fetch state.
+        if connection_reply_tx
+            .as_ref()
+            .is_some_and(OutboundSender::is_closed)
+        {
+            break;
+        }
 
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
@@ -1122,7 +1161,7 @@ fn abort_navigating_fetch_owner_for_lifecycle(
 fn emit_routed_intercepted_request(
     routed: crate::domains::fetch::RoutedInterceptedRequest,
     ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    reply_tx: &OutboundSender,
     paused: &mut InterceptedPauses,
 ) {
     // The navigating Page may temporarily be outside ctx.pages. Its session
@@ -1168,7 +1207,7 @@ fn emit_intercepted_request(
     loader_id: &str,
     document_url: &str,
     session_id: Option<String>,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    reply_tx: &OutboundSender,
     intercepted_paused: &mut InterceptedPauses,
 ) -> bool {
     if intercepted.resolver.is_closed() { return false; }
@@ -1369,7 +1408,7 @@ fn take_live_pending_navigation(
 
 fn forward_pending_events(
     ctx: &mut CdpContext,
-    reply_tx: Option<&mpsc::UnboundedSender<String>>,
+    reply_tx: Option<&OutboundSender>,
 ) {
     let Some(reply_tx) = reply_tx else {
         return;
@@ -1395,7 +1434,7 @@ fn has_active_screencast(ctx: &CdpContext) -> bool {
 
 async fn pump_and_forward_screencast_frames(
     ctx: &mut CdpContext,
-    reply_tx: Option<&mpsc::UnboundedSender<String>>,
+    reply_tx: Option<&OutboundSender>,
 ) {
     #[cfg(feature = "render")]
     crate::domains::page::pump_screencast_frames(ctx).await;
@@ -1566,9 +1605,15 @@ fn parse_continue_response_resolution(params: &serde_json::Value) -> Result<obsc
 fn handle_fetch_resolution(
     text: &str,
     ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    reply_tx: &OutboundSender,
     intercepted_paused: &mut InterceptedPauses,
 ) -> bool {
+    // A queued resolution may wake at the same instant that its websocket
+    // writer fails. Treat it as handled without mutating pause state; the
+    // processor's connection teardown will abort the resolver.
+    if reply_tx.is_closed() {
+        return true;
+    }
     intercepted_paused.retain(|_, pause| !pause.resolver.is_closed());
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
@@ -1745,13 +1790,16 @@ fn handle_fetch_resolution(
 async fn process_with_interception(
     text: &str,
     ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    reply_tx: &OutboundSender,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<crate::domains::fetch::RoutedInterceptedRequest>>,
     intercepted_paused: &mut InterceptedPauses,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
     send_command_response: bool,
 ) {
+    if reply_tx.is_closed() {
+        return;
+    }
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
@@ -1863,6 +1911,16 @@ async fn process_with_interception(
     // LocalSet).
     let mut connection_open = true;
     loop {
+        if connection_open && reply_tx.is_closed() {
+            connection_open = false;
+            for (_, pause) in intercepted_paused.drain() {
+                let _ = pause.resolver.send(
+                    obscura_js::ops::InterceptResolution::Fail {
+                        reason: "Aborted".into(),
+                    },
+                );
+            }
+        }
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
@@ -1893,6 +1951,17 @@ async fn process_with_interception(
                     }
                     continue;
                 };
+                if reply_tx.is_closed() {
+                    connection_open = false;
+                    for (_, pause) in intercepted_paused.drain() {
+                        let _ = pause.resolver.send(
+                            obscura_js::ops::InterceptResolution::Fail {
+                                reason: "Aborted".into(),
+                            },
+                        );
+                    }
+                    continue;
+                }
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
                 match msg {
                     ServerMessage::NewConnection { reply_tx: new_tx } => {
@@ -2024,8 +2093,11 @@ async fn process_with_interception(
 async fn process_cdp_message(
     text: &str,
     ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    reply_tx: &OutboundSender,
 ) {
+    if reply_tx.is_closed() {
+        return;
+    }
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
@@ -2054,6 +2126,10 @@ async fn process_cdp_message(
 
     if let Ok(json) = serde_json::to_string(&response) {
         let _ = reply_tx.send(json);
+    }
+
+    if reply_tx.is_closed() {
+        return;
     }
 
     if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {
@@ -2093,32 +2169,76 @@ async fn handle_connection_ws(
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
     let mut cfg = WebSocketConfig::default();
     cfg.write_buffer_size = 0;
-    cfg.max_write_buffer_size = 64 << 20;
+    cfg.max_write_buffer_size = crate::outbound::DEFAULT_MAX_BYTES;
     let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
+    let (reply_tx, mut reply_rx, mut outbound_closed) = crate::outbound::channel();
 
-    let _ = msg_tx.send(ServerMessage::NewConnection {
+    if msg_tx.send(ServerMessage::NewConnection {
         reply_tx: reply_tx.clone(),
-    });
+    }).is_err() {
+        reply_tx.close(OutboundCloseReason::ConnectionClosed);
+        return Err(anyhow::anyhow!("CDP processor closed before connection init"));
+    }
     if let Some(init_msg) = reply_rx.recv().await {
+        let init_msg = init_msg.as_str();
         tracing::debug!("Connection init: {}", &init_msg[..init_msg.len().min(100)]);
+    } else {
+        return Err(anyhow::anyhow!("CDP processor did not initialize connection"));
     }
 
-    let send_task = tokio::task::spawn_local(async move {
-        while let Some(msg) = reply_rx.recv().await {
-            if msg.contains("\"__init\"") {
+    let writer_reply_tx = reply_tx.clone();
+    let mut send_task = tokio::task::spawn_local(async move {
+        while let Some(envelope) = reply_rx.recv().await {
+            if envelope.as_str().contains("\"__init\"") {
                 continue;
             }
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+            let (message, reservation) = envelope.into_parts();
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_millis(OUTBOUND_SEND_TIMEOUT_MS),
+                ws_sender.send(Message::Text(message.into())),
+            )
+            .await;
+            drop(reservation);
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!("WS write error: {error}");
+                    writer_reply_tx.close(OutboundCloseReason::WriterIo);
+                    break;
+                }
+                Err(_) => {
+                    warn!("WS write timed out after {OUTBOUND_SEND_TIMEOUT_MS}ms");
+                    writer_reply_tx.close(OutboundCloseReason::WriterTimeout);
+                    break;
+                }
             }
         }
     });
 
-    while let Some(msg) = ws_receiver.next().await {
+    let mut writer_joined = false;
+    loop {
+        let next = tokio::select! {
+            changed = outbound_closed.changed() => {
+                if changed.is_err() || *outbound_closed.borrow() {
+                    warn!("closing CDP connection after outbound failure: {:?}", reply_tx.close_reason());
+                    break;
+                }
+                continue;
+            }
+            writer = &mut send_task => {
+                writer_joined = true;
+                if let Err(error) = writer {
+                    warn!("CDP writer task failed: {error}");
+                }
+                reply_tx.close(OutboundCloseReason::WriterIo);
+                break;
+            }
+            message = ws_receiver.next() => message,
+        };
+        let Some(msg) = next else { break; };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -2135,16 +2255,36 @@ async fn handle_connection_ws(
                             let _ = reply_tx.send(json);
                         }
                         if close_connection {
+                            // Seal admission before flushing so processor/event
+                            // tasks cannot extend the drain indefinitely. The
+                            // normal writer releases a reservation after the
+                            // websocket send completes. Failure/cancellation
+                            // also releases it and closes the connection, so
+                            // this is a bounded flush attempt rather than an
+                            // independent delivery acknowledgement.
+                            reply_tx.close(OutboundCloseReason::ConnectionClosed);
+                            if tokio::time::timeout(
+                                tokio::time::Duration::from_millis(OUTBOUND_SEND_TIMEOUT_MS),
+                                reply_tx.wait_empty(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!("Browser.close response flush timed out after {OUTBOUND_SEND_TIMEOUT_MS}ms");
+                            }
                             break;
                         }
                         continue;
                     }
                 }
 
-                let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {
+                if msg_tx.send(ServerMessage::Cdp(CdpMessage {
                     text: text.to_string(),
                     reply_tx: reply_tx.clone(),
-                }));
+                })).is_err() {
+                    reply_tx.close(OutboundCloseReason::ConnectionClosed);
+                    break;
+                }
             }
             Message::Close(_) => {
                 info!("WS closed by client");
@@ -2154,7 +2294,13 @@ async fn handle_connection_ws(
         }
     }
 
-    send_task.abort();
+    reply_tx.close(OutboundCloseReason::ConnectionClosed);
+    if !writer_joined {
+        if !send_task.is_finished() {
+            send_task.abort();
+        }
+        let _ = send_task.await;
+    }
     Ok(())
 }
 
@@ -2216,6 +2362,181 @@ pub(crate) mod tests {
         assert!(browser_close_response(&other).is_none());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn outbound_overflow_stops_before_later_queued_commands() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx, mut closed) =
+                    crate::outbound::channel_with_limits(1, 1024 * 1024, 1024 * 1024);
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new(
+                    obscura_net::EffectivePersona::builtin(
+                        obscura_net::StealthProfile::WindowsChrome145,
+                    ),
+                )
+                .default_context;
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                drop(reply_rx.recv().await.expect("processor init"));
+
+                server_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({"id": 1, "method": "Browser.getVersion"}).to_string(),
+                        reply_tx: reply_tx.clone(),
+                    }))
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while reply_tx.usage().0 != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("first response should occupy the queue");
+
+                let (later_tx, mut later_rx, _) = crate::outbound::channel();
+                server_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({"id": 2, "method": "Browser.getVersion"}).to_string(),
+                        reply_tx: reply_tx.clone(),
+                    }))
+                    .unwrap();
+                server_tx
+                    .send(super::ServerMessage::Cdp(super::CdpMessage {
+                        text: json!({"id": 3, "method": "Browser.getVersion"}).to_string(),
+                        reply_tx: later_tx,
+                    }))
+                    .unwrap();
+
+                tokio::time::timeout(std::time::Duration::from_secs(2), closed.changed())
+                    .await
+                    .expect("outbound overflow should close the connection")
+                    .expect("outbound close watch");
+                assert_eq!(
+                    reply_tx.close_reason(),
+                    Some(crate::outbound::CloseReason::Count)
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor should stop after outbound overflow")
+                    .expect("processor task");
+
+                let first: serde_json::Value =
+                    serde_json::from_str(reply_rx.try_recv().unwrap().as_str()).unwrap();
+                assert_eq!(first["id"], 1);
+                assert!(reply_rx.try_recv().is_err(), "overflow response must not be partial");
+                assert!(
+                    later_rx.try_recv().is_err(),
+                    "a queued command after overflow must not be dispatched"
+                );
+            })
+            .await;
+    }
+
+    #[test]
+    fn closed_outbound_does_not_apply_queued_fetch_resolution() {
+        let mut ctx = crate::dispatch::CdpContext::new(
+            obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        );
+        let (reply_tx, _reply_rx, _) = crate::outbound::channel();
+        let (resolver, mut resolved) = tokio::sync::oneshot::channel();
+        let key = (None, "request-after-close".to_string());
+        let mut paused = HashMap::from([(key.clone(), request_pause(resolver))]);
+        reply_tx.close(crate::outbound::CloseReason::WriterIo);
+
+        let command = json!({
+            "id": 91,
+            "method": "Fetch.continueRequest",
+            "params": {"requestId": "request-after-close"}
+        })
+        .to_string();
+        assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+        assert!(paused.contains_key(&key));
+        assert!(matches!(
+            resolved.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_close_flushes_response_before_transport_shutdown() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                let processor = tokio::task::spawn_local(async move {
+                    while let Some(message) = server_rx.recv().await {
+                        match message {
+                            super::ServerMessage::NewConnection { reply_tx } => {
+                                reply_tx.send(json!({"__init": true}).to_string()).unwrap();
+                            }
+                            super::ServerMessage::Cdp(_) => {
+                                panic!("Browser.close must be handled at the transport boundary");
+                            }
+                        }
+                    }
+                });
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    super::handle_connection_ws(stream, server_tx).await
+                });
+
+                let (mut client, _) = tokio_tungstenite::connect_async(
+                    format!("ws://{address}/devtools/browser"),
+                )
+                .await
+                .unwrap();
+                client
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id": 77, "method": "Browser.close", "params": {}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.next(),
+                )
+                .await
+                .expect("Browser.close response timeout")
+                .expect("transport closed before Browser.close response")
+                .expect("Browser.close websocket response");
+                let response: serde_json::Value = serde_json::from_str(
+                    response.into_text().expect("text response").as_str(),
+                )
+                .unwrap();
+                assert_eq!(response["id"], 77);
+                assert_eq!(response["result"], json!({}));
+
+                tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                    .await
+                    .expect("server should close after flushing response")
+                    .expect("server task")
+                    .expect("connection handler");
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("mock processor should stop with transport")
+                    .expect("mock processor task");
+            })
+            .await;
+    }
+
     #[test]
     fn discovery_uses_the_client_facing_http_authority() {
         let request = "GET /json/version HTTP/1.1\r\nhOsT: cdp.example.test:9222\r\n\r\n";
@@ -2246,7 +2567,7 @@ pub(crate) mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
                 let default_context = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)).default_context;
                 let processor = tokio::task::spawn_local(super::cdp_processor(
@@ -2465,7 +2786,7 @@ pub(crate) mod tests {
     #[test]
     fn continue_headers_server_preserves_order_case_values_and_retry() {
         let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         for supplied in [continue_header_fields(), json!([])] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
             let mut paused = HashMap::from([((None, "continued".to_string()), request_pause(resolver))]);
@@ -2493,7 +2814,7 @@ pub(crate) mod tests {
     #[test]
     fn continue_post_data_server_preserves_bytes_and_retryable_errors() {
         let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         for (value, expected) in [(Some(json!("AP8A/w==")), Some(vec![0, 255, 0, 255])),
             (Some(json!("")), Some(vec![])), (None, None)] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
@@ -2606,7 +2927,7 @@ pub(crate) mod tests {
         page.navigate("http://continue.test/").await.unwrap();
         let mut requests = page.enable_interception();
         let mut resolver_ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         let respond = async {
             for _ in 0..6 {
                 let request = requests.recv().await.unwrap();
@@ -2668,7 +2989,7 @@ pub(crate) mod tests {
     fn fulfilled_headers_preserve_duplicates_binary_values_and_capture_source() {
         use base64::Engine as _;
         let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         let binary = b"Set-Cookie: session=first-secret\0sEt-CoOkIe: session=second-secret\0X-Bytes: \xff\xfe\0";
         for params in [
             json!({"responseHeaders":[{"name":"Set-Cookie","value":"session=first-secret"},{"name":"sEt-CoOkIe","value":"session=second-secret"},{"name":"X-Unicode","value":"原文"}]}),
@@ -2706,7 +3027,7 @@ pub(crate) mod tests {
     fn fulfilled_invalid_headers_keep_request_paused_for_retry() {
         use base64::Engine as _;
         let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([((None, "fulfilled".to_string()), request_pause(resolver))]);
         for params in [json!({"binaryResponseHeaders":"%"}), json!({"body":"%"}), json!({"body":7}),
@@ -2731,7 +3052,7 @@ pub(crate) mod tests {
     #[test]
     fn fetch_body_read_during_request_pause_errors_without_dropping_resolver() {
         let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([((None, "paused".to_string()), request_pause(resolver))]);
         for method in ["Fetch.getResponseBody", "Fetch.takeResponseBodyAsStream"] {
@@ -2756,7 +3077,7 @@ pub(crate) mod tests {
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([((None, "request-1".to_string()), request_pause(resolution_tx))]);
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         let mut ctx = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
         assert!(handle_fetch_resolution(
@@ -2814,7 +3135,7 @@ pub(crate) mod tests {
             .expect("initial stream id");
         ctx.pending_events.clear();
 
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
         ctx.get_session_page_mut(&session)
             .expect("page")
             .evaluate(

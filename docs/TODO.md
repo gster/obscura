@@ -81,6 +81,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 进展（MCP 资源观察投影切片）：共享 `NetworkEventPhase` 提供生命周期分类，MCP 网络工具以 pretty JSON `events` 数组输出全部现有事件事实，明确 start/redirect/terminal、失败原因、文档与 preflight 关联及原始 headers。该格式替换旧文本行，读取不消费事件或响应 body。当前只承诺 active Page buffer，上游 JS/Worker 的 4096 条 oldest-drop、导航历史保留差异、请求正文保留与 CDP session 分发仍未收敛；本项保持未关闭。
 
+进展（CDP outbound reservation 切片）：每个连接的 outbound 保留队列上限为 1024 条、128 MiB 总 UTF-8 bytes，单条消息上限 80 MiB；reservation 在正常 writer 路径覆盖从入队到完整 socket send，而不是在 dequeue 时释放。单次 socket 写有 10 秒 deadline。count、总 bytes、单条 bytes overflow，以及 writer I/O、writer timeout、connection shutdown 均 sticky close，关闭后停止后续命令排队；服务不会靠静默丢弃、截断或脱敏消息维持连接。合法 `Browser.close` 会先封闭新消息，再以 10 秒总预算尝试 flush 已接受 envelope；写失败或超时则断开，reservation 释放本身不是送达确认。该切片仍未覆盖序列化瞬时内存、inbound `ServerMessage`、`pending_events`、Host/Origin/auth，或任意同步 V8 执行期间的立即断连；OB-021/OB-034 仍未关闭。
+
 ### OB-011 · P0 · Cookie 请求上下文与无损状态往返
 
 状态：未关闭。
@@ -103,6 +105,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 依赖：OB-001、OB-027。入口：obscura-cdp/src/server.rs、共享初始化与 CLI。
 动作：在已有连接/延迟消息上限之外，补入出站队列 count/bytes、帧大小、慢读与超载；核查认证、Host/Origin、默认 loopback；定义 owner 与关闭契约。
 完成：慢客户端/大消息/导航中断不会无界堆积；明确错误且资源回收；授权客户端可正常连接；未获准客户端被拒绝；取消/重连不自动重放输入。
+
+当前 outbound 边界：每连接保留 1024 条、128 MiB 总 bytes、单消息 80 MiB；reservation 在正常 writer 路径持续到 envelope 完成 socket send；单次写最多 10 秒。overflow、I/O、timeout、connection shutdown sticky close 并停止后续命令排队，服务不会靠静默丢弃、截断或脱敏消息维持连接。合法 `Browser.close` 会封闭新消息并在 10 秒总预算内尝试 flush 已接受 envelope；写失败或超时则断开，reservation 释放本身不是送达确认。尚未覆盖序列化瞬时内存、inbound `ServerMessage`、`pending_events`、Host/Origin/auth 及任意同步 V8 中的立即断连。
 
 ### OB-037 · P0 · 定性并恢复 obstacle 门禁
 
