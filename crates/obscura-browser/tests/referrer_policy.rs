@@ -1,3 +1,5 @@
+#![cfg(feature = "render")]
+
 use obscura_net::{
     CookieJar, ObscuraHttpClient, ReferrerPolicy, ResourceRequest, ResourceType, StealthHttpClient,
 };

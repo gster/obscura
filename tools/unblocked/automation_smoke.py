@@ -131,6 +131,59 @@ def inspect_png(data: bytes) -> dict[str, Any]:
     }
 
 
+def verify_locator_and_tab_storage(
+    context: Any, fixture_origin: str, observations: dict[str, Any]
+) -> None:
+    page = context.new_page()
+    sibling = None
+    try:
+        page.goto(f"{fixture_origin}/fixture?probe=locator-storage", wait_until="load")
+        page.evaluate(
+            """() => {
+              document.body.innerHTML = '<button aria-label="">Search flights</button>' +
+                '<button aria-label="   ">Whitespace label</button>' +
+                '<button aria-label="Explicit name">Other text</button><output></output>';
+              document.querySelector('button').onclick = () => {
+                document.querySelector('output').textContent = 'clicked';
+              };
+            }"""
+        )
+        names = ["Search flights", "Whitespace label", "Explicit name", "Other text"]
+        observations["roleCounts"] = {
+            name: page.get_by_role("button", name=name, exact=True).count()
+            for name in names
+        }
+        if observations["roleCounts"] != dict(zip(names, [1, 1, 1, 0])):
+            raise AssertionError(f"accessible name fallback differs: {observations!r}")
+        page.get_by_role("button", name="Search flights", exact=True).click(timeout=5000)
+        observations["clickOutput"] = page.locator("output").text_content()
+        if observations["clickOutput"] != "clicked":
+            raise AssertionError(f"empty aria-label click failed: {observations!r}")
+        page.evaluate(
+            """() => {
+              localStorage.setItem('__obscuraStorageProbeLocal', 'agreed');
+              sessionStorage.setItem('__obscuraStorageProbeSession', 'one');
+            }"""
+        )
+        page.goto(f"{fixture_origin}/fixture?probe=storage-navigation", wait_until="load")
+        read_storage = """[
+          localStorage.getItem('__obscuraStorageProbeLocal'),
+          sessionStorage.getItem('__obscuraStorageProbeSession')
+        ]"""
+        observations["afterNavigation"] = page.evaluate(read_storage)
+        sibling = context.new_page()
+        sibling.goto(f"{fixture_origin}/fixture?probe=storage-sibling", wait_until="load")
+        observations["sibling"] = sibling.evaluate(read_storage)
+        if observations["afterNavigation"] != ["agreed", "one"]:
+            raise AssertionError(f"navigation did not preserve storage: {observations!r}")
+        if observations["sibling"] != ["agreed", None]:
+            raise AssertionError(f"sibling tab storage scope differs: {observations!r}")
+    finally:
+        if sibling is not None:
+            sibling.close()
+        page.close()
+
+
 def run(obscura_bin: Path, *, log_root: Path | None = None) -> dict[str, Any]:
     from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
@@ -639,6 +692,10 @@ def run(obscura_bin: Path, *, log_root: Path | None = None) -> dict[str, Any]:
                         "Log.enable supports only empty params",
                     )
 
+                    result["locatorAndTabStorage"] = {}
+                    verify_locator_and_tab_storage(
+                        context, fixture_origin, result["locatorAndTabStorage"]
+                    )
                     result["document"] = document
                     result["unknownMethodError"] = unknown_error
                     result["invalidParamsError"] = invalid_params_error

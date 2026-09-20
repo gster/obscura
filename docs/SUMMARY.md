@@ -1,5 +1,25 @@
 # 项目现状与文档核验摘要
 
+剩余共享行为回归迁移（2026-09-20，实施基线 `d84b343`，macOS arm64）：从私有 runtime 迁出 170 个只依赖根公开 API 的回归，保留测试名称、属性、fixture、显式 Persona 和行为断言。162 个 browser 测试共用一个 integration target，映射如下；另 8 个 referrer 测试除 render gate 外与旧文件逐字相同。
+
+| 旧位置（`d84b343`） | 新位置（`crates/obscura-browser/tests/`） | 测试数 |
+| --- | --- | ---: |
+| `runtime/src/browser.rs` 测试模块 | `native_platform/web_platform.rs` | 12 |
+| 同上 | `native_platform/persona_network.rs` | 6 |
+| 同上 | `native_platform/forms.rs` | 34 |
+| 同上 | `native_platform/location.rs` | 34 |
+| 同上 | `native_platform/focus.rs` | 9 |
+| 同上 | `native_platform/text_input.rs` | 23 |
+| 同上 | `native_platform/history.rs` | 30 |
+| 同上 | `native_platform/controls.rs` | 14 |
+| `runtime/src/referrer_tests.rs` | `referrer_policy.rs` | 8 |
+
+定向 **170/170** 通过后，删除 browser 的旧测试模块 **5486 行**、referrer 旧测试文件 **394 行**及 `main.rs` 的两行测试声明。独立审查确认测试模块之外的生产定义与基线逐字相同；迁移时仅移除测试专用截图目录写入，PNG helper 改用现有 image 解码且仍断言 RGBA8。私有 runtime 剩余两个包装测试 **2/2**。完整文件删除仅一份旧测试文件，SDK/runtime 本体仍未移除，OB-006 保持未关闭。
+
+官方 Playwright smoke 新增空/空白 aria-label 的文本回退、显式名称优先和真实点击；storage 探针证实同 tab 导航后为 `["agreed", "one"]`、同 context 新 tab 为 `["agreed", null]`。完整观测值与原始进程/协议日志保留。扩展 smoke 与 37-method 画像、Python 工具测试 **38/38** 均通过。此证据不覆盖未知结果后的副作用不重放、同步无限 click handler 的产品入口终止或完整跨 origin dynamic-script CORS matrix，这些仍是 SDK 清理的后续验收项。
+
+根 release/render 全量首轮 **2126 passed、1 failed、4 skipped**：`module_graph_and_evaluation_share_one_active_budget` 得到 `[false,false]` 而非 `[true,false]`。未修改该测试或生产实现，定向重放 **1/1**、原命令完整复跑 **2127/2127**（4 skipped）通过。现有证据未确定首轮时序失败的根因，不将重跑称作修复。exact render build 与固定 benchmark 障碍课 **33/33** 通过，二进制 SHA-256 仍为 `1dfeb942c95edc935911b4ec48bb087e07f1c5d6174c8b09075460fd0dd5c406`。Astra light Spec 审核及独立 Standards 审核均无未解决阻断项。
+
 首批共享输入回归迁移（2026-09-20，实施基线 `f09e61d`，macOS arm64）：13 个 Page-only hit-test、mouse/pointer、stacking/clip/geometry 回归迁入 `crates/obscura-browser/tests/native_input.rs`。定向 **13/13** 通过后，删除 `runtime/src/browser.rs` 中对应 13 个旧函数及测试属性，共 524 行；仍被其他测试使用的 fixture/pixel/evidence helpers 保留。除移除本组私有截图 writer 调用、末项去掉 SDK 名称外，逐函数比较确认原行为断言等价；像素解码继续要求 RGBA8，Persona 仍显式初始化。本批未删除完整文件或生产实现，自有 Python SDK 和私有 runtime 尚未移除，OB-006 保持未关闭，也不代表 CDP native-input 接线完成。
 
 该批验证：根 release/render nextest **1957/1957**（4 skipped），独立 runtime **172/172**，exact render CLI release build、固定 benchmark 障碍课 **33/33**、官方 Playwright smoke 与 37-method 画像均通过；冻结 baseline 校验继续通过。render 二进制 SHA-256 为 `1dfeb942c95edc935911b4ec48bb087e07f1c5d6174c8b09075460fd0dd5c406`，与迁移前相同。Astra light Spec 审核无发现；Standards 无硬性违规，仅对局部 fixture 重复和测试文件规模提出非阻断建议。未修改 renderer 或身份/传输实现，不将本批结果扩展为新增产品能力或跨平台资格。

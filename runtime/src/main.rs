@@ -1,7 +1,5 @@
 mod browser;
 mod protocol;
-#[cfg(test)]
-mod referrer_tests;
 mod takeover;
 
 use browser::BrowserRuntime;
