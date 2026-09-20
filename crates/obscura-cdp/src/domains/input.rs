@@ -72,25 +72,81 @@ const BACKSPACE_JS: &str = "(function() {\
     t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
 })()";
 
-fn mouse_button_code(button: &str) -> u8 {
-    match button {
-        "middle" => 1,
-        "right" => 2,
-        "back" => 3,
-        "forward" => 4,
-        _ => 0,
+fn mouse_input(params: &Value) -> Result<obscura_browser::MouseInput, String> {
+    use obscura_browser::{MouseInput, MouseInputPhase};
+    let phase = match params.get("type").and_then(Value::as_str) {
+        Some("mouseMoved") => MouseInputPhase::Move,
+        Some("mousePressed") => MouseInputPhase::Down,
+        Some("mouseReleased") => MouseInputPhase::Up,
+        _ => return Err("Invalid Input.dispatchMouseEvent type".into()),
+    };
+    let coordinate = |name: &str| -> Result<f32, String> {
+        let value = params.get(name).and_then(Value::as_f64)
+            .ok_or_else(|| format!("Invalid mouse {name}: expected a finite number"))?;
+        if !value.is_finite() || !(value as f32).is_finite() {
+            return Err(format!("Invalid mouse {name}: expected a finite coordinate"));
+        }
+        Ok(value as f32)
+    };
+    let integer = |name: &str, default: u64, max: u64| -> Result<u64, String> {
+        match params.get(name) {
+            None => Ok(default),
+            Some(value) => value.as_u64().filter(|value| *value <= max)
+                .ok_or_else(|| format!("Invalid mouse {name}")),
+        }
+    };
+    let button = match params.get("button") {
+        None => -1,
+        Some(value) => match value.as_str() {
+            Some("none") => -1,
+            Some("left") => 0,
+            Some("middle") => 1,
+            Some("right") => 2,
+            Some("back") => 3,
+            Some("forward") => 4,
+            _ => return Err("Invalid mouse button".into()),
+        },
+    };
+    // The qualified path models a mouse. Do not acknowledge pen orientation input
+    // while silently replacing its identity and event metadata with a mouse.
+    if let Some(value) = params.get("pointerType") {
+        match value.as_str() {
+            Some("mouse") => {}
+            Some("pen") => return Err("UNSUPPORTED: pen pointer input".into()),
+            _ => return Err("Invalid mouse pointerType".into()),
+        }
     }
-}
-
-fn mouse_button_mask(button: &str) -> u64 {
-    match button {
-        "right" => 2,
-        "middle" => 4,
-        "back" => 8,
-        "forward" => 16,
-        "none" => 0,
-        _ => 1,
+    for (name, min, max, integral) in [
+        ("tangentialPressure", -1.0, 1.0, false),
+        ("tiltX", -90.0, 90.0, true),
+        ("tiltY", -90.0, 90.0, true),
+        ("twist", 0.0, 359.0, true),
+    ] {
+        if let Some(value) = params.get(name) {
+            let value = value.as_f64().filter(|value| {
+                value.is_finite() && *value >= min && *value <= max
+                    && (!integral || value.fract() == 0.0)
+            }).ok_or_else(|| format!("Invalid mouse {name}"))?;
+            if value != 0.0 {
+                return Err(format!("UNSUPPORTED: nonzero mouse {name}"));
+            }
+        }
     }
+    let force = match params.get("force") {
+        None => 0.0,
+        Some(value) => value.as_f64().filter(|value| {
+            value.is_finite() && (0.0..=1.0).contains(value)
+        }).ok_or_else(|| "Invalid mouse force".to_string())? as f32,
+    };
+    let default_buttons = if matches!(phase, MouseInputPhase::Down) {
+        match button { 0 => 1, 1 => 4, 2 => 2, 3 => 8, 4 => 16, _ => 0 }
+    } else { 0 };
+    Ok(MouseInput {
+        phase, x: coordinate("x")?, y: coordinate("y")?, button, force,
+        buttons: integer("buttons", default_buttons, 31)? as u8,
+        click_count: integer("clickCount", 0, i32::MAX as u64)? as u32,
+        modifiers: integer("modifiers", 0, 15)? as u8,
+    })
 }
 
 fn modifier_flags(modifiers: u64) -> (bool, bool, bool, bool) {
@@ -111,167 +167,35 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "dispatchMouseEvent" => {
-            let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
-            let button_code = mouse_button_code(button);
-            let buttons = params
-                .get("buttons")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_else(|| mouse_button_mask(button));
-            let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
-            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
-            let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
-
-            if event_type == "mousePressed" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    let code = format!(
-                        "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
-                            if (!target) return;\
-                            globalThis.__obscura_click_target = target;\
-                            globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
-                        }})()",
-                        x = x,
-                        y = y,
-                        button_code = button_code,
-                        buttons = buttons,
-                        click_count = click_count,
-                        alt_key = alt_key,
-                        ctrl_key = ctrl_key,
-                        meta_key = meta_key,
-                        shift_key = shift_key,
-                    );
-                    page.evaluate(&code);
-                }
-            } else if event_type == "mouseReleased" {
-                let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    let code = format!(
-                        "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
-                            if (!target) return;\
-                            var down = globalThis.__obscura_mouse_down;\
-                            globalThis.__obscura_mouse_down = null;\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
-                            if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
-                            var clickTarget = down.target;\
-                            while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
-                                clickTarget = clickTarget.parentElement;\
-                            }}\
-                            if (!clickTarget) return;\
-                            var tag = clickTarget.tagName;\
-                            var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
-                            if (globalThis.__obscura_isDisabled(clickTarget)) return;\
-                            var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
-                            var oldChecked = checkable ? !!clickTarget.checked : false;\
-                            var oldIndeterminate = checkable ? !!clickTarget.indeterminate : false;\
-                            var radioStates = null;\
-                            if (checkable && type === 'radio') {{\
-                                var radioName = clickTarget.getAttribute('name') || '';\
-                                if (radioName) {{\
-                                    var candidates = document.querySelectorAll('input');\
-                                    radioStates = [];\
-                                    for (var ri = 0; ri < candidates.length; ri++) {{\
-                                        var radio = candidates[ri];\
-                                        if ((radio.getAttribute('type') || '').toLowerCase() !== 'radio' || (radio.getAttribute('name') || '') !== radioName || radio.form !== clickTarget.form) continue;\
-                                        radioStates.push([radio, !!radio.checked]);\
-                                        if (radio !== clickTarget) radio.checked = false;\
-                                    }}\
-                                }}\
-                                clickTarget.checked = true;\
-                            }} else if (checkable) {{\
-                                clickTarget.checked = !oldChecked;\
-                                clickTarget.indeterminate = false;\
-                            }}\
-                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            var cancelled = !clickTarget.dispatchEvent(click);\
-                            if (cancelled) {{\
-                                if (radioStates) {{\
-                                    for (var rr = 0; rr < radioStates.length; rr++) radioStates[rr][0].checked = radioStates[rr][1];\
-                                }} else if (checkable) {{ clickTarget.checked = oldChecked; clickTarget.indeterminate = oldIndeterminate; }}\
-                                return;\
-                            }}\
-                            if (checkable && clickTarget.checked !== oldChecked) {{\
-                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
-                                try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
-                                return;\
-                            }}\
-                            var labelHost = tag === 'LABEL' ? clickTarget : (clickTarget.closest ? clickTarget.closest('label') : null);\
-                            var interactiveHost = globalThis.__obscura_interactiveHost(clickTarget);\
-                            if (labelHost && !(interactiveHost && labelHost.contains(interactiveHost))) {{\
-                                var ctl = globalThis.__obscura_labeledControl(labelHost);\
-                                if (ctl && ctl !== clickTarget && globalThis.__obscura_activateLabel(labelHost, ctl, true)) {{ return; }}\
-                            }}\
-                            var link = clickTarget.closest ? clickTarget.closest('a[href]') : null;\
-                            if (!link && tag === 'A' && clickTarget.getAttribute('href')) link = clickTarget;\
-                            if (link) {{\
-                                var href = link.getAttribute('href');\
-                                if (href && !href.startsWith('#') && !href.startsWith('javascript:')) location.assign(href);\
-                            }} else if (tag === 'BUTTON' && type !== 'button' && type !== 'reset') {{\
-                                var form = clickTarget.closest ? clickTarget.closest('form') : null;\
-                                if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(clickTarget); }} else {{ form.submit(clickTarget); }} }} catch(e) {{}} }}\
-                            }} else if (tag === 'INPUT' && (type === 'submit' || type === 'image')) {{\
-                                var form2 = clickTarget.closest ? clickTarget.closest('form') : null;\
-                                if (form2) {{ try {{ if (typeof form2.requestSubmit === 'function') {{ form2.requestSubmit(clickTarget); }} else {{ form2.submit(clickTarget); }} }} catch(e) {{}} }}\
-                            }} else if ({click_count} >= 3 && (tag === 'INPUT' || tag === 'TEXTAREA')) {{\
-                                var len = clickTarget.value ? clickTarget.value.length : 0;\
-                                if (clickTarget.setSelectionRange) clickTarget.setSelectionRange(0, len);\
-                                else {{ clickTarget.selectionStart = 0; clickTarget.selectionEnd = len; }}\
-                            }}\
-                        }})()",
-                        x = x,
-                        y = y,
-                        button_code = button_code,
-                        click_count = click_count,
-                        alt_key = alt_key,
-                        ctrl_key = ctrl_key,
-                        meta_key = meta_key,
-                        shift_key = shift_key,
-                    );
-                    page.evaluate(&code);
-                    let moved = page
-                        .process_pending_navigation()
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    // Fork: a single page app answers a click by routing itself,
-                    // with no document fetch. The client still has to be told the
-                    // frame moved, or the click looks like it did nothing.
-                    if moved {
-                        let url = page.url_string();
-                        let frame_id = page.frame_id.clone();
-                        Some((page.id.clone(), frame_id, url))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+            let event_type = params.get("type").and_then(Value::as_str);
+            if event_type != Some("mouseWheel") {
+                let input = mouse_input(params)?;
+                let page = ctx.get_session_page_mut(session_id)
+                    .ok_or_else(|| "Input requires an attached page session".to_string())?;
+                page.dispatch_mouse_input(input)?;
+                let moved = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+                let moved_frame = moved.then(|| (page.id.clone(), page.frame_id.clone(), page.url_string()));
                 if let Some((page_id, frame_id, url)) = moved_frame {
-                    let loader_id = ctx
-                        .current_loader_ids
-                        .get(&page_id)
-                        .cloned()
+                    let loader_id = ctx.current_loader_ids.get(&page_id).cloned()
                         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
                     ctx.pending_events.push(crate::types::CdpEvent {
                         method: "Page.frameNavigated".into(),
                         params: json!({
                             "frame": crate::domains::page::frame_value(
-                                &frame_id,
-                                None,
-                                &loader_id,
-                                &url,
-                                "text/html",
+                                &frame_id, None, &loader_id, &url, "text/html",
                             ),
                             "type": "Navigation",
                         }),
-                        session_id: Some(session_id.clone().unwrap_or_default()),
+                        session_id: session_id.clone(),
                     });
                 }
-            } else if event_type == "mouseWheel" {
+            } else {
+                // Wheel remains on the existing implementation until its native
+                // scrolling and cancellation path is qualified separately.
+                let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                let modifiers = params.get("modifiers").and_then(Value::as_u64).unwrap_or(0);
+                let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 if let Some(page) = ctx.get_session_page_mut(session_id) {

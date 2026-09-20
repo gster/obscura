@@ -19,6 +19,11 @@ async fn serve_fixture() -> String {
             #box { position: absolute; left: 20px; top: 20px; width: 180px;
                    height: 120px; overflow: auto; border: 10px solid black; }
             #inner { width: 700px; height: 800px; }
+            #check, #radio-a, #radio-b { position: absolute; margin: 0;
+                width: 24px; height: 24px; }
+            #check { left: 300px; top: 20px; }
+            #radio-a { left: 340px; top: 20px; }
+            #radio-b { left: 380px; top: 20px; }
         </style></head><body>
           <div id="page"></div>
           <div id="box"><div id="inner"></div></div>
@@ -182,7 +187,6 @@ async fn canceling_wheel_prevents_its_scroll_default() {
         r#"(() => {
             globalThis.wheelProbe = null;
             const page = document.getElementById('page');
-            document.elementFromPoint = () => page;
             page.addEventListener('wheel', event => {
                 wheelProbe = {
                     x: event.clientX, y: event.clientY,
@@ -253,9 +257,8 @@ async fn press_release_orders_events_and_defers_click_activation() {
         2,
         r#"(() => {
             const target = document.getElementById('check');
-            document.elementFromPoint = () => target;
             globalThis.mouseLog = [];
-            for (const type of ['mousedown', 'mouseup', 'click', 'input', 'change']) {
+            for (const type of ['pointerdown', 'mousedown', 'focus', 'focusin', 'pointerup', 'mouseup', 'click', 'input', 'change']) {
                 target.addEventListener(type, event => mouseLog.push({
                     type, checked: target.checked, x: event.clientX,
                     ctrl: event.ctrlKey, shift: event.shiftKey, trusted: event.isTrusted
@@ -271,7 +274,7 @@ async fn press_release_orders_events_and_defers_click_activation() {
         3,
         "Input.dispatchMouseEvent",
         json!({
-            "type": "mousePressed", "x": 31.0, "y": 42.0,
+            "type": "mousePressed", "x": 312.0, "y": 32.0,
             "button": "left", "clickCount": 1, "modifiers": 10
         }),
         &sid,
@@ -286,15 +289,15 @@ async fn press_release_orders_events_and_defers_click_activation() {
     .await;
     let pressed: Value = serde_json::from_str(pressed["result"]["value"].as_str().unwrap()).unwrap();
     assert_eq!(pressed["checked"], false, "checkbox activation must wait for release");
-    assert_eq!(pressed["log"][0]["type"], "mousedown");
-    assert_eq!(pressed["log"].as_array().unwrap().len(), 1, "press must not synthesize click");
+    assert_eq!(pressed["log"][0]["type"], "pointerdown");
+    assert_eq!(pressed["log"].as_array().unwrap().len(), 4, "press must not synthesize click");
 
     cdp(
         &mut ctx,
         5,
         "Input.dispatchMouseEvent",
         json!({
-            "type": "mouseReleased", "x": 31.0, "y": 42.0,
+            "type": "mouseReleased", "x": 312.0, "y": 32.0,
             "button": "left", "clickCount": 1, "modifiers": 10
         }),
         &sid,
@@ -314,13 +317,13 @@ async fn press_release_orders_events_and_defers_click_activation() {
         .iter()
         .map(|entry| entry["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["mousedown", "mouseup", "click", "input", "change"]);
+    assert_eq!(types, ["pointerdown", "mousedown", "focus", "focusin", "pointerup", "mouseup", "click", "input", "change"]);
     assert_eq!(released["checked"], true);
-    assert_eq!(released["log"][2]["checked"], true, "click sees checkbox pre-activation");
-    assert_eq!(released["log"][2]["x"], 31.0);
-    assert_eq!(released["log"][2]["ctrl"], true);
-    assert_eq!(released["log"][2]["shift"], true);
-    assert_eq!(released["log"][2]["trusted"], true);
+    assert_eq!(released["log"][6]["checked"], true, "click sees checkbox pre-activation");
+    assert_eq!(released["log"][6]["x"], 312.0);
+    assert_eq!(released["log"][6]["ctrl"], true);
+    assert_eq!(released["log"][6]["shift"], true);
+    assert_eq!(released["log"][6]["trusted"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -332,7 +335,6 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         r#"(() => {
             const a = document.getElementById('radio-a');
             const b = document.getElementById('radio-b');
-            document.elementFromPoint = () => b;
             globalThis.radioEvents = [];
             for (const radio of [a, b]) {
                 for (const type of ['mousedown', 'mouseup', 'click', 'input', 'change']) {
@@ -347,7 +349,7 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         &mut ctx,
         3,
         "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": 10.0, "y": 10.0, "button": "left"}),
+        json!({"type": "mousePressed", "x": 392.0, "y": 32.0, "button": "left", "clickCount": 1}),
         &sid,
     )
     .await;
@@ -355,7 +357,7 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         &mut ctx,
         4,
         "Input.dispatchMouseEvent",
-        json!({"type": "mouseReleased", "x": 10.0, "y": 10.0, "button": "left"}),
+        json!({"type": "mouseReleased", "x": 392.0, "y": 32.0, "button": "left", "clickCount": 1}),
         &sid,
     )
     .await;
@@ -374,4 +376,327 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         json!(["radio-b:mousedown", "radio-b:mouseup", "radio-b:click", "radio-b:input", "radio-b:change"]),
         "the newly selected radio alone receives activation events"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_click_restores_checkbox_preactivation_without_change_events() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        const check = document.getElementById('check');
+        check.indeterminate = true;
+        globalThis.cancelLog = [];
+        check.addEventListener('click', e => {
+            cancelLog.push([e.type, check.checked, check.indeterminate]);
+            e.preventDefault();
+        });
+        for (const type of ['input', 'change']) check.addEventListener(type, () => cancelLog.push([type]));
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":312,"y":32,"button":"left","clickCount":1}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify({log:cancelLog,checked:document.getElementById('check').checked,indeterminate:document.getElementById('check').indeterminate})", &sid).await;
+    let state: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state, json!({"log":[["click",true,false]],"checked":false,"indeterminate":true}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_mousedown_skips_focus_but_keeps_release_and_click() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        const check = document.getElementById('check');
+        globalThis.cancelLog = [];
+        check.addEventListener('mousedown', e => e.preventDefault());
+        for (const type of ['focus', 'mouseup', 'click']) check.addEventListener(type, () => cancelLog.push(type));
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":312,"y":32,"button":"left","clickCount":1}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify({log:cancelLog,checked:document.getElementById('check').checked})", &sid).await;
+    let state: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state, json!({"log":["mouseup","click"],"checked":true}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn right_button_preserves_metadata_and_does_not_activate_checkbox() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        const check = document.getElementById('check');
+        globalThis.buttonLog = [];
+        for (const type of ['mousedown', 'mouseup', 'click']) check.addEventListener(type, e => {
+            buttonLog.push([type,e.button,e.buttons,e.detail,e.altKey,e.ctrlKey,e.metaKey,e.shiftKey,e.isTrusted]);
+        });
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":312,"y":32,"button":"right","clickCount":2,"modifiers":15}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify({log:buttonLog,checked:document.getElementById('check').checked})", &sid).await;
+    let state: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state, json!({"log":[
+        ["mousedown",2,2,2,true,true,true,true,true],
+        ["mouseup",2,0,2,true,true,true,true,true]
+    ],"checked":false}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_mouse_overrides_cannot_redirect_native_click() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        const check = document.getElementById('check');
+        globalThis.nativeClicks = 0;
+        check.addEventListener('click', () => nativeClicks++);
+        document.elementFromPoint = () => document.getElementById('radio-b');
+        globalThis.MouseEvent = function() { throw new Error('public constructor'); };
+        globalThis.PointerEvent = function() { throw new Error('public constructor'); };
+        check.dispatchEvent = function() { throw new Error('public dispatcher'); };
+        globalThis.__obscura_mouse_down = {target:document.getElementById('radio-b'),button:0};
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":312,"y":32,"button":"left","clickCount":1}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify({clicks:nativeClicks,checked:document.getElementById('check').checked,radio:document.getElementById('radio-b').checked})", &sid).await;
+    let state: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state, json!({"clicks":1,"checked":true,"radio":false}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mouse_move_uses_protocol_defaults_and_preserves_explicit_buttons() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.moveLog = [];
+        for (const type of ['pointermove','mousemove']) {
+            document.getElementById('check').addEventListener(type, e => {
+                moveLog.push([type,e.button,e.buttons,e.detail,e.altKey,e.ctrlKey,e.metaKey,e.shiftKey]);
+            });
+        }
+    })()"#, &sid).await;
+    cdp(&mut ctx, 3, "Input.dispatchMouseEvent",
+        json!({"type":"mouseMoved","x":312,"y":32}), &sid).await;
+    cdp(&mut ctx, 4, "Input.dispatchMouseEvent",
+        json!({"type":"mouseMoved","x":312,"y":32,"button":"left","buttons":3,"modifiers":5}), &sid).await;
+    let result = evaluate(&mut ctx, 5, "JSON.stringify(moveLog)", &sid).await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([
+        ["pointermove",-1,0,0,false,false,false,false],
+        ["mousemove",0,0,0,false,false,false,false],
+        ["pointermove",-1,3,0,true,false,true,false],
+        ["mousemove",0,3,0,true,false,true,false]
+    ]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn release_on_sibling_clicks_only_the_common_ancestor_once() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        document.body.innerHTML = '<div id="parent" style="position:absolute;left:20px;top:20px;width:200px;height:60px"><div id="left" style="position:absolute;left:0;top:0;width:80px;height:60px"></div><div id="right" style="position:absolute;left:120px;top:0;width:80px;height:60px"></div></div>';
+        globalThis.phaseLog = [];
+        for (const id of ['left','right','parent']) {
+            document.getElementById(id).addEventListener('click', e => phaseLog.push([id,e.target.id]));
+        }
+    })()"#, &sid).await;
+    cdp(&mut ctx, 3, "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":40,"y":40,"button":"left","clickCount":1}), &sid).await;
+    cdp(&mut ctx, 4, "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":160,"y":40,"button":"left","clickCount":1}), &sid).await;
+    let result = evaluate(&mut ctx, 5, "JSON.stringify(phaseLog)", &sid).await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([["parent","parent"]]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mousedown_layout_change_allows_release_to_hit_the_current_target() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        document.body.innerHTML = '<div id="parent" style="position:absolute;left:20px;top:20px;width:300px;height:60px"><div id="under" style="position:absolute;left:0;top:0;width:80px;height:60px"></div><div id="moving" style="position:absolute;left:0;top:0;width:80px;height:60px;z-index:1"></div></div>';
+        globalThis.phaseLog = [];
+        document.getElementById('moving').addEventListener('mousedown', e => {
+            phaseLog.push(['down',e.target.id]);
+            e.target.style.left = '180px';
+        });
+        document.getElementById('parent').addEventListener('mouseup', e => phaseLog.push(['up',e.target.id]));
+        document.getElementById('parent').addEventListener('click', e => phaseLog.push(['click',e.target.id]));
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":40,"y":40,"button":"left","clickCount":1}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify(phaseLog)", &sid).await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([["down","moving"],["up","under"],["click","parent"]]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn document_replacement_discards_the_old_mouse_press() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        document.body.innerHTML = '<button id="old" style="position:absolute;left:20px;top:20px;width:100px;height:40px">old</button>';
+    })()"#, &sid).await;
+    cdp(&mut ctx, 3, "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":40,"y":35,"button":"left","clickCount":1}), &sid).await;
+    evaluate(&mut ctx, 4, r#"(() => {
+        document.open();
+        document.write('<!doctype html><html><body><button id="new" style="position:absolute;left:20px;top:20px;width:100px;height:40px">new</button></body></html>');
+        document.close();
+        globalThis.replacementLog = [];
+        for (const type of ['mouseup','click']) {
+            document.getElementById('new').addEventListener(type, e => replacementLog.push([type,e.target.id]));
+        }
+    })()"#, &sid).await;
+    cdp(&mut ctx, 5, "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":40,"y":35,"button":"left","clickCount":1}), &sid).await;
+    let result = evaluate(&mut ctx, 6, "JSON.stringify(replacementLog)", &sid).await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([["mouseup","new"]]), "new document must not inherit a press, even when node ids are reused");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_pointerdown_suppresses_compatibility_mouse_but_not_click_default() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        const check = document.getElementById('check');
+        globalThis.pointerCancelLog = [];
+        check.addEventListener('pointerdown', e => e.preventDefault());
+        for (const type of ['pointerdown','mousedown','focus','pointerup','mouseup','click','input','change']) {
+            check.addEventListener(type, e => pointerCancelLog.push([type,check.checked]));
+        }
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":312,"y":32,"button":"left","clickCount":1}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify({log:pointerCancelLog,checked:document.getElementById('check').checked})", &sid).await;
+    let state: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state, json!({"log":[["pointerdown",false],["pointerup",false],["click",true],["input",true],["change",true]],"checked":true}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn document_open_discards_a_press_on_the_retained_body_node() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        document.body.innerHTML = '';
+        document.body.style.cssText = 'margin:0;width:600px;height:400px';
+        globalThis.retainedBodyLog = [];
+        document.body.addEventListener('mousedown', e => retainedBodyLog.push(['down',e.target.tagName]));
+    })()"#, &sid).await;
+    cdp(&mut ctx, 3, "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":40,"y":35,"button":"left","clickCount":1}), &sid).await;
+    let pressed = evaluate(&mut ctx, 4, "JSON.stringify(retainedBodyLog)", &sid).await;
+    let pressed: Value = serde_json::from_str(pressed["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(pressed, json!([["down","BODY"]]), "the press must hit the node document.open retains");
+    evaluate(&mut ctx, 5, r#"(() => {
+        document.open();
+        document.write('<button id="replacement" style="position:absolute;left:20px;top:20px;width:100px;height:40px">new</button>');
+        document.close();
+        globalThis.retainedBodyLog = [];
+        for (const type of ['mouseup','click']) {
+            document.body.addEventListener(type, e => retainedBodyLog.push([type,e.target.id || e.target.tagName]));
+        }
+    })()"#, &sid).await;
+    cdp(&mut ctx, 6, "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":40,"y":35,"button":"left","clickCount":1}), &sid).await;
+    let result = evaluate(&mut ctx, 7, "JSON.stringify(retainedBodyLog)", &sid).await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([["mouseup","replacement"]]), "retained body identity must not preserve the old press epoch");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn triple_click_document_replacement_does_not_select_the_new_textarea() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        document.body.innerHTML = '<textarea id="original" style="position:absolute;left:20px;top:20px;width:200px;height:60px">old content</textarea>';
+        globalThis.originalTextArea = document.getElementById('original');
+        globalThis.replacementClicks = 0;
+        originalTextArea.addEventListener('click', () => {
+            replacementClicks++;
+            document.open();
+            document.write('<textarea id="replacement" style="position:absolute;left:20px;top:20px;width:200px;height:60px">replacement text</textarea>');
+            document.close();
+            document.getElementById('replacement').setSelectionRange(2,2);
+        });
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":40,"y":35,"button":"left","clickCount":3}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, r#"JSON.stringify({
+        clicks:replacementClicks,
+        value:document.getElementById('replacement').value,
+        start:document.getElementById('replacement').selectionStart,
+        end:document.getElementById('replacement').selectionEnd
+    })"#, &sid).await;
+    let state: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state["clicks"], 1, "the click callback must actually replace the document");
+    assert_eq!(state["value"], "replacement text");
+    assert_eq!(state["start"], 2);
+    assert_eq!(state["end"], 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mouse_down_and_up_without_a_button_succeed_without_dispatching_events() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.noButtonLog = [];
+        for (const type of ['pointerdown','mousedown','focus','pointerup','mouseup','click']) {
+            document.getElementById('check').addEventListener(type, () => noButtonLog.push(type));
+        }
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        let result = cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":312,"y":32}), &sid).await;
+        assert_eq!(result, json!({}));
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify({log:noButtonLog,checked:document.getElementById('check').checked})", &sid).await;
+    let state: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state, json!({"log":[],"checked":false}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn changed_left_button_is_applied_even_when_explicit_buttons_is_zero() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.explicitButtonsLog = [];
+        for (const type of ['mousedown','mouseup']) {
+            document.getElementById('check').addEventListener(type, e => explicitButtonsLog.push([type,e.button,e.buttons,e.detail]));
+        }
+    })()"#, &sid).await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent",
+            json!({"type":phase,"x":312,"y":32,"button":"left","buttons":0}), &sid).await;
+    }
+    let result = evaluate(&mut ctx, 5, "JSON.stringify(explicitButtonsLog)", &sid).await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([["mousedown",0,1,0],["mouseup",0,0,0]]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mouse_force_and_native_event_interfaces_match_the_wire_metadata() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.forceLog = [];
+        for (const type of ['pointerdown','mousedown','focus','focusin','pointerup','mouseup','click']) {
+            document.getElementById('check').addEventListener(type, e => forceLog.push({
+                type, constructor:e.constructor.name, detail:e.detail,
+                pressure:typeof e.pressure === 'undefined' ? null : e.pressure,
+                hasPressure:'pressure' in e, view:e.view === window
+            }));
+        }
+    })()"#, &sid).await;
+    cdp(&mut ctx, 3, "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":312,"y":32,"button":"left","clickCount":1,"force":0.5}), &sid).await;
+    cdp(&mut ctx, 4, "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":312,"y":32,"button":"left","clickCount":1}), &sid).await;
+    let result = evaluate(&mut ctx, 5, "JSON.stringify(forceLog)", &sid).await;
+    let log: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(log, json!([
+        {"type":"pointerdown","constructor":"PointerEvent","detail":0,"pressure":0.5,"hasPressure":true,"view":true},
+        {"type":"mousedown","constructor":"MouseEvent","detail":1,"pressure":null,"hasPressure":false,"view":true},
+        {"type":"focus","constructor":"FocusEvent","detail":0,"pressure":null,"hasPressure":false,"view":true},
+        {"type":"focusin","constructor":"FocusEvent","detail":0,"pressure":null,"hasPressure":false,"view":true},
+        {"type":"pointerup","constructor":"PointerEvent","detail":0,"pressure":0,"hasPressure":true,"view":true},
+        {"type":"mouseup","constructor":"MouseEvent","detail":1,"pressure":null,"hasPressure":false,"view":true},
+        {"type":"click","constructor":"PointerEvent","detail":1,"pressure":0,"hasPressure":true,"view":true}
+    ]));
 }

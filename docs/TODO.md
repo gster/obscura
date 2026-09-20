@@ -75,6 +75,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 动作：列出原生输入、等待、资源观察、限额和启动保护的归属；逐项迁移到内核共享层并由 CDP 调用。
 完成：正式客户端最小端到端场景不经过 SDK 私有 RPC；迁移项均有原路径/新路径对照。不得重写完整 Playwright Locator 产品。
 
+进展（2026-09-20，mouse 切片）：CDP move/press/release 已通过 typed Page API 接入共享 native hit-test、受保护事件分发、焦点与默认动作；移除该分支的页面 JS 拼接和全局按压状态。官方 Playwright 六组离线鼠标场景已与 Chrome 对照通过；document.open/导航使原按压状态失效，no-render 坐标输入明确 unsupported。wheel、keyboard/text、等待、资源观察、限额及启动保护的后续归口仍待完成，本项保持未关闭。
+
 ### OB-011 · P0 · Cookie 请求上下文与无损状态往返
 
 状态：未关闭。

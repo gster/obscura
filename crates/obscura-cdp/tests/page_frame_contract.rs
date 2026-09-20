@@ -17,8 +17,8 @@ async fn serve() -> String {
                     "<html><body>child</body></html>"
                 } else {
                     r##"<!doctype html><html><body>
-                        <a id="route" href="#next">next</a>
-                        <iframe src="/child.html"></iframe>
+                        <a id="route" style="position:absolute;left:20px;top:20px;width:100px;height:40px" href="#next">next</a>
+                        <iframe style="position:absolute;top:100px;left:20px" src="/child.html"></iframe>
                         <script>
                             route.addEventListener('click', event => {
                                 event.preventDefault();
@@ -189,41 +189,26 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
         .params["frame"];
     assert_frame_contract(child_event_frame);
 
-    cdp(
-        &mut ctx,
-        7,
-        "Runtime.evaluate",
-        json!({
-            "expression": "document.elementFromPoint = () => document.getElementById('route')"
-        }),
-        Some(&session_id),
-    )
-    .await;
-    cdp(
-        &mut ctx,
-        8,
-        "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": 0, "y": 0, "button": "left"}),
-        Some(&session_id),
-    )
-    .await;
-    let route_event_start = ctx.pending_events.len();
-    cdp(
-        &mut ctx,
-        9,
-        "Input.dispatchMouseEvent",
-        json!({"type": "mouseReleased", "x": 0, "y": 0, "button": "left"}),
-        Some(&session_id),
-    )
-    .await;
-    let route_frame = &ctx.pending_events[route_event_start..]
-        .iter()
-        .find(|event| {
-            event.method == "Page.frameNavigated" && event.params["frame"]["id"] == page_id
-        })
-        .expect("same-document navigation event was not emitted")
-        .params["frame"];
-    assert_frame_contract(route_frame);
-    assert_eq!(route_frame["loaderId"], loader_id);
-    assert!(route_frame["url"].as_str().unwrap().ends_with("/next"));
+    // Coordinate mouse routing is available only with renderer geometry.
+    #[cfg(feature = "render")]
+    {
+        let route_event_start = ctx.pending_events.len();
+        for (id, phase) in [(8, "mousePressed"), (9, "mouseReleased")] {
+            cdp(
+                &mut ctx, id, "Input.dispatchMouseEvent",
+                json!({"type": phase, "x": 40, "y": 35, "button": "left", "clickCount": 1}),
+                Some(&session_id),
+            ).await;
+        }
+        let route_frame = &ctx.pending_events[route_event_start..]
+            .iter()
+            .find(|event| {
+                event.method == "Page.frameNavigated" && event.params["frame"]["id"] == page_id
+            })
+            .expect("same-document navigation event was not emitted")
+            .params["frame"];
+        assert_frame_contract(route_frame);
+        assert_eq!(route_frame["loaderId"], loader_id);
+        assert!(route_frame["url"].as_str().unwrap().ends_with("/next"));
+    }
 }

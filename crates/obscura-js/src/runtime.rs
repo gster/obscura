@@ -216,6 +216,41 @@ pub struct NativeClick {
     pub default_prevented: bool,
 }
 
+/// One externally driven mouse phase. Protocol adapters keep their own wire
+/// validation, then hand the typed phase to the browser kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseInputPhase {
+    Move,
+    Down,
+    Up,
+}
+
+/// Browser-owned mouse input metadata. `button` follows CDP/DOM numbering:
+/// -1 means no changed button, while 0..=4 are left, middle, right, back and
+/// forward. Modifier bits are Alt=1, Ctrl=2, Meta=4 and Shift=8.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MouseInput {
+    pub phase: MouseInputPhase,
+    pub x: f32,
+    pub y: f32,
+    pub button: i16,
+    pub buttons: u8,
+    pub click_count: u32,
+    pub modifiers: u8,
+    pub force: f32,
+}
+
+fn mouse_button_mask(button: i16) -> Option<u8> {
+    match button {
+        0 => Some(1),
+        1 => Some(4),
+        2 => Some(2),
+        3 => Some(8),
+        4 => Some(16),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "render")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClickActivation {
@@ -585,6 +620,19 @@ pub struct ObscuraJsRuntime {
     native_lifecycle: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     mouse_buttons: u8,
     suppress_mouse: bool,
+    /// Protocol mouse phases are independent calls. Keep their down targets in
+    /// Rust rather than a page-writable global, and do not share the manual
+    /// action guard state above.
+    #[cfg(feature = "render")]
+    input_mouse_down: [Option<NodeId>; 5],
+    #[cfg(feature = "render")]
+    input_suppress_mouse: bool,
+    #[cfg(feature = "render")]
+    input_mouse_buttons: u8,
+    #[cfg(feature = "render")]
+    input_document_epoch: u64,
+    #[cfg(feature = "render")]
+    input_mouse_chorded: bool,
     // Keep the runtime last: custom `Drop` enters its isolate, then every
     // V8-backed field above is released before `OwnedIsolate` performs the
     // matching exit and disposes the isolate.
@@ -1038,6 +1086,16 @@ impl ObscuraJsRuntime {
             native_lifecycle: None,
             mouse_buttons: 0,
             suppress_mouse: false,
+            #[cfg(feature = "render")]
+            input_mouse_down: [None; 5],
+            #[cfg(feature = "render")]
+            input_suppress_mouse: false,
+            #[cfg(feature = "render")]
+            input_mouse_buttons: 0,
+            #[cfg(feature = "render")]
+            input_document_epoch: 0,
+            #[cfg(feature = "render")]
+            input_mouse_chorded: false,
             js_runtime: runtime,
         };
         // Take the op table before any page script can run, and drop the global
@@ -1824,6 +1882,8 @@ impl ObscuraJsRuntime {
         dom.set_document_url(&gs.url);
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
+        gs.input_document_epoch
+            .set(gs.input_document_epoch.get().wrapping_add(1));
         gs.activity_generation = 0;
         gs.document_lifecycle = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2695,6 +2755,193 @@ impl ObscuraJsRuntime {
         self.native_mouse_event(2, x, y)
     }
 
+    /// Dispatch one raw mouse phase through browser-owned hit testing, event
+    /// paths, focus and activation. Unlike the manual action helpers, separate
+    /// calls may have layout or script work between them.
+    pub fn dispatch_mouse_input(&mut self, mut input: MouseInput) -> Result<(), String> {
+        if !input.x.is_finite() || !input.y.is_finite() {
+            return Err("INVALID_MOUSE_INPUT_COORDINATES".into());
+        }
+        if !(-1..=4).contains(&input.button)
+            || input.buttons & !0x1f != 0
+            || input.modifiers & !0x0f != 0
+            || !input.force.is_finite()
+            || !(0.0..=1.0).contains(&input.force)
+        {
+            return Err("INVALID_MOUSE_INPUT_METADATA".into());
+        }
+        if !matches!(input.phase, MouseInputPhase::Move) && input.button < 0 {
+            return Ok(());
+        }
+        if input.button >= 0 {
+            let mask = mouse_button_mask(input.button).ok_or("INVALID_MOUSE_INPUT_METADATA")?;
+            match input.phase {
+                MouseInputPhase::Down => input.buttons |= mask,
+                MouseInputPhase::Up => input.buttons &= !mask,
+                MouseInputPhase::Move => {}
+            }
+        }
+        #[cfg(feature = "render")]
+        {
+            return self
+                .dispatch_mouse_input_render(input)
+                .map_err(str::to_owned);
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            let _ = input;
+            Err("INPUT_UNSUPPORTED_WITHOUT_RENDER".into())
+        }
+    }
+
+    #[cfg(feature = "render")]
+    fn dispatch_mouse_input_render(&mut self, input: MouseInput) -> Result<(), &'static str> {
+        let epoch = self.state.borrow().input_document_epoch.get();
+        if self.input_document_epoch != epoch {
+            self.clear_input_mouse();
+            self.input_document_epoch = epoch;
+        }
+        let result = self.dispatch_mouse_input_phase(input);
+        let epoch = self.state.borrow().input_document_epoch.get();
+        if result.is_err() || self.input_document_epoch != epoch {
+            self.clear_input_mouse();
+            self.input_document_epoch = epoch;
+        }
+        result
+    }
+
+    #[cfg(feature = "render")]
+    fn clear_input_mouse(&mut self) {
+        self.input_mouse_down = [None; 5];
+        self.input_suppress_mouse = false;
+        self.input_mouse_buttons = 0;
+        self.input_mouse_chorded = false;
+        let mut state = self.state.borrow_mut();
+        if state
+            .dom
+            .as_ref()
+            .is_some_and(|dom| dom.set_pointer_state(dom.input_state().hovered, None))
+        {
+            invalidate_input_render(&mut state);
+        }
+    }
+
+    #[cfg(feature = "render")]
+    fn dispatch_mouse_input_phase(&mut self, input: MouseInput) -> Result<(), &'static str> {
+        let document_epoch = self.input_document_epoch;
+        let hit = self.hit_test(input.x, input.y)?.ok_or("INPUT_NO_TARGET")?;
+        let button = usize::try_from(input.button).ok().filter(|button| *button < 5);
+        if matches!(input.phase, MouseInputPhase::Down) {
+            if self.input_mouse_buttons != 0 {
+                self.input_mouse_chorded = true;
+            }
+            self.input_mouse_down[button.ok_or("INVALID_MOUSE_INPUT_METADATA")?] = Some(hit);
+        }
+
+        {
+            let mut state = self.state.borrow_mut();
+            if state.dom.as_ref().is_some_and(|dom| {
+                let pressed = match input.phase {
+                    MouseInputPhase::Down => Some(hit),
+                    MouseInputPhase::Up if input.buttons == 0 => None,
+                    _ => dom.input_state().pressed,
+                };
+                dom.set_pointer_state(Some(hit), pressed)
+            }) {
+                invalidate_input_render(&mut state);
+            }
+        }
+
+        let mouse_phase = match input.phase {
+            MouseInputPhase::Move => 0,
+            MouseInputPhase::Down => 1,
+            MouseInputPhase::Up => 2,
+        };
+        let click_target = if matches!(input.phase, MouseInputPhase::Up) {
+            button
+                .and_then(|button| self.input_mouse_down[button].take())
+                .and_then(|down| self.mouse_click_target(down, hit))
+        } else {
+            None
+        };
+
+        let pointer_phase = match input.phase {
+            MouseInputPhase::Down if self.input_mouse_buttons != 0 => 0,
+            MouseInputPhase::Up if input.buttons != 0 => 0,
+            _ => mouse_phase,
+        };
+        let pointer_allowed = self.native_mouse_at_input(pointer_phase, hit, input)?;
+        self.native_input_checkpoint_with_epoch(Some(document_epoch))?;
+        if self.state.borrow().input_document_epoch.get() != document_epoch {
+            self.clear_input_mouse();
+            return Ok(());
+        }
+        if matches!(input.phase, MouseInputPhase::Down) && self.input_mouse_buttons == 0 {
+            self.input_suppress_mouse = !pointer_allowed;
+        }
+        let mouse_allowed = if self.input_suppress_mouse {
+            false
+        } else {
+            let allowed = self.native_mouse_at_input(mouse_phase + 4, hit, input)?;
+            self.native_input_checkpoint_with_epoch(Some(document_epoch))?;
+            if self.state.borrow().input_document_epoch.get() != document_epoch {
+                self.clear_input_mouse();
+                return Ok(());
+            }
+            allowed
+        };
+
+        if matches!(input.phase, MouseInputPhase::Down) && pointer_allowed && mouse_allowed {
+            let candidate = self
+                .with_dom(|dom| {
+                    std::iter::once(hit)
+                        .chain(dom.ancestors(hit))
+                        .find(|id| dom.can_focus(*id))
+                })
+                .flatten();
+            self.native_focus_node_with_epoch(candidate, Some(document_epoch))?;
+            self.native_input_checkpoint_with_epoch(Some(document_epoch))?;
+            if self.state.borrow().input_document_epoch.get() != document_epoch {
+                self.clear_input_mouse();
+                return Ok(());
+            }
+        }
+
+        self.input_mouse_buttons = input.buttons;
+        if matches!(input.phase, MouseInputPhase::Up) {
+            if input.button == 0 && !self.input_mouse_chorded {
+                if let Some(target) = click_target.filter(|target| {
+                    self.mouse_input_target_enabled(*target)
+                }) {
+                    self.activate_mouse_input_click(target, input)?;
+                }
+            }
+            if input.buttons == 0 {
+                self.input_suppress_mouse = false;
+                self.input_mouse_chorded = false;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    fn mouse_click_target(&self, down: NodeId, up: NodeId) -> Option<NodeId> {
+        self.with_dom(|dom| {
+            if !dom.is_connected(down) || !dom.is_connected(up) {
+                return None;
+            }
+            let up_path = std::iter::once(up)
+                .chain(dom.ancestors(up))
+                .collect::<Vec<_>>();
+            std::iter::once(down)
+                .chain(dom.ancestors(down))
+                .find(|candidate| {
+                    up_path.contains(candidate) && dom.is_light_document_element(*candidate)
+                })
+        })
+        .flatten()
+    }
+
     #[cfg(feature = "render")]
     fn clear_pressed_input(&mut self) {
         self.mouse_buttons = 0;
@@ -2807,7 +3054,45 @@ impl ObscuraJsRuntime {
         x: f32,
         y: f32,
     ) -> Result<bool, &'static str> {
+        let phase = match kind {
+            0 | 4 => MouseInputPhase::Move,
+            1 | 5 => MouseInputPhase::Down,
+            _ => MouseInputPhase::Up,
+        };
+        self.native_mouse_at_input(kind, hit, MouseInput {
+            phase,
+            x,
+            y,
+            button: if matches!(kind, 0 | 4) { -1 } else { 0 },
+            buttons: self.mouse_buttons,
+            click_count: u32::from(kind == 3),
+            modifiers: 0,
+            // Manual actions historically derive mouse pressure from the held
+            // button state. Raw CDP input bypasses this adapter and keeps its
+            // explicit wire `force`, including an omitted/default zero.
+            force: if self.mouse_buttons == 0 { 0.0 } else { 0.5 },
+        })
+    }
+
+    /// Dispatch through the retained pre-page-script adapter with explicit
+    /// event metadata. Manual actions use `native_mouse_at`; protocol phases
+    /// call this lower seam directly.
+    #[cfg(feature = "render")]
+    fn native_mouse_at_input(
+        &mut self,
+        kind: u8,
+        hit: NodeId,
+        input: MouseInput,
+    ) -> Result<bool, &'static str> {
         use deno_core::v8;
+        // A normal pointermove has no changed button even when CDP includes a
+        // button hint. Chord down/up phases also use kind 0, but retain the
+        // button that changed for their compatibility pointermove.
+        let button = if kind == 0 && matches!(input.phase, MouseInputPhase::Move) {
+            -1
+        } else {
+            input.button
+        };
         let nodes = self
             .with_dom(|dom| {
                 let mut nodes = vec![hit];
@@ -2819,7 +3104,6 @@ impl ObscuraJsRuntime {
             return Err("INPUT_PATH_LIMIT");
         }
         let function = self.native_mouse.clone().ok_or("INPUT_UNAVAILABLE")?;
-        let buttons = self.mouse_buttons;
         self.begin_javascript_task();
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
@@ -2841,9 +3125,13 @@ impl ObscuraJsRuntime {
         let arguments = [
             v8::Integer::new_from_unsigned(scope, kind as u32).into(),
             path.into(),
-            v8::Number::new(scope, x as f64).into(),
-            v8::Number::new(scope, y as f64).into(),
-            v8::Integer::new_from_unsigned(scope, buttons as u32).into(),
+            v8::Number::new(scope, input.x as f64).into(),
+            v8::Number::new(scope, input.y as f64).into(),
+            v8::Integer::new(scope, button as i32).into(),
+            v8::Integer::new_from_unsigned(scope, input.buttons as u32).into(),
+            v8::Integer::new_from_unsigned(scope, input.click_count).into(),
+            v8::Integer::new_from_unsigned(scope, input.modifiers as u32).into(),
+            v8::Number::new(scope, input.force as f64).into(),
         ];
         let receiver = v8::undefined(scope).into();
         let result = function
@@ -2869,6 +3157,15 @@ impl ObscuraJsRuntime {
 
     #[cfg(feature = "render")]
     fn native_focus_node(&mut self, node: Option<NodeId>) -> Result<bool, &'static str> {
+        self.native_focus_node_with_epoch(node, None)
+    }
+
+    #[cfg(feature = "render")]
+    fn native_focus_node_with_epoch(
+        &mut self,
+        node: Option<NodeId>,
+        input_document_epoch: Option<u64>,
+    ) -> Result<bool, &'static str> {
         use deno_core::v8;
         let function = self.native_focus.clone().ok_or("INPUT_UNAVAILABLE")?;
         self.begin_javascript_task();
@@ -2881,15 +3178,25 @@ impl ObscuraJsRuntime {
             let scope = &mut v8::TryCatch::new(scope);
             let function = v8::Local::new(scope, function);
             let node = v8::Integer::new(scope, node.map(|id| id.raw() as i32).unwrap_or(-1)).into();
+            let epoch = v8::Number::new(
+                scope,
+                input_document_epoch.map_or(-1.0, |epoch| epoch as f64),
+            )
+            .into();
             let receiver = v8::undefined(scope).into();
             let result = function
-                .call(scope, receiver, &[node])
+                .call(scope, receiver, &[node, epoch])
                 .ok_or("INPUT_DISPATCH_FAILED")?;
             if !result.is_boolean() {
                 return Err("INPUT_DISPATCH_FAILED");
             }
             result.boolean_value(scope)
         };
+        if input_document_epoch.is_some_and(|epoch| {
+            self.state.borrow().input_document_epoch.get() != epoch
+        }) {
+            return Ok(false);
+        }
         Ok(applied
             && self
                 .with_dom(|dom| dom.input_state().focused == node)
@@ -3058,17 +3365,37 @@ impl ObscuraJsRuntime {
 
     #[cfg(feature = "render")]
     fn native_input_checkpoint(&mut self) -> Result<(), &'static str> {
+        self.native_input_checkpoint_with_epoch(None)
+    }
+
+    #[cfg(feature = "render")]
+    fn native_input_checkpoint_with_epoch(
+        &mut self,
+        input_document_epoch: Option<u64>,
+    ) -> Result<(), &'static str> {
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         if self.runtime().v8_isolate().is_execution_terminating() {
             return Err("INPUT_DISPATCH_FAILED");
         }
-        self.native_focus_fixup()?;
+        if input_document_epoch.is_some_and(|epoch| {
+            self.state.borrow().input_document_epoch.get() != epoch
+        }) {
+            return Ok(());
+        }
+        self.native_focus_fixup_with_epoch(input_document_epoch)?;
         Ok(())
     }
 
     /// One fixup per rendering/input opportunity. A handler's newly invalid
     /// focus belongs to the next opportunity, avoiding a synchronous loop.
     fn native_focus_fixup(&mut self) -> Result<bool, &'static str> {
+        self.native_focus_fixup_with_epoch(None)
+    }
+
+    fn native_focus_fixup_with_epoch(
+        &mut self,
+        input_document_epoch: Option<u64>,
+    ) -> Result<bool, &'static str> {
         #[cfg(feature = "render")]
         {
             let invalid = {
@@ -3077,7 +3404,7 @@ impl ObscuraJsRuntime {
                 focused.is_some_and(|id| !input_focusable(&mut state, id))
             };
             if invalid {
-                self.native_focus_node(None)?;
+                self.native_focus_node_with_epoch(None, input_document_epoch)?;
                 self.runtime().v8_isolate().perform_microtask_checkpoint();
                 if self.runtime().v8_isolate().is_execution_terminating() {
                     return Err("INPUT_DISPATCH_FAILED");
@@ -3289,6 +3616,109 @@ impl ObscuraJsRuntime {
         Ok(())
     }
 
+    /// Resolve only defaults the kernel understands. Raw event delivery must
+    /// not be rejected merely because an element has an unsupported default.
+    #[cfg(feature = "render")]
+    fn mouse_input_click_activation(&self, hit: NodeId) -> ClickActivation {
+        self.with_dom(|dom| {
+            for id in std::iter::once(hit).chain(dom.ancestors(hit)) {
+                if dom.is_inert(id) {
+                    return ClickActivation::None;
+                }
+                match Self::direct_click_activation(dom, id) {
+                    Ok(Some(activation)) => {
+                        return if dom.is_disabled(id) {
+                            ClickActivation::None
+                        } else {
+                            activation
+                        };
+                    }
+                    Err(_) => return ClickActivation::None,
+                    Ok(None) => {}
+                }
+                if dom.is_html_element(id, "label") {
+                    let control = dom
+                        .labeled_control(id)
+                        .filter(|control| !dom.is_disabled(*control) && !dom.is_inert(*control));
+                    return ClickActivation::Label(id, control);
+                }
+            }
+            ClickActivation::None
+        })
+        .unwrap_or(ClickActivation::None)
+    }
+
+    #[cfg(feature = "render")]
+    fn mouse_input_target_enabled(&self, hit: NodeId) -> bool {
+        self.with_dom(|dom| {
+            dom.is_connected(hit)
+                && !dom.is_inert(hit)
+                && !std::iter::once(hit).chain(dom.ancestors(hit)).any(|id| {
+                    dom.is_disabled(id)
+                        && ["input", "button", "select", "textarea"]
+                            .iter()
+                            .any(|tag| dom.is_html_element(id, tag))
+                })
+        })
+        .unwrap_or(false)
+    }
+
+    #[cfg(feature = "render")]
+    fn activate_mouse_input_click(
+        &mut self,
+        hit: NodeId,
+        input: MouseInput,
+    ) -> Result<(), &'static str> {
+        let document_epoch = self.state.borrow().input_document_epoch.get();
+        let activation = self.mouse_input_click_activation(hit);
+        let allowed = match self.activate_native_click_with_input(
+            hit,
+            activation,
+            input.x,
+            input.y,
+            Some(input),
+        ) {
+            Ok(allowed) => allowed,
+            Err(error @ ("INPUT_DISPATCH_FAILED" | "INPUT_PATH_LIMIT" | "NO_DOCUMENT")) => {
+                return Err(error)
+            }
+            // Handler-driven target/default changes are ordinary raw input.
+            // The event has already been delivered; an unsupported default is
+            // simply not performed.
+            Err(
+                "INPUT_ELEMENT_UNSUPPORTED"
+                | "INPUT_TARGET_CHANGED"
+                | "ELEMENT_DISABLED"
+                | "UNEXPECTED_NAVIGATION",
+            ) => false,
+            Err(error) => return Err(error),
+        };
+        if self.state.borrow().input_document_epoch.get() != document_epoch {
+            return Ok(());
+        }
+        if input.click_count == 2 {
+            self.native_mouse_at_input(7, hit, input)?;
+            self.native_input_checkpoint_with_epoch(Some(document_epoch))?;
+            if self.state.borrow().input_document_epoch.get() != document_epoch {
+                return Ok(());
+            }
+        }
+        if allowed && input.click_count >= 3 {
+            let mut state = self.state.borrow_mut();
+            let selected = state.dom.as_ref().is_some_and(|dom| {
+                dom.text_control(hit).is_some_and(|text| {
+                    let end = text.value.encode_utf16().count().min(u32::MAX as usize) as u32;
+                    dom.set_text_selection(hit, 0, end, "none");
+                    true
+                })
+            });
+            if selected {
+                invalidate_input_render(&mut state);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "render")]
     fn activate_native_click(
         &mut self,
@@ -3297,6 +3727,19 @@ impl ObscuraJsRuntime {
         x: f32,
         y: f32,
     ) -> Result<bool, &'static str> {
+        self.activate_native_click_with_input(hit, activation, x, y, None)
+    }
+
+    #[cfg(feature = "render")]
+    fn activate_native_click_with_input(
+        &mut self,
+        hit: NodeId,
+        activation: ClickActivation,
+        x: f32,
+        y: f32,
+        input: Option<MouseInput>,
+    ) -> Result<bool, &'static str> {
+        let input_document_epoch = input.map(|_| self.state.borrow().input_document_epoch.get());
         let original = if let ClickActivation::Check(node) = activation {
             let mut state = self.state.borrow_mut();
             let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
@@ -3316,7 +3759,15 @@ impl ObscuraJsRuntime {
         } else {
             None
         };
-        let allowed = self.native_mouse_at(3, hit, x, y)?;
+        let allowed = match input {
+            Some(input) => self.native_mouse_at_input(3, hit, input)?,
+            None => self.native_mouse_at(3, hit, x, y)?,
+        };
+        if input_document_epoch.is_some_and(|epoch| {
+            self.state.borrow().input_document_epoch.get() != epoch
+        }) {
+            return Ok(allowed);
+        }
         if let Some((node, old, previous)) = original {
             if !allowed {
                 let mut state = self.state.borrow_mut();
@@ -3357,7 +3808,17 @@ impl ObscuraJsRuntime {
                     .ok_or("NO_DOCUMENT")??;
                 if send_change {
                     self.native_text_event(5, node, "")?;
+                    if input_document_epoch.is_some_and(|epoch| {
+                        self.state.borrow().input_document_epoch.get() != epoch
+                    }) {
+                        return Ok(allowed);
+                    }
                     self.native_text_event(6, node, "")?;
+                    if input_document_epoch.is_some_and(|epoch| {
+                        self.state.borrow().input_document_epoch.get() != epoch
+                    }) {
+                        return Ok(allowed);
+                    }
                 }
             }
         } else if allowed {
@@ -3375,10 +3836,10 @@ impl ObscuraJsRuntime {
                         .with_dom(|dom| !dom.is_disabled(control) && !dom.is_inert(control))
                         .unwrap_or(false);
                     if enabled {
-                        if Some(control) != original_control {
+                        if input.is_none() && Some(control) != original_control {
                             return Err("INPUT_TARGET_CHANGED");
                         }
-                        self.forward_native_label(label, control, x, y)?;
+                        self.forward_native_label(label, control, x, y, input)?;
                     }
                 }
             } else if self.with_dom(|dom| dom.is_connected(hit)).unwrap_or(false) {
@@ -3397,7 +3858,7 @@ impl ObscuraJsRuntime {
                         }).flatten().unwrap_or(false);
                         if same_document_fragment {
                             self.navigate_native_fragment(&url)?;
-                            self.native_input_checkpoint()?;
+                            self.native_input_checkpoint_with_epoch(input_document_epoch)?;
                             return Ok(allowed);
                         }
                         let mut state = self.state.borrow_mut();
@@ -3413,7 +3874,7 @@ impl ObscuraJsRuntime {
                         });
                         state.same_document_navigation = false;
                     }
-                    self.native_input_checkpoint()?;
+                    self.native_input_checkpoint_with_epoch(input_document_epoch)?;
                     return Ok(allowed);
                 }
                 if let ClickActivation::Submit(button, form) = activation {
@@ -3422,9 +3883,9 @@ impl ObscuraJsRuntime {
                     if enabled {
                         if self.click_activation(hit)? != activation { return Err("INPUT_TARGET_CHANGED"); }
                         if self.has_pending_navigation() { return Err("UNEXPECTED_NAVIGATION"); }
-                        self.submit_native_form(form, button)?;
+                        self.submit_native_form(form, button, input_document_epoch)?;
                     }
-                    self.native_input_checkpoint()?;
+                    self.native_input_checkpoint_with_epoch(input_document_epoch)?;
                     return Ok(allowed);
                 }
                 // Disabling a plain button is a normal click-handler update,
@@ -3433,18 +3894,23 @@ impl ObscuraJsRuntime {
                     if self.click_activation_state(hit, false)? != activation {
                         return Err("INPUT_TARGET_CHANGED");
                     }
-                    self.native_input_checkpoint()?;
+                    self.native_input_checkpoint_with_epoch(input_document_epoch)?;
                     return Ok(allowed);
                 }
                 if self.click_activation(hit)? != activation {
                     return Err("INPUT_TARGET_CHANGED");
                 }
                 if let ClickActivation::Reset(_, form) = activation {
-                    self.reset_native_form(form)?;
+                    self.reset_native_form(form, input_document_epoch)?;
                 }
             }
         }
-        self.native_input_checkpoint()?;
+        self.native_input_checkpoint_with_epoch(input_document_epoch)?;
+        if input_document_epoch.is_some_and(|epoch| {
+            self.state.borrow().input_document_epoch.get() != epoch
+        }) {
+            return Ok(allowed);
+        }
         Ok(allowed)
     }
 
@@ -3475,7 +3941,12 @@ impl ObscuraJsRuntime {
     }
 
     #[cfg(feature = "render")]
-    fn submit_native_form(&mut self, form: NodeId, button: NodeId) -> Result<(), &'static str> {
+    fn submit_native_form(
+        &mut self,
+        form: NodeId,
+        button: NodeId,
+        input_document_epoch: Option<u64>,
+    ) -> Result<(), &'static str> {
         use deno_core::v8;
         let function = self.native_submit.clone().ok_or("INPUT_UNAVAILABLE")?;
         self.begin_javascript_task();
@@ -3489,6 +3960,11 @@ impl ObscuraJsRuntime {
         let arguments = [
             v8::Integer::new_from_unsigned(scope, form.raw()).into(),
             v8::Integer::new_from_unsigned(scope, button.raw()).into(),
+            v8::Number::new(
+                scope,
+                input_document_epoch.map_or(-1.0, |epoch| epoch as f64),
+            )
+            .into(),
         ];
         let receiver = v8::undefined(scope).into();
         let result = function
@@ -3511,7 +3987,11 @@ impl ObscuraJsRuntime {
     }
 
     #[cfg(feature = "render")]
-    fn reset_native_form(&mut self, form: NodeId) -> Result<(), &'static str> {
+    fn reset_native_form(
+        &mut self,
+        form: NodeId,
+        input_document_epoch: Option<u64>,
+    ) -> Result<(), &'static str> {
         if !self
             .with_dom(|dom| dom.begin_form_reset(form))
             .flatten()
@@ -3521,6 +4001,11 @@ impl ObscuraJsRuntime {
         }
         let result = (|| {
             if self.native_text_event(7, form, "")? {
+                if input_document_epoch.is_some_and(|epoch| {
+                    self.state.borrow().input_document_epoch.get() != epoch
+                }) {
+                    return Ok(());
+                }
                 let mut state = self.state.borrow_mut();
                 if !state
                     .dom
@@ -3534,7 +4019,11 @@ impl ObscuraJsRuntime {
             }
             Ok(())
         })();
-        self.with_dom(|dom| dom.end_form_reset(form));
+        if input_document_epoch.is_none_or(|epoch| {
+            self.state.borrow().input_document_epoch.get() == epoch
+        }) {
+            self.with_dom(|dom| dom.end_form_reset(form));
+        }
         result
     }
 
@@ -3545,7 +4034,9 @@ impl ObscuraJsRuntime {
         control: NodeId,
         x: f32,
         y: f32,
+        input: Option<MouseInput>,
     ) -> Result<(), &'static str> {
+        let input_document_epoch = input.map(|_| self.state.borrow().input_document_epoch.get());
         if !self
             .with_dom(|dom| dom.begin_label_forwarding(label))
             .ok_or("NO_DOCUMENT")?
@@ -3553,12 +4044,21 @@ impl ObscuraJsRuntime {
             return Ok(());
         }
         let result = (|| {
-            let forwarded = self
+            let forwarded = match self
                 .with_dom(|dom| Self::direct_click_activation(dom, control))
-                .ok_or("NO_DOCUMENT")??
-                .unwrap_or(ClickActivation::None);
-            self.native_focus_node(Some(control))?;
-            self.native_input_checkpoint()?;
+                .ok_or("NO_DOCUMENT")?
+            {
+                Ok(activation) => activation.unwrap_or(ClickActivation::None),
+                Err(_) if input.is_some() => ClickActivation::None,
+                Err(error) => return Err(error),
+            };
+            self.native_focus_node_with_epoch(Some(control), input_document_epoch)?;
+            self.native_input_checkpoint_with_epoch(input_document_epoch)?;
+            if input_document_epoch.is_some_and(|epoch| {
+                self.state.borrow().input_document_epoch.get() != epoch
+            }) {
+                return Ok(());
+            }
             if !self
                 .with_dom(|dom| {
                     dom.is_connected(label)
@@ -3582,10 +4082,14 @@ impl ObscuraJsRuntime {
             {
                 return Err("INPUT_TARGET_CHANGED");
             }
-            self.activate_native_click(control, forwarded, x, y)?;
+            self.activate_native_click_with_input(control, forwarded, x, y, input)?;
             Ok(())
         })();
-        self.with_dom(|dom| dom.end_label_forwarding(label));
+        if input_document_epoch.is_none_or(|epoch| {
+            self.state.borrow().input_document_epoch.get() == epoch
+        }) {
+            self.with_dom(|dom| dom.end_label_forwarding(label));
+        }
         result
     }
 

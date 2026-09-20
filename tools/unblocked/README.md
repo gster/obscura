@@ -161,8 +161,13 @@ timeout and explicit page close before dispatch. A completed click must produce
 exactly one server effect even when a subsequent response wait times out.
 The watchdog case sets
 `OBSCURA_CDP_COMMAND_TIMEOUT_MS=2000` only for its browser, enters a synchronous
-infinite click handler, then requires JavaScript evaluation and a finite click
-to work on the original page and connection. This proves recovery with the
+infinite click handler through official `page.mouse.click`, requires the native
+`INPUT_DISPATCH_FAILED` error and exactly one handler entry, then requires
+JavaScript evaluation and a finite locator click to work on the original page
+and connection. Playwright 1.60 locator clicks retry this protocol error; using
+`locator.click(timeout=0)` would repeatedly enter the handler until the worker
+is killed. This gate proves one-shot input termination and recovery, not that
+locator actions never replay after a protocol failure. This proves recovery with the
 configured two-second budget, not the default timeout. The script case checks
 cross-origin classic scripts with default, anonymous, and credentialed modes,
 including denied CORS and document base URL resolution.
@@ -186,3 +191,37 @@ traces directly with:
 ```bash
 python3 tools/unblocked/cdp_trace.py left.json right.json
 ```
+
+## Native mouse qualification
+
+`native_mouse_smoke.py` drives the official Playwright mouse API through CDP.
+It uses six isolated offline pages: ordinary input, page overrides of public
+hit-test/event APIs, canceled mousedown, canceled checkbox click, canceled
+pointerdown, and triple-click text selection. It checks event order, trusted
+constructors, coordinates, button metadata, focus, cancellation and effects.
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+uv run --project tools/unblocked --frozen --python 3.12 \
+  python tools/unblocked/native_mouse_smoke.py \
+  --obscura-bin target/release/obscura \
+  --persona windows_chrome145 \
+  --with-chrome \
+  --output "$RUN_ROOT/native-mouse.json"
+```
+
+`--with-chrome` compares both engines against the Chromium bundled with the
+locked client. `--chrome-only` runs the reference alone. Without either flag,
+the runner checks Obscura against the recorded fixture contract. Each browser
+has a separate process and each worker has a 45-second deadline. Browser and
+worker stdout/stderr, including the complete Playwright protocol stream, stay
+in the output directory alongside fixture request/response wire bytes and HTML.
+Workers checkpoint completed cases so a later hard deadline preserves earlier
+observations. Failed comparisons retain the observations and failure details;
+missing observations and forced termination fail the gate.
+CI runs the Obscura fixture and uploads the complete evidence directory.
+
+This gate covers the listed mouse fixtures. Wheel, keyboard/text lifecycle,
+pen input, pointer capture, hover boundary events, multi-button gestures and
+user activation require their own qualification. Coordinate mouse input needs
+a render build; a no-render build reports that capability as unsupported.

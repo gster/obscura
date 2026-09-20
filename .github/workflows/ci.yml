@@ -204,6 +204,20 @@ jobs:
             tools/unblocked/automation-cdp-profile.json \
             "$smoke_root/combined-protocol.log"
 
+      - name: Run native mouse qualification
+        env:
+          DEBUG: pw:protocol
+        run: |
+          smoke_root="$RUNNER_TEMP/obscura-cdp-smoke"
+          mkdir -p "$smoke_root"
+          uv run --project tools/unblocked --frozen --python 3.12 \
+            python tools/unblocked/native_mouse_smoke.py \
+              --obscura-bin target/release/obscura \
+              --persona windows_chrome145 \
+              --output "$smoke_root/native-mouse.json" \
+              > "$smoke_root/native-mouse-stdout.json" \
+              2> "$smoke_root/native-mouse-driver.log"
+
       - name: Upload official client smoke evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -236,6 +236,42 @@
       "evidence": "Complete Playwright 1.60 get_by_role click response plus existing Rust geometry coverage."
     },
     {
+      "method": "DOM.describeNode",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "partial",
+      "params": "The observed official locator objectId shape is qualified; the handler also accepts nodeId or backendNodeId and an optional depth. Pierce semantics and other parameter combinations are not qualified.",
+      "result": "A serialized node record for the current document, including nodeId, backendNodeId, node type/name, attributes and the requested bounded child depth.",
+      "events": "None.",
+      "scope": "Page session current document and a node remote object or DOM identity.",
+      "errors": "Missing node identities and unresolvable objectIds fail; missing pages and unqualified depth/pierce combinations are not uniformly covered.",
+      "evidence": "Official Playwright 1.60 migration_lifecycle.py watchdog locator.bounding_box wire: DOM.describeNode objectId request and retained node response, plus the existing DOM handler and objectId regression tests."
+    },
+    {
+      "method": "DOM.resolveNode",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "partial",
+      "params": "The observed backendNodeId with executionContextId shape is qualified; the handler also accepts nodeId or objectId. Other execution-context and identity combinations are not qualified.",
+      "result": "A remote node object with type=object, subtype=node, className and objectId usable by the following locator geometry call.",
+      "events": "None.",
+      "scope": "Page session current document and its JS object store.",
+      "errors": "Missing node identities, unresolvable objectIds and missing JS runtime fail; arbitrary executionContextId semantics are not qualified.",
+      "evidence": "Official Playwright 1.60 migration_lifecycle.py watchdog locator.bounding_box wire: DOM.resolveNode backendNodeId/executionContextId request and retained node object response, plus existing DOM objectId regression tests."
+    },
+    {
+      "method": "DOM.getBoxModel",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "partial",
+      "params": "The observed official locator objectId shape is qualified; the handler also accepts nodeId or backendNodeId. Other box-model options and transformed-fragment geometry are not qualified.",
+      "result": "A model whose content, padding, border and margin quads are derived from the target bounding rectangle, with width and height in CSS pixels.",
+      "events": "None.",
+      "scope": "Page session current document and a node remote object or DOM identity.",
+      "errors": "Missing pages fail; an unresolvable identity returns null, and complete browser box-model/fragment geometry is not qualified.",
+      "evidence": "Official Playwright 1.60 migration_lifecycle.py watchdog locator.bounding_box wire: DOM.getBoxModel objectId request and retained model response, plus existing Rust geometry coverage."
+    },
+    {
       "method": "Input.insertText",
       "capability": "LIMITED",
       "implementation": "implemented",
@@ -252,12 +288,12 @@
       "capability": "LIMITED",
       "implementation": "implemented",
       "verification": "partial",
-      "params": "The observed Playwright mouseMoved, left mousePressed, and left mouseReleased shapes are qualified.",
-      "result": "Empty object after the implemented move, press, or release path.",
-      "events": "The observed press and release produce trusted mousedown, mouseup, and click events in order; complete focus and user-activation parity is not qualified.",
-      "scope": "Page session hit testing and current document.",
-      "errors": "Unknown event types and malformed option types are not yet rejected uniformly.",
-      "evidence": "Playwright 1.60 get_by_role click with retained event records plus Rust mouse-event parity tests."
+      "params": "Render builds qualify the observed Playwright mouseMoved, left mousePressed and mouseReleased shapes, including force 0.5 on press. Coordinates, button, buttons, modifiers, clickCount and force are validated; omitted button on press/release is a verified no-event success.",
+      "result": "Empty object after native phase delivery and pending-navigation processing. Mouse move is an actual dispatch, not an empty acknowledgement.",
+      "events": "The fixed fixtures qualify trusted pointermove/mousemove, pointerdown/mousedown, focus/focusin, pointerup/mouseup and click order, constructors, coordinates, button/detail/modifier and pressure fields. The triple-click fixture also qualifies its dblclick event and text selection. Canceled pointerdown, mousedown and checkbox click preserve their measured effects.",
+      "scope": "Page session and current document. Browser-owned hit testing, captured dispatch and press state survive page overrides; navigation and document.open invalidate the previous input epoch. Wheel, pen, pointer capture, hover boundary events, multi-button gestures and user activation are not qualified by this slice.",
+      "errors": "Malformed move/press/release parameters return -32602. Missing target sessions, no-render coordinate input, pen and nonzero tangential pressure/tilt/twist return errors; unsupported native capabilities use -32000. The legacy wheel branch still has separate, incomplete validation.",
+      "evidence": "Playwright 1.60 native_mouse_smoke.py: six offline fixtures compared with Chromium 148.0.7778.96 on macOS arm64, with full protocol and fixture wire captures. Rust mouse/default-action, document epoch and frame-navigation regressions cover the shared Page path."
     },
     {
       "method": "Network.enable",

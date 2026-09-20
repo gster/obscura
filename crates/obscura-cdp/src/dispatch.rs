@@ -912,7 +912,13 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),
         Err(msg) => {
             tracing::warn!("CDP error for {}: {}", req.method, msg);
-            let code = if req.method == "Fetch.continueRequest" { -32602 } else { -32601 };
+            let code = if req.method == "Fetch.continueRequest" {
+                -32602
+            } else if req.method == "Input.dispatchMouseEvent" {
+                if msg.starts_with("Invalid ") { -32602 } else { -32000 }
+            } else {
+                -32601
+            };
             CdpResponse::error(req.id, code, msg, req.session_id.clone())
         }
     }

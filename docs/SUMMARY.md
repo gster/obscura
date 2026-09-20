@@ -1,5 +1,15 @@
 # 项目现状与文档核验摘要
 
+OB-021 原生鼠标输入切片（2026-09-20，实施基线 `d4ec563`，macOS arm64）：CDP move/press/release 通过 typed `Page::dispatch_mouse_input` 进入共享 runtime，使用浏览器持有的 hit-test、受保护事件分发、焦点及默认动作。每个 document epoch 持有按压状态，导航和 `document.open` 使旧状态失效；move、取消事件、checkbox 默认动作回滚、修饰键、pressure、双击及三击选择均有专项证据。移除该 CDP 分支的页面 JS 拼接与全局按压变量。wheel、keyboard/text、pointer capture、hover boundary、多按钮完整手势和 user activation 尚未资格化，OB-021 保持未关闭。
+
+本切片验证：根 release/render nextest **2142/2142**（4 skipped），最终鼠标/默认动作/frame 定向 **41/41**；no-render 参数、显式 unsupported 和 frame 定向 **3/3**；两种 exact CLI release build 通过。render SHA-256 为 `10bbf6fcc650eb70712973eacfe8024c7b89e4dcaed80ae3d9d2db0d63bced9e`，no-render 为 `5f4fc5de6f8d216ad758cc5ce78d53d1c7b27f5516b7b3d7572f4991f759016a`。固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`、显式 Persona 的障碍课 **33/33**（含 observer-intersection）；同一冻结 render 产物通过官方 Playwright smoke、六组 native mouse 与 Chrome 对照，以及三项迁移门禁。Python 工具测试 **45/45**。新增三项现有 DOM 方法的有界画像，合并官方/迁移/native mouse 原始协议的 **40-method** 校验通过；新增方法仍为 LIMITED/partial。
+
+watchdog 门禁现在要求官方 `page.mouse.click` 单次发送在显式 2000ms 预算后报告 `INPUT_DISPATCH_FAILED`，无限处理器严格进入一次，再在原 page/连接完成求值和有限 locator 点击。实测错误返回约 2013ms。原 `locator.click(timeout=0)` 在原生错误变得可见后不断重试，45 秒硬杀结果保留为失败；没有恢复吞错成功。独立有限 locator 探针也确认：5000ms action timeout 后报 TimeoutError，处理器已经进入三次，底层三个输入错误和三次 watchdog 均保留；随后原页有限点击恢复。这证明此类已部分执行的 locator 动作不保证 at-most-once，不能把先前“dispatch 前 timeout 无迟到副作用”的证明扩大到原生错误后的重试。
+
+初轮 no-render frame 测试的新增 DOM.click 备用路径暴露 Runtime 求值后的导航处理会生成新 loaderId，与 Input 同文档路径不同；该备用路径并非坐标输入证明，最终仅将真实鼠标路由部分限定于 render，no-render 保留初始、主导航和子 frame 合约检查，并独立断言坐标输入 unsupported。Runtime 路径的 loaderId 差异未在本切片修复。此前首轮编译借用错误、JS 数值比较测试失败、force 0.5 初次拒绝和 MouseEvent pressure 泄露的诊断结果均保留，最终修复后的候选通过上述门禁。
+
+本机完整证据索引为 `/tmp/ob021-evidence.json`；六组对照、官方和迁移结果位于 `/tmp/ob021-smoke/`，有限 locator 重试负面证据为 `/tmp/ob021-locator-retry-ZU0SGS/evidence-summary.json`。原始 stdout/stderr、协议、fixture 请求响应字节完整保留，不脱敏、不裁剪；这些执行机临时产物不入 Git，保留期限由执行方管理。当前 worktree 保留，本切片没有新增临时 worktree。
+
 OB-006 已于 2026-09-20 完成：删除提交 `be486cc4fc392f4bdcf536683ddd9ee7de795bf3` 已推送远端 main，并快进本地 main；远端实查 SHA 一致，两处工作区 clean 后更新任务状态。独立 Spec/Standards 审核无未解决阻断项。当前 `ob-027-cdp-profile/obscura` worktree 保留，本批未新增临时 worktree；未清理其他任务的 worktree。
 
 OB-006 私有 SDK/runtime 删除（2026-09-20，实施基线 `ca40d0b`，macOS arm64）：删除配套 NDJSON workspace、自有 Python SDK 和专属 `examples/zg`，共移除 27 个旧路径、8350 行旧文件内容。根九个 crate 及 V8/JS runtime、Web Worker、MCP、CLI 和不可变 Persona 运行逻辑保留。旧 `runtime/build.rs` 的字体成员、嵌入声明、字节数与 SHA-256 构建门禁迁入 `obscura-render/build.rs`，对应 build dependencies 沿用既有版本，根锁文件仅记录新增依赖边。字体和渲染运行逻辑没有改动。此前迁出的 183 个共享 Rust 回归保留；原 runtime 剩余两个仅服务私有包装的测试随包装删除。实际移除文件如下，较早切片中的原路径和测试数字继续作为历史证据保留。

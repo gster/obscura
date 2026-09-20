@@ -521,9 +521,22 @@ async def _run_click_watchdog(
     original_page_url = page.url
     _stage(observations, "watchdog-page-loaded", url=original_page_url)
 
+    box = await page.locator("#infinite").bounding_box()
+    if box is None or box["width"] <= 0 or box["height"] <= 0:
+        raise AssertionError(f"infinite-handler target has no input geometry: {box!r}")
+    observations["watchdogInput"] = {
+        "api": "page.mouse.click",
+        "x": box["x"] + box["width"] / 2,
+        "y": box["y"] + box["height"] / 2,
+        "boundingBox": box,
+    }
     click_started = time.monotonic()
     try:
-        await page.locator("#infinite").click(timeout=0)
+        # Locator actions retry protocol failures. Mouse sends this click once,
+        # letting the command watchdog's actual error reach the official client.
+        await page.mouse.click(
+            observations["watchdogInput"]["x"], observations["watchdogInput"]["y"]
+        )
     except Exception as error:
         observations["infiniteClick"] = {
             "returned": False,
@@ -535,6 +548,8 @@ async def _run_click_watchdog(
             "infinite-click-returned-error",
             error=observations["infiniteClick"]["error"],
         )
+        if "INPUT_DISPATCH_FAILED" not in str(error):
+            raise AssertionError("infinite click did not expose the native dispatch failure") from error
     else:
         observations["infiniteClick"] = {
             "returned": True,
@@ -542,6 +557,7 @@ async def _run_click_watchdog(
             "error": None,
         }
         _stage(observations, "infinite-click-returned")
+        raise AssertionError("infinite click silently succeeded instead of reporting termination")
 
     after_watchdog = await page.evaluate(
         """() => ({
@@ -600,8 +616,9 @@ async def run_case(case: str, endpoint: str, observations: dict[str, Any]) -> No
     """Run one migration acceptance case against an existing CDP endpoint.
 
     The caller owns the browser process and must enforce an external hard deadline.
-    ``click-watchdog`` intentionally disables Playwright's action timeout so the
-    browser command watchdog and the caller's process deadline provide the bounds.
+    ``click-watchdog`` uses the official one-shot mouse API so locator retries
+    cannot replay the infinite handler. The browser watchdog must return its
+    dispatch error before the caller's process deadline.
     """
 
     if case not in {"no-replay", "click-watchdog"}:

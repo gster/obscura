@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -439,6 +439,10 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    /// Input-local document identity. Unlike `document_generation`, this also
+    /// advances for `document.open()`, whose replacement reuses the same
+    /// document object and may reuse DOM node ids.
+    pub input_document_epoch: Cell<u64>,
     pub document_lifecycle: u8,
     /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
     /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
@@ -664,6 +668,7 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            input_document_epoch: Cell::new(0),
             document_lifecycle: 0,
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
@@ -3210,8 +3215,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // document.open() discards what the input stream holds and starts over.
         "document_write_reset" => {
             *gs.write_stream.borrow_mut() = None;
+            gs.input_document_epoch.set(gs.input_document_epoch.get().wrapping_add(1));
             "true".into()
         }
+        "input_document_epoch" => gs.input_document_epoch.get().to_string(),
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| match &mut n.data {

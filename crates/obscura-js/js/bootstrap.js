@@ -10745,7 +10745,7 @@ globalThis.DeviceOrientationEvent = class DeviceOrientationEvent extends Event {
   }
 };
 _markNative(DeviceOrientationEvent);
-globalThis.MouseEvent = class extends Event {
+globalThis.MouseEvent = class MouseEvent extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
@@ -10817,9 +10817,9 @@ class KeyboardEvent extends Event {
   }
 }
 globalThis.KeyboardEvent = KeyboardEvent;
-globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
+globalThis.FocusEvent = class FocusEvent extends Event { constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.relatedTarget=o.relatedTarget||null; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
-globalThis.PointerEvent = class extends MouseEvent {
+globalThis.PointerEvent = class PointerEvent extends MouseEvent {
   constructor(t,o={}) {
     super(t,o); this.pointerId=o.pointerId||0; this.pointerType=o.pointerType||"";
     this.isPrimary=!!o.isPrimary; this.width=o.width===undefined?1:o.width;
@@ -18817,7 +18817,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       stopImmediatePropagation() { state.stop = true; state.immediate = true; },
       composedPath() { return state.phase ? slice(path) : []; }};
     if (pointer) assign(values, {pointerId: 1, pointerType: 'mouse', isPrimary: true,
-      width: 1, height: 1, pressure: init.buttons ? 0.5 : 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0});
+      width: 1, height: 1, pressure: init.pressure, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0});
     for (const name of keys(values)) define(event, name, {value: values[name], enumerable: true, writable: false, configurable: false});
     define(event, 'defaultPrevented', {get: () => state.cancelled, configurable: false});
     define(event, 'currentTarget', {get: () => state.current, configurable: false});
@@ -18884,10 +18884,15 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _historyEvent = (type, init) => dispatch(type, [globalThis],
     {bubbles:false,cancelable:false,composed:false,...init},
     type === 'popstate' ? NativePopStateEvent : NativeHashChangeEvent);
-  function mouse(type, path, x, y, buttons, pointer) {
+  function mouse(type, path, x, y, button, buttons, clickCount, modifiers, force, pointer) {
+    const move = type.endsWith('move');
     const init = {bubbles: true, cancelable: true, composed: true, view: globalThis,
-      clientX: x, clientY: y, screenX: x, screenY: y, buttons, detail: type === 'click' ? 1 : 0,
-      button: pointer && type.endsWith('move') ? -1 : 0};
+      clientX: x, clientY: y, screenX: x, screenY: y, buttons,
+      detail: move || type.startsWith('pointer') ? 0 : clickCount,
+      button: move ? (pointer ? button : 0) : button,
+      altKey: !!(modifiers & 1), ctrlKey: !!(modifiers & 2),
+      metaKey: !!(modifiers & 4), shiftKey: !!(modifiers & 8)};
+    if (pointer) init.pressure = force;
     return dispatch(type, path, init, pointer ? NativePointerEvent : NativeMouseEvent, pointer);
   }
   function pathFor(node) {
@@ -18897,7 +18902,10 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     if (nodes.length && _domParse('node_type',nodes[nodes.length-1]) === 9) path.push(globalThis);
     return path;
   }
-  function focus(node) {
+  function inputEpochMatches(inputEpoch) {
+    return inputEpoch < 0 || _domParse('input_document_epoch') === inputEpoch;
+  }
+  function focus(node, inputEpoch = -1) {
     if (node !== -1 && !_domParse('focusable', node)) return false;
     const initial = _domParse('focus_state');
     if (!initial) return false;
@@ -18914,11 +18922,14 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       generation = cleared[2];
       if (_domParse('text_take_change', old)) {
         textEvent(6, oldPath, '');
+        if (!inputEpochMatches(inputEpoch)) return false;
         if (_domParse('focus_state')?.[1] !== generation) return false;
       }
       for (const type of ['blur', 'focusout']) {
         dispatch(type, oldPath, {bubbles: type === 'focusout', cancelable: false,
-          composed: true, relatedTarget: node === -1 ? null : _wrap(node)}, NativeFocusEvent);
+          composed: true, view: globalThis, detail: 0,
+          relatedTarget: node === -1 ? null : _wrap(node)}, NativeFocusEvent);
+        if (!inputEpochMatches(inputEpoch)) return false;
         if (_domParse('focus_state')?.[1] !== generation) return false;
       }
     }
@@ -18928,7 +18939,9 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     generation = changed[2];
     for (const type of ['focus', 'focusin']) {
       dispatch(type, pathFor(node), {bubbles: type === 'focusin', cancelable: false,
-        composed: true, relatedTarget: old === -1 ? null : _wrap(old)}, NativeFocusEvent);
+        composed: true, view: globalThis, detail: 0,
+        relatedTarget: old === -1 ? null : _wrap(old)}, NativeFocusEvent);
+      if (!inputEpochMatches(inputEpoch)) return false;
       if (_domParse('focus_state')?.[1] !== generation) return false;
     }
     return true;
@@ -19183,7 +19196,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     get formData(){return this.#formData}
   };
   globalThis.FormDataEvent=NativeFormDataEvent;
-  function constructEntries(node,submitter) {
+  function constructEntries(node,submitter,inputEpoch = -1) {
     const entries=_domParse('form_entries_begin',node,submitter);
     if (entries === null) throw new ResetError('FORM_ENTRIES_REENTRY','InvalidStateError');
     if (entries.error) {
@@ -19198,16 +19211,21 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       for(let i=0;i<entries.length;i++) addEntry(list,[dataString(entries[i][0]),dataString(entries[i][1]),null]);
       set(formDataStore,data,list);
       dispatch('formdata',pathFor(node),{bubbles:true,cancelable:false,composed:false,formData:data},NativeFormDataEvent);
+      if (!inputEpochMatches(inputEpoch)) return null;
       return copyEntries(list);
-    } finally { _dom('form_entries_end',node); }
+    } finally {
+      if (inputEpochMatches(inputEpoch)) _dom('form_entries_end',node);
+    }
   }
   _isFormData = value => !!get(formDataStore,value);
   _formDataSnapshot = data => copyEntries(dataList(data));
 
   // Captured before page scripts; the form cannot replace the shared data path.
-  _navigateForm = (node, submitter) => {
+  _navigateForm = (node, submitter, inputEpoch = -1) => {
     if (!_domParse('is_connected',node) || _domParse('form_entries_active',node)) return;
-    const entries=constructEntries(node,submitter), pairs=[];
+    const entries=constructEntries(node,submitter,inputEpoch);
+    if (entries === null) return;
+    const pairs=[];
     for(let i=0;i<entries.length;i++) {
       const entry=entries[i], pair=[entry[0],typeof entry[1]==='string'?entry[1]:entry[2]];
       setPrototype(pair,null);addEntry(pairs,pair);
@@ -19219,7 +19237,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       result?.error || 'FORM_INVALID', 'NotSupportedError');
   };
   const navigateForm = Element.prototype._navigateSubmit;
-  _requestSubmitForm = function(node, submitter) {
+  _requestSubmitForm = function(node, submitter, inputEpoch = -1) {
     const started = _domParse('form_submit_begin',node,submitter);
     if (started.error === 'FORM_SUBMITTER_OWNER') throw new ResetError(started.error,'NotFoundError');
     if (started.error) throw new ResetTypeError(started.error);
@@ -19227,15 +19245,23 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     let allowed;
     try {
       if (!_domParse('form_no_validate',node,submitter) && !validate(node,true)) return;
+      if (!inputEpochMatches(inputEpoch)) return;
       allowed = textEvent(16,pathFor(node),_domString(submitter));
     }
-    finally { _dom('form_submit_end',node); }
+    finally {
+      if (inputEpochMatches(inputEpoch)) _dom('form_submit_end',node);
+    }
+    if (!inputEpochMatches(inputEpoch)) return;
     if (allowed && _domParse('is_connected',node)) {
-      apply(navigateForm,_wrap(node),[submitter === '' ? null : _wrap(NativeNumber(submitter))]);
+      if (inputEpoch < 0) {
+        apply(navigateForm,_wrap(node),[submitter === '' ? null : _wrap(NativeNumber(submitter))]);
+      } else {
+        _navigateForm(node,submitter,inputEpoch);
+      }
     }
   };
-  define(globalThis,'__obscura_native_submit_handoff',{configurable:true,value(form,button) {
-    try { _requestSubmitForm(form,_domString(button));return null; }
+  define(globalThis,'__obscura_native_submit_handoff',{configurable:true,value(form,button,inputEpoch) {
+    try { _requestSubmitForm(form,_domString(button),inputEpoch);return null; }
     catch(error) { return error?.message || 'INPUT_DISPATCH_FAILED'; }
   }});
   const nativeSelectValue = Object.getOwnPropertyDescriptor(Element.prototype, 'value').set;
@@ -19249,15 +19275,17 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }
     return textEvent(kind,path,value);
   }});
-  define(globalThis, '__obscura_native_mouse_handoff', {configurable: true, value(kind, nodes, x, y, buttons) {
+  define(globalThis, '__obscura_native_mouse_handoff', {configurable: true, value(kind, nodes, x, y, button, buttons, clickCount, modifiers, force) {
     const path = [];
     for (const id of nodes) path.push(_wrap(id));
     path.push(globalThis);
-    if (kind === 3) return mouse('click', path, x, y, buttons, true);
+    if (kind === 3) return mouse('click', path, x, y, button, buttons, clickCount, modifiers, force, true);
+    if (kind === 7) return mouse('dblclick', path, x, y, button, buttons, clickCount, modifiers, force, false);
     const pointer = kind < 3;
     const phase = pointer ? kind : kind - 4;
     const suffix = phase === 0 ? 'move' : phase === 1 ? 'down' : 'up';
-    return mouse((pointer ? 'pointer' : 'mouse') + suffix, path, x, y, buttons, pointer);
+    return mouse((pointer ? 'pointer' : 'mouse') + suffix, path, x, y,
+      button, buttons, clickCount, modifiers, force, pointer);
   }});
 })();
 

@@ -131,15 +131,6 @@ async fn request_submit_is_vetoed_by_prevent_default_listener() {
     )
     .await;
 
-    cdp(
-        &mut ctx,
-        4,
-        "Input.dispatchMouseEvent",
-        json!({"type": "mouseReleased", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
-        session_id,
-    )
-    .await;
-
     let page = ctx.get_page_mut(&page_id).unwrap();
     assert_ne!(
         page.url.as_ref().unwrap().path(),
@@ -152,7 +143,8 @@ async fn request_submit_is_vetoed_by_prevent_default_listener() {
 // cancelable `submit` event must fire and a preventDefault() listener must be
 // able to veto navigation. Before the input.rs fix this path called
 // `form.submit()` directly, bypassing the listener. Regression test for the
-// CDP automation surface (Puppeteer/Playwright elementHandle.click()).
+// CDP automation surface used by official Playwright Python.
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -164,25 +156,30 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
 
     navigate(&mut ctx, &url, session_id).await;
 
-    // Point the CDP click resolver at the submit button explicitly so the test
-    // does not depend on layout coordinates.
     cdp(
         &mut ctx,
         2,
         "Runtime.evaluate",
-        json!({"expression": "globalThis.__obscura_click_target = document.getElementById('b')"}),
+        json!({"expression": "(() => { const b = document.getElementById('b'); b.style.cssText = 'position:absolute;left:20px;top:20px;width:100px;height:40px'; globalThis.submitCount = 0; document.getElementById('f').addEventListener('submit', () => submitCount++); })()"}),
         session_id,
     )
     .await;
 
-    cdp(
-        &mut ctx,
-        3,
-        "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
-        session_id,
-    )
-    .await;
+    for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(
+            &mut ctx,
+            id,
+            "Input.dispatchMouseEvent",
+            json!({"type": phase, "x": 70.0, "y": 40.0, "button": "left", "clickCount": 1}),
+            session_id,
+        )
+        .await;
+    }
+    let count = cdp(
+        &mut ctx, 5, "Runtime.evaluate",
+        json!({"expression": "submitCount", "returnByValue": true}), session_id,
+    ).await;
+    assert_eq!(count["result"]["value"].as_f64(), Some(1.0), "release must actually attempt the cancelable submit");
 
     let page = ctx.get_page_mut(&page_id).unwrap();
     assert_ne!(
