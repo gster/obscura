@@ -11,9 +11,10 @@ package and binary.
   passed/failed/skipped/not-run results for OB-001.
   Its lockfile digests are resolved from the exact `source.revision` Git
   commit, so later working-tree changes do not rewrite historical evidence;
-  an unavailable revision or source lock blob is an error. Toolchain manifests,
-  CI pins, and release pins are current qualification inputs and are checked
-  from the working tree independently.
+  an unavailable revision or source lock blob is an error. The removed private
+  runtime's toolchain manifest is also checked from that historical commit.
+  The root toolchain manifest, CI pins, and release pins remain current
+  qualification inputs checked from the working tree independently.
 - `client-scope.json` records the official Playwright Python version, bundled
   driver and reference Chromium revision, connection boundary, and the
   required/deferred/unsupported API inventory for OB-025.
@@ -138,6 +139,43 @@ official client's complete raw driver protocol stream without normalization or
 field deletion. The `protocol-log` validator reads that untouched file and
 fails if the smoke's required inventory is truncated or any observed method is
 absent from the profile.
+
+## SDK removal behavior gates
+
+Run the remaining shared-behavior migration checks through the same pinned
+official client and a render binary:
+
+```bash
+OBSCURA_PERSONA=windows_chrome145 \
+  uv run --project tools/unblocked --frozen --python 3.12 \
+  python tools/unblocked/migration_smoke.py \
+    --obscura-bin target/release/obscura \
+    --output "$RUN_ROOT/migration.json"
+```
+
+Each case owns a separate browser and client worker. Cancelling a Python
+`asyncio.Task` cancels the local wait, not the remote action: the cancellation
+case makes that locator actionable afterwards and records its single eventual
+side effect without retrying it. Separate probes check an official action
+timeout and explicit page close before dispatch. A completed click must produce
+exactly one server effect even when a subsequent response wait times out.
+The watchdog case sets
+`OBSCURA_CDP_COMMAND_TIMEOUT_MS=2000` only for its browser, enters a synchronous
+infinite click handler, then requires JavaScript evaluation and a finite click
+to work on the original page and connection. This proves recovery with the
+configured two-second budget, not the default timeout. The script case checks
+cross-origin classic scripts with default, anonymous, and credentialed modes,
+including denied CORS and document base URL resolution.
+
+The parent enforces a 45-second worker deadline. A forced termination is always
+a failure and cannot count as watchdog recovery. Browser and worker stdout and
+stderr remain complete binary files, including the worker's `pw:protocol`
+stream. HTTP fixture records retain request headers and bodies, and each case
+records its assertions and errors in JSON. CI uploads the complete directory
+on success or failure and validates the combined regular-smoke and migration
+protocol inventory against the declared CDP profile.
+
+## Trace comparison
 
 Each successful mode writes one trace and `result.json` reports the first exact
 normalized divergence. Exit status is zero only when every selected mode runs

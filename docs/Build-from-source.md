@@ -4,7 +4,7 @@
 - C compiler (gcc or clang)
 - Sufficient disk and memory for Rust, V8 artifacts, native dependencies and linking; measure on the target host.
 
-The `v8` dependency normally downloads a prebuilt archive; `V8_FROM_SOURCE` selects its source build. Obscura itself generates a bootstrap snapshot during native builds. Build time depends on caches and platform, so there is no fixed five-minute guarantee. The root workspace and `runtime/` both pin Rust 1.98.1 in their own toolchain files.
+The `v8` dependency normally downloads a prebuilt archive; `V8_FROM_SOURCE` selects its source build. Obscura itself generates a bootstrap snapshot during native builds. Build time depends on caches and platform, so there is no fixed five-minute guarantee. The root workspace pins Rust 1.98.1 in `rust-toolchain.toml`.
 
 ## Build
 
@@ -15,8 +15,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura
 ```
 
 Binary is at `./target/release/obscura` unless `CARGO_TARGET_DIR` overrides it.
-This builds the CLI. The [isolated runtime](Use-the-isolated-runtime.md) has its
-own workspace, lockfile, and pinned toolchain in `runtime/`.
+This builds the CLI and the current product entry point.
 
 This produces the release binary with geometry, screenshots, screencasting,
 and PDF export.
@@ -65,7 +64,8 @@ cargo install --path crates/obscura-cli --features render
 cargo nextest run --release --features render --no-fail-fast
 ```
 
-The previously documented `tests/test_all.py` does not exist in this checkout. Use the tracked crate tests and the independent runtime tests described in [Testing and debugging](Testing-and-debugging.md).
+The previously documented `tests/test_all.py` does not exist in this checkout. Use the tracked crate tests and the official Playwright/CDP smoke described in [Testing and debugging](Testing-and-debugging.md).
 
-Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
-under the project's V8 test-isolation requirements; production pages can own separate isolates.
+Use `cargo nextest`, not `cargo test`: V8 tests require process isolation under
+the project's test-isolation requirements; production pages can own separate
+isolates.

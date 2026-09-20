@@ -1,16 +1,16 @@
 # Persona 必配、注入与一致性修复计划
 
-状态：已实施并通过最终门禁；提交前需满足独立审查无 blocker。本文既保留实施前审计，也记录 OB-005/014/015/016/031/044 的本次交付；平台资格和旧 Python SDK/private runtime 的删除仍以 [TODO](TODO.md) 为准。
+状态：已实施并通过最终门禁；提交前需满足独立审查无 blocker。本文既保留实施前审计，也记录 OB-005/014/015/016/031/044 的本次交付；旧 Python SDK/private runtime 已由 OB-006 清理，平台资格仍需单独验收。
 
 ## 0. 2026-09-20 实施结果
 
 本次以 `07c7b8cb27922d5bb5245a03fa056e8060e876fa` 为最终实施基线，完成以下收敛：
 
 - `obscura-net` 成为唯一权威 persona 模块。版本化 `PersonaSpec`、内置预设和外部 JSON 经同一流程编译为私有、不可变、带稳定摘要的 `EffectivePersona`。
-- CLI、CDP、MCP、Rust facade、scrape worker、页面、frame、Worker、module loader、网络和存续的独立 runtime 均显式消费同一 persona 快照；缺失配置不再选隐式默认身份。
+- CLI、CDP、MCP、Rust facade、scrape worker、页面、frame、Worker、module loader 和网络入口均显式消费同一 persona 快照；缺失配置不再选隐式默认身份。
 - BrowserContext 创建后不能逐字段修改身份；UA 和身份 header override 继续 fail closed。CDP 新 context 可继承启动快照，也可通过 `obscuraPersona` 注入新快照，并由 `Browser.getPersona` 读取摘要。
 - 进程级时区与 ICU 主语言在首个产品入口启动前冻结；同进程冲突组合在 context 注册或 V8 启动前拒绝。其他 persona 字段仍可按 context 隔离。
-- proxy、SSRF、cookie/storage 持久化和 tracker blocking 保持在会话或隐私策略中，不混入 persona。旧 runtime 复用共享协议，但 `bindings/python` 未新增功能，因为其产品方向是由 OB-006 删除。
+- proxy、SSRF、cookie/storage 持久化和 tracker blocking 保持在会话或隐私策略中，不混入 persona。旧 runtime/SDK 未新增功能，相关包装已按 OB-006 删除。
 - 本次只证明实现和本机回归，不把具名 profile、可解析配置或 DNT 字段写成跨平台、完整指纹、匿名性或价格公平资格。OB-014 及受控业务实验仍是独立工作。
 
 下文第 1 至 3 节是实施前基线审计，路径和行号不代表完成后的源码位置；第 4 至 7 节是本次采用的设计与验收边界。
@@ -58,7 +58,7 @@
 | 传输基线 | 根产品路径已迁移到强制 primp；旧 stealth feature 为兼容用途 | 保留现有成果，禁止恢复可选传输分支 |
 | persona 构造 | 有 `with_persona_profile`，其余便捷构造器仍隐式使用默认 profile | 所有可用 context 构造要求完整 persona |
 | 根产品入口 | CLI/CDP/MCP/Rust facade 未接入 persona 构造器 | 统一必填、解析、校验与传递 |
-| 独立 runtime | 已有独立 Persona 类型和生产调用，但构造后仍补写身份字段 | 迁入共享协议与校验；存续入口使用同一冻结快照 |
+| 独立 runtime（历史 C） | 已有独立 Persona 类型和生产调用，但构造后仍补写身份字段 | 历史迁移项；现行入口使用同一冻结快照 |
 | 旧 profile 表 | 根 crates 中 select_profile 无生产调用者 | 删除失效选择机制，不能重新作为第二个默认来源 |
 | 身份可变性 | UA/platform/language/WebGL 等字段公开可写 | 私有化 persona，移除重复可写字段 |
 | CDP 覆盖 | 已拒绝 UA 和部分身份头覆盖 | 保留保护，补全 context 创建、其他覆盖入口与诊断语义 |
@@ -76,9 +76,9 @@
 - `crates/obscura-cli/src/worker.rs:57`：scrape worker。
 - `crates/obscura-mcp/src/lib.rs:83`：MCP。
 - `crates/obscura/src/browser.rs:27,35`：Rust facade。
-- `runtime/src/browser.rs:6509`：独立 runtime 的 persona 生产调用。
+- `runtime/src/browser.rs:6509`：历史独立 runtime 的 persona 生产调用（已删除路径）。
 
-`with_persona_profile` 在 crates 与 runtime 中共有四个出现位置：context 构造器定义、context 测试、独立 runtime 测试和独立 runtime 生产调用。因此保留此前纠正：不能宣称“全仓零生产调用”。根产品入口未接入与独立 runtime 已部分接入是同时存在的现状。
+在历史 C 中，`with_persona_profile` 在 crates 与 runtime 中共有四个出现位置：context 构造器定义、context 测试、独立 runtime 测试和独立 runtime 生产调用。本段保留该历史事实；删除批次完成后，当前产品入口只以根 workspace 为准。
 
 其他缺口位置：
 
@@ -93,7 +93,7 @@
 
 重点是将现有 persona-owned transport 向上接成可注入协议，并让 context 必填、校验、冻结和投影形成完整契约。原来建议的“先合并旧本地 main”不再作为前置工作；reqwest 删除、强制 primp 和已落地 CDP 保护不重复实现。
 
-独立 runtime 在 C 中仍存在，因此必须处理它与共享协议的关系。其他分支已有的 runtime 删除、identity 集中定义或 response-stage 拦截工作可另行协调复用，但不因代码存在于别处，就将其当作当前基线已完成。若实施时这些工作先合入 main，再推进基线并缩减本 PR 范围。
+历史 C 中的独立 runtime 曾与共享协议并存，相关迁移边界已由 OB-006 完成。其他分支的 identity 集中定义或 response-stage 拦截工作仍需单独核对，不因历史代码或其他 worktree 存在就宣称当前产品已具备相应资格。
 
 ## 4. 目标设计
 
@@ -128,7 +128,7 @@
 
 核心构造接口必须要求 persona；无 persona 的 new、builder、Default 或便捷构造器不能创建可用浏览器 context。只移除枚举 Default 不够，旧接口中也不能改为硬编码常量。
 
-Context 私有持有不可变快照，各身份字段只读；初始化身份不通过公开 setter 补写。页面在首次脚本、preload 或请求之前获得完整投影。独立 JS runtime 同样要求有效身份，懒绑定 transport 只能消费已提供配置，不能重新选择。
+Context 私有持有不可变快照，各身份字段只读；初始化身份不通过公开 setter 补写。页面在首次脚本、preload 或请求之前获得完整投影。共享 JS runtime 同样要求有效身份，懒绑定 transport 只能消费已提供配置，不能重新选择。
 
 先做 schema、字段关系与引擎能力校验，再登记 context、启动 worker ready 或开放服务。身份配置错误必须提前拒绝；实际 DNS、连接和服务端错误仍属于请求阶段。保留连接池延迟初始化，避免为配置校验提前扫描 CA 或建立连接。
 
@@ -141,7 +141,7 @@ Context 私有持有不可变快照，各身份字段只读；初始化身份不
 | scrape / 独立 worker | 初始化消息携带完整快照，worker 校验后才能接受任务；不按自己的环境再次选预设 |
 | MCP | context 初始化必配；所有 tab 继承 |
 | Rust facade / 嵌入 | 创建接口必须传 persona；无便捷默认旁路 |
-| 独立 runtime / 现有 Python 包装 | 删除前通过共享协议适配；迁出已有校验和行为测试 |
+| 独立 runtime / 现有 Python 包装（历史） | 删除前通过共享协议适配；迁出已有校验和行为测试 |
 | frame / popup / 浏览器 worker / 新导航 | 使用所属 context 的冻结快照 |
 | isolated_copy | 复制相同 persona，cookie/storage 隔离语义保持 |
 
@@ -176,13 +176,13 @@ Browser 级版本与不同 context persona 的兼容范围需要客户端实测�
 | 阶段 | 工作 | 完成判据 |
 | --- | --- | --- |
 | P0 固定实施基线 | 以当前 main 的 C 为起点；确认协议与并行工作接口，若 HEAD 更新则记录新 SHA 并审核增量 | 不默认合并旧 main 或其他 worktree；保留 C 已有传输和 CDP 行为 |
-| P1 协议与校验 | 迁出独立 runtime 有价值逻辑，建立协议、预设、外部注入与能力检查；映射 OB-014/015 | 非内置名称 persona 通过同一流程；非法配置创建前拒绝 |
+| P1 协议与校验 | 迁出历史独立 runtime 有价值逻辑，建立协议、预设、外部注入与能力检查；映射 OB-014/015 | 非内置名称 persona 通过同一流程；非法配置创建前拒绝 |
 | P2 核心收敛 | 必填构造器、私有快照、移除 net/JS 默认身份、取消构造后补写 | 不能无 persona 创建可用 context，不能分别写身份字段 |
 | P3 一致投影 | 网络、JS、frame/worker、时区、screen/字体/渲染；映射 OB-016 | 首个请求与脚本正确；并存 context 不互相污染 |
-| P4 入口和协议 | CLI/MCP/facade/worker/runtime/CDP 创建与诊断；映射 OB-003/004/005/006/031/044 | 每个存续入口必配，特殊请求路径与派生规则一致 |
+| P4 入口和协议 | CLI/MCP/facade/worker/CDP 创建与诊断；映射 OB-003/004/005/006/031/044 | 每个存续入口必配，特殊请求路径与派生规则一致 |
 | P5 清理与资格 | 删除失效选择器，迁移旧参数、示例和 harness；完成回归 | 文档与实际支持匹配，全部必要门禁通过 |
 
-本轮已按 P1 至 P5 接通共享协议、核心冻结、投影和存续入口。其他分支成果仅在确定范围并审核后复用，没有把未审查的 worktree 修改自动纳入；Python SDK/private runtime 删除仍由 OB-006 单独完成。
+本轮已按 P1 至 P5 接通共享协议、核心冻结、投影和存续入口。其他分支成果仅在确定范围并审核后复用，没有把未审查的 worktree 修改自动纳入；Python SDK/private runtime 删除已由 OB-006 单独完成。
 
 ## 6. 验收矩阵
 
@@ -192,10 +192,10 @@ Browser 级版本与不同 context persona 的兼容范围需要客户端实测�
 4. 隔离：A/B 不同 persona 交替导航、创建 frame/worker，输出不串用；进程不支持的组合在创建前拒绝或进入已验证隔离路径。
 5. 继承：新页面、popup、frame、worker、重导航、isolated_copy 与 scrape 子进程保持相同配置摘要及对应行为。
 6. 网络实证：本地 HTTP 服务记录最终请求头，TLS fixture 检查所选档案；JS 同时采集 UA/UA-CH、locale/timezone、screen/DPR、WebGL 等。TLS 扩展集合相等不是完整指纹相同的证明。
-7. 禁止绕过：旧构造、UA/header 覆盖、拦截修改、CDP 设备模拟、original、独立 runtime 和模块请求均覆盖。
+7. 禁止绕过：旧构造、UA/header 覆盖、拦截修改、CDP 设备模拟、original、历史独立 runtime 迁移路径和模块请求均覆盖。
 8. 浏览器行为回归：请求方法、跨域凭据与 CORS、session 隔离、输入、布局和绘制；对实际改动路径使用 C 的既有测试并补必要 fixture。其他分支的测试只有明确复用时才纳入，不能假定都已在 C。
 9. 保留当前基线成果：primp-only、原始头、body spool、Fetch pause owner 隔离、redirect 与取消的成功/失败终态。
-10. 其他本地成果：若采用 response-stage WIP，覆盖响应暂停/继续、body stream 和 owner 生命周期；若采用 worker/identity/字体或 runtime 删除成果，承接其通用回归并验证 persona 初始化不会使其退化。已有测试源码不等于本轮测试通过。
+10. 其他本地成果：若采用 response-stage WIP，覆盖响应暂停/继续、body stream 和 owner 生命周期；worker/identity/字体或 runtime 删除成果须承接其通用回归并验证 persona 初始化不会使其退化。已有测试源码不等于本轮测试通过。
 
 实现阶段运行 focused release nextest，然后执行全量 release nextest 与精确 CLI release build：
 
@@ -205,7 +205,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
 ```
 
-身份与传输在 render/no-render 都验证。C 已删除运行时 `--stealth`，其验收不能再要求传该参数。独立 runtime 存续且依赖被修改时，按它的独立 workspace/toolchain 运行对应 build/nextest，根测试不替代它。
+身份与传输在 render/no-render 都验证。C 已删除运行时 `--stealth`，其验收不能再要求传该参数。独立 runtime 的历史结果只作为迁移账本，当前门禁不再运行其 workspace/toolchain，根测试和官方 Playwright/CDP smoke 共同覆盖现行入口。
 
 另需障碍课 33/33、官方 Playwright Python smoke/协议画像、确定性渲染 fixture 和真实站点 top/bottom 捕获。C 已弃用 Puppeteer 资格；本计划不增加新的 Puppeteer 资格承诺。输出放仓库外，不提交生成的截图或报告。性能旧新交错对比，固定页面、viewport、网络、settle 和捕获条件，报告分布与资源使用；约 ±10% 噪声范围内不作确定优化结论。
 
@@ -217,7 +217,7 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 | --- | --- |
 | persona/context/CDP/CLI 聚焦 release nextest | 通过；内置/外部配置、必配失败、冻结、继承、override 拒绝和进程级时区/locale 冲突均有覆盖 |
 | 根 workspace release nextest，render | **1944/1944 passed，4 skipped，0 failed**；最终源码以 4 个测试线程复跑 |
-| 独立 runtime release nextest | **185/185 passed，0 skipped** |
+| 独立 runtime release nextest（删除前历史结果） | **185/185 passed，0 skipped** |
 | exact CLI release build，render | 通过；冻结二进制 SHA-256 `10dca946d36267c3613199ea5ca37379409c95ff8b286fe1c835c921b176e732` |
 | exact CLI release build，no-default-features | 通过；冻结二进制 SHA-256 `eff85327d056a6532cefa2289f208be1add1bd42efeb960049a6805cdc86975d` |
 | CLI 实测 | 缺 persona 在请求前退出；内置 preset 与外部 JSON 在 render/no-render 均正确投影 UA、language、timezone、screen 和 DPR |
@@ -259,7 +259,7 @@ git branch -vv
 
 若需要评估并行工作，对相应 worktree 分别检查 HEAD、status、staged/unstaged diff 与 untracked 文件；对未挂载分支读取固定 SHA。根目录 status 不覆盖其他 worktree。远端 freshness 是另一项检查，fetch 不等于把当前分支移动到远端。
 
-源码永久链接：[当前基线 context](https://github.com/gster/obscura/blob/3fb94d6e1b190480ed5a21fe1a9c31a2d4c7766c/crates/obscura-browser/src/context.rs)、[当前基线独立 runtime](https://github.com/gster/obscura/blob/3fb94d6e1b190480ed5a21fe1a9c31a2d4c7766c/runtime/src/browser.rs)。
+源码永久链接：[当前基线 context](https://github.com/gster/obscura/blob/3fb94d6e1b190480ed5a21fe1a9c31a2d4c7766c/crates/obscura-browser/src/context.rs)、[删除前历史 runtime](https://github.com/gster/obscura/blob/3fb94d6e1b190480ed5a21fe1a9c31a2d4c7766c/runtime/src/browser.rs)。
 
 ## 附录：先前分叉与 worktree 审查记录
 
@@ -314,4 +314,4 @@ R 的 primp-only、请求/响应原始头、response body spool、Fetch pause �
 
 `respective-canid` 中的宿主常量与字体配置不是新的全局默认答案。其 `select_device()` 再次调用 `select_profile()`，说明仍需一次解析冻结；自动 rotation 场景必须避免多次选取。集中定义的字段值、字体行为和平台资格尚未由本轮重新验证。
 
-因此“独立 runtime 仍存在”只适用于 R、L 及清单中的相关 worktree；在 respective-canid 已有删除提交。最终集成若采用已审查通过的删除方案，应承接有价值的 persona/输入/worker 回归，不先重建已删除入口再删除。不能预设整个本地环境都还处于同一迁移阶段。
+因此“独立 runtime 仍存在”只适用于本附录记录的 R、L 及当时相关 worktree 快照；OB-006 删除批次已将其从当前产品树移除。最终集成应承接已审查的 persona/输入/worker 回归，不先重建已删除入口再删除。不能把历史快照或其他 worktree 的状态当作当前产品状态。

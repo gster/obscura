@@ -1,7 +1,7 @@
 # Local patches to `primp-rustls` 0.23.43
 
-This crate is vendored (and wired up via `[patch.crates-io]` in both the root and
-the `runtime/` workspace) for exactly one behavioural fix in the TLS
+This crate is vendored and wired up via `[patch.crates-io]` in the root workspace
+for exactly one behavioural fix in the TLS
 ClientHello. Everything else is upstream, unmodified. The dependency's
 Apache-2.0 / ISC / MIT licenses are retained (`LICENSE`, `LICENSE-APACHE`,
 `LICENSE-ISC`, `LICENSE-MIT`).

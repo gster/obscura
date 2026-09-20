@@ -207,6 +207,63 @@ class ManifestValidationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("source blob is unavailable", result.stderr)
 
+    def test_baseline_reads_historical_runtime_toolchain_after_current_removed(self) -> None:
+        with self.source_repository() as (repository, manifest, _):
+            (repository / "runtime" / "rust-toolchain.toml").unlink()
+            result = self.run_validator("baseline", str(manifest))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_baseline_rejects_a_missing_historical_runtime_toolchain(self) -> None:
+        with self.source_repository() as (repository, manifest, baseline):
+            (repository / "runtime" / "rust-toolchain.toml").unlink()
+            subprocess.run(["git", "add", "-u"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "remove historical runtime toolchain"],
+                cwd=repository,
+                check=True,
+            )
+            baseline["source"]["revision"] = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            manifest.write_text(json.dumps(baseline), encoding="utf-8")
+            result = self.run_validator("baseline", str(manifest))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("source blob is unavailable", result.stderr)
+
+    def test_baseline_rejects_a_historical_runtime_toolchain_with_wrong_version(self) -> None:
+        with self.source_repository() as (repository, manifest, baseline):
+            (repository / "runtime" / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "1.97.0"\n', encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "add", "runtime/rust-toolchain.toml"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-qm", "tamper historical runtime toolchain"],
+                cwd=repository,
+                check=True,
+            )
+            baseline["source"]["revision"] = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            manifest.write_text(json.dumps(baseline), encoding="utf-8")
+            result = self.run_validator("baseline", str(manifest))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("runtime toolchain manifest does not pin Rust 1.98.1", result.stderr)
+
     def test_baseline_rejects_a_current_toolchain_manifest_with_wrong_version(self) -> None:
         with self.source_repository() as (repository, manifest, _):
             (repository / "rust-toolchain.toml").write_text(

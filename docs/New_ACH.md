@@ -32,13 +32,14 @@ Rust facade 保留底层嵌入与测试能力，不发展另一套覆盖 Playwri
 | --- | --- | --- |
 | CORE | CDP、V8、DOM、网络/存储、Worker/frame、原生输入、布局/字体/Canvas/SVG/截图 | 维持安全与行为回归 |
 | KEEP | MCP 与对诊断、自动化及 agent 接入有用的 CLI | 复用同一内核、persona、primp 和安全策略；逐命令保留有用途的能力，不维护第二套浏览器逻辑 |
-| DELETE | 自有 Python SDK、配套 NDJSON runtime/私有动作 RPC、已无消费者的包装、非目标平台产品发布 | 下一步优先清理；先迁出独有共享能力与回归，验证官方 Python/CDP 替代调用，再删除代码、依赖及发行入口 |
+| DELETE | 自有 Python SDK、配套 NDJSON runtime/私有动作 RPC、已无消费者的包装 | SDK/runtime 清理已完成；保留迁移历史，继续防止私有入口回流 |
+| TODO | 非目标平台产品发布及相关发行入口 | OB-007 仍需单独清理，不因 SDK/runtime 删除而宣称完成 |
 | DEV-ONLY | 参考 Chrome、采集/差分/诊断工具、旧路径短期迁移对照 | 独立依赖锁，不进入生产构建或产物；对照到期移除 |
 | FROZEN | 高级打印、screencast、非必需 DevTools/媒体扩展 | 仍编译或暴露的实现继续维护安全与必要回归 |
 
 CLI 的 serve、诊断、截图和结构化输出有明确用途，保留；scrape/worker 包装按 agent 使用价值、消费者与维护成本评估，不因裁剪方向一并删除。Web Worker 与 CLI worker 是不同概念；不做移动产品不等于删除桌面规范中的 Touch/Pointer 类型。
 
-不强制新增 `obscura-host` 产物。保留 CLI 作为启动/诊断入口，提取共享初始化，供 CDP、MCP 和 Rust 嵌入一致使用。迁移 `runtime/` 独有的输入、等待、V8 flags、时区、SSRF、watchdog、预算和退出职责后，删除 `runtime/` 与 `bindings/python/`；这是删除自有包装，不是删除 V8/JS runtime 或官方 Playwright Python。
+不强制新增 `obscura-host` 产物。保留 CLI 作为启动/诊断入口，提取共享初始化，供 CDP、MCP 和 Rust 嵌入一致使用。OB-006 已将已确认的共享回归迁入根 workspace；其余职责由现有共享层、宿主启动的 CDP 服务和官方 Playwright client 按各自边界承接。`runtime/` 与 `bindings/python/` 已删除。这是删除自有包装，不宣称所有旧 runtime 职责或完整迁移资格已经完成，也不是删除 V8/JS runtime 或官方 Playwright Python。
 
 裁剪需以代码引用、Cargo normal/build 依赖、测试迁移、发布清单共同证明。仅隐藏命令或使用 `default-members` 不算删除。锁文件受控更新，不顺便升级依赖；成本比较分开记录下载、冷编译、热构建、链接与测试，不预设性能收益。
 
@@ -91,7 +92,7 @@ Cookie 内部状态与 CDP 视图分离，持久化保留 host-only、domain/pat
 | 阶段 | 退出条件 |
 | --- | --- |
 | G0 基线 | 固定源码/锁/工具链/客户端/schema/fixture；真实测试账本、最小 CDP trace、裁剪与成本清单 |
-| G1 自动化 | 未修改 Python 客户端最小链路、world/句柄/事件/安全回归通过；共享能力迁移后删除自有 Python SDK/私有 runtime，MCP 和有用 CLI 保留 |
+| G1 自动化 | 未修改 Python 客户端最小链路、world/句柄/事件/安全回归通过；已确认的共享回归迁入根 workspace，自有 Python SDK/私有 runtime 删除，MCP 和有用 CLI 保留。以上条件全部满足前，G1 不算通过 |
 | G2 Persona/传输 | 统一 persona、强制 stealth、全出口 primp 有证据；首个平台完整配置有证据，另一平台状态明确；覆盖规则不产生半更新身份 |
 | G3 状态与安全 | 请求/存储隔离、权限、控制面认证、资源回收与隐私策略通过声明范围的测试 |
 | G4 资格与性能 | 声明客户端/API/平台全部有证据；双平台长稳与完整进程链资源对照；Southwest shopping 对照验收通过 |

@@ -185,6 +185,25 @@ jobs:
             tools/unblocked/automation-cdp-profile.json \
             "$smoke_root/playwright-protocol.log"
 
+      - name: Run SDK removal behavior gates
+        env:
+          DEBUG: pw:protocol
+          OBSCURA_PERSONA: windows_chrome145
+        run: |
+          smoke_root="$RUNNER_TEMP/obscura-cdp-smoke"
+          uv run --project tools/unblocked --frozen --python 3.12 \
+            python tools/unblocked/migration_smoke.py \
+              --obscura-bin target/release/obscura \
+              --output "$smoke_root/migration.json" \
+              > "$smoke_root/migration-stdout.json" \
+              2> "$smoke_root/migration-driver.log"
+          cp "$smoke_root/playwright-protocol.log" "$smoke_root/combined-protocol.log"
+          find "$smoke_root" -name worker.stderr.bin -exec cat {} + \
+            >> "$smoke_root/combined-protocol.log"
+          python3 tools/unblocked/validate.py protocol-log \
+            tools/unblocked/automation-cdp-profile.json \
+            "$smoke_root/combined-protocol.log"
+
       - name: Upload official client smoke evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

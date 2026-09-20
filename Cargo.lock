@@ -2035,6 +2035,8 @@ dependencies = [
  "log",
  "obscura-dom",
  "resvg",
+ "serde_json",
+ "sha2",
  "swash",
  "taffy",
  "tiny-skia",

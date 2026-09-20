@@ -9,6 +9,6 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release -p obscura
 
 产物为 `target/release/obscura` 和 `obscura-worker`（设置 `CARGO_TARGET_DIR` 时路径不同）。版本字符串不足以识别源码，交付时同时记录完整提交、锁文件、target、features 和 SHA-256。
 
-primp 传输与统一身份基线包含在所有构建中，没有运行时开关。`runtime/` 是另一套产物，根构建不会生成它，见 [迁移期独立 runtime](Use-the-isolated-runtime.md)。
+primp 传输与统一身份基线包含在所有构建中，没有运行时开关。当前产品通过 CLI 启动 CDP 服务，再由官方 Playwright Python 使用 `connect_over_cdp` 连接；自有 Python SDK 和独立 runtime 不再是安装产物。迁移背景见[独立 runtime 迁移说明](Use-the-isolated-runtime.md)。
 
 下一阶段主平台目标是 macOS arm64 与 Linux x86_64；完整平台资格尚未建立。当前仓库保留的其他平台发布配置不等于已经移除，也不构成本 fork 的正式支持承诺。

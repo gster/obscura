@@ -71,7 +71,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 状态：未关闭。
 
-依赖：OB-027，随 OB-028/029 分步推进。入口：runtime/src/automation.rs、runtime/src/browser.rs、obscura-browser、CDP。
+依赖：OB-027，随 OB-028/029 分步推进。入口：obscura-browser、CDP、迁入的 browser 集成测试；已删除的私有 runtime 路径仅在 Git 历史中保留。
 动作：列出原生输入、等待、资源观察、限额和启动保护的归属；逐项迁移到内核共享层并由 CDP 调用。
 完成：正式客户端最小端到端场景不经过 SDK 私有 RPC；迁移项均有原路径/新路径对照。不得重写完整 Playwright Locator 产品。
 
@@ -263,10 +263,12 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 剩余共享回归迁移（Owner: Codex，实施基线 `d84b343`）：162 个 browser 测试按 8 个行为模块迁入根 `native_platform` 集成测试，8 个 referrer 测试迁入根 `referrer_policy`；定向 **170/170** 通过后，删除旧 browser 测试模块 **5486 行**、旧 `runtime/src/referrer_tests.rs` **394 行**及 `main.rs` 两行测试模块声明。保留全部生产定义；私有 runtime 剩余两个包装测试通过。官方 smoke 新增空/空白 aria-label 名称回退与点击、同 context 导航/跨 tab 的 localStorage 共享和 sessionStorage 隔离回归。根全量复跑 **2127/2127**（4 skipped）；首轮 module-budget 用例失败及其未改代码的定向重放通过均保留为证据，不宣称时序问题已修复。
 
-当前完整删除文件仅为已迁移的 referrer 测试文件；SDK/runtime 产品实现仍存在。本项保持未关闭。下一步补齐 Python 迁移审计中的副作用不重放、同步无限 click handler 的产品入口终止、dynamic-script 跨 origin CORS 证据，再移除私有 SDK/runtime 包装与现行配置引用；历史基线记录仍须保留。
+取消语义核验（2026-09-20）：官方 Playwright Python 的 `asyncio.Task.cancel()` 仅停止本地等待。实测取消缺失 locator 后插入同 selector，服务器副作用计数从 0 变为 1；不能将 `CancelledError` 当作远端动作撤销。此负面证据与 `client-scope.json` 的 indeterminate-write 边界一致，旧 SDK 取消时杀自有进程的策略不迁回私有包装。迁移门禁分别验证本地取消后不自动重放、官方 action timeout 和显式 page close 的停止边界、已执行 click 后 response timeout 仍恰一次；不以弱化计数断言掩盖差异。
 
-依赖：OB-021、OB-005、OB-025；按调用点完成 OB-027/028/029 的替代 smoke。入口：runtime/、bindings/python/、私有 NDJSON/RPC、专属 examples/scripts/CI/发行配置。
-动作：下一步清理主项；清点消费者，迁出独有输入、等待、persona、启动保护与回归，再删除配套进程/协议/SDK 和无消费者依赖。
+实际删除批次（Owner: Codex，实施基线 `ca40d0b`）：官方客户端三项迁移门禁通过，生命周期计数为 task-cancel=1、official-timeout=0、page-close=0、sibling-control=1、post-dispatch=1；显式 2000ms watchdog 后原 page 恢复，五项 dynamic-script CORS 符合矩阵。移除 `runtime/`、`bindings/python/`、`examples/zg/` 共 27 个旧路径，完整清单见 SUMMARY。旧构建脚本中唯一的字体成员/声明/bytes/SHA-256 门禁迁入 `obscura-render/build.rs`，一项正常和五项篡改实测符合预期；不保留私有进程协议。冻结 baseline 未改，历史 runtime toolchain 与两份 lock 从 source Git blob 校验。最终构建与全量门禁确认前保持未关闭。
+
+依赖：OB-021、OB-005、OB-025；按调用点完成 OB-027/028/029 的替代 smoke。现行入口：根 browser 回归、`tools/unblocked/migration_smoke.py`、render 字体构建门禁；私有 NDJSON/RPC 与专属 examples 仅保留 Git 历史。
+动作：完成删除批次的最终审核与验证；共享 native input 的 CDP 接线及完整 world/句柄资格仍由 OB-021/027/028/029 验收，不将它们混同于私有包装删除。
 完成：官方 Playwright Python/CDP 接替需要保留的调用，产品与发布不再依赖自有 SDK/IPC；根测试承接有用回归后移除独立 workspace/锁文件/专属 CI。保留 V8/JS runtime、Web Worker、MCP 和有用 CLI；不以私有 runtime 旧测试总数阻止删除。
 
 ### OB-007 · P0 · 删除非目标平台产品配置

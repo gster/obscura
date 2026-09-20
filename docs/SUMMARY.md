@@ -1,5 +1,19 @@
 # 项目现状与文档核验摘要
 
+OB-006 私有 SDK/runtime 删除（2026-09-20，实施基线 `ca40d0b`，macOS arm64）：删除配套 NDJSON workspace、自有 Python SDK 和专属 `examples/zg`，共移除 27 个旧路径、8350 行旧文件内容。根九个 crate 及 V8/JS runtime、Web Worker、MCP、CLI 和不可变 Persona 运行逻辑保留。旧 `runtime/build.rs` 的字体成员、嵌入声明、字节数与 SHA-256 构建门禁迁入 `obscura-render/build.rs`，对应 build dependencies 沿用既有版本，根锁文件仅记录新增依赖边。字体和渲染运行逻辑没有改动。此前迁出的 183 个共享 Rust 回归保留；原 runtime 剩余两个仅服务私有包装的测试随包装删除。实际移除文件如下，较早切片中的原路径和测试数字继续作为历史证据保留。
+
+- `runtime/`：`.gitignore`、`Cargo.lock`、`Cargo.toml`、`README.md`、`build.rs`、`rust-toolchain.toml`、`src/automation.rs`、`src/browser.rs`、`src/main.rs`、`src/manual.rs`、`src/network.rs`、`src/protocol.rs`、`src/takeover.rs`。
+- `bindings/python/`：`README.md`、`pyproject.toml`、`src/obscura_runtime/__init__.py`、`src/obscura_runtime/_io.py`、`src/obscura_runtime/automation.py`、`src/obscura_runtime/browser.py`、`tests/compare_playwright.py`、`tests/test_automation.py`、`tests/test_script_fetch.py`、`tests/test_zg.py`。
+- `examples/zg/`：`README.md`、`fixture.py`、`flow.py`、`run.py`。
+
+官方客户端迁移门禁全部通过：Task.cancel 仅取消本地等待，迟到目标仍执行一次，结果明确为 indeterminate；官方 action timeout 后目标出现仍为零次；显式 page close 后挂起操作失败且副作用为零，兄弟页控制操作为一次；已执行点击后的 response wait timeout 不增加副作用。原始失败探针曾把 Task.cancel 误当撤销，得到 1 而非 0，该负面证据保留，不宣称修复了客户端语义。无限同步 click handler 在显式 2000ms CDP watchdog 后，原 page/连接继续执行 JS 并完成有限点击；默认预算未在此证明。动态 classic-script 五项跨 origin CORS 矩阵覆盖 default/anonymous/credentials/denied/base，实际执行、Cookie、Origin、Sec-Fetch-Dest 和请求次数全部一致。
+
+开发工具保留 browser/worker 的完整二进制双流、完整协议日志及 fixture 的真实请求头/body 字节；硬超时和强杀只判失败。CI 持续运行这些门禁并在失败时上传原始证据。冻结 `baseline.json` 未改；两份 lock 及已删除 runtime 工具链从固定历史 Git blob 校验，根工具链和 CI/release pins 仍按现行文件校验。
+
+删除批次验证：Python 工具测试 **45/45**，字体构建脚本一项正常与五项篡改校验均符合预期，冻结 baseline/client/profile 与完整 37-method 协议清单校验通过。根 release/render 全量最终以 `NEXTEST_TEST_THREADS=2` 运行 **2127/2127**（4 skipped）。此前默认并发两轮分别为 **2126 passed、1 failed、4 skipped**：MCP `test_evaluate` 标题为空，随后未改代码定向重放两个匹配测试通过；另一次 `post_load_dynamic_script_waits_only_when_caller_requests_settle` 耗时 310.9ms 超过 300ms 断言。本批未修改、忽略或放宽这些测试，不把受控并发通过称作已修复根因。字体门禁落盘前的一次编译已主动停止，未计作测试结果。 exact render CLI build 通过，SHA-256 为 `c772c13ba3d1a6b4f0e1bfbe8aff1ade92df2a83dd41d5ec179daba972606335`；该冻结产物通过固定 benchmark 障碍课 **33/33**（含 observer-intersection）、官方 Playwright smoke、三项迁移门禁及合并协议日志的 **37-method** 校验。障碍课首次漏传必填 Persona 导致 **0/33**，保存该错误启动结果和必配拒绝信息后，以显式 `OBSCURA_PERSONA=windows_chrome145` 运行上述正确配置；未改 fixture 或期望值。 no-render 网络/CLI 定向 nextest **227/227**（0 skipped）及 exact no-render CLI build 通过，SHA-256 为 `cde1666f736fc20d32a173542ed1408cd58d152c6e8f50899be2887634523d70`。`cargo metadata --locked --no-deps` 确认根仍为九个 workspace members；源码/配置残余扫描只保留 JS snapshot 内部名称与历史 baseline 验证路径，没有私有 SDK 的生产消费者。
+
+本机完整原始证据索引为 `/tmp/ob006-removal-evidence.json`；render/no-render 测试和构建日志使用 `/tmp/ob006-removal-*` 前缀，官方 smoke 与迁移门禁的完整进程/协议文件位于 `/tmp/ob006-removal-smoke/`。这些执行机临时文件不入 Git；字段和字节不脱敏、不裁剪，由执行方管理留存。
+
 剩余共享行为回归迁移（2026-09-20，实施基线 `d84b343`，macOS arm64）：从私有 runtime 迁出 170 个只依赖根公开 API 的回归，保留测试名称、属性、fixture、显式 Persona 和行为断言。162 个 browser 测试共用一个 integration target，映射如下；另 8 个 referrer 测试除 render gate 外与旧文件逐字相同。
 
 | 旧位置（`d84b343`） | 新位置（`crates/obscura-browser/tests/`） | 测试数 |
@@ -36,7 +50,7 @@ Cookie 排序切片验证（基线 `8ddaa15`，macOS arm64，Owner: Codex）：�
 
 CDP-first、官方 Playwright Python、独立内核和 persona 是实现路径。反追踪不能用 `DNT=1`、清空 Cookie 或几个伪装字段代替；分别验收 RPA 正确性/效率、网络与行为一致性、跨站/会话/身份空间关联抵抗、完整进程链性能及兼容性成本。受控报价实验在使用方进行，内核提供隔离、配置和完整原始证据。开发工具不做脱敏或删字段，日志的保管、清理和对外流转由执行方负责。
 
-**当前处于迁移阶段。** 已有 Rust/V8/DOM/渲染、CDP 和 Worker 能力；CLI/MCP、自有 Python SDK/NDJSON runtime 仍存在。`tools/unblocked/` 已包含机器可读的基线、官方 Playwright Python 1.60.0 范围、独立锁和校验器、macOS 首批三路 CDP 记录/差分证据，以及首批实际观测的 Automation CDP Profile 和必需 smoke；Linux 资格、采集开关副作用和完整 profile 仍未完成。OB-044 已完成运行时 `--stealth`/环境开关删除和产品构建强制 primp；共享 `PersonaSpec` 到不可变 `EffectivePersona` 的编译、加载、摘要、入口注入和 context 投影已在本轮实现，进程级时区与 ICU 主语言冲突会 fail closed。OB-012 全出口收敛、容器干净验证和跨平台 persona 资格仍未完成。最新范围：删除自有 Python SDK/配套私有 runtime；保留 MCP 和有用 CLI，不强制新增宿主产物；全出口 primp 与 Chrome 差异修补继续推进。Southwest shopping 不再 403 且返回有效结果是重要业务门槛。不要把规划中的删除、认证和独立发布写成已经完成。
+**当前处于迁移阶段。** 已有 Rust/V8/DOM/渲染、CDP 和 Worker 能力；CLI/MCP 保留，自有 Python SDK/NDJSON runtime 已由 OB-006 移除。`tools/unblocked/` 已包含机器可读的基线、官方 Playwright Python 1.60.0 范围、独立锁和校验器、macOS 首批三路 CDP 记录/差分证据，以及首批实际观测的 Automation CDP Profile 和必需 smoke；Linux 资格、采集开关副作用和完整 profile 仍未完成。OB-044 已完成运行时 `--stealth`/环境开关删除和产品构建强制 primp；共享 `PersonaSpec` 到不可变 `EffectivePersona` 的编译、加载、摘要、入口注入和 context 投影已在本轮实现，进程级时区与 ICU 主语言冲突会 fail closed。OB-012 全出口收敛、容器干净验证和跨平台 persona 资格仍未完成。最新范围：自有 Python SDK/配套私有 runtime 已移除；保留 MCP 和有用 CLI，不强制新增宿主产物；全出口 primp 与 Chrome 差异修补继续推进。Southwest shopping 不再 403 且返回有效结果是重要业务门槛。不要把规划中的删除、认证和独立发布写成已经完成。
 
 目标与阶段：[New_ACH](New_ACH.md)。唯一执行队列：[TODO](TODO.md)。
 
@@ -149,20 +163,20 @@ OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run
 | Cookie 持久化格式与连接合并 | version 1 envelope 直接保存内部 CookieEntry，保留 host_only；load 兼容历史裸 CookieInfo 数组；CookieJar 提供 lossless snapshot/from_snapshot/apply_snapshot_delta，CDP 连接关闭时按快照差异合并 | render/no-render Cookie 相关回归各 53/53，根 release nextest 1926/1926；SameSite 完整请求上下文、分区及 CDP/MCP 对外状态往返资格仍未完成；OB-011 |
 | Cookie 请求上下文不完整 | get_cookie_header 仅接收 URL；SameSite 字段存在但该选择路径无 site/method/请求类型上下文；分区能力也未完成 | 源码确认；不能只因 version 1 能无损保存内部 CookieEntry 就宣称完整 Cookie 语义；OB-011/012 |
 | IndexedDB 部分实现 | 请求、upgrade transaction、索引/游标已有代码与回归；abort/commit 空体，数据库存于 JS realm 的 Map | 源码确认，完整事务/生命周期未验证；OB-041 |
-| 身份配置分叉 | BrowserContext 网络与 JS 已收敛到同一 `StealthProfile`，但独立 runtime Persona、CDP Browser.getVersion 和平台 preset 仍有各自字段 | OB-014/015/016/031；还没有完整 persona 编译器或已认证的 Linux/macOS persona |
+| 身份跨平台资格 | `5b01925` 已统一显式 `PersonaSpec` 编译和不可变 `EffectivePersona`；旧独立 runtime 已移除 | OB-014/015/016/031 的未完成资格仍见 TODO；不将编译器实现等同于 Linux/macOS 指纹认证 |
 | 控制面边界 | CDP 无内建鉴权；server 有 unbounded_channel，连接限制不等于消息/队列预算 | OB-034；不以 loopback 替代完整授权/背压 |
 
-主要源码入口：[CDP dispatch](../crates/obscura-cdp/src/dispatch.rs)、[server](../crates/obscura-cdp/src/server.rs)、[Runtime 域](../crates/obscura-cdp/src/domains/runtime.rs)、[Page 域](../crates/obscura-cdp/src/domains/page.rs)、[Browser 域](../crates/obscura-cdp/src/domains/browser.rs)、[bootstrap](../crates/obscura-js/js/bootstrap.js)、[CookieJar](../crates/obscura-net/src/cookies.rs)、[BrowserContext](../crates/obscura-browser/src/context.rs)、[runtime Persona](../runtime/src/browser.rs)。源码审阅和以上实验不是完整安全审计。
+主要源码入口：[CDP dispatch](../crates/obscura-cdp/src/dispatch.rs)、[server](../crates/obscura-cdp/src/server.rs)、[Runtime 域](../crates/obscura-cdp/src/domains/runtime.rs)、[Page 域](../crates/obscura-cdp/src/domains/page.rs)、[Browser 域](../crates/obscura-cdp/src/domains/browser.rs)、[bootstrap](../crates/obscura-js/js/bootstrap.js)、[CookieJar](../crates/obscura-net/src/cookies.rs)、[BrowserContext](../crates/obscura-browser/src/context.rs)、[共享 Persona](../crates/obscura-net/src/persona.rs)。源码审阅和以上实验不是完整安全审计。
 
 raw CDP 复验次序：创建并 attach target → Page.navigate 本地页面 → Runtime.evaluate 写入全局/建立带 getter 的对象 → Page.getFrameTree/createIsolatedWorld → 带新 contextId evaluate → getProperties → 回读 getter 计数。unknown Log 方法、Beacon 服务端计数、第二连接 target 清单和双进程 storage-dir 分别独立观察。所有 sessionId 使用 attach 返回值。
 
 ## 不应重复立项的已有实现
 
-根 workspace 有九个 crate，独立 runtime 另有 workspace。Page 和 Worker 已有独立 isolate；Worker 已有线程、V8 序列化、transfer、终止、预算和网络转发。Worker 使用 detached primp 独立连接池。旧“同页模拟 Worker”“普通路径尚未修”“先迁入 primp”已失效。
+根 workspace 有九个 crate，配套私有 runtime workspace 已删除。Page 和 Worker 已有独立 isolate；Worker 已有线程、V8 序列化、transfer、终止、预算和网络转发。Worker 使用 detached primp 独立连接池。旧“同页模拟 Worker”“普通路径尚未修”“先迁入 primp”已失效。
 
-Cookie 键已区分 domain/name/path，已有 host-only、HttpOnly 写保护和过期导入回归；应修剩余语义，不从旧快照重新实现已有保护。iframe/fragment、Text 更新、表单传输、预检和原生输入已有修复，现有回归位于 browser/page、JS runtime/bootstrap、net 与独立 runtime tests；迁移时保留这些能力。保留成果与回归，不据此夸大完整标准资格。
+Cookie 键已区分 domain/name/path，已有 host-only、HttpOnly 写保护和过期导入回归；应修剩余语义，不从旧快照重新实现已有保护。iframe/fragment、Text 更新、表单传输、预检和原生输入已有修复，现有回归位于 browser/page、JS runtime/bootstrap、net，以及从私有 runtime 迁入的 browser 集成测试；共迁入 183 个共享回归。保留成果与回归，不据此夸大完整标准资格。
 
-页面所有的产品传输及独立 runtime/module loader 当前强制使用 persona-owned primp；`ObscuraHttpClient` 已收敛为 policy/context，项目自有直接 reqwest 客户端/backend 与 `wreq_client` 兼容别名已删除，CLI `original` 文件和 HTTP 辅助路径也统一走 `StealthHttpClient`。这只描述项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。V8 依赖通常取预构建 archive；`V8_FROM_SOURCE` 才走源码构建，本项目还会执行 bootstrap snapshot 生成。旧“首次必编译 V8、固定五分钟”不是准确的构建契约。
+页面所有的产品传输及共享 module loader 当前强制使用 persona-owned primp；`ObscuraHttpClient` 已收敛为 policy/context，项目自有直接 reqwest 客户端/backend 与 `wreq_client` 兼容别名已删除，CLI `original` 文件和 HTTP 辅助路径也统一走 `StealthHttpClient`。这只描述项目自有直接依赖和客户端，不代表整个依赖生态绝对不含 reqwest。V8 依赖通常取预构建 archive；`V8_FROM_SOURCE` 才走源码构建，本项目还会执行 bootstrap snapshot 生成。旧“首次必编译 V8、固定五分钟”不是准确的构建契约。
 
 ## Southwest 与历史记录的结论
 
@@ -174,7 +188,7 @@ shopping 不再 403 且有有效航班/报价结果现已列为 OB-046 的重要
 
 1. G0：OB-001/025 固定双平台与正式客户端，OB-026 继续补齐可重复 trace/fixture。OB-027 首批 profile 和 smoke 已进入门禁，但仍只是实际观测切片。
 2. 扩展 OB-027，并修清楚的语义与隔离缺口：OB-028/029/030、OB-011、OB-041。OB-037 obstacle 门禁已恢复。
-3. 迁出独有能力并优先清理 Python SDK/私有 runtime；保留 MCP 和有用 CLI。统一 primp/强制 stealth，强化统一 persona，持续修补 Chrome 差异。
+3. Python SDK/私有 runtime 清理后，继续验证共享输入的 CDP 接线和官方客户端边界；保留 MCP 和有用 CLI，持续修补 Chrome 差异。
 4. 按目标分别验收 Chrome 一致性、反关联/防标记、Southwest shopping 业务结果、完整进程链性能与发布资格。没有实际证据的组合保持未认证。
 
 全部 46 项任务、依赖与关闭标准只在 [TODO](TODO.md) 维护。

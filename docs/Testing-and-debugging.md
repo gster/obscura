@@ -23,9 +23,10 @@ By name:
 cargo nextest run --release --features render runtime_click_submit_prevent_default
 ```
 
-Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
-under the project's V8 isolation requirements; production pages can own separate isolates. Render tests must run in
-release mode; debug builds are not a fidelity or performance gate.
+Use `cargo nextest`, not `cargo test`. V8 tests require process isolation under
+the project's V8 isolation requirements; production pages can own separate
+isolates. Render tests must run in release mode; debug builds are not a fidelity
+or performance gate.
 
 ### CDP parity tests
 
@@ -138,16 +139,19 @@ Memory with heaptrack:
 heaptrack ./target/release/obscura serve
 ```
 
-## Independent runtime and obstacle course
+## Official client and obstacle course
 
-```bash
-(cd runtime && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --no-fail-fast)
-```
+Run the pinned official Playwright Python smoke against a root-built Obscura
+CDP server as described in [Use with Playwright](Use-with-Playwright.md). The
+private Python SDK and independent runtime are historical migration inputs and
+are no longer current test targets.
 
 The companion `obscura-benchmark` repository is separate. Check out a fixed revision, then execute from that repository with an absolute candidate path:
 
 ```bash
-OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
+OBSCURA_PERSONA=windows_chrome145 \
+OBSCURA_BIN=/absolute/obscura/target/release/obscura \
+  python3 obstacle-course/run.py --runs 1 --warmup 0
 ```
 
 The current CI pin is `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` in the `gster/obscura-benchmark` fork. That revision repairs the observer fixture so its first real intersection drains the bounded initial page; reference Chrome and Obscura were both re-run, and the full Obscura course reached 33/33. Keep failed/skipped/not-run separate and do not replace a failed fixture's expected value to obtain 33/33. WPT results use subtest denominators. Current audit results are in [SUMMARY](SUMMARY.md).

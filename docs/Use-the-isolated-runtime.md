@@ -1,15 +1,12 @@
-# 迁移期独立 runtime
+# 独立 runtime 迁移说明
 
-`runtime/` 直接嵌入引擎，产物名为 `autopilot-browser-runtime`，启用 render，并自动包含强制 primp 和统一身份基线。`bindings/python/` 的自有 SDK 通过有界 stdin/stdout NDJSON 与它通信，**不运行 CDP，也不是官方 Playwright Python**。
+此前版本曾提供独立的 `runtime/` workspace、NDJSON 动作协议和配套
+Python SDK。它们已从当前产品树删除；本页只保留迁移背景，不再提供构建、
+wheel 或旧协议命令。
 
-```bash
-(cd runtime && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release)
-(cd runtime && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --no-fail-fast)
-(cd bindings/python && uv build --wheel --out-dir /absolute/wheelhouse)
-```
+当前使用方式是先在宿主进程启动根 CLI 的 CDP 服务，再由未修改的官方
+Playwright Python 客户端通过 `BrowserType.connect_over_cdp` 连接。入口和示例
+见 [项目 README](../README.md) 与 [Playwright 接入](Use-with-Playwright.md)。
 
-它有自己的 Cargo workspace、锁文件和 Rust 1.98.1 工具链。根 CLI 的 build/nextest 不覆盖它。详见 [runtime 构建说明](../runtime/README.md) 与 [SDK 契约](../bindings/python/README.md)。使用方提供产物绝对路径、完整摘要、persona、允许 origins 和私有 workspace；安装 wheel 不会自动安装 Rust 产物。
-
-新方向停止扩展自有 SDK，先把原生输入、等待、网络证据、资源预算和启动/退出保护迁入共享层，再删除私有协议包装。替代客户端链路通过之前，保留必要修复和回归，见 TODO OB-005/006/021/032。历史消费仓库 pin、主机路径、现场部署和测试数字不再在本仓库重复维护。
-
-本轮实际测试状态统一见 [SUMMARY](SUMMARY.md)。旧 SDK 或离线例子通过不能证明官方 Python/CDP 资格，也不能证明任何真实购票或支付流程成功。
+旧 runtime/SDK 的测试数字、路径和消费仓库 pin 属于历史记录，不能作为当前
+产品资格；当前门禁以根 workspace、CDP profile 和官方客户端 smoke 为准。

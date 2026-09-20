@@ -128,6 +128,16 @@ def source_sha256(repository: Path, revision: str, relative_path: str) -> str:
     return hashlib.sha256(source_blob(repository, revision, relative_path)).hexdigest()
 
 
+def toolchain_manifest_text(
+    repository: Path, source_revision: str, workspace: str, manifest_name: str
+) -> str:
+    if workspace == "runtime":
+        return source_blob(repository, source_revision, manifest_name).decode("utf-8")
+    manifest = repository / manifest_name
+    require(manifest.is_file(), f"missing {workspace} toolchain manifest: {manifest}")
+    return manifest.read_text(encoding="utf-8")
+
+
 def locked_package_version(lock_text: str, package: str) -> str | None:
     for block in re.split(r"(?=^\[\[package\]\]$)", lock_text, flags=re.MULTILINE):
         name = re.search(r'^name\s*=\s*"([^"]+)"\s*$', block, re.MULTILINE)
@@ -194,9 +204,10 @@ def validate_baseline(path: Path) -> None:
         toolchain = toolchains.get(workspace)
         require(isinstance(toolchain, dict), f"missing {workspace} toolchain")
         require(toolchain.get("rust") == "1.98.1", f"{workspace} Rust must be pinned to 1.98.1")
-        manifest = repository / str(toolchain.get("manifest", ""))
-        require(manifest.is_file(), f"missing {workspace} toolchain manifest: {manifest}")
-        manifest_text = manifest.read_text(encoding="utf-8")
+        manifest_name = str(toolchain.get("manifest", ""))
+        manifest_text = toolchain_manifest_text(
+            repository, source_revision, workspace, manifest_name
+        )
         require(
             re.search(r'^channel\s*=\s*"1\.98\.1"\s*$', manifest_text, re.MULTILINE) is not None,
             f"{workspace} toolchain manifest does not pin Rust 1.98.1",

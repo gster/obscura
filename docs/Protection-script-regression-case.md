@@ -65,15 +65,15 @@ This companion test uses a mocked fetch operation. Its timer ordering has not
 yet been checked against a controlled Chrome networking fixture, so passing
 it does not establish Chromium task-order conformance or explain a live 403.
 
-The isolated runtime separately validates startup persona defaults and rejects
-locale combinations where `navigator.language`, `navigator.languages`, and
-`Accept-Language` contradict one another. The effective persona is returned by
-the runtime's ready response so the caller can record the identity that was
-actually applied.
+Historically, the isolated runtime separately validated startup persona defaults
+and rejected locale combinations where `navigator.language`,
+`navigator.languages`, and `Accept-Language` contradicted one another. That
+wrapper has been removed; the current root CLI/CDP path records the effective
+persona through its supported diagnostics.
 
 The name-validation change also has an independent DOM regression test,
 `create_element_accepts_unicode_xml_names_and_rejects_invalid_names`. A local
-fixture opened through Chrome computer use and through the isolated Python SDK
+fixture opened through Chrome computer use and through the historical isolated Python SDK
 showed that an ASCII-only validator rejected valid Chinese, accented, and
 supplementary-plane names. The shared validator now uses the
 [XML 1.0 Name grammar](https://www.w3.org/TR/xml/#NT-NameStartChar), preserving
@@ -82,7 +82,7 @@ has not been established as a cause of the airline's HTTP 403 response.
 
 ## Run it
 
-Use nextest because each runtime test needs its own V8 process:
+Use nextest because each V8 test needs its own process:
 
 ```bash
 cargo nextest run --release --features render -p obscura-js \

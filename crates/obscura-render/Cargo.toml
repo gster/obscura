@@ -41,6 +41,10 @@ wuff = { version = "0.2.7", optional = true }
 [dev-dependencies]
 log = "0.4"
 
+[build-dependencies]
+serde_json = { workspace = true }
+sha2 = "0.10"
+
 [lib]
 path = "src/lib.rs"
 
