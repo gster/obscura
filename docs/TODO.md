@@ -257,7 +257,9 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 状态：未关闭。
 
-2026-09-20 进度（Owner: Codex，基线 `9eccdc7`）：本轮实际删除 SDK/runtime 文件 **0 个**。已完成工具子进程 stdout/stderr 原始字节保留（`cf258a2`）和历史 source lock 摘要校验（`9eccdc7`），两者是迁移前置修复，不代表 SDK removal 完成。后续先把 13 个 Page-only 原生输入/几何回归迁入根共享 tests，验证覆盖等价后删除旧测试副本，再继续实际移除 `bindings/python/` 与私有 `runtime/`。保持强制且不可变的 Persona 契约，不恢复默认身份或独立配置入口。
+2026-09-20 前置修复（Owner: Codex，基线 `9eccdc7`）：工具子进程 stdout/stderr 原始字节保留（`cf258a2`）和历史 source lock 摘要校验（`9eccdc7`）已完成，该批实际删除 SDK/runtime 文件 **0 个**。
+
+首批回归迁移（Owner: Codex，实施基线 `f09e61d`）：13 个 Page-only 原生输入/几何回归已迁入 `crates/obscura-browser/tests/native_input.rs`，定向 **13/13** 通过后，从 `runtime/src/browser.rs` 删除对应旧测试及属性，共 524 行。逐函数复核保留 fixture、行为和像素断言，显式 Persona 与 RGBA8 检查不变；只移除该组私有截图 writer 调用，末项 `sdk_inline_link_after_button_has_geometry` 改为 `inline_link_after_button_has_native_input_geometry`。其他 runtime 测试仍使用的 helpers 保留。根 release/render 门禁 **1957/1957**（4 skipped），独立 runtime **172/172**。本批未删除完整文件或生产实现，`bindings/python/` 与私有 `runtime/` 仍存在；后续继续迁移有用回归并实际移除私有包装，保持强制且不可变的 Persona 契约。迁移测试不代表 CDP 已接入共享 native input。
 
 依赖：OB-021、OB-005、OB-025；按调用点完成 OB-027/028/029 的替代 smoke。入口：runtime/、bindings/python/、私有 NDJSON/RPC、专属 examples/scripts/CI/发行配置。
 动作：下一步清理主项；清点消费者，迁出独有输入、等待、persona、启动保护与回归，再删除配套进程/协议/SDK 和无消费者依赖。
