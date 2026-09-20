@@ -3,6 +3,7 @@
 // `StealthHttpClient::detached`.
 pub(crate) mod transport;
 use transport::header;
+use crate::observation::RequestTrace;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -416,7 +417,7 @@ impl StealthHttpClient {
         url: &Url,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, ResourceRequest::navigation(), callbacks)
+        self.fetch_with_profile(url, ResourceRequest::navigation(), callbacks, None)
             .await
     }
 
@@ -426,7 +427,13 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, request, callbacks).await
+        self.fetch_with_profile(url, request, callbacks, None).await
+    }
+
+    pub async fn fetch_resource_traced(
+        &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>, trace: &RequestTrace,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(url, request, callbacks, Some(trace)).await
     }
 
     async fn fetch_with_profile(
@@ -434,9 +441,10 @@ impl StealthHttpClient {
         url: &Url,
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
+        trace: Option<&RequestTrace>,
     ) -> Result<Response, ObscuraNetError> {
         let Some(cache_key) = self.resource_cache_key(url, &request).await else {
-            return self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[]).await;
+            return self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[], trace).await;
         };
 
         enum Acquisition {
@@ -460,6 +468,7 @@ impl StealthHttpClient {
 
         match acquisition {
             Acquisition::Cached(response) => {
+                if let Some(trace) = trace { trace.response(&response, true); }
                 self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
                 Ok(response)
             }
@@ -468,16 +477,17 @@ impl StealthHttpClient {
                 if let Some(outcome) = outcome {
                     break match outcome {
                         SharedFetchOutcome::Cacheable(response) => {
-                            self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
+                            if let Some(trace) = trace { trace.response(&response, true); }
+                self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
                             Ok(response)
                         }
                         SharedFetchOutcome::RetryUncoalesced => {
-                            self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[]).await
+                            self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[], trace).await
                         }
                     };
                 }
                 if receiver.changed().await.is_err() {
-                    break self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[]).await;
+                    break self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[], trace).await;
                 }
             },
             Acquisition::Leader(sender) => {
@@ -488,7 +498,7 @@ impl StealthHttpClient {
                     finished: false,
                 };
                 let result = self.fetch_method_with_profile(
-                    url, request, callbacks, http::Method::GET, &[],
+                    url, request, callbacks, http::Method::GET, &[], trace,
                 ).await;
                 let outcome = match &result {
                     Ok(response) => match response_cache_lifetime(response) {
@@ -577,12 +587,13 @@ impl StealthHttpClient {
         &self, url: &Url, body: &str, request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_method_with_profile(url, request, callbacks, http::Method::POST, body.as_bytes()).await
+        self.fetch_method_with_profile(url, request, callbacks, http::Method::POST, body.as_bytes(), None).await
     }
 
     async fn fetch_method_with_profile(
         &self, url: &Url, mut request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>, mut method: http::Method, initial_body: &[u8],
+        trace: Option<&RequestTrace>,
     ) -> Result<Response, ObscuraNetError> {
         let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut request_body = initial_body.to_vec();
@@ -605,6 +616,9 @@ impl StealthHttpClient {
         // Follow up to 20 redirects (Fetch spec): 0..=20 makes
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
+            if !redirects.is_empty() {
+                if let Some(trace) = trace { trace.begin(current_url.as_str(), method.as_str(), None, request_body.len()); }
+            }
             validate_request_mode(&request, &current_url)?;
             if let Some(host) = current_url.host_str() {
                 if self.block_trackers() && crate::blocklist::is_blocked(host) {
@@ -677,6 +691,7 @@ impl StealthHttpClient {
 
             let (transport, prepared) = self.client.request(method.clone(), &current_url, headers, &request_body, std::time::Duration::from_secs(30))?;
             request_info.raw_headers = Some(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
+            if let Some(trace) = trace { trace.prepared(request_info.raw_headers.clone().unwrap()); }
             request_info.headers = request_info.raw_headers.as_ref().unwrap().text_headers();
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
@@ -690,14 +705,12 @@ impl StealthHttpClient {
             let resp = self.client.send_prepared(transport, prepared).await?;
 
             let status = resp.status();
-            validate_stealth_cors_response(
-                &request,
-                &current_url,
-                &request_origin,
-                resp.headers(),
-            )?;
+            let cors_result = validate_stealth_cors_response(
+                &request, &current_url, &request_origin, resp.headers(),
+            );
+            if trace.is_none() { cors_result.as_ref().map_err(|error| ObscuraNetError::Cors(error.to_string()))?; }
 
-            if request.sends_credentials_to(&current_url) {
+            if cors_result.is_ok() && request.sends_credentials_to(&current_url) {
                 for val in resp.headers().get_all("set-cookie") {
                     if let Ok(s) = val.to_str() {
                         self.cookie_jar.set_cookie(s, &current_url);
@@ -709,9 +722,23 @@ impl StealthHttpClient {
             let request_raw_headers = resp.request_headers.clone();
             let response_headers = raw_headers.text_headers();
 
+            let mut captured_body = None;
+            let mut resp = Some(resp);
+            if let Some(trace) = trace {
+                let mut response = Response { url: current_url.clone(), status: status.as_u16(),
+                    headers: response_headers.clone(), body: Vec::new(), redirected_from: redirects.clone(),
+                    raw_headers: Some(raw_headers.clone()), request_raw_headers: Some(request_raw_headers.clone()),
+                    request_referrer: request.referrer.clone() };
+                trace.response(&response, false);
+                response.body = read_stealth_body_limited(resp.take().unwrap(), &current_url, request.max_response_bytes).await?;
+                trace.response(&response, true);
+                captured_body = Some(response.body);
+            }
+            cors_result?;
+
             if status.is_redirection() {
-                if let Some(location) = resp.headers().get("location") {
-                    let location_str = location.to_str().map_err(|_| {
+                if let Some(location) = raw_headers.fields.iter().find(|field| field.name.eq_ignore_ascii_case(b"location")) {
+                    let location_str = std::str::from_utf8(&location.value).map_err(|_| {
                         ObscuraNetError::Network("Invalid redirect Location".into())
                     })?;
                     let mut next_url = current_url.join(location_str).map_err(|e| {
@@ -725,8 +752,8 @@ impl StealthHttpClient {
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
-                    if let Some(policy) = resp.headers().get_all("referrer-policy").iter()
-                        .filter_map(|value| value.to_str().ok().and_then(ReferrerPolicy::from_header)).last()
+                    if let Some(policy) = raw_headers.fields.iter().filter(|field| field.name.eq_ignore_ascii_case(b"referrer-policy"))
+                        .filter_map(|field| std::str::from_utf8(&field.value).ok().and_then(ReferrerPolicy::from_header)).last()
                     {
                         request.referrer_policy = policy;
                     }
@@ -739,8 +766,10 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_stealth_body_limited(resp, &current_url, request.max_response_bytes)
-                .await?;
+            let body = match captured_body {
+                Some(body) => body,
+                None => read_stealth_body_limited(resp.unwrap(), &current_url, request.max_response_bytes).await?,
+            };
 
             let response = Response {
                 url: current_url,
@@ -812,6 +841,17 @@ impl StealthHttpClient {
         timeout: std::time::Duration,
         observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
     ) -> Result<Response, ObscuraNetError> {
+        self.send_single_traced_fields(method, url, fields, body, send_cookies, store_cookies,
+            max_response_bytes, timeout, observation, None).await
+    }
+
+    pub async fn send_single_traced_fields(
+        &self, method: &str, url: &Url, fields: &[(String, String)], body: &[u8],
+        send_cookies: bool, store_cookies: bool, max_response_bytes: usize,
+        timeout: std::time::Duration,
+        observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
+        trace: Option<&RequestTrace>,
+    ) -> Result<Response, ObscuraNetError> {
         let in_flight = InFlightGuard::new(&self.in_flight);
         if let Some(host) = url.host_str() {
             if self.block_trackers() && crate::blocklist::is_blocked(host) {
@@ -855,6 +895,9 @@ impl StealthHttpClient {
             .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
             .and_then(|(_, value)| Url::parse(value).ok());
         let (transport, prepared) = self.client.request(req_method, url, headers, body, timeout)?;
+        if let Some(trace) = trace {
+            trace.prepared(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
+        }
         if let Some((callbacks, resource_type)) = observation {
             if callbacks.has_request_callbacks().await {
                 info.raw_headers = Some(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
@@ -878,6 +921,12 @@ impl StealthHttpClient {
         let raw_headers = crate::HeaderCapture::from_headers("transportResponse", resp.headers());
         let request_raw_headers = resp.request_headers.clone();
         let response_headers = raw_headers.text_headers();
+        if let Some(trace) = trace {
+            trace.response(&Response { url: url.clone(), status: status.as_u16(),
+                headers: response_headers.clone(), body: Vec::new(), redirected_from: Vec::new(),
+                raw_headers: Some(raw_headers.clone()), request_raw_headers: Some(request_raw_headers.clone()),
+                request_referrer: request_referrer.clone() }, false);
+        }
         let resp_body = read_stealth_body_limited(resp, url, max_response_bytes).await?;
         drop(in_flight);
 

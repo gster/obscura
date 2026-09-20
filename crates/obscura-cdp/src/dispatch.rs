@@ -51,11 +51,14 @@ pub(crate) struct ExecutionContextRecord {
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub(crate) navigating_page_id: Option<String>,
+    pub(crate) navigating_document_loader: Option<(u64, String)>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
     /// Current document loader per page. Navigation events and later
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
+    pub document_loaders: HashMap<(String, u64), String>,
+    pub network_owners: HashMap<(String, String), Option<String>>,
     /// Pages whose initial navigation event sequence has been emitted. A page
     /// is created already loaded (about:blank), but Chrome emits that load's
     /// events when the client attaches; Page.enable emits them once per page
@@ -161,8 +164,11 @@ impl CdpContext {
         CdpContext {
             pages: Vec::new(),
             navigating_page_id: None,
+            navigating_document_loader: None,
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
+            document_loaders: HashMap::new(),
+            network_owners: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
@@ -324,6 +330,8 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.document_loaders.retain(|(page_id, _), _| page_id != id);
+        self.network_owners.retain(|(page_id, _), _| page_id != id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {

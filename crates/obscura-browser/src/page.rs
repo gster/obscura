@@ -171,6 +171,16 @@ fn escape_for_js_template_literal(input: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
+    pub document_generation: u64,
+    pub document_url: String,
+    pub initiator_request_id: Option<String>,
+    pub retired_document_url: Option<String>,
+    pub pending: bool,
+    pub error: Option<String>,
+    pub request_body_size: usize,
+    pub request_started: bool,
+    pub redirect: bool,
+    pub response_body_request_id: Option<String>,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -289,6 +299,10 @@ pub struct Page {
     response_bodies: Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
     js_response_body_counter: Arc<std::sync::atomic::AtomicU64>,
     network_event_counter: u32,
+    pub network_document_generation: u64,
+    pub network_retired_generations: Vec<u64>,
+    network_teardown_events: Arc<std::sync::Mutex<Vec<obscura_js::ops::JsNetworkEvent>>>,
+    pub network_teardown_notify: Arc<tokio::sync::Notify>,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
@@ -1140,6 +1154,9 @@ impl Page {
             response_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             js_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             network_event_counter: 0,
+            network_document_generation: 0, network_retired_generations: Vec::new(),
+            network_teardown_events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            network_teardown_notify: Arc::new(tokio::sync::Notify::new()),
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
@@ -1769,7 +1786,7 @@ impl Page {
             // Every frame realm holds a V8 handle into this isolate, so the
             // frames of the outgoing document must go before the runtime does.
             self.frames.clear();
-            let _ = self.js.take();
+            self.retire_js_network_events();
         }
 
         // Thread the BrowserContext's proxy through to the ES-module loader
@@ -1781,6 +1798,8 @@ impl Page {
             self.context.proxy_url.clone(),
             &self.context.language,
         );
+        self.network_document_generation += 1;
+        rt.set_network_observation_context(self.network_document_generation, self.url_string(), self.network_teardown_events.clone(), self.network_teardown_notify.clone());
         rt.set_network_response_body_store(self.response_bodies.clone(), self.js_response_body_counter.clone());
         rt.set_url(&self.url_string());
         rt.set_session_history(self.session_history.clone());
@@ -3319,7 +3338,9 @@ impl Page {
         // The previous document's background loads end with the document.
         self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
-        self.network_events.clear();
+        // A failed navigation must not erase unflushed script terminals from
+        // the prior document. Static navigation captures can be replaced.
+        self.network_events.retain(|event| event.document_generation != u64::MAX);
         let history_request = request.clone();
 
         if self.context.obey_robots {
@@ -3705,7 +3726,8 @@ impl Page {
         self.retire_render_resources();
         self.pending_frame_work.clear();
         self.frames.clear();
-        self.js = None;
+        self.retire_js_network_events();
+        self.network_document_generation += 1;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
             "<!DOCTYPE html><html><head></head><body></body></html>",
@@ -4197,17 +4219,36 @@ impl Page {
     /// responseReceived for them (issue #406). Idempotent: the runtime's queue
     /// is drained, so calling this repeatedly does not duplicate events. The
     /// fetch-{N} request id is preserved so Network.getResponseBody resolves.
+    fn retire_js_network_events(&mut self) {
+        if let Some(js) = self.js.take() {
+            self.network_retired_generations.push(self.network_document_generation);
+            let (document_url, events) = js.retire_network_events();
+            self.append_js_network_events(events, Some(document_url));
+            self.sync_js_network_events();
+        }
+    }
+
     pub fn sync_js_network_events(&mut self) {
         let events = match self.js.as_ref() {
             Some(js) => js.take_js_network_events(),
-            None => return,
+            None => std::mem::take(&mut *self.network_teardown_events.lock().unwrap_or_else(|e| e.into_inner())),
         };
+        self.append_js_network_events(events, None);
+    }
+
+    fn append_js_network_events(&mut self, events: Vec<obscura_js::ops::JsNetworkEvent>, retired_document_url: Option<String>) {
         for ev in events {
             self.network_events.push(NetworkEvent {
+                document_generation: ev.document_generation, document_url: ev.document_url,
+                retired_document_url: retired_document_url.clone(),
+                initiator_request_id: ev.initiator_request_id.clone(),
+                pending: ev.pending, error: ev.error, request_body_size: ev.request_body_size,
+                request_started: ev.request_started, redirect: ev.redirect,
+                response_body_request_id: ev.response_body_request_id,
                 request_id: ev.request_id,
                 url: ev.url,
                 method: ev.method,
-                resource_type: format!("{:?}", ev.resource_type),
+                resource_type: if ev.initiator_request_id.is_some() { "Preflight".into() } else { format!("{:?}", ev.resource_type) },
                 status: ev.status,
                 headers: ev.request_raw_headers.as_ref().map(|h| h.text_headers()).unwrap_or_default(),
                 response_headers: Arc::new(ev.response_headers),
@@ -4510,6 +4551,10 @@ impl Page {
             .unwrap_or_default()
             .as_secs_f64();
         self.network_events.push(NetworkEvent {
+            document_generation: u64::MAX, document_url: String::new(),
+            initiator_request_id: None,
+            retired_document_url: None,
+            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
             request_id: request_id.clone(),
             url: url.to_string(),
             method: method.to_string(),
@@ -4619,7 +4664,7 @@ impl Page {
         // can, so they are rebuilt when the page next loads a document.
         self.pending_frame_work.clear();
         self.frames.clear();
-        self.js = None;
+        self.retire_js_network_events();
     }
 
     pub fn resume_js(&mut self) {

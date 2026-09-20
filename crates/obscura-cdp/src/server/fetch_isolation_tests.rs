@@ -72,10 +72,12 @@ async fn fixture_with_requests() -> (String, tokio::task::JoinHandle<()>, Arc<st
     let captured = requests.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    let cross_origin = format!("http://localhost:{}", listener.local_addr().unwrap().port());
     let task = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
             let captured = captured.clone();
+            let cross_origin = cross_origin.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 loop {
@@ -89,7 +91,10 @@ async fn fixture_with_requests() -> (String, tokio::task::JoinHandle<()>, Arc<st
                 let path = request.split_whitespace().nth(1).unwrap();
                 captured.lock().unwrap().push(path.to_string());
                 let body = if path == "/" { "<html>ready</html>" } else { path };
-                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nSet-Cookie: session=complete-secret; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let status = if path == "/redirect-preflight" {
+                    format!("302 Found\r\nLocation: {cross_origin}/final")
+                } else if path.starts_with("/redirect/") { "302 Found\r\nLocation: /final".into() } else { "200 OK".into() };
+                let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization\r\nSet-Cookie: session=complete-secret; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                 socket.write_all(response.as_bytes()).await.unwrap();
             });
         }
@@ -363,11 +368,219 @@ fn closed_reply_channel_aborts_instead_of_registering_a_pause() {
     drop(reply_rx);
     let (resolver, mut resolved) = tokio::sync::oneshot::channel();
     let request = obscura_js::ops::InterceptedRequest {
+                document_generation: 0, document_url: "https://example.test/".into(), redirect_response: None,
+                network_id: "fixture-network-id".into(),
+                network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                request_raw_headers: None, request_body_size: 0,
         request_id: "intercept-1".into(), url: "https://example.test/".into(), method: "GET".into(),
         headers: HashMap::new(), resource_type: "Fetch".into(), resolver,
     };
     let mut paused = InterceptedPauses::new();
-    emit_intercepted_request(request, "frame", Some("session".into()), &reply_tx, &mut paused);
+    emit_intercepted_request(request, "frame", "loader", "https://example.test/", Some("session".into()), &reply_tx, &mut paused);
     assert!(paused.is_empty());
     assert!(matches!(resolved.try_recv(), Ok(obscura_js::ops::InterceptResolution::Fail { reason }) if reason == "Aborted"));
+}
+
+#[test]
+fn closed_routed_pause_does_not_restore_a_retired_network_owner() {
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session = Some("closed-route-session".to_string());
+    ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+    ctx.fetch_intercept.owners.insert(page_id.clone(), session.clone());
+    let (resolver, resolved) = tokio::sync::oneshot::channel();
+    drop(resolved);
+    let request = obscura_js::ops::InterceptedRequest {
+        document_generation: 0, document_url: "https://example.test/".into(), redirect_response: None,
+        network_id: "retired-network-id".into(),
+        network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        request_raw_headers: None, request_body_size: 0,
+        request_id: "intercept-retired".into(), url: "https://example.test/".into(), method: "GET".into(),
+        headers: HashMap::new(), resource_type: "Fetch".into(), resolver,
+    };
+    let routed = crate::domains::fetch::RoutedInterceptedRequest {
+        page_id: page_id.clone(), frame_id: "frame".into(), session_id: session, request,
+    };
+    let (reply_tx, mut replies) = mpsc::unbounded_channel();
+    let mut paused = InterceptedPauses::new();
+    emit_routed_intercepted_request(routed, &mut ctx, &reply_tx, &mut paused);
+    assert!(paused.is_empty());
+    assert!(ctx.network_owners.is_empty());
+    assert!(replies.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failure_observation_native_abort_retires_cdp_pause_and_keeps_session() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base, fixture_task, requests) = fixture_with_requests().await;
+        let (mut client, processor) = client().await;
+        let (_, session) = page(&mut client, &base).await;
+        client.ok(Some(&session), "Runtime.evaluate", json!({"expression":format!(
+            "globalThis.c=new AbortController(); globalThis.result=fetch({:?},{{signal:c.signal}}).catch(e=>e.name); 'started'", format!("{base}/abort")), "returnByValue":true})).await;
+        let pause = client.pause(&session).await;
+        let id = pause["params"]["requestId"].as_str().unwrap();
+        let network_id = pause["params"]["networkId"].as_str().unwrap();
+        assert_ne!(id, network_id);
+        assert!(client.events.iter().any(|event| event["method"] == "Network.requestWillBeSent" && event["params"]["requestId"] == network_id && event["sessionId"] == session));
+        client.ok(Some(&session), "Runtime.evaluate", json!({"expression":"c.abort(); 'aborted'", "returnByValue":true})).await;
+        assert_eq!(client.result(&session).await, json!("AbortError"));
+        for method in ["Fetch.continueRequest", "Fetch.failRequest", "Fetch.fulfillRequest"] {
+            assert!(client.command(Some(&session), method, json!({"requestId":id,"errorReason":"Failed","responseCode":200})).await.get("error").is_some());
+        }
+        while !client.events.iter().any(|event| event["method"] == "Network.loadingFailed" && event["params"]["requestId"] == network_id) {
+            let event = client.recv().await; client.events.push(event);
+        }
+        let terminal = client.events.iter().filter(|event| event["params"]["requestId"] == network_id &&
+            (event["method"] == "Network.loadingFailed" || event["method"] == "Network.loadingFinished")).collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["method"], "Network.loadingFailed");
+        assert_eq!(terminal[0]["sessionId"], session);
+        assert_eq!(*requests.lock().unwrap(), vec!["/"]);
+        drop(client); processor.await.unwrap(); fixture_task.abort();
+    }).await;
+}
+
+
+#[tokio::test(flavor = "current_thread")]
+async fn failure_observation_redirect_pauses_each_hop_and_keeps_owner_headers_and_body() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base, fixture_task, requests) = fixture_with_requests().await;
+        let (mut client, processor) = client().await;
+        let (target, owner) = page(&mut client, &base).await;
+        let other = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        for fail in [false, true] {
+            let first_url=format!("{base}/redirect/{}",if fail {"failure"}else{"success"});
+            client.start_fetch(&owner,&first_url,false).await;
+            let first=client.pause(&owner).await;
+            let network=first["params"]["networkId"].clone();
+            client.ok(Some(&owner),"Fetch.continueRequest",json!({"requestId":first["params"]["requestId"]})).await;
+            let second=client.pause(&owner).await;
+            assert_eq!(second["params"]["networkId"],network);
+            assert_ne!(second["params"]["requestId"],first["params"]["requestId"]);
+            let starts=client.events.iter().filter(|e|e["method"]=="Network.requestWillBeSent" && e["params"]["requestId"]==network).collect::<Vec<_>>();
+            assert_eq!(starts.len(),2);
+            assert_eq!(starts[1]["params"]["redirectResponse"]["status"],302);
+            assert_eq!(starts[1]["params"]["redirectResponse"]["url"],first_url);
+            assert!(starts.iter().all(|e|e["params"]["loaderId"].as_str().is_some_and(|id|!id.is_empty()) && e["params"]["documentURL"]==format!("{base}/")));
+            let hop_body=starts[1]["params"]["redirectResponse"]["bodyRequestId"].clone();
+            assert!(client.command(Some(&other),"Fetch.failRequest",json!({"requestId":second["params"]["requestId"]})).await.get("error").is_some());
+            if fail {
+                client.ok(Some(&owner),"Fetch.failRequest",json!({"requestId":second["params"]["requestId"],"errorReason":"BlockedByClient"})).await;
+            } else {
+                client.ok(Some(&owner),"Fetch.continueRequest",json!({"requestId":second["params"]["requestId"],"headers":[{"name":"Authorization","value":"Bearer override-complete-secret"},{"name":"X-Route","value":"second-hop"}]})).await;
+            }
+            assert_eq!(client.result(&owner).await,if fail {"failed"}else{"/final"});
+            let terminal=if fail {"Network.loadingFailed"}else{"Network.loadingFinished"};
+            while !client.events.iter().any(|e|e["method"]==terminal && e["params"]["requestId"]==network) {
+                let event=client.recv().await; client.events.push(event);
+            }
+            let events=client.events.iter().filter(|e|e["params"]["requestId"]==network).collect::<Vec<_>>();
+            assert!(events.iter().all(|e|e["sessionId"]==owner));
+            assert_eq!(events.iter().filter(|e|e["method"]=="Network.requestWillBeSent").count(),2);
+            assert_eq!(events.iter().filter(|e|e["method"]=="Network.responseReceived").count(),usize::from(!fail));
+            assert_eq!(events.iter().filter(|e|e["method"]==terminal).count(),1);
+            if !fail {
+                let extra=events.iter().filter(|e|e["method"]=="Network.requestWillBeSentExtraInfo").last().unwrap();
+                let headers=extra["params"]["headers"].as_object().unwrap();
+                let get=|name:&str|headers.iter().find(|(key,_)|key.eq_ignore_ascii_case(name)).map(|(_,value)|value.as_str().unwrap()).unwrap();
+                assert_eq!(get("Authorization"),"Bearer override-complete-secret");
+                assert!(get("Cookie").contains("session=complete-secret"));
+                assert_eq!(get("X-Route"),"second-hop");
+                assert!(!get("User-Agent").is_empty());
+                assert_eq!(client.ok(Some(&owner),"Fetch.getResponseBody",json!({"requestId":first["params"]["requestId"]})).await["body"],format!("/redirect/success"));
+                assert_eq!(client.ok(Some(&owner),"Fetch.getResponseBody",json!({"requestId":second["params"]["requestId"]})).await["body"],"/final");
+            }
+            assert_eq!(client.ok(Some(&owner),"Network.getResponseBody",json!({"requestId":hop_body})).await["body"],if fail {"/redirect/failure"}else{"/redirect/success"});
+        }
+        assert_eq!(*requests.lock().unwrap(),vec!["/","/redirect/success","/final","/redirect/failure"]);
+        drop(client);processor.await.unwrap();fixture_task.abort();
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failure_observation_immediate_abort_before_router_drain_has_one_start_and_terminal() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base,fixture_task,requests)=fixture_with_requests().await;
+        let (mut client,processor)=client().await;
+        let (_,session)=page(&mut client,&base).await;
+        client.ok(Some(&session),"Runtime.evaluate",json!({"expression":format!("globalThis.c=new AbortController();globalThis.result=fetch('{base}/immediate',{{signal:c.signal}}).catch(e=>'aborted');c.abort('complete abort reason');'started'"),"returnByValue":true})).await;
+        assert_eq!(client.result(&session).await,"aborted");
+        while !client.events.iter().any(|e|e["method"]=="Network.loadingFailed") {
+            let event=client.recv().await;client.events.push(event);
+        }
+        let failed=client.events.iter().find(|e|e["method"]=="Network.loadingFailed").unwrap();
+        let id=failed["params"]["requestId"].clone();
+        assert!(failed["params"]["errorText"].as_str().unwrap().contains("complete abort reason"));
+        let events=client.events.iter().filter(|e|e["params"]["requestId"]==id).collect::<Vec<_>>();
+        assert_eq!(events.iter().filter(|e|e["method"]=="Network.requestWillBeSent").count(),1);
+        assert_eq!(events.iter().filter(|e|e["method"]=="Network.loadingFailed").count(),1);
+        assert_eq!(events[0]["method"],"Network.requestWillBeSent");
+        assert!(!events.iter().any(|e|e["method"]=="Network.loadingFinished"));
+        assert_eq!(*requests.lock().unwrap(),vec!["/"]);
+        drop(client);processor.await.unwrap();fixture_task.abort();
+    }).await;
+}
+
+
+#[tokio::test(flavor = "current_thread")]
+async fn failure_observation_navigation_pause_uses_pending_document_loader() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base,fixture_task)=fixture().await;
+        let (mut client,processor)=client().await;
+        let (_,session)=page(&mut client,&base).await;
+        let html=format!("<script>globalThis.result=fetch('{base}/during-nav').then(r=>r.text())</script>");
+        let url=format!("data:text/html,{html}");
+        client.id+=1;
+        let command_id=client.id;
+        client.tx.send(ServerMessage::Cdp(CdpMessage {
+            text:json!({"id":command_id,"method":"Page.navigate","sessionId":session,"params":{"url":url}}).to_string(),reply_tx:client.reply_tx.clone(),
+        })).unwrap();
+        let pause=client.pause(&session).await;
+        let network=pause["params"]["networkId"].clone();
+        let start=client.events.iter().find(|event|event["method"]=="Network.requestWillBeSent" && event["params"]["requestId"]==network).unwrap();
+        let loader=start["params"]["loaderId"].clone();
+        assert_eq!(start["params"]["documentURL"],url);
+        client.ok(Some(&session),"Fetch.fulfillRequest",json!({"requestId":pause["params"]["requestId"],"body":"b2s="})).await;
+        loop {
+            if let Some(response)=client.events.iter().find(|event|event["id"]==command_id) {
+                assert_eq!(response["result"]["loaderId"],loader);break;
+            }
+            let event=client.recv().await;client.events.push(event);
+        }
+        drop(client);processor.await.unwrap();fixture_task.abort();
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failure_observation_unintercepted_redirect_preflight_has_ordered_starts_and_redirect_response() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base, fixture_task, requests) = fixture_with_requests().await;
+        let (mut client, processor) = client().await;
+        let target = client.ok(None,"Target.createTarget",json!({"url":format!("{base}/")})).await["targetId"].as_str().unwrap().to_string();
+        let session = client.ok(None,"Target.attachToTarget",json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        client.ok(Some(&session),"Network.enable",json!({})).await;
+        let url=format!("{base}/redirect-preflight");
+        client.start_fetch(&session,&url,false).await;
+        assert_eq!(client.result(&session).await,"/final");
+        while !client.events.iter().any(|e|e["method"]=="Network.loadingFinished" && e["params"]["requestId"].as_str().is_some_and(|id|id.starts_with("fetch-"))) {
+            let event=client.recv().await;client.events.push(event);
+        }
+        // A final Runtime call drains the terminal event batch as well.
+        client.ok(Some(&session),"Runtime.evaluate",json!({"expression":"1"})).await;
+        let starts=client.events.iter().filter(|e|e["method"]=="Network.requestWillBeSent" && e["params"]["requestId"].as_str().is_some_and(|id|id.starts_with("fetch-"))).collect::<Vec<_>>();
+        assert_eq!(starts.len(),3,"{starts:?}");
+        assert_eq!(starts[0]["params"]["request"]["url"],url);
+        assert!(starts[1]["params"]["request"]["url"].as_str().unwrap().contains("localhost:"));
+        assert_eq!(starts[1]["params"]["requestId"],starts[0]["params"]["requestId"]);
+        assert_eq!(starts[1]["params"]["redirectResponse"]["status"],302);
+        assert_eq!(starts[1]["params"]["redirectResponse"]["url"],url);
+        assert_eq!(starts[2]["params"]["request"]["method"],"OPTIONS");
+        assert_ne!(starts[2]["params"]["requestId"],starts[0]["params"]["requestId"]);
+        assert_eq!(starts[2]["params"]["initiator"]["requestId"],starts[0]["params"]["requestId"]);
+        let body_id=starts[1]["params"]["redirectResponse"]["bodyRequestId"].clone();
+        assert_eq!(client.ok(Some(&session),"Network.getResponseBody",json!({"requestId":body_id})).await["body"],"/redirect-preflight");
+        assert!(!client.events.iter().any(|e|e["method"]=="Network.loadingFailed"));
+        assert_eq!(*requests.lock().unwrap(),vec!["/","/redirect-preflight","/final","/final"]);
+        drop(client);processor.await.unwrap();fixture_task.abort();
+    }).await;
 }

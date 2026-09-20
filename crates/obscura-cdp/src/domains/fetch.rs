@@ -360,7 +360,11 @@ mod tests {
         assert_eq!(result.value, Some(json!([large.len(), 0, 16, invalid, "", "internal-text", 302, "AbortError"])));
         page.sync_js_network_events();
         let events: Vec<_> = page.network_events.drain(..).collect();
-        assert_eq!(events.len(), bodies.len(), "Fail must not emit successful response observations");
+        assert_eq!(events.len(), bodies.len() + 1);
+        let failure = events.last().unwrap();
+        assert_eq!(failure.status, 0);
+        assert_eq!(failure.error.as_deref(), Some("Failed"));
+        assert!(ctx.get_page(&page_id).unwrap().get_response_body_result(&failure.request_id).is_none());
         for (index, (event, bytes)) in events.iter().zip(&bodies).enumerate() {
             assert_eq!(event.status, if index == 4 { 302 } else { 201 });
             assert_eq!(event.method, if index == 0 { "POST" } else { "GET" });
@@ -375,7 +379,7 @@ mod tests {
                 assert_eq!(capture.fields[1].value, b"second=secret");
                 assert_eq!(capture.fields[2].value, [0xff, 0xfe]);
             } else { assert!(event.raw_headers.is_none()); }
-            assert!(event.request_raw_headers.is_none());
+            assert_eq!(event.request_raw_headers.as_ref().unwrap().capture_stage, "scriptRequest");
             if index == 0 {
                 assert_eq!(event.response_headers["set-cookie"], "second=secret");
                 assert_eq!(event.response_headers["x-complete"], "unaltered");
@@ -843,6 +847,10 @@ mod relay_cleanup_tests {
         for id in ["intercept-1", "intercept-2"] {
             let (resolver, receiver) = tokio::sync::oneshot::channel();
             tx.send(obscura_js::ops::InterceptedRequest {
+                document_generation: 0, document_url: "https://example.test/".into(), redirect_response: None,
+                network_id: "fixture-network-id".into(),
+                network_start: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                request_raw_headers: None, request_body_size: 0,
                 request_id: id.into(), url: "https://example.test/".into(), method: "GET".into(),
                 headers: HashMap::new(), resource_type: "Fetch".into(), resolver,
             }).unwrap();

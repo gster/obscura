@@ -246,6 +246,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                 proxy_url.as_deref().unwrap_or("direct")
             );
 
+            let mut observation = page_state.as_ref().and_then(Weak::upgrade).map(|state|
+                crate::ops::NetworkRequest::new(state, None, &url, "GET", None, 0, obscura_net::ResourceType::Script));
+            let result = async {
             match page_network {
                 Ok((client, callbacks, referrer_policy)) => {
                     let requested = ModuleSpecifier::parse(&url)
@@ -253,10 +256,17 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let mut request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
                     request.referrer_policy = referrer_policy;
-                    let resp = client
-                        .fetch_resource_with_callbacks(&requested, request, callbacks.as_deref())
-                        .await
+                    let fetch = async {
+                        if let Some(observation) = &observation {
+                            client.fetch_resource_traced(&requested, request, callbacks.as_deref(), &observation.trace).await
+                        } else {
+                            client.fetch_resource_with_callbacks(&requested, request, callbacks.as_deref()).await
+                        }
+                    };
+                    let resp = tokio::time::timeout(crate::ops::fetch_timeout(), fetch).await
+                        .map_err(|_| io_err(format!("Module fetch timed out: {}", url)))?
                         .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    if let Some(observation) = &observation { observation.trace.response_if_missing(&resp); }
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",
@@ -271,12 +281,6 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .borrow_mut()
                             .push(found.to_string());
                     }
-                    // Page runtimes expose successful graph fetches through the
-                    // same event/body contract as fetch/XHR. Standalone loaders
-                    // have no owning Page or CDP observation channel.
-                    if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
-                        state.borrow_mut().record_network_response(&resp, "GET", obscura_net::ResourceType::Script);
-                    }
                     let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                     Ok(ModuleSource::new_with_redirect(
                         deno_core::ModuleType::JavaScript,
@@ -288,6 +292,11 @@ impl ModuleLoader for ObscuraModuleLoader {
                 }
                 Err(error) => Err(io_err(error)),
             }
+            }.await;
+            if let Some(observation) = &mut observation {
+                observation.finish(result.as_ref().err().map(ToString::to_string));
+            }
+            result
         })))
     }
 }
@@ -323,6 +332,34 @@ mod tests {
             request
         });
         (format!("http://{address}"), thread)
+    }
+
+    #[tokio::test]
+    async fn failure_observation_module_http_and_cors_errors_keep_real_response() {
+        for (status, url, expected) in [(403, "http://example.com/denied.js", "HTTP 403"),
+            (200, "http://cross.test/denied.js", "CORS")]
+        {
+            let body = b"\x00\xffdenied";
+            let mut response = format!("HTTP/1.1 {status} Response\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nSet-Cookie: raw=secret\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+            response.extend_from_slice(body);
+            let (proxy_url, server) = proxy(response);
+            let standalone = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
+            let state = Rc::new(RefCell::new(ObscuraState::new()));
+            state.borrow_mut().stealth_client = standalone.standalone_client.clone();
+            let loader = ObscuraModuleLoader::with_page_state("http://example.com/", None, &state, state.borrow().import_map.clone());
+            let error = load(&loader, url).await.err().expect("module must reject");
+            assert!(error.to_string().contains(expected), "{error}");
+            let state = state.borrow();
+            let events = state.network_teardown_events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            assert_eq!(event.status, status);
+            assert!(event.error.as_ref().unwrap().contains(expected));
+            assert!(event.raw_headers.is_some() && event.request_raw_headers.is_some());
+            let (stored, _) = state.network_response_bodies.lock().unwrap().get(&event.request_id).unwrap().unwrap();
+            assert_eq!(stored.with_bytes(|bytes| bytes.to_vec()).unwrap(), body);
+            assert!(!server.join().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

@@ -931,6 +931,7 @@ async fn cdp_processor(
     let mut runtime_pump_error_streak = 0_u8;
 
     loop {
+        intercepted_paused.retain(|_, resolver| !resolver.is_closed());
         cleanup_detached_fetch_owners(&mut ctx, &mut intercepted_paused);
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
@@ -941,6 +942,7 @@ async fn cdp_processor(
         } else {
             let screencast_active = has_active_screencast(&ctx);
             let has_intercept_rx = intercept_rx.is_some();
+            let network_notifiers = ctx.pages.iter().map(|page| page.network_teardown_notify.clone()).collect();
             tokio::select! {
                 biased;
                 msg = rx.recv() => match msg {
@@ -950,6 +952,11 @@ async fn cdp_processor(
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
+                },
+                _ = wait_network_teardown(network_notifiers) => {
+                    sync_live_page_network_events(&mut ctx);
+                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                    None
                 },
                 pump_result = pump_live_page_event_loop(&mut ctx), if runtime_pump_armed => {
                     match pump_result {
@@ -1005,7 +1012,7 @@ async fn cdp_processor(
                     }
                 }, if has_intercept_rx => {
                     if let Some(reply_tx) = connection_reply_tx.as_ref() {
-                        emit_routed_intercepted_request(intercepted, &ctx, reply_tx, &mut intercepted_paused);
+                        emit_routed_intercepted_request(intercepted, &mut ctx, reply_tx, &mut intercepted_paused);
                     } else {
                         let _ = intercepted.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
                     }
@@ -1110,7 +1117,7 @@ fn cleanup_detached_fetch_owners(ctx: &mut CdpContext, paused: &mut InterceptedP
 
 fn emit_routed_intercepted_request(
     routed: crate::domains::fetch::RoutedInterceptedRequest,
-    ctx: &CdpContext,
+    ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     paused: &mut InterceptedPauses,
 ) {
@@ -1125,7 +1132,20 @@ fn emit_routed_intercepted_request(
             url: None, method: None, headers: None, body: None,
         });
     } else if valid {
-        emit_intercepted_request(routed.request, &routed.frame_id, routed.session_id, reply_tx, paused);
+        let loader_id = ctx.current_loader_ids.get(&routed.page_id).cloned().unwrap_or_else(|| format!("loader-blank-{}", routed.page_id));
+        let loader_id = if ctx.navigating_page_id.as_ref() == Some(&routed.page_id) {
+            ctx.navigating_document_loader.as_ref().filter(|(old_generation, _)| routed.request.document_generation > *old_generation)
+                .map(|(_, loader)| loader.clone()).unwrap_or(loader_id)
+        } else { loader_id };
+        let loader_id = ctx.document_loaders.entry((routed.page_id.clone(), routed.request.document_generation)).or_insert(loader_id).clone();
+        let document_url = routed.request.document_url.clone();
+        let owner_key = (routed.page_id, routed.request.network_id.clone());
+        let owner_session = routed.session_id.clone();
+        if emit_intercepted_request(routed.request, &routed.frame_id, &loader_id, &document_url,
+            routed.session_id, reply_tx, paused)
+        {
+            ctx.network_owners.insert(owner_key, owner_session);
+        }
     } else {
         let _ = routed.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
     }
@@ -1134,10 +1154,14 @@ fn emit_routed_intercepted_request(
 fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     frame_id: &str,
+    loader_id: &str,
+    document_url: &str,
     session_id: Option<String>,
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut InterceptedPauses,
-) {
+) -> bool {
+    if intercepted.resolver.is_closed() || intercepted.network_start.compare_exchange(0, 1,
+        std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() { return false; }
     tracing::info!(
         "INTERCEPTION: requestPaused for {} {} (sending to client)",
         intercepted.method,
@@ -1151,15 +1175,24 @@ fn emit_intercepted_request(
         "url": intercepted.url,
         "method": intercepted.method,
         "headers": intercepted.headers,
+        "rawHeaders": intercepted.request_raw_headers,
+        "hasPostData": intercepted.request_body_size > 0,
+        "bodySize": intercepted.request_body_size,
         "initialPriority": "High",
         "referrerPolicy": "strict-origin-when-cross-origin",
     });
     let request_will_be_sent = json!({
         "method": "Network.requestWillBeSent",
         "params": {
-            "requestId": intercepted.request_id,
-            "loaderId": "",
-            "documentURL": "",
+            "requestId": intercepted.network_id,
+            "loaderId": loader_id,
+            "documentURL": document_url,
+            "redirectHasExtraInfo": false,
+            "redirectResponse": intercepted.redirect_response.as_ref().and_then(|exchange| exchange.response.as_ref().map(|response| json!({
+                "url": exchange.url, "status": response.status, "statusText": "", "headers": response.headers,
+                "rawHeaders": response.raw_headers, "bodyRequestId": exchange.body_request_id,
+                "mimeType": response.headers.get("content-type").cloned().unwrap_or_default(),
+            }))),
             "request": request,
             "timestamp": now,
             "wallTime": now,
@@ -1171,7 +1204,7 @@ fn emit_intercepted_request(
     });
     if reply_tx.send(request_will_be_sent.to_string()).is_err() {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
-        return;
+        return false;
     }
 
     let request_paused = json!({
@@ -1181,7 +1214,7 @@ fn emit_intercepted_request(
             "request": request,
             "frameId": frame_id,
             "resourceType": intercepted.resource_type,
-            "networkId": intercepted.request_id,
+            "networkId": intercepted.network_id,
             "responseErrorReason": null,
             "responseStatusCode": null,
             "responseHeaders": null,
@@ -1190,9 +1223,16 @@ fn emit_intercepted_request(
     });
     if reply_tx.send(request_paused.to_string()).is_err() {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
-        return;
+        return false;
     }
     intercepted_paused.insert((session_id, intercepted.request_id), intercepted.resolver);
+    true
+}
+
+async fn wait_network_teardown(notifiers: Vec<Arc<Notify>>) {
+    if notifiers.is_empty() { std::future::pending::<()>().await; }
+    let waiters: Vec<_> = notifiers.into_iter().map(|notify| Box::pin(notify.notified_owned())).collect();
+    futures_util::future::select_all(waiters).await;
 }
 
 async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
@@ -1234,7 +1274,6 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
     let live_ids: Vec<String> = ctx
         .pages
         .iter()
-        .filter(|page| page.has_js())
         .map(|page| page.id.clone())
         .collect();
     for page_id in live_ids {
@@ -1431,6 +1470,7 @@ fn handle_fetch_resolution(
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut InterceptedPauses,
 ) -> bool {
+    intercepted_paused.retain(|_, resolver| !resolver.is_closed());
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
         if method == "Fetch.disable" {
@@ -1537,8 +1577,11 @@ fn handle_fetch_resolution(
         } else { None };
         if let Some(resolver) = intercepted_paused.remove(&key) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
-            let _ = resolver.send(parsed_resolution.expect("validated fetch resolution"));
-            let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
+            let resp = if resolver.send(parsed_resolution.expect("validated fetch resolution")).is_ok() {
+                crate::types::CdpResponse::success(req.id, json!({}), req.session_id)
+            } else {
+                crate::types::CdpResponse::error(req.id, -32000, "requestId is no longer paused".into(), req.session_id)
+            };
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
             }
@@ -1613,6 +1656,10 @@ async fn process_with_interception(
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    // The new runtime can pause before the navigating Page returns to ctx.
+    // Retain the old generation mapping and pre-register the expected new one.
+    ctx.navigating_document_loader = Some((page.network_document_generation, loader_id.clone()));
+    ctx.document_loaders.insert((page_id.clone(), page.network_document_generation + 1), loader_id.clone());
 
     let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
     let url_owned = url.to_string();
@@ -1756,8 +1803,8 @@ async fn process_with_interception(
 
     ctx.pages.push(page);
     ctx.navigating_page_id = None;
+    ctx.navigating_document_loader = None;
 
-    #[cfg(feature = "render")]
     let navigation_succeeded = navigate_result.is_ok();
     let response = match navigate_result {
         Ok(()) => crate::types::CdpResponse::success(
@@ -1779,6 +1826,7 @@ async fn process_with_interception(
     // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
     // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
     // to the WS reply channel.
+    if navigation_succeeded {
     crate::domains::page::emit_navigation_events(
         ctx,
         &session_for_events,
@@ -1790,6 +1838,10 @@ async fn process_with_interception(
         wait_until,
         reached_network_idle,
     );
+    } else {
+        crate::domains::page::emit_runtime_network_events(ctx, &session_for_events,
+            &frame_id, &page_url, &page_id_for_events, &network_events);
+    }
     #[cfg(feature = "render")]
     if navigation_succeeded {
         if let Err(error) = crate::domains::page::queue_screencast_frame(

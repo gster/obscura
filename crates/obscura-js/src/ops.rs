@@ -75,6 +75,13 @@ pub enum InterceptResolution {
 }
 
 pub struct InterceptedRequest {
+    pub document_generation: u64,
+    pub document_url: String,
+    pub redirect_response: Option<obscura_net::observation::Exchange>,
+    pub network_id: String,
+    pub network_start: Arc<std::sync::atomic::AtomicU8>,
+    pub request_raw_headers: Option<obscura_net::HeaderCapture>,
+    pub request_body_size: usize,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -109,6 +116,16 @@ pub(crate) fn stored_network_response_body(bytes: &[u8]) -> StoredNetworkRespons
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
 #[derive(Debug, Clone)]
 pub struct JsNetworkEvent {
+    pub document_generation: u64,
+    pub document_url: String,
+    pub initiator_request_id: Option<String>,
+    /// A terminal failure never produces loadingFinished, even with a real response.
+    pub pending: bool,
+    pub error: Option<String>,
+    pub request_body_size: usize,
+    pub request_started: bool,
+    pub redirect: bool,
+    pub response_body_request_id: Option<String>,
     /// Matches the `fetch-{N}` id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
@@ -335,6 +352,11 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    pub network_document_generation: u64,
+    pub network_document_url: String,
+    pub network_teardown_events: Arc<std::sync::Mutex<Vec<JsNetworkEvent>>>,
+    pub network_teardown_notify: Arc<tokio::sync::Notify>,
+    pub(crate) fetch_cancellations: HashMap<String, (tokio::sync::watch::Sender<Option<String>>, Option<String>)>,
     // Frame documents that have been fetched and are waiting for a realm.
     // Building one needs the whole runtime, which an op cannot reach, so
     // `op_frame_document_ready` queues here and the Page drains it between
@@ -521,41 +543,6 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
-    /// The successful-response event contract shared by fetch/XHR and modules.
-    /// Redirect hops and failed requests are not synthesized here.
-    pub(crate) fn record_network_response(&mut self, response: &obscura_net::Response,
-        method: &str, resource_type: obscura_net::ResourceType,
-    ) -> String {
-        let id = self.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let request_id = format!("fetch-{id}");
-        // Retention failures are sticky and returned by the CDP result APIs;
-        // they must not change the page's fetch/XHR response semantics.
-        let _ = self.network_response_bodies.lock().unwrap_or_else(|e| e.into_inner())
-            .insert(request_id.clone(), &response.body, false);
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        self.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: response.url.to_string(),
-            method: method.to_string(),
-            resource_type,
-            status: response.status,
-            response_headers: response.headers.clone(),
-            raw_headers: response.raw_headers.clone(),
-            request_raw_headers: response.request_raw_headers.clone(),
-            body_size: response.body.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if self.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = self.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            self.js_network_events.drain(0..overflow);
-        }
-        request_id
-    }
-
     /// Bind the fixed standalone persona once, unless the owning page already
     /// installed its transport. Never derive identity from mutable JS values.
     pub(crate) fn ensure_persona_transport(&mut self) -> Arc<StealthHttpClient> {
@@ -611,6 +598,10 @@ impl ObscuraState {
             network_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            network_document_generation: 0, network_document_url: String::new(),
+            network_teardown_events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            network_teardown_notify: Arc::new(tokio::sync::Notify::new()),
+            fetch_cancellations: HashMap::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
             frame_id_counter: 0,
@@ -3468,7 +3459,7 @@ fn op_console_msg(
         }));
 }
 
-fn fetch_timeout() -> std::time::Duration {
+pub(crate) fn fetch_timeout() -> std::time::Duration {
     let timeout_ms = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -3761,6 +3752,174 @@ fn intercept_fulfill_response(
     })
 }
 
+/// One logical request, including redirect hops. The trace is scoped to this
+/// operation; Page/Worker transports never keep a global last-request slot.
+pub(crate) struct NetworkRequest {
+    state: SharedState,
+    pub id: String,
+    pub trace: obscura_net::observation::RequestTrace,
+    network_start: Arc<std::sync::atomic::AtomicU8>,
+    hop_starts: Vec<Arc<std::sync::atomic::AtomicU8>>,
+    hop_interceptions: Vec<Option<String>>,
+    pub interception_id: Option<String>,
+    pub initiator_request_id: Option<String>,
+    resource_type: ResourceType,
+    finished: bool,
+    emitted_exchanges: usize,
+    document_generation: u64,
+    document_url: String,
+}
+
+impl NetworkRequest {
+    pub(crate) fn new(state: SharedState, id: Option<String>, url: &str, method: &str,
+        headers: Option<obscura_net::HeaderCapture>, body_size: usize, resource_type: ResourceType,
+    ) -> Self {
+        let id = id.unwrap_or_else(|| {
+            let state = state.borrow();
+            let id = state.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            format!("fetch-{id}")
+        });
+        let trace = obscura_net::observation::RequestTrace::new(state.borrow().network_response_bodies.clone(), id.clone());
+        trace.begin(url, method, headers, body_size);
+        let document_generation = state.borrow().network_document_generation;
+        let document_url = state.borrow().network_document_url.clone();
+        Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 }
+    }
+
+    fn start_before_preflight(&mut self) {
+        let start = self.hop_starts.last().unwrap_or(&self.network_start).clone();
+        if start.load(std::sync::atomic::Ordering::SeqCst) == 1 { return; }
+        // Publish completed redirects and the next start in one synchronous
+        // batch before a preflight can yield. finish() must not replay them.
+        let redirects = self.trace.completed_since(self.emitted_exchanges);
+        for exchange in redirects {
+            let event = self.exchange_event(self.emitted_exchanges, exchange, true, None);
+            self.state.borrow_mut().js_network_events.push(event);
+            self.emitted_exchanges += 1;
+        }
+        let Some(exchange) = self.trace.last() else { return; };
+        self.state.borrow_mut().js_network_events.push(JsNetworkEvent {
+            document_generation: self.document_generation, document_url: self.document_url.clone(),
+            initiator_request_id: None,
+            pending: true, error: None, request_id: self.id.clone(), url: exchange.url.clone(), method: exchange.method.clone(),
+            resource_type: self.resource_type, status: 0, response_headers: HashMap::new(), raw_headers: None,
+            request_raw_headers: exchange.request_headers.clone(), request_body_size: exchange.request_body_size,
+            request_started: false, redirect: false, response_body_request_id: None, body_size: 0,
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+        });
+        start.store(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn finish(&mut self, error: Option<String>) {
+        let failure = error.is_some();
+        self.finish_into(error, failure);
+    }
+
+    fn finish_into(&mut self, error: Option<String>, teardown: bool) {
+        if self.finished { return; }
+        self.finished = true;
+        let exchanges = self.trace.take();
+        let count = exchanges.len();
+        let mut events = Vec::new();
+        for (index, exchange) in exchanges.into_iter().enumerate().skip(self.emitted_exchanges) {
+            events.push(self.exchange_event(index, exchange, index + 1 < count, error.clone()));
+        }
+        let mut state = self.state.borrow_mut();
+        if teardown {
+            let pending = std::mem::take(&mut state.js_network_events);
+            let mut queue = state.network_teardown_events.lock().unwrap_or_else(|e| e.into_inner());
+            queue.extend(pending);
+            queue.extend(events);
+            let excess = queue.len().saturating_sub(4096);
+            queue.drain(..excess);
+            state.network_teardown_notify.notify_one();
+        } else {
+            state.js_network_events.extend(events);
+            let excess = state.js_network_events.len().saturating_sub(4096);
+            state.js_network_events.drain(..excess);
+        }
+    }
+    fn exchange_event(&self, index: usize, exchange: obscura_net::observation::Exchange,
+        redirect: bool, error: Option<String>,
+    ) -> JsNetworkEvent {
+        let state = self.state.borrow();
+        let response = exchange.response;
+        let body_captured = exchange.body_complete && response.is_some();
+        let body_id = exchange.body_request_id;
+        if !redirect && body_captured {
+            let mut store = state.network_response_bodies.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(body_id) = &body_id {
+                let _ = store.alias(body_id, &self.id);
+            }
+        }
+        if body_captured {
+            let alias = if index == 0 { self.interception_id.as_ref() } else { self.hop_interceptions.get(index - 1).and_then(Option::as_ref) };
+            if let (Some(body_id), Some(alias)) = (&body_id, alias) {
+                let _ = state.network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).alias(body_id, alias);
+            }
+        }
+        JsNetworkEvent {
+            document_generation: self.document_generation, document_url: self.document_url.clone(),
+            initiator_request_id: self.initiator_request_id.clone(),
+            pending: false,
+            request_id: self.id.clone(), url: exchange.url, method: exchange.method,
+            resource_type: self.resource_type,
+            status: response.as_ref().map_or(0, |r| r.status),
+            response_headers: response.as_ref().map(|r| r.headers.clone()).unwrap_or_default(),
+            raw_headers: response.as_ref().and_then(|r| r.raw_headers.clone()),
+            request_raw_headers: exchange.request_headers.or_else(|| response.as_ref().and_then(|r| r.request_raw_headers.clone())),
+            body_size: exchange.body_size,
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+            error: if redirect { None } else { error },
+            request_body_size: exchange.request_body_size,
+            request_started: if index == 0 { self.network_start.swap(2, std::sync::atomic::Ordering::SeqCst) == 1 } else {
+                self.hop_starts.get(index - 1).is_some_and(|start| start.swap(2, std::sync::atomic::Ordering::SeqCst) == 1)
+            }, redirect,
+            response_body_request_id: if redirect { body_id } else { body_captured.then(|| self.id.clone()) },
+        }
+    }
+
+}
+
+impl Drop for NetworkRequest {
+    fn drop(&mut self) { self.finish_into(Some("Aborted".into()), true); }
+}
+
+fn request_header_capture(headers: impl IntoIterator<Item = (String, String)>) -> obscura_net::HeaderCapture {
+    obscura_net::HeaderCapture { capture_stage: "scriptRequest", encoding: "base64",
+        fields: headers.into_iter().map(|(name, value)| obscura_net::RawHeader {
+            name: name.into_bytes(), value: value.into_bytes(),
+        }).collect() }
+}
+
+#[op2]
+#[string]
+fn op_fetch_start(state: &mut OpState) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    let interception_id = state.intercept_enabled.then(|| {
+        let id = state.intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        format!("intercept-{id}")
+    });
+    let id = state.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let id = format!("fetch-{id}");
+    state.fetch_cancellations.insert(id.clone(), (tokio::sync::watch::channel(None).0, interception_id));
+    id
+}
+
+#[op2(fast)]
+fn op_fetch_abort(state: &mut OpState, #[string] id: String, #[string] reason: String) {
+    let shared = state.borrow::<SharedState>().clone();
+    if let Some((sender, _)) = shared.borrow().fetch_cancellations.get(&id) {
+        sender.send_replace(Some(reason));
+    };
+}
+
+#[op2(fast)]
+fn op_fetch_cleanup(state: &mut OpState, #[string] id: String) {
+    state.borrow::<SharedState>().borrow_mut().fetch_cancellations.remove(&id);
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -3772,14 +3931,60 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
-    #[string] destination: Option<String>,
+    #[string] options: Option<String>,
+) -> Result<String, deno_error::JsErrorBox> {
+    let options_json = options.as_deref().and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+    let destination = options_json.as_ref().and_then(|value| value["destination"].as_str()).map(str::to_owned)
+        .or_else(|| options.filter(|value| !value.starts_with('{')));
+    let request_id = options_json.as_ref().and_then(|value| value["requestId"].as_str()).map(str::to_owned);
+    let shared = state.borrow().borrow::<SharedState>().clone();
+    let resource_type = if matches!(destination.as_deref(), Some("script" | "worker")) { ResourceType::Script } else { ResourceType::Fetch };
+    let fields = serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default();
+    let mut observation = NetworkRequest::new(shared.clone(), request_id, &url, &method,
+        Some(request_header_capture(fields)), body.len(), resource_type);
+    observation.interception_id = shared.borrow().fetch_cancellations.get(&observation.id).and_then(|(_, id)| id.clone());
+    let mut cancel = shared.borrow().fetch_cancellations.get(&observation.id).map(|(sender, _)| sender.subscribe());
+    let result = {
+        let operation = fetch_url_inner(state.clone(), url, method, headers_json, body.to_vec(), origin,
+            mode, credentials, destination, &mut observation);
+        tokio::pin!(operation);
+        if let Some(cancel) = cancel.as_mut() {
+            tokio::select! {
+                biased;
+                reason = async {
+                    loop {
+                        if let Some(reason) = cancel.borrow().clone() { break reason; }
+                        if cancel.changed().await.is_err() { break "Aborted".into(); }
+                    }
+                } => Err(deno_error::JsErrorBox::generic(reason)),
+                result = &mut operation => result,
+            }
+        } else { operation.await }
+    };
+    let error = match &result {
+        Err(error) => Some(error.to_string()),
+        Ok(result) => serde_json::from_str::<serde_json::Value>(result).ok().and_then(|value| {
+            if value["blocked"] == true || value["corsBlocked"] == true || value["status"] == 0 {
+                Some(value["error"].as_str().or(value["corsError"].as_str()).unwrap_or("Blocked").to_string())
+            } else { None }
+        }),
+    };
+    observation.finish(error);
+    shared.borrow_mut().fetch_cancellations.remove(&observation.id);
+    crate::worker::flush_observations(&state.borrow());
+    result
+}
+
+async fn fetch_url_inner(
+    state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String, body: Vec<u8>,
+    origin: String, mode: String, credentials: String, destination: Option<String>,
+    observation: &mut NetworkRequest,
 ) -> Result<String, deno_error::JsErrorBox> {
     crate::worker::refresh_policy(&state.borrow());
     let resource_type = match destination.as_deref() {
         Some("script" | "worker") => ResourceType::Script,
         _ => ResourceType::Fetch,
     };
-    let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -3812,10 +4017,11 @@ async fn op_fetch_url(
             gs.intercept_tx.is_some()
         );
         let itx = if gs.intercept_enabled {
-            let id = gs.intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            gs.intercept_tx
-                .clone()
-                .map(|tx| (tx, format!("intercept-{id}")))
+            let id = observation.interception_id.clone().unwrap_or_else(|| {
+                let id = gs.intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                format!("intercept-{id}")
+            });
+            gs.intercept_tx.clone().map(|tx| (tx, id))
         } else {
             None
         };
@@ -3849,12 +4055,6 @@ async fn op_fetch_url(
             .to_string());
         }
     }
-    struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
-    impl Drop for PageInFlightGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut page_in_flight_guard = Some(PageInFlightGuard(page_in_flight));
 
@@ -3870,6 +4070,11 @@ async fn op_fetch_url(
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
+            document_generation: observation.document_generation, document_url: observation.document_url.clone(), redirect_response: None,
+            network_id: observation.id.clone(),
+            network_start: observation.network_start.clone(),
+            request_raw_headers: Some(request_header_capture(custom_headers.clone())),
+            request_body_size: body.len(),
             request_id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),
@@ -3878,6 +4083,7 @@ async fn op_fetch_url(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
+            observation.interception_id = Some(request_id.clone());
             let resolution = resolve_rx.await;
             let raw_headers = match &resolution {
                 Ok(InterceptResolution::FulfillWithHeaders { raw_headers, .. }) => Some(raw_headers.clone()),
@@ -3909,16 +4115,12 @@ async fn op_fetch_url(
                             raw_headers, request_raw_headers: None,
                             redirected_from: Vec::new(), request_referrer: None,
                         };
+                        observation.trace.response(&response, status != 0);
+                        observation.finish(None);
                         let shared = state.borrow().borrow::<SharedState>().clone();
-                        let response_request_id = shared.borrow_mut()
-                            .record_network_response(&response, &method, resource_type);
-                        // The client already knows the request-stage pause ID.
-                        // Once fulfilled, both IDs resolve to the same retained
-                        // bytes and share stream consumption and budget errors.
                         let _ = shared.borrow().network_response_bodies.lock()
-                            .unwrap_or_else(|e| e.into_inner()).alias(&response_request_id, &request_id);
-                        result["requestId"] = serde_json::Value::String(response_request_id);
-                        crate::worker::flush_observations(&state.borrow());
+                            .unwrap_or_else(|e| e.into_inner()).alias(&observation.id, &request_id);
+                        result["requestId"] = serde_json::Value::String(observation.id.clone());
                     }
                     return Ok(result.to_string());
                 }
@@ -3957,8 +4159,10 @@ async fn op_fetch_url(
                     override_headers = Some(headers);
                     override_body = body;
                 }
-                Err(_) => {}
+                Err(_) => return Err(deno_error::JsErrorBox::generic("Aborted: interception resolver closed")),
             }
+        } else {
+            return Err(deno_error::JsErrorBox::generic("Aborted: interception channel closed"));
         }
     }
 
@@ -3967,6 +4171,11 @@ async fn op_fetch_url(
     // gate as the original request (checked above) and as redirects (checked
     // below). Without this re-validation a rewrite to an internal address would
     // bypass validate_fetch_url entirely.
+    observation.trace.take();
+    observation.trace.begin(override_url.as_deref().unwrap_or(&url), override_method.as_deref().unwrap_or(&method),
+        Some(request_header_capture(override_headers.clone().unwrap_or_else(||
+            serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default().into_iter().collect()))),
+        override_body.as_ref().unwrap_or(&body).len());
     let url = if let Some(new_url) = override_url {
         if let Ok(parsed) = url::Url::parse(&new_url) {
             if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
@@ -3993,7 +4202,6 @@ async fn op_fetch_url(
     } else {
         origin.clone()
     };
-    let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
     let credentials = FetchCredentials::parse(&credentials);
 
     let req_method: http::Method = method.parse().unwrap_or(http::Method::GET);
@@ -4003,11 +4211,31 @@ async fn op_fetch_url(
     });
     custom_headers.retain(|(key, _)| !key.eq_ignore_ascii_case("referer") && !key.eq_ignore_ascii_case("origin") && !key.to_ascii_lowercase().starts_with("sec-"));
 
+    drop(page_in_flight_guard.take());
+    scripted_preflight(state.clone(), &stealth_client, &url, &method, &custom_headers,
+        &page_origin, &mode, credentials, referrer.as_ref(), referrer_policy, observation).await?;
+
+    // Redirects and the response body stay inside the persona-owned transport.
+    drop(page_in_flight_guard.take());
+    stealth_fetch_all(
+        state.clone(), stealth_client, url, req_method.as_str().to_string(),
+        custom_headers, body, page_origin, mode, credentials, destination,
+        resource_type, callbacks, allow_private_network, referrer, referrer_policy, observation,
+    ).await
+}
+
+async fn scripted_preflight(
+    state: Rc<RefCell<OpState>>, stealth_client: &StealthHttpClient, url: &str, method: &str,
+    custom_headers: &[(String, String)], page_origin: &str, mode: &str, credentials: FetchCredentials,
+    referrer: Option<&url::Url>, referrer_policy: ReferrerPolicy, observation: &mut NetworkRequest,
+) -> Result<(), deno_error::JsErrorBox> {
+    let is_cross_origin = request_origin(url).is_some_and(|origin| origin != page_origin);
+    let req_method: http::Method = method.parse().unwrap_or(http::Method::GET);
     let unsafe_header_names = if is_cross_origin && mode == "cors" {
         // CORS classifies the combined value of repeated, case-insensitive
         // names. Keep this derived view separate from the outgoing field list.
         let mut combined = HashMap::<String, String>::new();
-        for (name, value) in &custom_headers {
+        for (name, value) in custom_headers {
             combined.entry(name.to_ascii_lowercase()).and_modify(|previous| {
                 previous.push_str(", "); previous.push_str(value);
             }).or_insert_with(|| value.clone());
@@ -4021,25 +4249,32 @@ async fn op_fetch_url(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
+        observation.start_before_preflight();
         let parsed_url = url::Url::parse(&url)
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
         let mut headers = HashMap::from([
-            ("Origin".to_string(), page_origin.clone()),
-            ("Access-Control-Request-Method".to_string(), method.clone()),
+            ("Origin".to_string(), page_origin.to_string()),
+            ("Access-Control-Request-Method".to_string(), method.to_string()),
         ]);
         if !unsafe_header_names.is_empty() {
             headers.insert("Access-Control-Request-Headers".into(), unsafe_header_names.join(","));
         }
-        if let Some(value) = referrer_policy.referrer(referrer.as_ref(), &parsed_url) {
+        if let Some(value) = referrer_policy.referrer(referrer, &parsed_url) {
             headers.insert("Referer".into(), value.to_string());
         }
         // Preflights are credential-free and may not follow redirects. Hand
         // off pre-send accounting before primp starts counting this request.
-        drop(page_in_flight_guard.take());
-        let response = tokio::time::timeout(fetch_timeout(), stealth_client.send_single_with_limit(
-            "OPTIONS", &parsed_url, &headers, &[], false, false, fetch_max_body_bytes(), fetch_timeout()))
+        let fields: Vec<_> = headers.into_iter().collect();
+        let shared = state.borrow().borrow::<SharedState>().clone();
+        let mut preflight = NetworkRequest::new(shared, None, &url, "OPTIONS",
+            Some(request_header_capture(fields.clone())), 0, ResourceType::Other);
+        preflight.initiator_request_id = Some(observation.id.clone());
+        let preflight_result: Result<(), deno_error::JsErrorBox> = async {
+        let response = tokio::time::timeout(fetch_timeout(), stealth_client.send_single_traced_fields(
+            "OPTIONS", &parsed_url, &fields, &[], false, false, fetch_max_body_bytes(), fetch_timeout(), None, Some(&preflight.trace)))
             .await.map_err(|_| deno_error::JsErrorBox::generic("CORS preflight timed out"))?
             .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+        preflight.trace.response(&response, true);
         let preflight_status = response.status;
         let mut preflight_headers = http::header::HeaderMap::new();
         for (name, value) in response.headers {
@@ -4106,15 +4341,91 @@ async fn op_fetch_url(
                 name
             )));
         }
+            Ok(())
+        }.await;
+        preflight.finish(preflight_result.as_ref().err().map(ToString::to_string));
+        preflight_result?;
     }
 
-    // Redirects and the response body stay inside the persona-owned transport.
-    drop(page_in_flight_guard.take());
-    stealth_fetch_all(
-        state.clone(), stealth_client, url, req_method.as_str().to_string(),
-        custom_headers, body, page_origin, mode, credentials, destination,
-        resource_type, callbacks, allow_private_network, referrer, referrer_policy,
-    ).await
+    Ok(())
+}
+
+struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
+impl Drop for PageInFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn pause_redirect_hop(
+    state: &Rc<RefCell<OpState>>, observation: &mut NetworkRequest,
+    previous: obscura_net::observation::Exchange,
+    url: &mut String, method: &mut String, headers: &mut Vec<(String, String)>, body: &mut Vec<u8>,
+    allow_private_network: bool,
+) -> Result<Option<obscura_net::Response>, deno_error::JsErrorBox> {
+    let start = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    observation.hop_starts.push(start.clone());
+    observation.hop_interceptions.push(None);
+    let shared = state.borrow().borrow::<SharedState>().clone();
+    let intercept = {
+        let state = shared.borrow();
+        if state.intercept_enabled { state.intercept_tx.clone() } else { None }
+    };
+    let Some(tx) = intercept else { return Ok(None); };
+    let page_in_flight = shared.borrow().page_in_flight.clone();
+    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _page_in_flight_guard = PageInFlightGuard(page_in_flight);
+    let id = shared.borrow().intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let request_id = format!("intercept-{id}");
+    *observation.hop_interceptions.last_mut().unwrap() = Some(request_id.clone());
+    let (resolver, resolution) = tokio::sync::oneshot::channel();
+    tx.send(InterceptedRequest {
+        document_generation: observation.document_generation, document_url: observation.document_url.clone(),
+        redirect_response: Some(previous), network_id: observation.id.clone(), network_start: start,
+        request_raw_headers: Some(request_header_capture(headers.clone())), request_body_size: body.len(),
+        request_id, url: url.clone(), method: method.clone(), headers: headers.iter().cloned().collect(),
+        resource_type: format!("{:?}", observation.resource_type), resolver,
+    }).map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception channel closed"))?;
+    let resolution = resolution.await.map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception resolver closed"))?;
+    match resolution {
+        InterceptResolution::Fail { reason } => Err(deno_error::JsErrorBox::generic(reason)),
+        InterceptResolution::Continue { url: u, method: m, headers: h, body: b } => {
+            if let Some(u) = u { *url = u; }
+            if let Some(m) = m { *method = m; }
+            if let Some(h) = h { *headers = h.into_iter().collect(); }
+            if let Some(b) = b { *body = b; }
+            observation.trace.update_request(url, method, request_header_capture(headers.clone()), body.len());
+            let parsed = url::Url::parse(url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+            validate_fetch_url(&parsed, allow_private_network).map_err(deno_error::JsErrorBox::generic)?;
+            Ok(None)
+        }
+        InterceptResolution::ContinueWithHeaders { url: u, method: m, headers: h, body: b } => {
+            if let Some(u) = u { *url = u; }
+            if let Some(m) = m { *method = m; }
+            *headers = h;
+            if let Some(b) = b { *body = b; }
+            observation.trace.update_request(url, method, request_header_capture(headers.clone()), body.len());
+            let parsed = url::Url::parse(url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+            validate_fetch_url(&parsed, allow_private_network).map_err(deno_error::JsErrorBox::generic)?;
+            Ok(None)
+        }
+        fulfillment => {
+            let raw_headers = match &fulfillment {
+                InterceptResolution::FulfillWithHeaders { raw_headers, .. } => Some(raw_headers.clone()),
+                _ => None,
+            };
+            let (InterceptResolution::Fulfill { status, headers, body, body_base64 }
+                | InterceptResolution::FulfillWithHeaders { status, headers, body, body_base64, .. }) = fulfillment else { unreachable!() };
+            let bytes = if body_base64.is_empty() { body.into_bytes() } else {
+                BASE64.decode(body_base64).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
+            };
+            Ok(Some(obscura_net::Response {
+                url: url::Url::parse(url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?,
+                status, headers, body: bytes, raw_headers, request_raw_headers: None,
+                redirected_from: Vec::new(), request_referrer: None,
+            }))
+        }
+    }
 }
 
 /// Scripted fetch()/XHR over primp: mirrors op_fetch_url's redirect, SSRF,
@@ -4128,7 +4439,7 @@ async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
-    custom_headers: Vec<(String, String)>,
+    mut custom_headers: Vec<(String, String)>,
     body: Vec<u8>,
     page_origin: String,
     mode: String,
@@ -4139,6 +4450,7 @@ async fn stealth_fetch_all(
     allow_private_network: bool,
     mut referrer: Option<url::Url>,
     mut referrer_policy: ReferrerPolicy,
+    observation: &mut NetworkRequest,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -4152,9 +4464,9 @@ async fn stealth_fetch_all(
     let mut response = loop {
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
-            Err(_) => {
+            Err(error) => {
                 return Ok(serde_json::json!({
-                    "status": 0, "body": "", "url": current_url, "headers": {},
+                    "status": 0, "body": "", "url": current_url, "headers": {}, "error": error.to_string(),
                 })
                 .to_string());
             }
@@ -4182,7 +4494,7 @@ async fn stealth_fetch_all(
         req_headers.extend(custom_headers.iter().cloned());
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let r = tokio::time::timeout(fetch_timeout(), stealth
-            .send_single_observed_fields(
+            .send_single_traced_fields(
                 &current_method,
                 &parsed_current,
                 &req_headers,
@@ -4195,20 +4507,27 @@ async fn stealth_fetch_all(
                 // callback carries the final hop's independently captured headers.
                 callbacks.as_deref().filter(|_| redirects_followed == 0)
                     .map(|callbacks| (callbacks, resource_type)),
+                Some(&observation.trace),
             ))
             .await
             .map_err(|_| deno_error::JsErrorBox::generic("fetch timed out"))?
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
+        observation.trace.response(&r, r.status != 0);
         if !(300..400).contains(&r.status) {
             break r;
+        }
+        if current_is_cross_origin && mode == "cors" && !cors_response_allows(credentials, &page_origin,
+            r.headers.get("access-control-allow-origin").map(String::as_str).unwrap_or(""),
+            r.headers.get("access-control-allow-credentials").map(String::as_str).unwrap_or("")) {
+            return Err(deno_error::JsErrorBox::generic(format!("CORS redirect response from {} did not allow origin {}", current_url, page_origin)));
         }
         let Some(location) = r.headers.get("location").cloned() else {
             break r;
         };
         let next_url = match parsed_current.join(&location) {
             Ok(u) => u,
-            Err(_) => break r,
+            Err(error) => return Err(deno_error::JsErrorBox::generic(format!("Invalid redirect URL: {}", error))),
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
@@ -4239,6 +4558,19 @@ async fn stealth_fetch_all(
             referrer_policy = policy;
         }
         current_url = next_url.to_string();
+        let previous = observation.trace.last().expect("redirect response trace");
+        observation.trace.begin(&current_url, &current_method, Some(request_header_capture(custom_headers.clone())), current_body.len());
+        if let Some(response) = pause_redirect_hop(&state, observation, previous, &mut current_url,
+            &mut current_method, &mut custom_headers, &mut current_body, allow_private_network).await? {
+            observation.trace.response(&response, response.status != 0);
+            break response;
+        }
+        custom_headers.retain(|(key, _)| !key.eq_ignore_ascii_case("referer") && !key.eq_ignore_ascii_case("origin") && !key.to_ascii_lowercase().starts_with("sec-"));
+        if mode == "same-origin" && request_origin(&current_url).is_some_and(|origin| origin != page_origin) {
+            return Err(deno_error::JsErrorBox::generic("CORS: same-origin request redirected across origins"));
+        }
+        scripted_preflight(state.clone(), &stealth, &current_url, &current_method, &custom_headers,
+            &page_origin, &mode, credentials, referrer.as_ref(), referrer_policy, observation).await?;
     };
 
     response.redirected_from = redirected_from;
@@ -4293,14 +4625,7 @@ async fn stealth_fetch_all(
         }
     }
 
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        gs.record_network_response(&response, &current_method, resource_type)
-    };
-
-    crate::worker::flush_observations(&state.borrow());
+    let response_request_id = observation.id.clone();
 
     Ok(serde_json::json!({
         "status": status,
@@ -6480,6 +6805,9 @@ pub fn build_extension() -> Extension {
         op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
+        op_fetch_start(),
+        op_fetch_abort(),
+        op_fetch_cleanup(),
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),

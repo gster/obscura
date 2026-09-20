@@ -6323,8 +6323,32 @@ impl ObscuraJsRuntime {
     /// Drain the network events recorded for script-initiated requests
     /// (fetch/XHR/dynamic resource). The Page moves these into its own
     /// network_events so the CDP layer emits Network events for them (#406).
+    pub fn set_network_observation_context(&self, generation: u64, url: String,
+        teardown: std::sync::Arc<std::sync::Mutex<Vec<crate::ops::JsNetworkEvent>>>,
+        notify: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.network_document_generation = generation;
+        state.network_document_url = url;
+        state.network_teardown_events = teardown;
+        state.network_teardown_notify = notify;
+    }
+
+    /// Dropping pending ops creates terminal abort observations. Retain the
+    /// outgoing state until V8 has dropped those futures, then drain it.
+    pub fn retire_network_events(self) -> (String, Vec<crate::ops::JsNetworkEvent>) {
+        let state = self.state.clone();
+        let document_url = state.borrow().network_document_url.clone();
+        drop(self);
+        let events = std::mem::take(&mut state.borrow_mut().js_network_events);
+        (document_url, events)
+    }
+
     pub fn take_js_network_events(&self) -> Vec<crate::ops::JsNetworkEvent> {
-        std::mem::take(&mut self.state.borrow_mut().js_network_events)
+        let mut state = self.state.borrow_mut();
+        let mut events = std::mem::take(&mut *state.network_teardown_events.lock().unwrap_or_else(|e| e.into_inner()));
+        events.append(&mut state.js_network_events);
+        events
     }
 
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
@@ -6853,7 +6877,7 @@ mod tests {
         assert_eq!(event.body_size, bytes.len());
         assert_eq!(event.response_headers["Set-Cookie"], "secret=complete");
         assert!(event.raw_headers.is_none());
-        assert!(event.request_raw_headers.is_none());
+        assert_eq!(event.request_raw_headers.as_ref().unwrap().capture_stage, "scriptRequest");
         let (body, _) = rt.get_network_response_body_result(&event.request_id).unwrap().unwrap();
         assert_eq!(body.with_bytes(|body| body.to_vec()).unwrap(), bytes);
         let (alias, _) = rt.get_network_response_body_result(&pause_id).unwrap().unwrap();
@@ -6864,13 +6888,274 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_transport_error_preserves_prepared_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            try { await fetch('/no-transport?secret=complete', {method:'POST', body:new Uint8Array([0,255]),
+                headers:{Authorization:'Bearer complete+/=', Cookie:'manual=full'}}); return false; }
+            catch(_) { return true; }
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(true)));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert!(event.error.is_some());
+        assert_eq!(event.status, 0);
+        assert_eq!(event.request_body_size, 2);
+        assert!(event.url.ends_with("?secret=complete"));
+        let raw = event.request_raw_headers.as_ref().unwrap();
+        assert_eq!(raw.capture_stage, "transportRequest");
+        assert_eq!(raw.text_headers()["authorization"], "Bearer complete+/=");
+        assert_eq!(raw.text_headers()["cookie"], "manual=full");
+        assert!(rt.get_network_response_body_result(&event.request_id).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_redirect_policy_retains_redirect_response_only() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096]; stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/private?full=secret\r\nContent-Length: 3\r\nSet-Cookie: redirect=full\r\nConnection: close\r\n\r\n\x00\xffR").unwrap();
+        });
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp("async () => {try {await fetch('/redirect');return false;} catch(_) {return true;}}", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(true)));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, 302);
+        assert!(events[0].error.as_ref().unwrap().contains("forbidden"));
+        assert_eq!(events[0].response_headers["location"], "http://127.0.0.1/private?full=secret");
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "AP9S");
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_preflight_preserves_response_and_original_request_metadata() {
+        let (proxy, server) = standalone_proxy(vec![("Set-Cookie: preflight=raw-secret\r\nX-Repeated: one\r\nX-Repeated: two\r\n".into(), vec![0, 255, 17])]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            try { await fetch('http://cross.test/denied?full=secret', {method:'PUT',
+                headers:{Authorization:'Bearer Full+/=', Cookie:'explicit=complete'}, body:new Uint8Array([0,255,17])}); }
+            catch(e) { return e.message; }
+        }"#, None, &[], true, true).await.unwrap();
+        assert!(result.value.unwrap().as_str().unwrap().contains("CORS preflight"));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 3);
+        assert!(events[0].pending);
+        assert_eq!(events[1].method, "OPTIONS");
+        assert_ne!(events[0].request_id, events[1].request_id);
+        assert_eq!(events[0].request_id, events[2].request_id);
+        assert_eq!(events[2].request_body_size, 3);
+        assert_eq!(events[2].status, 0);
+        assert!(events[1].error.is_some() && events[2].error.is_some());
+        let headers = events[2].request_raw_headers.as_ref().unwrap().text_headers();
+        assert_eq!(headers["Authorization"], "Bearer Full+/=");
+        assert_eq!(headers["Cookie"], "explicit=complete");
+        assert_eq!(rt.get_network_response_body(&events[1].request_id).unwrap().body, "AP8R");
+        assert!(rt.get_network_response_body_result(&events[2].request_id).is_none());
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_redirect_preflight_starts_in_wire_order() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, headers, body) in [
+                ("302 Found", "Location: http://cross.test/final\r\n", "redirect-secret"),
+                ("200 OK", "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: x-full\r\n", ""),
+                ("200 OK", "Access-Control-Allow-Origin: *\r\n", "complete"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096]; let count = stream.read(&mut request).unwrap();
+                requests.push(String::from_utf8_lossy(&request[..count]).to_string());
+                write!(stream, "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let result = rt.call_function_on_for_cdp("async () => (await fetch('/redirect', {headers:{'X-Full':'secret'}})).text()", None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("complete")));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(events[0].url.ends_with("/redirect") && events[0].redirect);
+        assert_eq!(events[0].status, 302);
+        assert!(events[1].pending && events[1].url.ends_with("/final"));
+        assert_eq!(events[2].method, "OPTIONS");
+        assert_eq!(events[2].initiator_request_id.as_ref(), Some(&events[0].request_id));
+        assert_ne!(events[2].request_id, events[0].request_id);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        assert_eq!(events[0].request_id, events[3].request_id);
+        assert!(events[3].request_started && !events[3].redirect);
+        assert_eq!(rt.get_network_response_body(events[0].response_body_request_id.as_ref().unwrap()).unwrap().body, "redirect-secret");
+        assert_eq!(rt.get_network_response_body(&events[3].request_id).unwrap().body, "complete");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET ") && requests[1].starts_with("OPTIONS ") && requests[2].starts_with("GET "));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_xhr_reopen_cancels_old_timer_and_ignores_old_completion() {
+        let mut rt = setup_runtime("<html></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx); rt.set_intercept_enabled(true);
+        rt.execute_script("xhr-old", r#"
+            globalThis.xhr = new XMLHttpRequest(); globalThis.xhrEvents=[];
+            for (const name of ['load','error','abort','timeout','loadend']) xhr.addEventListener(name,()=>xhrEvents.push(name));
+            xhr.open('GET','https://example.test/old'); xhr.timeout=40; xhr.send();
+        "#).unwrap();
+        let old = tokio::select! {
+            request=rx.recv()=>request.unwrap(),
+            result=rt.run_event_loop_bounded(1000)=>panic!("old pause missing: {result:?}"),
+        };
+        rt.evaluate("(() => { xhr.open('GET','https://example.test/new'); xhr.timeout=0; xhr.send(); return 'reopened'; })()").unwrap();
+        let new = tokio::select! {
+            request=rx.recv()=>request.unwrap(),
+            result=rt.run_event_loop_bounded(1000)=>panic!("new pause missing: {result:?}"),
+        };
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert!(old.resolver.is_closed());
+        assert!(!new.resolver.is_closed(), "old timeout must not abort the reopened request");
+        assert_eq!(rt.evaluate("[xhr.readyState,xhr.status,xhrEvents]").unwrap(), serde_json::json!([1,0,[]]));
+        new.resolver.send(crate::ops::InterceptResolution::Fulfill {status:200,headers:HashMap::new(),body:"new-body".into(),body_base64:String::new()}).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("[xhr.status,xhr.responseText,xhrEvents]").unwrap(), serde_json::json!([200,"new-body",["load","loadend"]]));
+        assert_eq!(rt.active_network_requests(),0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_worker_terminate_and_close_keep_terminal_after_runtime_drop() {
+        let mut rt = setup_runtime("<html></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx); rt.set_intercept_enabled(true);
+        for close in [false, true] {
+            rt.execute_script("worker-teardown", &format!(r#"
+                globalThis.worker = new Worker(URL.createObjectURL(new Blob([
+                    "fetch('https://example.test/pending').catch(()=>{{}}); onmessage=()=>close();"
+                ])));
+            "#)).unwrap();
+            let request = loop {
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(20), rt.run_autonomous_event_loop_turn()).await;
+                if let Ok(request) = rx.try_recv() { break request; }
+            };
+            rt.evaluate(if close { "worker.postMessage('close')" } else { "worker.terminate()" }).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let events = loop {
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(10), rt.run_autonomous_event_loop_turn()).await;
+                let events = rt.take_js_network_events();
+                if !events.is_empty() { break events; }
+                assert!(std::time::Instant::now() < deadline, "worker teardown did not publish failure");
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].request_id, request.network_id);
+            assert_eq!(events[0].error.as_deref(), Some("Aborted"));
+            assert!(request.resolver.is_closed());
+            assert!(rt.take_js_network_events().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_unprintable_abort_reason_still_cancels() {
+        let mut rt = setup_runtime("<html></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx); rt.set_intercept_enabled(true);
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const reason=Object.create(null); const c=new AbortController(); c.abort(reason);
+            try {await fetch('https://example.test/pre-abort', {signal:c.signal}); return false;} catch(e) {return e===reason;}
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(true)));
+        assert!(rx.try_recv().is_err());
+        let events=rt.take_js_network_events();
+        assert_eq!(events.len(),1);
+        assert_eq!(events[0].error.as_deref(),Some("Aborted"));
+        assert_eq!(events[0].status,0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_native_abort_cancels_page_worker_and_xhr_once() {
+        let mut rt = setup_runtime("<html></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.execute_script("abort-lifecycle", r#"
+            globalThis.results = [];
+            const controller = new AbortController();
+            fetch('https://example.test/page-abort', {signal:controller.signal}).catch(e => results.push(e.name));
+            setTimeout(() => controller.abort(), 20);
+            const xhr = new XMLHttpRequest(); xhr.open('GET', 'https://example.test/xhr-abort');
+            xhr.onabort=()=>results.push('xhr-abort'); xhr.onerror=()=>results.push('xhr-error'); xhr.onload=()=>results.push('xhr-load');
+            xhr.onloadend=()=>results.push('xhr-end'); xhr.send(); setTimeout(()=>xhr.abort(), 20);
+            const timed = new XMLHttpRequest(); timed.open('GET', 'https://example.test/xhr-timeout'); timed.timeout=20;
+            timed.ontimeout=()=>results.push('xhr-timeout'); timed.onerror=()=>results.push('timeout-error');
+            timed.onloadend=()=>results.push('timeout-end'); timed.send();
+            const source = `const c = new AbortController(); fetch('https://example.test/worker-abort', {signal:c.signal}).catch(e=>postMessage(e.name)); setTimeout(()=>c.abort(),20);`;
+            const worker = new Worker(URL.createObjectURL(new Blob([source])));
+            worker.onmessage=e=>{results.push('worker-'+e.data);worker.terminate();};
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("JSON.stringify(results.sort())").unwrap(), serde_json::json!("[\"AbortError\",\"timeout-end\",\"worker-AbortError\",\"xhr-abort\",\"xhr-end\",\"xhr-timeout\"]"));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 4, "{events:?}");
+        for event in &events {
+            assert!(event.error.as_ref().unwrap().starts_with("Aborted"));
+            assert_eq!(event.status, 0);
+            assert!(rt.get_network_response_body_result(&event.request_id).is_none());
+        }
+        let mut pauses = 0;
+        while let Ok(request) = rx.try_recv() {
+            pauses += 1;
+            assert!(request.resolver.is_closed());
+            assert!(events.iter().any(|event| event.request_id == request.network_id));
+        }
+        assert_eq!(pauses, 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_invalid_signal_has_no_request_or_cancellation_entry() {
+        let mut rt = setup_runtime("<html></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            let errors=0; for(let i=0;i<20;i++) { try { await fetch('https://example.test/', {signal:{}}); } catch(e) { if(e.name==='TypeError') errors++; } }
+            return errors;
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.and_then(|value| value.as_f64()), Some(20.0));
+        assert!(rt.take_js_network_events().is_empty());
+        assert_eq!(rt.state.borrow().network_response_body_counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_invalid_native_arguments_cleanup_cancellation_entries() {
+        let mut rt = setup_runtime("<html></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            let errors=0;
+            for(let i=0;i<20;i++) for(const options of [{method:Symbol('method')},{mode:Symbol('mode')},{method:Object.create(null)}]) {
+                try { await fetch('https://example.test/', options); } catch(e) { errors++; }
+            }
+            return errors;
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.and_then(|value| value.as_f64()), Some(60.0));
+        assert!(rt.state.borrow().fetch_cancellations.is_empty());
+        assert!(rt.take_js_network_events().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cors_rejected_transport_response_has_no_success_capture() {
         let (proxy, server) = standalone_proxy(vec![(String::new(), b"not-exposed".to_vec())]);
         let mut rt = standalone_proxy_runtime(&proxy);
         let result = rt.call_function_on_for_cdp("async () => { try { await fetch('http://cross.test/denied'); return 'unexpected'; } catch(e) { return e.name; } }", None, &[], true, true).await.unwrap();
         assert_eq!(result.value, Some(serde_json::json!("TypeError")));
-        assert!(rt.take_js_network_events().is_empty());
-        assert!(rt.get_network_response_body_result("fetch-1").is_none());
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].error.as_ref().unwrap().contains("CORS"));
+        assert_eq!(events[0].status, 200);
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "not-exposed");
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
@@ -6933,8 +7218,9 @@ mod tests {
         assert_eq!(result.value.unwrap(), serde_json::json!({"fetch":binary,"xhr":binary,"cross":binary,"cookie":"session=raw-secret",
             "identity":["x86",obscura_net::StealthProfile::default().platform().2,obscura_net::StealthProfile::default().full_version()]}));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 3);
-        for event in events {
+        assert_eq!(events.len(), 5);
+        assert_eq!(events.iter().filter(|event| event.method == "OPTIONS").count(), 1);
+        for event in events.into_iter().filter(|event| !event.pending && event.method != "OPTIONS") {
             assert_eq!(event.body_size, 4);
             let body = rt.get_network_response_body(&event.request_id).unwrap();
             assert_eq!(body.body, "AID/EA==");
@@ -7130,6 +7416,15 @@ mod tests {
             return [fetchRejected, xhrRejected];
         }"#, None, &[], true, true).await.unwrap();
         assert_eq!(result.value.unwrap(), serde_json::json!([true, true]));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert!(event.error.is_some());
+            assert_eq!(event.status, 200);
+            assert!(event.raw_headers.is_some());
+            assert!(event.request_raw_headers.is_some());
+            assert!(rt.get_network_response_body_result(&event.request_id).is_none());
+        }
         assert_eq!(server.join().unwrap().len(), 2);
         std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
 
@@ -9459,7 +9754,7 @@ return {before,removed,reinsert,moved,cleared};
             let workerInitKeys;
             try {
                 Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, destination) => {
-                    calls.push({url, destination: destination || null});
+                    calls.push({url, destination: destination && destination.startsWith('{') ? (JSON.parse(destination).destination || null) : (destination || null)});
                     return JSON.stringify({status: 200, headers: {}, url, body: 'postMessage("ready");'});
                 };
                 globalThis.fetch = (...args) => {
@@ -12295,6 +12590,44 @@ return {before,removed,reinsert,moved,cleared};
         std::thread::sleep(std::time::Duration::from_millis(600));
 
         assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_activity_redirect_pause_remains_active_until_continue_or_abort() {
+        use std::io::{Read as _, Write as _};
+        for abort in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0;4096]; stream.read(&mut request).unwrap();
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                if !abort {
+                    let (mut stream, _) = listener.accept().unwrap(); stream.read(&mut request).unwrap();
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                }
+            });
+            let mut rt = standalone_proxy_runtime(&proxy);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+            rt.set_intercept_tx(tx); rt.set_intercept_enabled(true);
+            rt.execute_script("redirect-activity", "globalThis.controller=new AbortController(); globalThis.result='pending'; fetch('/redirect',{signal:controller.signal}).then(r=>r.text()).then(v=>result=v).catch(()=>result='aborted');").unwrap();
+            let first=tokio::select! { request=rx.recv()=>request.unwrap(), result=rt.run_event_loop_bounded(1000)=>panic!("first pause: {result:?}") };
+            first.resolver.send(crate::ops::InterceptResolution::Continue {url:None,method:None,headers:None,body:None}).unwrap();
+            let second=tokio::select! { request=rx.recv()=>request.unwrap(), result=rt.run_event_loop_bounded(1000)=>panic!("second pause: {result:?}") };
+            assert_eq!(rt.active_network_requests(),1);
+            // Longer than networkidle0's 500 ms quiet window. A paused redirect
+            // remains active even though its previous transport has completed.
+            rt.run_event_loop_bounded(600).await.unwrap();
+            assert_eq!(rt.active_network_requests(),1);
+            assert_eq!(rt.evaluate("result").unwrap(),serde_json::json!("pending"));
+            if abort { rt.evaluate("controller.abort()").unwrap(); } else {
+                second.resolver.send(crate::ops::InterceptResolution::Continue {url:None,method:None,headers:None,body:None}).unwrap();
+            }
+            rt.run_event_loop_bounded(1000).await.unwrap();
+            assert_eq!(rt.active_network_requests(),0);
+            assert_eq!(rt.evaluate("result").unwrap(),serde_json::json!(if abort {"aborted"} else {"ok"}));
+            server.join().unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -22524,9 +22857,12 @@ return {before,removed,reinsert,moved,cleared};
         assert_eq!(value["directRedirected"], false);
 
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
+        assert!(events[0].redirect && events[0].url.ends_with("/hop/1"));
+        assert_eq!(events[0].request_id, events[1].request_id);
+        assert_ne!(events[1].request_id, events[2].request_id);
         assert!(
-            events[0].url.ends_with("/hop/0"),
+            events[1].url.ends_with("/hop/0"),
             "network response event did not report the final URL: {:?}",
             events[0].url
         );
@@ -22644,9 +22980,11 @@ return {before,removed,reinsert,moved,cleared};
             )]
         );
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].method, expected_method);
-        assert!(events[0].url.ends_with("/final"));
+        assert_eq!(events.len(), 2);
+        assert!(events[0].redirect);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        assert_eq!(events[1].method, expected_method);
+        assert!(events[1].url.ends_with("/final"));
         let wire_requests = wire_requests.lock().unwrap();
         assert!(wire_requests[0].starts_with("POST /start "));
         assert!(wire_requests[1].starts_with(&format!("{expected_method} /final ")));

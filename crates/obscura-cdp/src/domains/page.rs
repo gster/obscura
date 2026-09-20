@@ -879,6 +879,18 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    let generation = ctx.get_page(page_id).map_or(0, |page| page.network_document_generation);
+    let previous_loader = ctx.current_loader_ids.get(page_id).cloned().unwrap_or_else(|| format!("loader-blank-{page_id}"));
+    let retired = ctx.get_page_mut(page_id).map(|page| std::mem::take(&mut page.network_retired_generations)).unwrap_or_default();
+    for retired in retired { ctx.document_loaders.entry((page_id.to_string(), retired)).or_insert_with(|| previous_loader.clone()); }
+    let retired_events: Vec<_> = network_events.iter().filter(|event| event.retired_document_url.is_some() || event.document_generation < generation).cloned().collect();
+    for event in &retired_events {
+        ctx.document_loaders.entry((page_id.to_string(), event.document_generation)).or_insert_with(|| previous_loader.clone());
+    }
+    emit_runtime_network_events(ctx, session_id, frame_id, page_url, page_id, &retired_events);
+    let current_events: Vec<_> = network_events.iter().filter(|event| event.retired_document_url.is_none() && event.document_generation >= generation).cloned().collect();
+    let network_events = current_events.as_slice();
+    ctx.document_loaders.insert((page_id.to_string(), generation), loader_id.to_string());
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
@@ -970,6 +982,7 @@ pub fn emit_navigation_events(
 
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
+            if net_event.pending || net_event.request_started || net_event.error.is_some() { continue; }
             let rid = &nav_request_ids[i];
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
@@ -989,25 +1002,22 @@ pub fn emit_navigation_events(
         }
     }
 
+    let mut redirect_responses = std::collections::HashMap::new();
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
-        if Some(i) != nav_idx {
+        let owner_key = (page_id.to_string(), net_event.request_id.clone());
+        let owner_session = ctx.network_owners.get(&owner_key).cloned().unwrap_or_else(|| es.clone());
+        let redirect_key = (net_event.document_generation, rid.clone());
+        if Some(i) != nav_idx && !net_event.request_started {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-                session_id: es.clone(),
+                params: json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                session_id: owner_session.clone(),
             });
         }
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "rawHeaders": net_event.raw_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
-            session_id: es.clone(),
-        });
+        if net_event.redirect { redirect_responses.insert(redirect_key, network_response_value(net_event)); }
+        emit_network_result(ctx, &owner_session, loader_id, frame_id, net_event, rid);
+        if !net_event.pending && !net_event.redirect { ctx.network_owners.remove(&owner_key); }
     }
 
     let mut phase3 = vec![
@@ -1087,12 +1097,31 @@ pub(crate) fn emit_runtime_network_events(
         .get(page_id)
         .cloned()
         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+    let retired = ctx.get_page_mut(page_id).map(|page| {
+        let mut generations = std::mem::take(&mut page.network_retired_generations);
+        generations.push(page.network_document_generation);
+        generations
+    }).unwrap_or_default();
+    for generation in retired { ctx.document_loaders.entry((page_id.to_string(), generation)).or_insert_with(|| loader_id.clone()); }
+    let mut redirect_responses = std::collections::HashMap::new();
     for network_event in network_events {
+        let page_url = if network_event.document_url.is_empty() { page_url } else { &network_event.document_url };
+        let loader_id = if network_event.document_generation == u64::MAX { loader_id.clone() } else {
+            ctx.document_loaders.entry((page_id.to_string(), network_event.document_generation))
+                .or_insert_with(|| loader_id.clone()).clone()
+        };
         let request_id = &network_event.request_id;
+        let owner_key = (page_id.to_string(), request_id.clone());
+        let owner_session = ctx.network_owners.get(&owner_key).or_else(|| ctx.fetch_intercept.owners.get(page_id)).cloned().unwrap_or_else(|| session_id.clone());
+        let session_id = &owner_session;
+        let redirect_key = (network_event.document_generation, request_id.clone());
+        if !network_event.request_started {
         ctx.pending_events.push(CdpEvent {
             method: "Network.requestWillBeSent".into(),
             params: json!({
                 "requestId": request_id,
+                "redirectResponse": redirect_responses.remove(&redirect_key),
+                "redirectHasExtraInfo": false,
                 "loaderId": loader_id,
                 "documentURL": page_url,
                 "request": {
@@ -1100,44 +1129,75 @@ pub(crate) fn emit_runtime_network_events(
                     "method": network_event.method,
                     "headers": network_event.headers,
                     "rawHeaders": network_event.request_raw_headers,
+                    "hasPostData": network_event.request_body_size > 0,
+                    "bodySize": network_event.request_body_size,
                 },
                 "timestamp": network_event.timestamp,
                 "wallTime": network_event.timestamp,
-                "initiator": {"type": "script"},
+                "initiator": if let Some(parent) = &network_event.initiator_request_id {
+                    json!({"type": "preflight", "requestId": parent})
+                } else { json!({"type": "script"}) },
                 "type": network_event.resource_type,
                 "frameId": frame_id,
             }),
             session_id: session_id.clone(),
         });
+        }
+        if network_event.redirect { redirect_responses.insert(redirect_key, network_response_value(network_event)); }
+        emit_network_result(ctx, session_id, &loader_id, frame_id, network_event, request_id);
+        if !network_event.pending && !network_event.redirect { ctx.network_owners.remove(&owner_key); }
+    }
+}
+
+fn network_response_value(event: &obscura_browser::NetworkEvent) -> Value {
+    json!({"url": event.url, "status": event.status, "statusText": "",
+        "headers": &*event.response_headers, "rawHeaders": event.raw_headers,
+        "bodyRequestId": event.response_body_request_id,
+        "mimeType": event.response_headers.get("content-type").cloned().unwrap_or_default()})
+}
+
+fn emit_network_result(
+    ctx: &mut CdpContext, session_id: &Option<String>, loader_id: &str, frame_id: &str,
+    event: &obscura_browser::NetworkEvent, request_id: &str,
+) {
+    if event.pending { return; }
+    if let Some(raw) = &event.request_raw_headers {
+        if raw.capture_stage == "transportRequest" {
+            ctx.pending_events.push(CdpEvent {
+                method: "Network.requestWillBeSentExtraInfo".into(),
+                params: json!({"requestId": request_id, "headers": raw.text_headers(), "rawHeaders": raw,
+                    "associatedCookies": [], "connectTiming": {"requestTime": event.timestamp},
+                    "bodySize": event.request_body_size}),
+                session_id: session_id.clone(),
+            });
+        }
+    }
+    if event.redirect { return; }
+    if event.status != 0 {
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
-            params: json!({
-                "requestId": request_id,
-                "loaderId": loader_id,
-                "timestamp": network_event.timestamp,
-                "type": network_event.resource_type,
-                "response": {
-                    "url": network_event.url,
-                    "status": network_event.status,
-                    "statusText": "",
-                    "headers": &*network_event.response_headers,
-                    "rawHeaders": network_event.raw_headers,
-                    "mimeType": network_event.response_headers
-                        .get("content-type")
-                        .cloned()
-                        .unwrap_or_default(),
-                },
-                "frameId": frame_id,
-            }),
+            params: json!({"requestId": request_id, "loaderId": loader_id,
+                "timestamp": event.timestamp, "type": event.resource_type, "frameId": frame_id, "hasExtraInfo": false,
+                "response": {"url": event.url, "status": event.status, "statusText": "",
+                    "headers": &*event.response_headers, "rawHeaders": event.raw_headers,
+                    "bodyRequestId": event.response_body_request_id,
+                    "mimeType": event.response_headers.get("content-type").cloned().unwrap_or_default()}}),
             session_id: session_id.clone(),
         });
+    }
+    if let Some(error) = &event.error {
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.loadingFailed".into(),
+            params: json!({"requestId": request_id, "timestamp": event.timestamp,
+                "type": event.resource_type, "errorText": error,
+                "canceled": error.starts_with("Aborted")}),
+            session_id: session_id.clone(),
+        });
+    } else {
         ctx.pending_events.push(CdpEvent {
             method: "Network.loadingFinished".into(),
-            params: json!({
-                "requestId": request_id,
-                "timestamp": network_event.timestamp,
-                "encodedDataLength": network_event.body_size,
-            }),
+            params: json!({"requestId": request_id, "timestamp": event.timestamp,
+                "encodedDataLength": event.body_size}),
             session_id: session_id.clone(),
         });
     }
@@ -1855,8 +1915,10 @@ mod tests {
         page.sync_js_network_events();
         let scripted: Vec<_> = page.network_events.drain(..).collect();
         assert_eq!(navigation.len(), 1);
-        assert_eq!(scripted.len(), 1);
-        for (event, (request, response)) in navigation.iter().chain(scripted.iter()).zip(responses.lock().unwrap().iter()) {
+        assert_eq!(scripted.len(), 2);
+        assert!(scripted[0].redirect);
+        assert_eq!(scripted[0].request_id, scripted[1].request_id);
+        for (event, (request, response)) in navigation.iter().chain(scripted.iter().filter(|event| !event.redirect)).zip(responses.lock().unwrap().iter()) {
             assert_eq!(event.raw_headers, response.raw_headers);
             assert_eq!(event.request_raw_headers, request.raw_headers);
             assert_eq!(event.request_raw_headers, response.request_raw_headers);
@@ -2043,16 +2105,18 @@ mod tests {
         emit_runtime_network_events(&mut ctx, &session, "frame-worker", "http://worker-headers.test/", &page_id, &events);
         for event in &events {
             let emitted: Vec<_> = ctx.pending_events.iter().filter(|item| item.params["requestId"] == event.request_id).collect();
-            assert_eq!(emitted.len(), 3);
+            assert_eq!(emitted.len(), 4);
             assert!(emitted.iter().all(|item| item.session_id == session));
             assert_eq!(emitted[0].method, "Network.requestWillBeSent");
             assert_eq!(emitted[0].params["request"]["rawHeaders"], json!(event.request_raw_headers));
             assert_eq!(emitted[0].params["type"], event.resource_type);
-            assert_eq!(emitted[1].method, "Network.responseReceived");
-            assert_eq!(emitted[1].params["response"]["rawHeaders"], json!(event.raw_headers));
-            assert_eq!(emitted[1].params["response"]["status"], event.status);
-            assert_eq!(emitted[2].method, "Network.loadingFinished");
-            assert_eq!(emitted[2].params["encodedDataLength"], event.body_size);
+            assert_eq!(emitted[1].method, "Network.requestWillBeSentExtraInfo");
+            assert_eq!(emitted[1].params["rawHeaders"], json!(event.request_raw_headers));
+            assert_eq!(emitted[2].method, "Network.responseReceived");
+            assert_eq!(emitted[2].params["response"]["rawHeaders"], json!(event.raw_headers));
+            assert_eq!(emitted[2].params["response"]["status"], event.status);
+            assert_eq!(emitted[3].method, "Network.loadingFinished");
+            assert_eq!(emitted[3].params["encodedDataLength"], event.body_size);
         }
         let binary = events.iter().find(|event| event.url.ends_with("/binary")).unwrap();
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": binary.request_id}), &mut ctx, &session).await.unwrap();
@@ -2202,6 +2266,134 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_worker_teardown_stays_with_original_loader_across_navigation() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html>original</html>").await.unwrap();
+        let old_url=page.url_string();
+        let generation=page.network_document_generation;
+        let frame=page.frame_id.clone();
+        page.network_events.clear();
+        let mut requests=page.enable_interception();
+        assert_eq!(page.evaluate(r#"(()=>{globalThis.worker=new Worker(URL.createObjectURL(new Blob(["fetch('https://example.test/pending').catch(()=>{});"]))); return 'started';})()"#), json!("started"));
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+        let request=loop {
+            let _=tokio::time::timeout(std::time::Duration::from_millis(10),page.run_autonomous_event_loop_turn()).await;
+            if let Ok(request)=requests.try_recv(){break request;}
+            assert!(std::time::Instant::now()<deadline, "{:?}", page.evaluate("[typeof Worker,typeof fetch,globalThis.fetchError]"));
+        };
+        ctx.current_loader_ids.insert(page_id.clone(),"loader-original".into());
+        ctx.document_loaders.insert((page_id.clone(),generation),"loader-original".into());
+        let mut delayed = Vec::new();
+        for index in 1..=2 {
+            let page=ctx.get_page_mut(&page_id).unwrap();
+            page.navigate(&format!("data:text/html,<html>new-{index}</html>")).await.unwrap();
+            page.sync_js_network_events();
+            let url=page.url_string();
+            let (old, events): (Vec<_>, Vec<_>) = page.network_events.drain(..).partition(|event| event.request_id == request.network_id);
+            delayed.extend(old);
+            emit_navigation_events(&mut ctx,&session,&frame,&format!("loader-new-{index}"),&url,&page_id,&events,WaitUntil::Load,false);
+        }
+        assert!(!ctx.pending_events.iter().any(|event| event.method == "Network.loadingFailed" && event.params["requestId"] == request.network_id));
+        // Deliberately deliver the original Worker's terminal after both newer
+        // documents commit; thread scheduling must not choose its loader.
+        ctx.get_page_mut(&page_id).unwrap().network_events.extend(delayed);
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+        loop {
+            let page=ctx.get_page_mut(&page_id).unwrap();
+            page.sync_js_network_events();
+            let url=page.url_string();
+            let events=page.network_events.drain(..).collect::<Vec<_>>();
+            emit_runtime_network_events(&mut ctx,&session,&frame,&url,&page_id,&events);
+            if ctx.pending_events.iter().any(|event|event.method=="Network.loadingFailed" && event.params["requestId"]==request.network_id){break;}
+            assert!(std::time::Instant::now()<deadline);
+            tokio::task::yield_now().await;
+        }
+        let events=ctx.pending_events.iter().filter(|event|event.params["requestId"]==request.network_id).collect::<Vec<_>>();
+        assert_eq!(events.iter().filter(|event|event.method=="Network.loadingFailed").count(),1);
+        assert!(!events.iter().any(|event|event.method=="Network.loadingFinished"));
+        let start=events.iter().find(|event|event.method=="Network.requestWillBeSent").unwrap();
+        assert_eq!(start.params["loaderId"],"loader-original");
+        assert_eq!(start.params["documentURL"],old_url);
+        assert!(events.iter().all(|event|event.session_id==session));
+        assert!(request.resolver.is_closed());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_retired_runtime_keeps_old_loader_and_no_success_terminal() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        ctx.current_loader_ids.insert(page_id.clone(), "loader-old".into());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.resume_js();
+        let mut intercepts = page.enable_interception();
+        assert_eq!(page.evaluate("(()=>{fetch('https://example.test/pending').catch(e=>globalThis.fetchError=String(e)); return 'started';})()"), json!("started"));
+        for _ in 0..10 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), page.run_autonomous_event_loop_turn()).await;
+            if !intercepts.is_empty() { break; }
+        }
+        let request = intercepts.try_recv().unwrap_or_else(|e| panic!("{e:?}: {:?}", page.evaluate("globalThis.fetchError")));
+        page.navigate_blank();
+        assert!(request.resolver.is_closed());
+        let events = page.network_events.drain(..).collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].request_id, request.network_id);
+        assert_eq!(events[0].error.as_deref(), Some("Aborted"));
+        assert!(events[0].document_generation < page.network_document_generation);
+        assert_eq!(events[0].document_url, "about:blank");
+        let frame = page.frame_id.clone();
+        emit_navigation_events(&mut ctx, &session, &frame, "loader-new", "http://new.test/", &page_id, &events, WaitUntil::Load, false);
+        let failed = ctx.pending_events.iter().filter(|event| event.method == "Network.loadingFailed").collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].session_id, session);
+        assert_eq!(failed[0].params["requestId"], request.network_id);
+        assert!(ctx.pending_events.iter().all(|event| event.method != "Network.loadingFinished"));
+        let failure_position = ctx.pending_events.iter().position(|event| event.method == "Network.loadingFailed").unwrap();
+        let new_document_position = ctx.pending_events.iter().position(|event| event.method == "Page.frameNavigated").unwrap();
+        assert!(failure_position < new_document_position);
+        assert_eq!(ctx.current_loader_ids[&page_id], "loader-new");
+        ctx.get_page_mut(&page_id).unwrap().sync_js_network_events();
+        assert!(ctx.get_page(&page_id).unwrap().network_events.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_observation_suspend_then_failed_navigation_keeps_old_terminal() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        ctx.current_loader_ids.insert(page_id.clone(), "loader-old".into());
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html>old</html>").await.unwrap();
+        page.network_events.clear();
+        let old_url = page.url_string();
+        let mut intercepts = page.enable_interception();
+        assert_eq!(page.evaluate("(()=>{fetch('https://example.test/pending').catch(()=>{});return 'started';})()"),json!("started"));
+        let _=tokio::time::timeout(std::time::Duration::from_millis(20),page.run_autonomous_event_loop_turn()).await;
+        let request=intercepts.try_recv().unwrap();
+        page.suspend_js();
+        assert!(request.resolver.is_closed());
+        assert!(page.navigate("http://127.0.0.1:1/refused").await.is_err());
+        page.sync_js_network_events();
+        let events=page.network_events.drain(..).collect::<Vec<_>>();
+        let frame=page.frame_id.clone();
+        emit_runtime_network_events(&mut ctx,&session,&frame,&old_url,&page_id,&events);
+        let events=ctx.pending_events.iter().filter(|event|event.params["requestId"]==request.network_id).collect::<Vec<_>>();
+        assert_eq!(events.iter().filter(|event|event.method=="Network.loadingFailed").count(),1);
+        assert!(!events.iter().any(|event|event.method=="Network.loadingFinished"));
+        let start=events.iter().find(|event|event.method=="Network.requestWillBeSent").unwrap();
+        assert_eq!(start.params["loaderId"],"loader-old");
+        assert_eq!(start.params["documentURL"],old_url);
+        ctx.get_page_mut(&page_id).unwrap().sync_js_network_events();
+        assert!(ctx.get_page(&page_id).unwrap().network_events.is_empty());
+    }
+
     #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {
         let mut ctx = CdpContext::new();
@@ -2212,6 +2404,10 @@ mod tests {
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
+            document_generation: 0, document_url: String::new(),
+            initiator_request_id: None,
+            retired_document_url: None,
+            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
             raw_headers: None,
             request_raw_headers: None,
             request_id: "fetch-7".into(),

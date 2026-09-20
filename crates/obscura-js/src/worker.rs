@@ -121,6 +121,10 @@ impl Size for WorkerEvent {
             Self::Observations(value) => {
                 let network: usize = value.network.iter().map(|event| {
                     std::mem::size_of_val(event) + event.request_id.len() + event.url.len() + event.method.len()
+                        + event.document_url.len()
+                        + event.initiator_request_id.as_ref().map_or(0, String::len)
+                        + event.error.as_ref().map_or(0, String::len)
+                        + event.response_body_request_id.as_ref().map_or(0, String::len)
                         + event.response_headers.iter().map(|(k,v)| k.len() + v.len()).sum::<usize>()
                         + event.raw_headers.iter().chain(event.request_raw_headers.iter())
                             .map(|capture| capture.fields.iter().map(|field|
@@ -186,6 +190,10 @@ impl WorkerObservations {
 }
 
 struct WorkerConfig {
+    document_generation: u64,
+    document_url: String,
+    teardown_events: std::sync::Arc<std::sync::Mutex<Vec<crate::ops::JsNetworkEvent>>>,
+    teardown_notify: std::sync::Arc<tokio::sync::Notify>,
     policy: std::sync::Arc<std::sync::Mutex<WorkerPolicy>>,
     resources: std::sync::Arc<queue::Resources>,
     url: String,
@@ -882,7 +890,11 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
     let worker_stealth = parent.stealth_client.as_ref().map(|client| {
         std::sync::Arc::new(obscura_net::StealthHttpClient::detached(client))
     });
-    let config = WorkerConfig { policy: registry.borrow().policy.clone(), resources: resources.clone(), url: url.into(), globals, blobs,
+    let config = WorkerConfig {
+        document_generation: parent.network_document_generation,
+        document_url: parent.network_document_url.clone(), teardown_events: parent.network_teardown_events.clone(),
+        teardown_notify: parent.network_teardown_notify.clone(),
+        policy: registry.borrow().policy.clone(), resources: resources.clone(), url: url.into(), globals, blobs,
         identity: parent.device_identity.clone(), cookies: parent.cookie_jar.clone(),
         http: worker_http, callbacks: parent.callbacks.clone(),
         stealth: worker_stealth,
@@ -929,6 +941,10 @@ async fn run_worker(id: u32, config: WorkerConfig,
         state.url = config.url.clone();
         state.device_identity = config.identity;
         state.cookie_jar = config.cookies;
+        state.network_document_generation = config.document_generation;
+        state.network_document_url = config.document_url;
+        state.network_teardown_events = config.teardown_events;
+        state.network_teardown_notify = config.teardown_notify;
         state.http_client = config.http;
         state.callbacks = config.callbacks;
         state.stealth_client = config.stealth;
@@ -1190,6 +1206,9 @@ mod tests {
     #[test]
     fn worker_observation_queue_accounts_for_raw_header_fields() {
         let mut event = crate::ops::JsNetworkEvent {
+            document_generation: 0, document_url: String::new(),
+            initiator_request_id: None,
+            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
             request_id: "fetch-1".into(), url: "http://example.test/".into(), method: "GET".into(),
             resource_type: obscura_net::ResourceType::Fetch, status: 200,
             response_headers: HashMap::new(), raw_headers: None, request_raw_headers: None,

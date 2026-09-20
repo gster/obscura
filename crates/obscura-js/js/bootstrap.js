@@ -7877,7 +7877,8 @@ globalThis.fetch = async (input, init = {}) => {
       });
     }
   }
-  const method = init.method || (request ? request.method : "GET");
+  const method = String(init.method || (request ? request.method : "GET"));
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) throw new TypeError('Invalid HTTP method');
   const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
   let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
   const inheritsRequestBody = init.body === undefined && request !== null;
@@ -7886,7 +7887,8 @@ globalThis.fetch = async (input, init = {}) => {
     : (request ? request.body : undefined);
   const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (request ? request.mode : "cors");
+  const fetchMode = String(init.mode || (request ? request.mode : "cors"));
+  if (!['cors', 'no-cors', 'same-origin'].includes(fetchMode)) throw new TypeError('Invalid RequestMode');
   const fetchRedirect = init.redirect || (request ? request.redirect : "follow");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
@@ -7895,7 +7897,28 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, destination);
+  const signal = init.signal !== undefined ? init.signal : (request ? request.signal : null);
+  if (signal != null && !(signal instanceof AbortSignal)) throw new TypeError('fetch signal must be an AbortSignal');
+  const alreadyAborted = signal && signal.aborted;
+  let requestId;
+  const abort = () => {
+    let reason = 'Aborted';
+    try { reason += ': ' + String(signal.reason); } catch (_) {}
+    if (requestId) Deno.core.ops.op_fetch_abort(requestId, reason);
+  };
+  if (signal) signal.addEventListener('abort', abort, {once: true});
+  requestId = Deno.core.ops.op_fetch_start();
+  if (alreadyAborted) abort();
+  let raw;
+  try {
+    raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, JSON.stringify({destination, requestId}));
+  } catch (error) {
+    if (signal && signal.aborted) throw signal.reason;
+    throw error;
+  } finally {
+    Deno.core.ops.op_fetch_cleanup(requestId);
+    if (signal) signal.removeEventListener('abort', abort);
+  }
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -8001,6 +8024,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
+    this._requestGeneration = 0;
+    this._timeoutId = null;
     this._listeners = {};
     this.onreadystatechange = null;
     this.onload = null;
@@ -8013,6 +8038,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   open(method, url, async_) {
+    ++this._requestGeneration;
+    if (this._timeoutId !== null) clearTimeout(this._timeoutId);
+    this._timeoutId = null;
+    if (this._fetchController) this._fetchController.abort();
+    this._fetchController = null;
     this._method = method;
     this._url = url;
     this._headers = {};
@@ -8050,19 +8080,25 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     if (this._aborted) return;
 
     const xhr = this;
+    const generation = ++this._requestGeneration;
     this._fireEvent('loadstart');
 
     // Same rule as fetch: always resolve through the URL parser.
     let url = _resolveUrl(this._url);
 
+    const controller = this._fetchController = new AbortController();
+    const timeoutId = this._timeoutId = this.timeout > 0 ? setTimeout(() => {
+      controller.abort(new DOMException('XMLHttpRequest timed out', 'TimeoutError'));
+    }, this.timeout) : null;
     fetch(url, {
+      signal: controller.signal,
       method: this._method,
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
     }).then(async (resp) => {
-      if (xhr._aborted) return;
+      if (xhr._aborted || xhr._requestGeneration !== generation) return;
 
       xhr.status = resp.status;
       xhr.statusText = resp.statusText || '';
@@ -8073,6 +8109,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       }
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
+      if (xhr._aborted || xhr._requestGeneration !== generation) return;
 
       // Read the body as bytes, ALWAYS. Going through resp.text() and then
       // TextEncoder().encode() for the binary responseTypes is not a
@@ -8082,7 +8119,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       // Emscripten loaders fetch .wasm and data files this way, so they saw
       // corrupted assets while fetch() was byte-correct.
       const buffer = await resp.arrayBuffer();
-      if (xhr._aborted) return;
+      if (xhr._aborted || xhr._requestGeneration !== generation) return;
 
       const wantsText = xhr.responseType === '' || xhr.responseType === 'text'
                      || xhr.responseType === 'json' || xhr.responseType === 'document';
@@ -8092,6 +8129,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
+      if (xhr._aborted || xhr._requestGeneration !== generation) return;
 
       switch (xhr.responseType) {
         case 'json':
@@ -8115,14 +8153,19 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       }
 
       xhr._setReadyState(4); // DONE
+      if (xhr._aborted || xhr._requestGeneration !== generation) return;
       xhr._fireEvent('load');
-      xhr._fireEvent('loadend');
+      if (xhr._requestGeneration === generation) xhr._fireEvent('loadend');
     }).catch((err) => {
-      if (xhr._aborted) return;
+      if (xhr._aborted || xhr._requestGeneration !== generation) return;
       xhr.status = 0;
       xhr.readyState = 4;
       xhr._fireEvent('readystatechange');
-      if (err && err.__aborted) {
+      if (xhr._aborted || xhr._requestGeneration !== generation) return;
+      if (err && err.name === 'TimeoutError') {
+        xhr._fireEvent('timeout');
+        xhr._fireEvent('loadend');
+      } else if (err && err.__aborted) {
         xhr._aborted = true;
         xhr._fireEvent('abort');
         xhr._fireEvent('loadend');
@@ -8132,10 +8175,19 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
         xhr._fireEvent('loadend');
         if (xhr.onerror) xhr.onerror(err);
       }
+    }).finally(() => {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      if (xhr._requestGeneration === generation) {
+        xhr._timeoutId = null;
+        xhr._fetchController = null;
+      }
     });
   }
 
   abort() {
+    if (this._timeoutId !== null) clearTimeout(this._timeoutId);
+    this._timeoutId = null;
+    if (this._fetchController) this._fetchController.abort();
     this._aborted = true;
     if (this.readyState > 0 && this.readyState < 4) {
       this._setReadyState(4);
@@ -8312,7 +8364,7 @@ if (typeof Request === 'undefined') {
       }
       this.redirect = init.redirect || 'follow';
       this.referrer = init.referrer || '';
-      this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
+      this.signal = init.signal || new AbortController().signal;
       this.cache = init.cache || 'default';
     }
     clone() {
