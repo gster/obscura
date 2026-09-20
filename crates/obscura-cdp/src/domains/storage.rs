@@ -95,8 +95,8 @@ mod tests {
 
     #[tokio::test]
     async fn clear_cookies_is_scoped_to_browser_context() {
-        let mut ctx = CdpContext::new();
-        let browser_context_id = ctx.create_browser_context();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let browser_context_id = ctx.create_browser_context(None).unwrap();
         ctx.browser_context(&browser_context_id)
             .unwrap()
             .cookie_jar
@@ -127,7 +127,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_cookies_without_context_clears_default_context() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         ctx.default_context
             .cookie_jar
             .set_cookies_from_cdp(vec![sample_cookie("default")]);
@@ -141,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_storage_method_errors() {
-        let error = handle("auditMethodDoesNotExist", &json!({}), &mut CdpContext::new(), &None)
+        let error = handle("auditMethodDoesNotExist", &json!({}), &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
             .await
             .expect_err("unknown Storage methods must fail explicitly");
         assert!(error.contains("Unknown Storage method"));
@@ -157,7 +157,7 @@ mod tests {
             ("enable", json!({"invented": true})),
         ] {
             assert!(
-                handle(method, &params, &mut CdpContext::new(), &None)
+                handle(method, &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                     .await
                     .is_err(),
                 "must reject {method} {params}"

@@ -76,7 +76,7 @@ const SETUP: &str = r#"(function () {
 
 #[tokio::test(flavor = "current_thread")]
 async fn get_properties_walks_into_a_child_whose_key_holds_a_control_character() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -170,7 +170,7 @@ const SETUP_NODES: &str = r#"(function () {
 
 #[tokio::test(flavor = "current_thread")]
 async fn describe_node_resolves_a_child_handle_whose_key_holds_a_control_character() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());

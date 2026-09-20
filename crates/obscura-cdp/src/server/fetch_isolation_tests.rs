@@ -111,7 +111,7 @@ async fn client() -> (Client, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let (reply_tx, replies) = mpsc::unbounded_channel();
     let context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
-        "multi-page-pause".into(), None, true, None, None, true,
+        "multi-page-pause".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,
     ));
     let processor = tokio::task::spawn_local(cdp_processor(rx, context, Arc::new(Notify::new())));
     tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
@@ -636,7 +636,7 @@ async fn queued_fetches_abort_before_disconnect_without_transport() {
 async fn closed_pause_relay_aborts_real_fetch_without_transport() {
     let (base, fixture_task, requests) = fixture_with_requests().await;
     let context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
-        "closed-relay".into(), None, true, None, None, true,
+        "closed-relay".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,
     ));
     let mut ctx = CdpContext::new_with_shared_context(context);
     let page_id = ctx.create_page();
@@ -679,7 +679,7 @@ fn closed_reply_channel_aborts_instead_of_registering_a_pause() {
 
 #[test]
 fn closed_routed_pause_does_not_restore_a_retired_network_owner() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session = Some("closed-route-session".to_string());
     ctx.sessions.insert(session.clone().unwrap(), page_id.clone());

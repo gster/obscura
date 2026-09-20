@@ -396,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn print_to_pdf_returns_paginated_pdf_with_requested_media_box() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id.clone());

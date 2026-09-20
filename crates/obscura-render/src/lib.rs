@@ -239,6 +239,15 @@ pub mod inline {
             None
         }
 
+        pub(crate) fn push_owned_word(
+            &mut self,
+            _text: &str,
+            _style: &crate::LayoutStyle,
+            _owners: &[NodeId],
+        ) -> Option<usize> {
+            None
+        }
+
         pub(crate) fn measure_word(&mut self, _idx: usize) -> (f32, f32) {
             (0.0, 0.0)
         }
@@ -296,6 +305,65 @@ pub mod inline {
             "progress" => Some((font_size * 10.0, font_size)),
             "meter" => Some((font_size * 5.0, font_size)),
             _ => None,
+        }
+    }
+
+    pub(crate) fn inline_child_ok(
+        tree: &DomTree,
+        cid: NodeId,
+        styles: &HashMap<NodeId, crate::LayoutStyle>,
+        has_text: &mut bool,
+    ) -> bool {
+        let Some(node) = tree.get_node(cid) else {
+            return true;
+        };
+        match &node.data {
+            obscura_dom::tree::NodeData::Text { contents } => {
+                if !contents.trim().is_empty() {
+                    *has_text = true;
+                }
+                true
+            }
+            obscura_dom::tree::NodeData::Element { .. } => {
+                let Some(elem) = node.as_element() else {
+                    return true;
+                };
+                let Some(style) = styles.get(&cid) else {
+                    return false;
+                };
+                if style.display == crate::Display::None {
+                    return true;
+                }
+                if elem.local.as_ref() == "br" {
+                    *has_text = true;
+                    return true;
+                }
+                if is_replaced(elem.local.as_ref()) || style.is_inline_block {
+                    return false;
+                }
+                let foldable_inline = style.display == crate::Display::Inline
+                    && !matches!(style.position, Some(taffy::Position::Absolute))
+                    && style.float.is_none()
+                    && !style.overflow_hidden
+                    && style.before_pseudo.is_none()
+                    && style.after_pseudo.is_none();
+                if !foldable_inline {
+                    return false;
+                }
+                if style.margin != crate::Edges::default()
+                    || style.padding != crate::Edges::default()
+                    || style.border != crate::Edges::default()
+                {
+                    *has_text = true;
+                }
+                for child in crate::dom::rendered_children(tree, cid) {
+                    if !inline_child_ok(tree, child, styles, has_text) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => true,
         }
     }
 

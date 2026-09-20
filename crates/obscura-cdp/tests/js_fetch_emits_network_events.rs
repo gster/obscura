@@ -118,7 +118,7 @@ fn response_request_id(ctx: &CdpContext, url_needle: &str) -> Option<String> {
 async fn js_fetch_emits_network_request_and_response() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = serve().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -200,7 +200,7 @@ async fn navigation_without_script_fetch_is_unaffected() {
     });
     let base = format!("http://{addr}/");
 
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());

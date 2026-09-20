@@ -47,7 +47,7 @@ async fn select_defaults_match_browser_semantics() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
 
@@ -85,7 +85,7 @@ async fn select_without_explicit_selection_defaults_to_first_option() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
 

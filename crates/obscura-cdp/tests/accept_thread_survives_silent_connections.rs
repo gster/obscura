@@ -53,6 +53,9 @@ fn accept_thread_survives_silent_connections() {
                 None,
                 true,
                 128,
+                obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
             )
             .await;
         });

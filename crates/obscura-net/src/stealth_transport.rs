@@ -216,7 +216,7 @@ mod tests {
                 bytes
             });
             let proxy = proxied.then(|| format!("http://{address}"));
-            let client = Client::new(StealthProfile::default(), proxy.as_deref(), true, None, None);
+            let client = Client::new(StealthProfile::WindowsChrome145, proxy.as_deref(), true, None, None);
             let url = Url::parse(&if proxied { "http://headers.test/".into() } else { format!("http://{address}/") }).unwrap();
             let mut headers = HeaderMap::new();
             for value in [b"first".as_slice(), b"\x80\xff".as_slice()] {
@@ -233,7 +233,7 @@ mod tests {
             assert!(!request.text_headers().contains_key("x-repeated"), "a partial text projection must not hide an invalid duplicate");
             assert_eq!(values(request, b"authorization"), [b"Bearer Raw+/=123".to_vec()]);
             assert_eq!(values(request, b"cookie"), [b"session=Raw+/=123".to_vec()]);
-            assert_eq!(values(request, b"user-agent"), [StealthProfile::default().user_agent().as_bytes().to_vec()]);
+            assert_eq!(values(request, b"user-agent"), [StealthProfile::WindowsChrome145.user_agent().as_bytes().to_vec()]);
             let raw = crate::HeaderCapture::from_headers("transportResponse", response.headers());
             assert_eq!(values(&raw, b"set-cookie"), [b"first=Raw+/=; Path=/".to_vec(), b"second=Keep; Path=/".to_vec()]);
             assert_eq!(values(&raw, b"x-repeated"), [b"first".to_vec(), b"second".to_vec()]);
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn scripted_request_timeout_overrides_default_for_preflight_and_redirect_hops() {
-        let client = Client::new(StealthProfile::default(), None, true, None, None);
+        let client = Client::new(StealthProfile::WindowsChrome145, None, true, None, None);
         let url = Url::parse("http://127.0.0.1/").unwrap();
         for timeout in [Duration::from_millis(25), Duration::from_secs(60)] {
             for method in [http::Method::OPTIONS, http::Method::GET, http::Method::POST] {
@@ -306,7 +306,7 @@ mod tests {
             std::env::remove_var("SSL_CERT_FILE");
             std::env::remove_var("SSL_CERT_DIR");
             std::env::set_var(name, path);
-            let client = Client::new(StealthProfile::default(), None, true, None, None);
+            let client = Client::new(StealthProfile::WindowsChrome145, None, true, None, None);
             let response = client.send(http::Method::GET, &url, HeaderMap::new(), &[]).await.unwrap();
             let body = super::super::read_stealth_body_limited(response, &url, 1024).await.unwrap();
             assert_eq!(body, [0, 128, 255, 16]);
@@ -315,7 +315,7 @@ mod tests {
         std::env::remove_var("SSL_CERT_DIR");
         for request in server.await.unwrap() {
             assert!(std::str::from_utf8(&request).unwrap().to_ascii_lowercase().contains(
-                &format!("user-agent: {}\r\n", StealthProfile::default().user_agent().to_ascii_lowercase())));
+                &format!("user-agent: {}\r\n", StealthProfile::WindowsChrome145.user_agent().to_ascii_lowercase())));
         }
     }
 

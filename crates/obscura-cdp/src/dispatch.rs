@@ -136,30 +136,38 @@ pub struct CdpContext {
 }
 
 impl CdpContext {
-    pub fn new() -> Self {
-        Self::new_with_options(None)
+    pub fn new(persona: obscura_net::EffectivePersona) -> Self {
+        Self::new_with_options(persona, None)
     }
 
-    pub fn new_with_proxy(proxy: Option<String>) -> Self {
-        Self::new_with_options(proxy)
+    pub fn new_with_proxy(
+        persona: obscura_net::EffectivePersona,
+        proxy: Option<String>,
+    ) -> Self {
+        Self::new_with_options(persona, proxy)
     }
 
-    pub fn new_with_options(proxy: Option<String>) -> Self {
-        Self::new_with_security(proxy, false)
+    pub fn new_with_options(
+        persona: obscura_net::EffectivePersona,
+        proxy: Option<String>,
+    ) -> Self {
+        Self::new_with_security(persona, proxy, false)
     }
 
     pub fn new_with_storage(
+        persona: obscura_net::EffectivePersona,
         proxy: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        Self::_new_inner(proxy, storage_dir, false, false)
+        Self::_new_inner(persona, proxy, storage_dir, false, false)
     }
 
     pub fn new_with_security(
+        persona: obscura_net::EffectivePersona,
         proxy: Option<String>,
         allow_file_access: bool,
     ) -> Self {
-        Self::_new_inner(proxy, None, allow_file_access, false)
+        Self::_new_inner(persona, proxy, None, allow_file_access, false)
     }
 
     /// Build a CDP context around an already-constructed default browser
@@ -208,20 +216,23 @@ impl CdpContext {
     }
 
     fn _new_inner(
+        persona: obscura_net::EffectivePersona,
         proxy: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
         allow_file_access: bool,
         allow_private_network: bool,
     ) -> Self {
-        let mut ctx = BrowserContext::with_storage_and_network(
+        let ctx = BrowserContext::with_options(
             "default".to_string(),
-            proxy,
-            true,
-            None,
-            storage_dir,
-            allow_private_network,
+            persona,
+            obscura_browser::BrowserContextOptions {
+                proxy_url: proxy,
+                storage_dir,
+                allow_file_access,
+                allow_private_network,
+                ..Default::default()
+            },
         );
-        ctx.allow_file_access = allow_file_access;
         Self::new_with_shared_context(Arc::new(ctx))
     }
 
@@ -272,12 +283,31 @@ impl CdpContext {
         }
     }
 
-    pub fn create_browser_context(&mut self) -> String {
+    pub fn create_browser_context(
+        &mut self,
+        persona: Option<obscura_net::EffectivePersona>,
+    ) -> Result<String, String> {
+        let persona = persona.unwrap_or_else(|| self.default_context.persona().clone());
+        if persona.timezone() != self.default_context.persona().timezone()
+            || persona.language() != self.default_context.persona().language()
+        {
+            return Err(format!(
+                "persona timezone {:?} and language {:?} are unsupported in this process; all contexts must use startup timezone {:?} and language {:?}",
+                persona.timezone(),
+                persona.language(),
+                self.default_context.persona().timezone(),
+                self.default_context.persona().language(),
+            ));
+        }
         self.browser_context_counter += 1;
         let id = format!("context-{}", self.browser_context_counter);
-        let context = Arc::new(self.default_context.isolated_copy(id.clone(), false));
+        let context = Arc::new(
+            self.default_context
+                .try_isolated_copy_with_persona(id.clone(), false, persona)
+                .map_err(|error| error.to_string())?,
+        );
         self.browser_contexts.insert(id.clone(), context);
-        id
+        Ok(id)
     }
 
     /// Allocate a distinct CDP session for every explicit target attachment.
@@ -558,7 +588,7 @@ mod context_ownership_tests {
 
     #[test]
     fn repeated_page_teardown_does_not_grow_context_maps() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         for cycle in 0..64 {
             let page_id = ctx.create_page();
             let session_id = format!("session-{cycle}");
@@ -584,7 +614,7 @@ mod context_ownership_tests {
 
     #[test]
     fn isolated_compatibility_ids_are_not_claimed_as_default_realm_routes() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let isolated = ctx.next_isolated_context();
 
         assert!(ctx.valid_context_ids.contains(&isolated));
@@ -593,7 +623,7 @@ mod context_ownership_tests {
 
     #[test]
     fn default_and_isolated_allocators_do_not_collide_past_one_thousand_ids() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let mut ids = HashSet::new();
         for index in 0..1_200 {
             let id = if index % 2 == 0 {
@@ -608,7 +638,7 @@ mod context_ownership_tests {
 
     #[test]
     fn repeated_document_commits_keep_only_live_page_contexts() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let first = ctx.create_page();
         let second = ctx.create_page();
         ctx.ensure_default_context(&second).unwrap();
@@ -629,7 +659,7 @@ mod context_ownership_tests {
 
     #[test]
     fn detached_frame_contexts_are_pruned_without_touching_siblings() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page = ctx.create_page();
         let main = ctx.ensure_default_context(&page).unwrap();
         let child = ctx.create_isolated_context(
@@ -680,6 +710,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Target.detachFromTarget"
             | "Target.activateTarget"
             | "Browser.getVersion"
+            | "Browser.getPersona"
             | "Browser.close"
             | "Browser.getWindowForTarget"
             | "Browser.setDownloadBehavior"
@@ -819,7 +850,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
 
     let result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
-        "Browser" => domains::browser::handle(method, &req.params).await,
+        "Browser" => domains::browser::handle(method, &req.params, ctx).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
@@ -1217,9 +1248,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn browser_context_rejects_process_global_locale_conflicts() {
+        let startup = obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        );
+        let mut ctx = CdpContext::new(startup);
+        let mut spec = obscura_net::PersonaSpec::preset(
+            obscura_net::StealthProfile::WindowsChrome145,
+        );
+        spec.language = Some("fr-CA".to_string());
+        let alternate = spec.compile().unwrap();
+
+        let error = ctx.create_browser_context(Some(alternate)).unwrap_err();
+        assert!(error.contains("language"), "{error}");
+        assert_eq!(ctx.browser_contexts.len(), 0);
+    }
+
     #[tokio::test]
     async fn audits_enable_returns_empty_success() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let resp = dispatch(&req("Audits.enable"), &mut ctx).await;
         assert!(
             resp.error.is_none(),
@@ -1231,7 +1279,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_domain_still_errors() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let resp = dispatch(&req("DefinitelyNotADomain.enable"), &mut ctx).await;
         let err = resp.error.expect("unknown domain must surface as error");
         assert_eq!(err.code, -32601);
@@ -1253,7 +1301,7 @@ mod tests {
             "Overlay.auditMethodDoesNotExist",
             "Audits.auditMethodDoesNotExist",
         ] {
-            let mut ctx = CdpContext::new();
+            let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
             let response = dispatch(&req(method), &mut ctx).await;
             let error = response
                 .error
@@ -1267,7 +1315,7 @@ mod tests {
     async fn limited_initializer_rejects_nonempty_params() {
         let mut request = req("Log.enable");
         request.params = json!({"invented": true});
-        let response = dispatch(&request, &mut CdpContext::new()).await;
+        let response = dispatch(&request, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145))).await;
         let error = response.error.expect("unsupported parameter combinations must fail");
         assert_eq!(error.code, -32601);
         assert!(error.message.contains("empty params"));
@@ -1275,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message_to_target_unwraps_inner_call() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let inner = json!({
             "id": 42,
             "method": "Browser.getVersion",
@@ -1324,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message_to_target_rejects_invalid_message() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let outer = CdpRequest {
             id: 5,
             method: "Target.sendMessageToTarget".into(),

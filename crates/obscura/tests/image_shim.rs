@@ -66,7 +66,7 @@ async fn new_image_survives_non_configurable_src() {
 </body></html>"#,
     );
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
 
@@ -93,7 +93,7 @@ async fn new_image_still_emulates_load_when_src_is_configurable() {
 </body></html>"#,
     );
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     // The shim fires `load` on a setTimeout(0); pump the event loop.
@@ -131,7 +131,7 @@ async fn invalid_image_bytes_emit_error_like_chromium() {
 </body></html>"#,
     );
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
     for _ in 0..10 {

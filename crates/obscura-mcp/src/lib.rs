@@ -79,8 +79,15 @@ pub struct BrowserState {
 }
 
 impl BrowserState {
-    pub fn new(proxy: Option<String>) -> Self {
-        let context = Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, true));
+    pub fn new(proxy: Option<String>, persona: obscura_net::EffectivePersona) -> Self {
+        let context = Arc::new(BrowserContext::with_options(
+            "mcp".to_string(),
+            persona,
+            obscura_browser::BrowserContextOptions {
+                proxy_url: proxy,
+                ..Default::default()
+            },
+        ));
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
@@ -235,13 +242,17 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
     }
 }
 
-pub async fn run(proxy: Option<String>) -> Result<()> {
+pub async fn run(
+    proxy: Option<String>,
+    persona: obscura_net::EffectivePersona,
+) -> Result<()> {
+    obscura_net::activate_process_persona(&persona)?;
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
 
-    let mut state = BrowserState::new(proxy);
+    let mut state = BrowserState::new(proxy, persona);
     let mut runtime_pump_armed = false;
 
     loop {
@@ -2126,7 +2137,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn render_tool_calls_return_mcp_binary_content_and_reject_bad_options() {
-        let mut state = BrowserState::new(None);
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state.page_mut().navigate(
             "data:text/html,<html style='margin:0'><body style='margin:0;background:red'><div style='width:64px;height:48px'></div></body></html>",
         ).await.expect("render test page should navigate");
@@ -2177,7 +2188,7 @@ mod tests {
                 console.error('mcp-console-click');\
                 setTimeout(()=>{console.error('mcp-console-async');document.body.id='done'},25)\
             }</script>";
-        let mut state = BrowserState::new(None);
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state
             .page_mut()
             .navigate(PAGE)
@@ -2253,7 +2264,7 @@ mod tests {
         // --allow-private-network to run their repro.
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None);
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state
             .page_mut()
             .navigate(&base)
@@ -2290,7 +2301,7 @@ mod tests {
     async fn network_tool_includes_completed_script_fetches() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None);
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state
             .page_mut()
             .navigate(&base)
@@ -2325,7 +2336,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_tools_notify_controlled_input_tracker() {
-        let mut state = BrowserState::new(None);
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state
             .page_mut()
             .navigate("data:text/html,<div id=root><input id=field></div>")
@@ -2400,7 +2411,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_form_check_and_select_use_native_setter_and_trusted_events() {
-        let mut state = BrowserState::new(None);
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         state
             .page_mut()
             .navigate(

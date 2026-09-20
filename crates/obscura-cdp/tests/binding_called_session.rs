@@ -67,7 +67,7 @@ fn binding_calls<'a>(ctx: &'a CdpContext) -> Vec<(&'a str, &'a Value)> {
 /// matter which session that ordering happens to pick.
 #[tokio::test(flavor = "current_thread")]
 async fn every_session_that_added_the_binding_is_called() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (target_id, first) = created_and_attached(&mut ctx).await;
     let second = attach_to(&mut ctx, &target_id, 902).await;
     assert_ne!(first, second, "the second attach reused the first session");
@@ -109,7 +109,7 @@ async fn every_session_that_added_the_binding_is_called() {
 /// does not see a call it has no handler for.
 #[tokio::test(flavor = "current_thread")]
 async fn a_session_that_did_not_subscribe_is_not_called() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (target_id, subscriber) = created_and_attached(&mut ctx).await;
     let bystander = attach_to(&mut ctx, &target_id, 902).await;
 
@@ -144,7 +144,7 @@ async fn a_session_that_did_not_subscribe_is_not_called() {
 /// call cannot be delivered to a client that has stopped listening.
 #[tokio::test(flavor = "current_thread")]
 async fn a_removed_binding_is_not_called() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let (_, session) = created_and_attached(&mut ctx).await;
 
     cdp(&mut ctx, 1, "Runtime.enable", json!({}), Some(&session)).await;

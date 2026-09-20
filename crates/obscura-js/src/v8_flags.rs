@@ -66,7 +66,7 @@ mod tests {
     // (no SIGTRAP) is the regression check.
     #[test]
     fn late_call_after_a_runtime_exists_does_not_abort() {
-        let _rt = crate::runtime::ObscuraJsRuntime::new();
+        let _rt = crate::runtime::ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         set_v8_flags("--max-old-space-size=32");
         assert!(PLATFORM_STARTED.load(Ordering::SeqCst));
     }

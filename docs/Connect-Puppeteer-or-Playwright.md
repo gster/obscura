@@ -1,4 +1,5 @@
 > 本页示例是现有 CDP 用法参考，不是完整客户端兼容承诺。实际核验版本、结果与缺口见 [SUMMARY](SUMMARY.md)。
+> 启动命令必须显式选择 persona；示例使用 `windows_chrome145`。
 
 Obscura speaks the Chrome DevTools Protocol over WebSocket. The supported
 client path is official Playwright Python through `connect_over_cdp`.
@@ -6,7 +7,7 @@ client path is official Playwright Python through `connect_over_cdp`.
 ## Start the server
 
 ```bash
-obscura serve --port 9222
+obscura --persona windows_chrome145 serve --port 9222
 ```
 
 ```

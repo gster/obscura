@@ -1,4 +1,4 @@
-> MCP 与有用的 CLI 保留，用于自动化和 agent 接入。所有入口自动使用统一身份基线和 primp；没有运行时 stealth 开关。
+> MCP 与有用的 CLI 保留，用于自动化和 agent 接入。所有入口必须显式选择统一 persona；下列命令假定已设置 `export OBSCURA_PERSONA=windows_chrome145`。
 
 `obscura mcp` exposes obscura as a Model Context Protocol server so MCP-capable clients (Claude Desktop, Claude Code, etc.) can drive it.
 

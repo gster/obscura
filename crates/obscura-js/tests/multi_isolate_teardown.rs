@@ -2,8 +2,8 @@ use obscura_js::runtime::ObscuraJsRuntime;
 
 #[test]
 fn runtimes_can_be_used_and_dropped_out_of_creation_order() {
-    let mut first = ObscuraJsRuntime::new();
-    let mut second = ObscuraJsRuntime::new();
+    let mut first = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+    let mut second = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
     assert_eq!(first.evaluate("1 + 1").unwrap(), serde_json::json!(2.0),);
     assert_eq!(second.evaluate("2 + 2").unwrap(), serde_json::json!(4.0),);
@@ -15,8 +15,8 @@ fn runtimes_can_be_used_and_dropped_out_of_creation_order() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_futures_can_be_interleaved_on_one_thread() {
-    let mut first = ObscuraJsRuntime::new();
-    let mut second = ObscuraJsRuntime::new();
+    let mut first = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+    let mut second = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
     first
         .execute_script("first", "setTimeout(() => globalThis.done = 1, 1)")
@@ -35,8 +35,8 @@ async fn runtime_futures_can_be_interleaved_on_one_thread() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn module_loads_can_be_interleaved_on_one_thread() {
-    let mut first = ObscuraJsRuntime::new();
-    let mut second = ObscuraJsRuntime::new();
+    let mut first = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+    let mut second = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
     let (first_result, second_result) = tokio::join!(
         first.load_inline_module(

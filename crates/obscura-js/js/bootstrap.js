@@ -30,7 +30,7 @@ function _relativeTimeNow() {
     '__obscura_ua_full_version', '__obscura_ua_architecture',
     '__obscura_do_not_track', '__obscura_language', '__obscura_languages',
     '__obscura_webgl_vendor', '__obscura_webgl_renderer',
-    '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_markTrusted', '__obscura_core_handoff',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
@@ -16073,7 +16073,7 @@ _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
-// Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
+// Timezone is driven by the process TZ selected from the required startup persona,
 // so native Intl.DateTimeFormat and Date report the same zone. No JS override:
 // forcing a fixed zone here only on Intl left Date on UTC, which is the exact
 // cross-surface mismatch a fingerprinting script looks for.
@@ -18231,9 +18231,9 @@ globalThis.__obscura_init = function() {
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
-  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
+  var hwValues = [4, 6, 8, 12, 16];
   globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
+  var memValues = [4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
   // A navigation start precedes the wall clock, so skew into the past only: an

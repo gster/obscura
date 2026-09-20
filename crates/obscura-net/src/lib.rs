@@ -1,6 +1,7 @@
 pub mod client;
 pub mod response_body;
 pub mod observation;
+pub mod persona;
 pub mod headers;
 pub use headers::{HeaderCapture, RawHeader};
 pub mod cookies;
@@ -25,4 +26,8 @@ pub use blocklist::is_blocked as is_tracker_blocked;
 pub use stealth_client::{
     StealthHttpClient, StealthProfile, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
+};
+pub use persona::{
+    activate_process_persona, EffectivePersona, GeolocationSpec, PersonaError, PersonaSpec, ViewportSpec,
+    PERSONA_SCHEMA_VERSION,
 };

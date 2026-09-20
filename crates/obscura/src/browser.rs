@@ -18,27 +18,22 @@ pub struct Browser {
 }
 
 impl Browser {
-    pub fn new() -> Result<Self, Error> {
-        Self::build(BrowserConfig::default())
+    pub fn new(persona: obscura_net::EffectivePersona) -> Result<Self, Error> {
+        Self::build(BrowserConfig::new(persona))
     }
 
     pub fn build(config: BrowserConfig) -> Result<Self, Error> {
-        let context = if let Some(ref dir) = config.storage_dir {
-            BrowserContext::with_storage_full(
-                "api".to_string(),
-                config.proxy,
-                true,
-                None,
-                Some(dir.clone()),
-            )
-        } else {
-            BrowserContext::with_full_options(
-                "api".to_string(),
-                config.proxy,
-                true,
-                None,
-            )
-        };
+        obscura_net::activate_process_persona(&config.persona)
+            .map_err(anyhow::Error::from)?;
+        let context = BrowserContext::with_options(
+            "api".to_string(),
+            config.persona,
+            obscura_browser::BrowserContextOptions {
+                proxy_url: config.proxy,
+                storage_dir: config.storage_dir,
+                ..Default::default()
+            },
+        );
 
         let context = Arc::new(context);
         let cookie_jar = context.cookie_jar.clone();
@@ -46,8 +41,8 @@ impl Browser {
         Ok(Browser { context, cookie_jar })
     }
 
-    pub fn builder() -> BrowserBuilder {
-        BrowserBuilder::default()
+    pub fn builder(persona: obscura_net::EffectivePersona) -> BrowserBuilder {
+        BrowserBuilder { config: BrowserConfig::new(persona) }
     }
 
     pub async fn new_page(&self) -> Result<Page, Error> {
@@ -67,7 +62,6 @@ impl Browser {
     }
 }
 
-#[derive(Default)]
 pub struct BrowserBuilder {
     config: BrowserConfig,
 }

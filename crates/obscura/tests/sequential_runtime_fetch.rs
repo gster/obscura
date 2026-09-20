@@ -38,7 +38,7 @@ fn spawn_server() -> String {
 }
 
 async fn run_browser(base: &str) {
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(base).await.unwrap();
 

@@ -3,7 +3,7 @@ use obscura_cdp::types::CdpRequest;
 use serde_json::{json, Value};
 
 async fn check_by_value(method: &str, await_promise: bool) {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session_id = "by-value".to_string();
     ctx.sessions.insert(session_id.clone(), page_id);

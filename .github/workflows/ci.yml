@@ -165,6 +165,7 @@ jobs:
       - name: Run required official Playwright Python smoke
         env:
           DEBUG: pw:protocol
+          OBSCURA_PERSONA: windows_chrome145
         run: |
           smoke_root="$RUNNER_TEMP/obscura-cdp-smoke"
           mkdir -p "$smoke_root"
@@ -314,6 +315,7 @@ jobs:
               --json --runs 3 --warmup 1 > "$results_root/obstacle-base.json"
           base_status=$?
           OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-pr" \
+            OBSCURA_PERSONA=windows_chrome145 \
             python3 obscura-benchmark/obstacle-course/run.py \
               --json --runs 3 --warmup 1 > "$results_root/obstacle-pr.json"
           pr_status=$?

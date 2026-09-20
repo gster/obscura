@@ -43,10 +43,11 @@ See the [SDK contract](../bindings/python/README.md) for limits and failure stat
 
 ## SDK browser identity
 
-Protocol 2 accepts `macos_chrome152` and the legacy `windows_chrome145` persona
-profiles. `Browser.launch` defaults an omitted persona `profile` to
-`macos_chrome152`; an explicit profile is preserved. Protocol 1 retains its
-Windows Chrome 145 restriction. The ZG example selects the macOS profile.
+Protocol 2 accepts `macos_chrome152`, `macos_chrome153`, and the legacy
+`windows_chrome145` persona profiles. Every caller must provide a complete
+versioned PersonaSpec including `schema_version`, `persona_id`, `revision`, and
+`profile`; there is no implicit profile. Protocol 1 retains its Windows Chrome
+145 restriction. The ZG example selects the macOS profile explicitly.
 
 The macOS profile matches the captured headed Chrome 152.0.7977.83 identity:
 reduced UA `Chrome/152.0.0.0`, `MacIntel`, Client Hints `macOS`, platform version
@@ -55,7 +56,7 @@ reduced UA `Chrome/152.0.0.0`, `MacIntel`, Client Hints `macOS`, platform versio
 Navigation, subresources and fetch/XHR share the same stealth client. Frame
 realms inherit the identity.
 
-Persona surface defaults are resolved once during `init` and returned in the
+Optional persona fields are resolved once during `init` and returned in the
 ready payload. Callers may set `language`, `languages`, `accept_language`,
 `timezone`, `do_not_track`, `hardware_concurrency`, `device_memory`,
 `screen_width`, `screen_height`, `screen_avail_width`, `screen_avail_height`,
@@ -64,8 +65,10 @@ ready payload. Callers may set `language`, `languages`, `accept_language`,
 `webgl_renderer` in the startup Persona. Omitted fields use the selected
 profile's defaults. The
 runtime rejects locale combinations whose primary navigator language disagrees
-with `Accept-Language`; the effective Persona drives HTTP headers, JS globals,
-Intl, process timezone, screen values, and WebGL identity together.
+with `Accept-Language`; the shared persona compiler freezes the process timezone
+and ICU primary language before V8 and drives HTTP headers, JS globals, Intl, screen values, and WebGL
+identity together. Privacy policy such as tracker blocking is a separate init
+field and is not part of PersonaSpec.
 
 The macOS profile uses primp 2.0.1's Chrome 152/macOS TLS and HTTP/2
 preset. Windows Chrome 145 uses primp ChromeV145/Windows. Obscura owns

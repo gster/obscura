@@ -54,8 +54,29 @@ async fn main() {
     let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let mut context = BrowserContext::with_options("worker".to_string(), proxy, true);
-    context.obey_robots = obey_robots;
+    let persona_json = std::env::var("OBSCURA_PERSONA_JSON").unwrap_or_else(|_| {
+        eprintln!("OBSCURA_PERSONA_JSON is required");
+        std::process::exit(2);
+    });
+    let persona = obscura_net::PersonaSpec::from_json(&persona_json)
+        .and_then(obscura_net::PersonaSpec::compile)
+        .unwrap_or_else(|error| {
+            eprintln!("Invalid OBSCURA_PERSONA_JSON: {error}");
+            std::process::exit(2);
+        });
+    obscura_net::activate_process_persona(&persona).unwrap_or_else(|error| {
+        eprintln!("Cannot activate OBSCURA_PERSONA_JSON: {error}");
+        std::process::exit(2);
+    });
+    let context = BrowserContext::with_options(
+        "worker".to_string(),
+        persona,
+        obscura_browser::BrowserContextOptions {
+            proxy_url: proxy,
+            obey_robots,
+            ..Default::default()
+        },
+    );
     let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);
 

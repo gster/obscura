@@ -178,25 +178,32 @@ pub async fn handle(
                 .ok_or("Emulation.setDeviceMetricsOverride requires boolean mobile")?;
             // Parse optional dimensions independently. Even an incomplete
             // screen-size pair must reject a malformed or out-of-range member.
-            let screen_width = optional_metric_dimension(params, "screenWidth")?;
-            let screen_height = optional_metric_dimension(params, "screenHeight")?;
-            let screen_size = match (screen_width, screen_height) {
-                (Some(screen_width), Some(screen_height))
-                    if screen_width > 0 && screen_height > 0 =>
-                {
-                    Some((screen_width as f32, screen_height as f32))
-                }
-                _ => None,
-            };
+            // Playwright includes viewport-sized screen dimensions when it
+            // changes only the viewport. Validate their shape, but do not let
+            // them replace the process persona's physical screen identity.
+            let _screen_width = optional_metric_dimension(params, "screenWidth")?;
+            let _screen_height = optional_metric_dimension(params, "screenHeight")?;
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page for session")?;
+            let persona = page.context.persona();
+            if mobile {
+                return Err(
+                    "Emulation.setDeviceMetricsOverride cannot change frozen persona mobile identity"
+                        .to_string(),
+                );
+            }
+            if device_scale_factor > 0.0
+                && (device_scale_factor - persona.device_scale_factor()).abs() > f64::EPSILON
+            {
+                return Err(format!(
+                    "Emulation.setDeviceMetricsOverride deviceScaleFactor conflicts with frozen persona value {}",
+                    persona.device_scale_factor(),
+                ));
+            }
             page.apply_device_metrics_override(
                 (width > 0).then_some(width as f32),
                 (height > 0).then_some(height as f32),
-                (device_scale_factor > 0.0).then_some(device_scale_factor as f32),
-                screen_size,
-                mobile,
             );
             Ok(json!({}))
         }
@@ -246,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_metrics_override_updates_page_and_window_viewport() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("viewport-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
@@ -256,10 +263,10 @@ mod tests {
             &json!({
                 "width": 1024,
                 "height": 768,
-                "deviceScaleFactor": 2,
+                "deviceScaleFactor": 1,
                 "mobile": false,
-                "screenWidth": 1440,
-                "screenHeight": 900,
+                "screenWidth": 1920,
+                "screenHeight": 1080,
                 "screenOrientation": {"type": "landscapePrimary", "angle": 0}
             }),
             &mut ctx,
@@ -272,20 +279,20 @@ mod tests {
             .get_session_page_mut(&session_id)
             .expect("page for session");
         assert_eq!(page.viewport, (1024.0, 768.0));
-        assert_eq!(page.device_scale_factor, 2.0);
+        assert_eq!(page.device_scale_factor(), 1.0);
         assert_eq!(
             page.evaluate(
                 "return [innerWidth, innerHeight, visualViewport.width,\
                          visualViewport.height, screen.width, screen.height,\
                          screen.availWidth, screen.availHeight, devicePixelRatio];"
             ),
-            json!([1024, 768, 1024, 768, 1440, 900, 1440, 900, 2])
+            json!([1024, 768, 1024, 768, 1920, 1080, 1920, 1040, 1])
         );
     }
 
     #[tokio::test]
     async fn device_metrics_override_rejects_unqualified_options() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("viewport-options-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
@@ -302,14 +309,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omitted_screen_metrics_clear_only_the_screen_override() {
-        let mut ctx = CdpContext::new();
+    async fn screen_metrics_are_accepted_but_cannot_mutate_persona_identity() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("screen-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
 
-        for params in [
-            json!({
+        handle(
+            "setDeviceMetricsOverride",
+            &json!({
                 "width": 1024,
                 "height": 768,
                 "deviceScaleFactor": 1,
@@ -317,32 +325,25 @@ mod tests {
                 "screenWidth": 1111,
                 "screenHeight": 777
             }),
-            json!({
-                "width": 800,
-                "height": 600,
-                "deviceScaleFactor": 1,
-                "mobile": false
-            }),
-        ] {
-            handle("setDeviceMetricsOverride", &params, &mut ctx, &session_id)
-                .await
-                .unwrap();
-        }
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("Playwright viewport request should ignore screen identity fields");
 
         let page = ctx.get_session_page_mut(&session_id).unwrap();
-        assert_eq!(page.viewport, (800.0, 600.0));
+        assert_eq!(page.viewport, (1024.0, 768.0));
         assert_eq!(
             page.evaluate(
-                "return [innerWidth, innerHeight, screen.width !== 1111,\
-                         screen.height !== 777];"
+                "return [innerWidth, innerHeight, screen.width, screen.height];"
             ),
-            json!([800, 600, true, true])
+            json!([1024, 768, 1920, 1080])
         );
     }
 
     #[tokio::test]
     async fn device_metrics_override_rejects_fractional_and_out_of_range_dimensions() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("viewport-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
@@ -362,13 +363,12 @@ mod tests {
 
     #[tokio::test]
     async fn zero_dimensions_disable_size_override() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("zero-size-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
         let page = ctx.get_session_page_mut(&session_id).unwrap();
         page.set_viewport((1111.0, 777.0));
-        page.set_device_scale_factor(1.5);
 
         handle(
             "setDeviceMetricsOverride",
@@ -386,18 +386,17 @@ mod tests {
 
         let page = ctx.get_session_page_mut(&session_id).unwrap();
         assert_eq!(page.viewport, (1111.0, 777.0));
-        assert_eq!(page.device_scale_factor, 1.5);
+        assert_eq!(page.device_scale_factor(), 1.0);
     }
 
     #[tokio::test]
     async fn repeated_overrides_keep_baseline_and_clear_restores_it() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("scale-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
         let page = ctx.get_session_page_mut(&session_id).unwrap();
         page.set_viewport((1111.0, 777.0));
-        page.set_device_scale_factor(1.5);
         let baseline_screen = page.evaluate(
             "return [screen.width, screen.height, screen.availWidth, screen.availHeight];",
         );
@@ -407,10 +406,10 @@ mod tests {
             &json!({
                 "width": 640,
                 "height": 480,
-                "deviceScaleFactor": 3,
+                "deviceScaleFactor": 1,
                 "mobile": false,
-                "screenWidth": 900,
-                "screenHeight": 700
+                "screenWidth": 1920,
+                "screenHeight": 1080
             }),
             &mut ctx,
             &session_id,
@@ -420,8 +419,8 @@ mod tests {
         assert_eq!(
             ctx.get_session_page(&session_id)
                 .unwrap()
-                .device_scale_factor,
-            3.0
+                .device_scale_factor(),
+            1.0
         );
 
         handle(
@@ -439,7 +438,7 @@ mod tests {
         .expect("zero restores the corresponding baseline metric");
         let page = ctx.get_session_page(&session_id).unwrap();
         assert_eq!(page.viewport, (1111.0, 333.0));
-        assert_eq!(page.device_scale_factor, 1.5);
+        assert_eq!(page.device_scale_factor(), 1.0);
 
         handle(
             "clearDeviceMetricsOverride",
@@ -451,7 +450,7 @@ mod tests {
         .unwrap();
         let page = ctx.get_session_page_mut(&session_id).unwrap();
         assert_eq!(page.viewport, (1111.0, 777.0));
-        assert_eq!(page.device_scale_factor, 1.5);
+        assert_eq!(page.device_scale_factor(), 1.0);
         assert_eq!(
             page.evaluate(
                 "return [screen.width, screen.height, screen.availWidth, screen.availHeight];"
@@ -462,13 +461,12 @@ mod tests {
 
     #[tokio::test]
     async fn inactive_clear_is_a_no_op() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("inactive-clear-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
         let page = ctx.get_session_page_mut(&session_id).unwrap();
         page.set_viewport((901.0, 607.0));
-        page.set_device_scale_factor(1.25);
 
         handle(
             "clearDeviceMetricsOverride",
@@ -481,12 +479,12 @@ mod tests {
 
         let page = ctx.get_session_page(&session_id).unwrap();
         assert_eq!(page.viewport, (901.0, 607.0));
-        assert_eq!(page.device_scale_factor, 1.25);
+        assert_eq!(page.device_scale_factor(), 1.0);
     }
 
     #[tokio::test]
-    async fn mobile_without_complete_screen_size_uses_effective_viewport() {
-        let mut ctx = CdpContext::new();
+    async fn mobile_and_conflicting_identity_metrics_are_rejected() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("mobile-screen-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
@@ -501,28 +499,27 @@ mod tests {
             json!({
                 "width": 700,
                 "height": 500,
-                "deviceScaleFactor": 1,
-                "mobile": true,
-                "screenWidth": 1000
+                "deviceScaleFactor": 2,
+                "mobile": false
             }),
         ] {
             handle("setDeviceMetricsOverride", &params, &mut ctx, &session_id)
                 .await
-                .unwrap();
+                .expect_err("persona identity fields are frozen");
         }
 
         let page = ctx.get_session_page_mut(&session_id).unwrap();
         assert_eq!(
             page.evaluate(
-                "return [screen.width, screen.height, screen.availWidth, screen.availHeight];"
+                "return [innerWidth, innerHeight, screen.width, screen.height, devicePixelRatio];"
             ),
-            json!([700, 500, 700, 500])
+            json!([1280, 720, 1920, 1080, 1])
         );
     }
 
     #[tokio::test]
     async fn validates_mobile_and_each_optional_screen_dimension() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("validation-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);
@@ -590,7 +587,7 @@ mod tests {
         let error = handle(
             "auditMethodDoesNotExist",
             &json!({}),
-            &mut CdpContext::new(),
+            &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)),
             &None,
         )
         .await
@@ -607,7 +604,7 @@ mod tests {
             json!({"enabled": true, "invented": true}),
         ] {
             assert!(
-                handle("setFocusEmulationEnabled", &params, &mut CdpContext::new(), &None)
+                handle("setFocusEmulationEnabled", &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                     .await
                     .is_err(),
                 "must reject {params}"
@@ -616,7 +613,7 @@ mod tests {
         handle(
             "setFocusEmulationEnabled",
             &json!({"enabled": true}),
-            &mut CdpContext::new(),
+            &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)),
             &None,
         )
         .await
@@ -628,7 +625,7 @@ mod tests {
         handle(
             "setTouchEmulationEnabled",
             &json!({"enabled": false}),
-            &mut CdpContext::new(),
+            &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)),
             &None,
         )
         .await
@@ -640,7 +637,7 @@ mod tests {
             json!({"enabled": false, "maxTouchPoints": 0}),
         ] {
             assert!(
-                handle("setTouchEmulationEnabled", &params, &mut CdpContext::new(), &None)
+                handle("setTouchEmulationEnabled", &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                     .await
                     .is_err(),
                 "must reject {params}"
@@ -659,28 +656,28 @@ mod tests {
                 {"name": "prefers-contrast", "value": "no-preference"}
             ]
         });
-        handle("setEmulatedMedia", &defaults, &mut CdpContext::new(), &None)
+        handle("setEmulatedMedia", &defaults, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
             .await
             .expect("the fixed default bundle should be accepted");
 
         let mut dark = defaults.clone();
         dark["features"][0]["value"] = json!("dark");
         assert!(
-            handle("setEmulatedMedia", &dark, &mut CdpContext::new(), &None)
+            handle("setEmulatedMedia", &dark, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                 .await
                 .is_err()
         );
         let mut extra_top_level = defaults.clone();
         extra_top_level["invented"] = json!(true);
         assert!(
-            handle("setEmulatedMedia", &extra_top_level, &mut CdpContext::new(), &None)
+            handle("setEmulatedMedia", &extra_top_level, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                 .await
                 .is_err()
         );
         let mut extra_feature_field = defaults;
         extra_feature_field["features"][0]["invented"] = json!(true);
         assert!(
-            handle("setEmulatedMedia", &extra_feature_field, &mut CdpContext::new(), &None)
+            handle("setEmulatedMedia", &extra_feature_field, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                 .await
                 .is_err()
         );

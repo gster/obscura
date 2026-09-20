@@ -17,6 +17,7 @@ fn dump_text_preserves_whitespace_between_inline_spans() {
             "text",
             "--quiet",
         ])
+        .env("OBSCURA_PERSONA", "windows_chrome145")
         .output()
         .expect("run obscura fetch");
 

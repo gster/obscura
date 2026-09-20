@@ -90,27 +90,31 @@ pub struct ObscuraModuleLoader {
 }
 
 impl ObscuraModuleLoader {
-    pub fn new(base_url: &str) -> Self {
-        Self::with_proxy(base_url, None)
+    pub fn new(base_url: &str, persona: obscura_net::EffectivePersona) -> Self {
+        Self::with_proxy(base_url, None, persona)
     }
 
-    pub fn with_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+    pub fn with_proxy(
+        base_url: &str,
+        proxy_url: Option<String>,
+        persona: obscura_net::EffectivePersona,
+    ) -> Self {
         let import_map = Rc::new(RefCell::new(ImportMap::default()));
-        Self::with_proxy_and_import_map(base_url, proxy_url, import_map)
+        Self::with_proxy_and_import_map(base_url, proxy_url, import_map, persona)
     }
 
     fn with_proxy_and_import_map(
         base_url: &str,
         proxy_url: Option<String>,
         import_map: Rc<RefCell<ImportMap>>,
+        persona: obscura_net::EffectivePersona,
     ) -> Self {
         let cookie_jar = Arc::new(obscura_net::CookieJar::new());
         let policy = Arc::new(obscura_net::ObscuraHttpClient::with_options(
             cookie_jar.clone(), proxy_url.as_deref(),
         ));
-        let standalone_client = Arc::new(obscura_net::StealthHttpClient::with_policy_profile_persona(
-            cookie_jar, proxy_url.as_deref(), policy,
-            obscura_net::StealthProfile::default(), "en-US,en;q=0.9", None,
+        let standalone_client = Arc::new(obscura_net::StealthHttpClient::with_policy_persona(
+            cookie_jar, proxy_url.as_deref(), policy, &persona,
         ));
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
@@ -306,6 +310,16 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    fn test_persona() -> obscura_net::EffectivePersona {
+        obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)
+    }
+
+    fn persona_with(profile: obscura_net::StealthProfile, language: &str) -> obscura_net::EffectivePersona {
+        let mut spec = obscura_net::PersonaSpec::preset(profile);
+        spec.language = Some(language.to_string());
+        spec.compile().unwrap()
+    }
+
     async fn load(loader: &ObscuraModuleLoader, url: &str) -> Result<ModuleSource, ModuleLoaderError> {
         let url = ModuleSpecifier::parse(url).unwrap();
         match loader.load(&url, None, false, RequestedModuleType::None) {
@@ -343,8 +357,8 @@ mod tests {
             let mut response = format!("HTTP/1.1 {status} Response\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nSet-Cookie: raw=secret\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
             response.extend_from_slice(body);
             let (proxy_url, server) = proxy(response);
-            let standalone = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
-            let state = Rc::new(RefCell::new(ObscuraState::new()));
+            let standalone = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url), test_persona());
+            let state = Rc::new(RefCell::new(ObscuraState::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145))));
             state.borrow_mut().stealth_client = standalone.standalone_client.clone();
             let loader = ObscuraModuleLoader::with_page_state("http://example.com/", None, &state, state.borrow().import_map.clone());
             let error = load(&loader, url).await.err().expect("module must reject");
@@ -370,8 +384,8 @@ mod tests {
         let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=windows-1252\r\nContent-Length: {}\r\nSet-Cookie: module=secret\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
         response.extend_from_slice(&body);
         let (proxy_url, server) = proxy(response);
-        let standalone = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
-        let state = Rc::new(RefCell::new(ObscuraState::new()));
+        let standalone = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url), test_persona());
+        let state = Rc::new(RefCell::new(ObscuraState::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145))));
         state.borrow_mut().stealth_client = standalone.standalone_client.clone();
         let loader = ObscuraModuleLoader::with_page_state(
             "http://example.com/", None, &state, state.borrow().import_map.clone());
@@ -394,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_module_uses_persona_proxy_and_isolated_cookies() {
         let (proxy_url, server) = proxy(b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 17\r\nConnection: close\r\n\r\nexport default 7;");
-        let loader = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
+        let loader = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url), test_persona());
         let client = loader.standalone_client.as_ref().unwrap();
         client.cookie_jar.set_cookie("session=raw-secret; Path=/", &ModuleSpecifier::parse("http://example.com/").unwrap());
         client.set_extra_headers(std::collections::HashMap::from([
@@ -407,7 +421,7 @@ mod tests {
         let lower = request.to_ascii_lowercase();
         assert!(request.starts_with("GET http://example.com/entry.js HTTP/1.1\r\n"), "{request}");
         for header in [
-            format!("user-agent: {}\r\n", obscura_net::StealthProfile::default().user_agent().to_ascii_lowercase()),
+            format!("user-agent: {}\r\n", obscura_net::StealthProfile::WindowsChrome145.user_agent().to_ascii_lowercase()),
             "sec-ch-ua-platform: \"windows\"\r\n".into(),
             "accept-language: en-us,en;q=0.9\r\n".into(),
             "sec-fetch-dest: script\r\n".into(),
@@ -416,7 +430,7 @@ mod tests {
         ] {
             assert!(lower.contains(&header), "missing {header:?} in {request}");
         }
-        let other = ObscuraModuleLoader::new("http://example.com/");
+        let other = ObscuraModuleLoader::new("http://example.com/", test_persona());
         assert!(other.standalone_client.as_ref().unwrap().cookie_jar
             .get_cookie_header(&ModuleSpecifier::parse("http://example.com/").unwrap()).is_empty());
     }
@@ -427,7 +441,7 @@ mod tests {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
         file.write_all(b"export default 'local';").unwrap();
         let url = ModuleSpecifier::from_file_path(&path).unwrap();
-        let loader = ObscuraModuleLoader::new(url.as_str());
+        let loader = ObscuraModuleLoader::new(url.as_str(), test_persona());
         let result = load(&loader, url.as_str()).await;
         std::fs::remove_file(path).unwrap();
         let ModuleSourceCode::String(code) = result.unwrap().code else { panic!("expected decoded module source") };
@@ -438,11 +452,11 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_module_rejects_private_initial_and_redirect_targets() {
-        let loader = ObscuraModuleLoader::new("http://127.0.0.1/");
+        let loader = ObscuraModuleLoader::new("http://127.0.0.1/", test_persona());
         let error = load(&loader, "http://127.0.0.1/entry.js").await.unwrap_err();
         assert!(error.to_string().contains("private/internal IP address"), "{error}");
         let (proxy_url, server) = proxy(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/private.js\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        let loader = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url));
+        let loader = ObscuraModuleLoader::with_proxy("http://example.com/", Some(proxy_url), test_persona());
         let error = load(&loader, "http://example.com/entry.js").await.unwrap_err();
         assert!(error.to_string().contains("private/internal IP address"), "{error}");
         assert!(!server.join().unwrap().is_empty());
@@ -472,11 +486,11 @@ mod tests {
     async fn page_module_keeps_bound_primp_interceptor_without_plain_client() {
         let policy = Arc::new(obscura_net::ObscuraHttpClient::new());
         *policy.interceptor.write().await = Some(Arc::new(FulfillModule));
-        let client = Arc::new(obscura_net::StealthHttpClient::with_policy_profile_persona(
-            policy.cookie_jar.clone(), None, policy,
-            obscura_net::StealthProfile::MacChrome153, "en-US,en;q=0.9", None,
+        let persona = persona_with(obscura_net::StealthProfile::MacChrome153, "en-US");
+        let client = Arc::new(obscura_net::StealthHttpClient::with_policy_persona(
+            policy.cookie_jar.clone(), None, policy, &persona,
         ));
-        let state = Rc::new(RefCell::new(ObscuraState::new()));
+        let state = Rc::new(RefCell::new(ObscuraState::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145))));
         state.borrow_mut().stealth_client = Some(client);
         let loader = ObscuraModuleLoader::with_page_state(
             "https://example.com/", None, &state, state.borrow().import_map.clone(),

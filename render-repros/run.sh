@@ -12,7 +12,8 @@ mkdir -p "$OUT"
 status=0
 for f in "$DIR"/*.html; do
   n=$(basename "$f" .html)
-  if ! OBSCURA_SHOT_W=900 OBSCURA_SHOT_H=1000 OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
+  if ! OBSCURA_PERSONA="${OBSCURA_PERSONA:-windows_chrome145}" \
+    OBSCURA_SHOT_W=900 OBSCURA_SHOT_H=1000 OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
     timeout 60 "$BIN" fetch "file://$f" --screenshot "$OUT/$n.obscura.png" \
       --timeout 30000 --wait 2 >"$OUT/$n.obscura.log" 2>&1 || [[ ! -s "$OUT/$n.obscura.png" ]]; then
     echo "FAILED obscura: $n (see $OUT/$n.obscura.log)" >&2

@@ -60,7 +60,7 @@ async fn create_and_attach(ctx: &mut CdpContext, url: &str, id: u64) -> String {
 /// unrelated command runs against a *different* page on the same connection.
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_pages_keep_their_own_js_heap() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let first = create_and_attach(&mut ctx, "about:blank", 1).await;
     let second = create_and_attach(&mut ctx, "about:blank", 10).await;
 
@@ -126,7 +126,7 @@ async fn concurrent_pages_keep_their_own_js_heap() {
 /// Playwright's utility script.
 #[tokio::test(flavor = "current_thread")]
 async fn an_objectid_keeps_its_live_object_across_a_command_on_another_page() {
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let first = create_and_attach(&mut ctx, "about:blank", 1).await;
     let second = create_and_attach(&mut ctx, "about:blank", 10).await;
 

@@ -1,4 +1,4 @@
-> `fetch` 自动使用统一身份基线和 primp；没有运行时 stealth 开关。
+> 下列命令假定已设置 `export OBSCURA_PERSONA=windows_chrome145`；也可在每条命令上传 `--persona`。没有隐式 persona 或运行时 stealth 开关。
 
 `obscura fetch` loads a URL, runs its JavaScript, and prints the result.
 

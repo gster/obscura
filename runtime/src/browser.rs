@@ -3,7 +3,7 @@ use obscura_net::{
     interceptor::{InterceptAction, RequestInterceptor},
     RequestInfo,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -174,17 +174,27 @@ mod tests {
 
     #[test]
     fn macos_identity_is_inherited_by_frame() {
-        let mut rt = obscura_js::runtime::ObscuraJsRuntime::new();
+        let mut rt = obscura_js::runtime::ObscuraJsRuntime::new(
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::MacChrome152),
+        );
         rt.set_dom(obscura_dom::parse_html("<!doctype html><body>identity</body>"));
         rt.set_url("http://127.0.0.1/identity");
-        rt.set_user_agent(obscura_net::StealthProfile::MacChrome152.user_agent());
-        rt.set_platform("MacIntel", "macOS", "26.6.2");
-        rt.set_user_agent_details(obscura_net::StealthProfile::MacChrome152.full_version(), "arm");
         rt.run_page_init();
         let script = "[navigator.userAgent,navigator.platform,JSON.stringify(navigator.userAgentData.brands)]";
         let expected = rt.evaluate(script).unwrap();
+        assert_eq!(
+            rt.evaluate("devicePixelRatio").unwrap().as_f64(),
+            Some(2.0),
+        );
         let child = obscura_js::frame::FrameRealm::new(&mut rt, 1, 0, "http://127.0.0.1/child", "<!doctype html><body>child</body>").unwrap();
         assert_eq!(child.evaluate(&mut rt, script).unwrap(), expected);
+        assert_eq!(
+            child
+                .evaluate(&mut rt, "devicePixelRatio")
+                .unwrap()
+                .as_f64(),
+            Some(2.0),
+        );
         let high = "navigator.userAgentData.getHighEntropyValues(['architecture','uaFullVersion']).then(v=>globalThis.identityResult=[v.architecture,v.uaFullVersion])";
         child.evaluate(&mut rt, high).unwrap();
         // Frame microtasks settle when returning from the V8 call.
@@ -193,64 +203,58 @@ mod tests {
 
     #[test]
     fn native_persona_seed_and_frame_identity_are_stable() {
-        let persona: Persona = serde_json::from_value(json!({
+        let spec: obscura_net::PersonaSpec = serde_json::from_value(json!({
             "schema_version":"1", "persona_id":"fixture_windows145", "revision":"1",
             "profile":"windows_chrome145", "viewport":{"width":640,"height":480}
         }))
         .unwrap();
-        let identity = persona.device_identity();
-        let mut changed = persona.clone();
+        let persona = spec.clone().compile().unwrap();
+        let identity = obscura_browser::DeviceIdentity {
+            seed: persona.seed(),
+            hardware_concurrency: persona.hardware_concurrency(),
+            device_memory: persona.device_memory(),
+            screen_width: persona.screen_width(),
+            screen_height: persona.screen_height(),
+        };
+        let mut changed = spec.clone();
         changed.revision = "2".into();
-        assert_ne!(identity.seed, changed.device_identity().seed);
-        let mut changed_viewport = persona.clone();
-        changed_viewport.viewport.width = 800;
-        assert_eq!(identity.seed, changed_viewport.device_identity().seed);
-        let mut macos = persona.clone();
+        assert_ne!(identity.seed, changed.compile().unwrap().seed());
+        let mut changed_viewport = spec.clone();
+        changed_viewport.viewport.as_mut().unwrap().width = 800;
+        assert_eq!(identity.seed, changed_viewport.compile().unwrap().seed());
+        let mut macos = spec.clone();
         macos.profile = "macos_chrome152".into();
-        macos.apply_defaults();
-        let macos_identity = macos.device_identity();
-        assert_eq!(macos_identity.hardware_concurrency, 15);
-        assert_eq!(macos_identity.device_memory, 32.0);
-        assert_eq!(macos.language.as_deref(), Some("en"));
-        assert_eq!(macos.languages.as_deref(), Some(&["en".into(), "zh-CN".into()][..]));
-        assert_eq!(macos.accept_language.as_deref(), Some("en,zh-CN;q=0.9,zh;q=0.8"));
-        assert_eq!(macos.timezone.as_deref(), Some("Asia/Shanghai"));
-        // Chrome 153 on macOS sends no DNT header and reports
-        // navigator.doNotTrack === null, so the macOS defaults must leave the
-        // preference unset rather than fabricate one.
-        assert_eq!(macos.do_not_track, None);
-        assert_eq!((macos.screen_width, macos.screen_height), (Some(2560), Some(1440)));
-        assert_eq!((macos.screen_avail_width, macos.screen_avail_height), (Some(2560), Some(1320)));
-        assert_eq!((macos.outer_width, macos.outer_height), (Some(640), Some(480)));
-        assert_eq!(macos.device_scale_factor, Some(2.0));
-        assert_eq!((macos.battery_charging, macos.battery_level), (Some(true), Some(0.8)));
-        assert_eq!(macos.network_rtt, Some(100));
-        assert_eq!(macos.storage_quota, Some(10_738_064_711));
-        assert_eq!(macos.webgl_vendor.as_deref(), Some("Google Inc. (Apple)"));
-        assert!(macos.webgl_renderer.as_deref().unwrap().contains("Apple M5 Pro"));
-        assert!(macos.locale_is_consistent());
-        let mut custom = persona.clone();
+        let macos = macos.compile().unwrap();
+        assert_eq!(macos.hardware_concurrency(), 15);
+        assert_eq!(macos.device_memory(), 32.0);
+        assert_eq!(macos.language(), "en");
+        assert_eq!(macos.languages(), ["en", "zh-CN"]);
+        assert_eq!(macos.accept_language(), "en,zh-CN;q=0.9,zh;q=0.8");
+        assert_eq!(macos.timezone(), "Asia/Shanghai");
+        assert_eq!(macos.do_not_track(), None);
+        assert_eq!((macos.screen_width(), macos.screen_height()), (2560, 1440));
+        assert_eq!((macos.screen_avail_width(), macos.screen_avail_height()), (2560, 1320));
+        assert_eq!((macos.outer_width(), macos.outer_height()), (640, 480));
+        assert_eq!(macos.device_scale_factor(), 2.0);
+        assert_eq!((macos.battery_charging(), macos.battery_level()), (true, 0.8));
+        assert_eq!(macos.network_rtt(), 100);
+        assert_eq!(macos.storage_quota(), 10_738_064_711);
+        assert_eq!(macos.webgl_vendor(), "Google Inc. (Apple)");
+        assert!(macos.webgl_renderer().contains("Apple M5 Pro"));
+        let mut custom = spec;
         custom.language = Some("fr-CA".into());
         custom.languages = None;
         custom.accept_language = None;
-        custom.apply_defaults();
-        // A single `language` expands to the primary tag plus its base language,
-        // which is what a browser reports and what `accept_language` already
-        // derived. Reporting ["fr-CA"] alongside "fr-CA,fr;q=0.9" was internally
-        // inconsistent.
-        assert_eq!(custom.languages.as_deref(), Some(&["fr-CA".into(), "fr".into()][..]));
-        assert_eq!(custom.accept_language.as_deref(), Some("fr-CA,fr;q=0.9"));
-        assert!(custom.locale_is_consistent());
-        custom.accept_language = Some("en-US,en;q=0.9".into());
-        assert!(!custom.locale_is_consistent());
+        let custom = custom.compile().unwrap();
+        assert_eq!(custom.languages(), ["fr-CA", "fr"]);
+        assert_eq!(custom.accept_language(), "fr-CA,fr;q=0.9");
         let snapshot = "[navigator.hardwareConcurrency,navigator.deviceMemory,screen.width,screen.height,screen.availWidth,screen.availHeight]";
         for _ in 0..2 {
-            let mut rt = obscura_js::runtime::ObscuraJsRuntime::new();
+            let mut rt = obscura_js::runtime::ObscuraJsRuntime::new(persona.clone());
             rt.set_dom(obscura_dom::parse_html(
                 "<!doctype html><body>PERSONA</body>",
             ));
             rt.set_url("http://127.0.0.1/persona");
-            rt.set_device_identity(Some(identity.clone()));
             rt.run_page_init();
             assert_eq!(
                 rt.evaluate(snapshot).unwrap(),
@@ -278,31 +282,22 @@ mod tests {
 
     #[test]
     fn startup_persona_drives_the_primp_transport_profile() {
-        let mut persona: Persona = serde_json::from_value(json!({
+        let spec: obscura_net::PersonaSpec = serde_json::from_value(json!({
             "schema_version":"1", "persona_id":"fixture_macos153", "revision":"1",
             "profile":"macos_chrome153", "viewport":{"width":640,"height":480},
             "language":"zh-CN", "languages":["zh-CN","zh"],
             "accept_language":"zh-CN,zh;q=0.9", "do_not_track":"1"
         }))
         .unwrap();
-        persona.apply_defaults();
-        let profile = persona.stealth_profile();
-        let mut context = BrowserContext::with_persona_profile(
-            "persona".into(),
-            None,
-            profile,
-            None,
-            false,
-        );
-        context.accept_language = persona.accept_language.clone().unwrap();
-        context.do_not_track = persona.do_not_track.clone();
+        let persona = spec.compile().unwrap();
+        let context = BrowserContext::new("persona".into(), persona.clone());
         let page = Page::new("persona-page".into(), Arc::new(context));
         let transport = page.stealth_client.transport_params();
 
         assert_eq!(transport.profile, obscura_net::StealthProfile::MacChrome153);
-        assert_eq!(transport.accept_language, persona.accept_language);
-        assert_eq!(transport.do_not_track, persona.do_not_track);
-        assert_eq!(page.context.user_agent, transport.profile.user_agent());
+        assert_eq!(transport.accept_language.as_deref(), Some(persona.accept_language()));
+        assert_eq!(transport.do_not_track.as_deref(), persona.do_not_track());
+        assert_eq!(page.context.persona().user_agent(), transport.profile.user_agent());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1277,7 +1272,14 @@ mod tests {
             let mut policy = ObscuraHttpClient::with_full_options(cookies.clone(), None, false);
             policy.block_trackers = blocked;
             *policy.interceptor.write().await = Some(std::sync::Arc::new(FixtureResponse));
-            let stealth = StealthHttpClient::with_policy(cookies, None, Arc::new(policy));
+            let stealth = StealthHttpClient::with_policy(
+                cookies,
+                None,
+                Arc::new(policy),
+                &obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
+            );
             assert_eq!(stealth.fetch(&url).await.unwrap().status, status);
             assert_eq!(
                 stealth
@@ -1329,7 +1331,14 @@ mod tests {
         let cookies = Arc::new(CookieJar::new());
         let policy = ObscuraHttpClient::with_full_options(cookies.clone(), None, true);
         *policy.interceptor.write().await = Some(std::sync::Arc::new(RequestHeaders));
-        let stealth = StealthHttpClient::with_policy(cookies, None, Arc::new(policy));
+        let stealth = StealthHttpClient::with_policy(
+            cookies,
+            None,
+            Arc::new(policy),
+            &obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        );
         assert_eq!(stealth.fetch(&url).await.unwrap().status, 200);
         assert!(server
             .join()
@@ -1358,9 +1367,7 @@ mod tests {
 
     async fn input_fixture(html: &'static str) -> Page {
         let mut context = BrowserContext::with_storage_and_network(
-            "native-input-test".into(),
-            None,
-            true,
+            "native-input-test".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
             None,
             None,
             true,
@@ -4072,9 +4079,7 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
         {
             let enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut context = BrowserContext::with_storage_and_network(
-                "history-redirect".into(),
-                None,
-                true,
+                "history-redirect".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
                 None,
                 None,
                 true,
@@ -4153,9 +4158,7 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
         for failure in [0, 204, 205] {
             let gate = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(200));
             let mut context = BrowserContext::with_storage_and_network(
-                "history-failure".into(),
-                None,
-                true,
+                "history-failure".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
                 None,
                 None,
                 true,
@@ -4811,7 +4814,8 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
                 client.block_trackers = false;
                 let url = Url::parse(&(base.clone() + "/start#one")).unwrap();
                 let client = Arc::new(client);
-                let response = StealthHttpClient::with_policy_profile(cookies, None, client, profile)
+                let persona = obscura_net::EffectivePersona::builtin(profile);
+                let response = StealthHttpClient::with_policy(cookies, None, client, &persona)
                     .fetch(&url)
                     .await
                     .unwrap();
@@ -6039,212 +6043,25 @@ LINE 2</textarea><input id="password" type="password" value="HIDDEN">"#).await;
 
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Viewport {
-    width: u32,
-    height: u32,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Persona {
-    schema_version: String,
-    persona_id: String,
-    revision: String,
-    profile: String,
-    viewport: Viewport,
-    #[serde(default)]
-    tracker_blocking: bool,
-    #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
-    languages: Option<Vec<String>>,
-    #[serde(default)]
-    accept_language: Option<String>,
-    #[serde(default)]
-    timezone: Option<String>,
-    #[serde(default)]
-    do_not_track: Option<String>,
-    #[serde(default)]
-    hardware_concurrency: Option<u32>,
-    #[serde(default)]
-    device_memory: Option<f64>,
-    #[serde(default)]
-    screen_width: Option<u32>,
-    #[serde(default)]
-    screen_height: Option<u32>,
-    #[serde(default)]
-    screen_avail_width: Option<u32>,
-    #[serde(default)]
-    screen_avail_height: Option<u32>,
-    #[serde(default)]
-    outer_width: Option<u32>,
-    #[serde(default)]
-    outer_height: Option<u32>,
-    #[serde(default)]
-    device_scale_factor: Option<f64>,
-    #[serde(default)]
-    battery_charging: Option<bool>,
-    #[serde(default)]
-    battery_level: Option<f64>,
-    #[serde(default)]
-    network_rtt: Option<u32>,
-    #[serde(default)]
-    storage_quota: Option<u64>,
-    #[serde(default)]
-    webgl_vendor: Option<String>,
-    #[serde(default)]
-    webgl_renderer: Option<String>,
-}
-
-impl Persona {
-    fn stealth_profile(&self) -> obscura_net::StealthProfile {
-        match self.profile.as_str() {
-            "macos_chrome153" => obscura_net::StealthProfile::MacChrome153,
-            "macos_chrome152" => obscura_net::StealthProfile::MacChrome152,
-            _ => obscura_net::StealthProfile::WindowsChrome145,
-        }
-    }
-
-    fn apply_defaults(&mut self) {
-        let macos = matches!(self.profile.as_str(), "macos_chrome152" | "macos_chrome153");
-        if self.language.is_none() && self.languages.is_none() {
-            let defaults = if macos {
-                vec!["en".into(), "zh-CN".into()]
-            } else {
-                vec!["en-US".into(), "en".into()]
-            };
-            self.language = defaults.first().cloned();
-            self.languages = Some(defaults);
-        } else if self.language.is_none() {
-            self.language = self.languages.as_ref().and_then(|v| v.first()).cloned();
-        } else if self.languages.is_none() {
-            // Derive the language list the way a browser reports it: the primary
-            // tag followed by its base language. `accept_language` below already
-            // expands the same way, so a single `language` must not leave
-            // navigator.languages reporting ["en-US"] while Accept-Language says
-            // "en-US,en" -- no real browser is internally inconsistent like that.
-            let primary = self.language.clone().unwrap();
-            let mut derived = vec![primary.clone()];
-            if let Some((base, _)) = primary.split_once('-') {
-                if !derived.iter().any(|tag| tag == base) {
-                    derived.push(base.to_string());
-                }
-            }
-            self.languages = Some(derived);
-        }
-        self.accept_language.get_or_insert_with(|| {
-            let mut expanded = Vec::<String>::new();
-            for language in self.languages.as_ref().unwrap() {
-                if !expanded.contains(language) { expanded.push(language.clone()); }
-                if let Some((base, _)) = language.split_once('-') {
-                    let base = base.to_string();
-                    if !expanded.contains(&base) { expanded.push(base); }
-                }
-            }
-            expanded.into_iter().enumerate().map(|(index, language)| {
-                if index == 0 { language } else {
-                    format!("{};q=0.{}", language, 9usize.saturating_sub(index - 1).max(1))
-                }
-            }).collect::<Vec<_>>().join(",")
-        });
-        self.timezone.get_or_insert_with(|| if macos { "Asia/Shanghai".into() } else { "America/New_York".into() });
-        // Do NOT invent a DNT preference. Real Chrome ships no default DNT
-        // value: it sends no `DNT` request header and reports
-        // `navigator.doNotTrack === null` (measured against Chrome 153 on
-        // macOS). Defaulting the macOS profile to "1" asserted the opposite on
-        // both layers at once - a deliberate-looking privacy stance that no
-        // stock Chrome has, and a well-known automation tell. A persona may
-        // still set `do_not_track` explicitly; only the fabricated default is
-        // gone.
-        self.hardware_concurrency.get_or_insert(if macos { 15 } else { 8 });
-        self.device_memory.get_or_insert(if macos { 32.0 } else { 8.0 });
-        self.screen_width.get_or_insert(if macos { 2560 } else { 1920 });
-        self.screen_height.get_or_insert(if macos { 1440 } else { 1080 });
-        self.screen_avail_width.get_or_insert(self.screen_width.unwrap());
-        self.screen_avail_height.get_or_insert(
-            self.screen_height.unwrap().saturating_sub(if macos { 120 } else { 40 }),
-        );
-        self.outer_width.get_or_insert(if macos { self.viewport.width } else { self.screen_width.unwrap() });
-        self.outer_height.get_or_insert(if macos { self.viewport.height } else { self.screen_avail_height.unwrap() });
-        self.device_scale_factor.get_or_insert(if macos { 2.0 } else { 1.0 });
-        self.battery_charging.get_or_insert(true);
-        self.battery_level.get_or_insert(0.8);
-        self.network_rtt.get_or_insert(100);
-        self.storage_quota.get_or_insert(10_738_064_711);
-        self.webgl_vendor.get_or_insert_with(|| if macos {
-            "Google Inc. (Apple)".into()
-        } else {
-            "Google Inc. (NVIDIA)".into()
-        });
-        self.webgl_renderer.get_or_insert_with(|| if macos {
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)".into()
-        } else {
-            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)".into()
-        });
-    }
-
-    fn locale_is_consistent(&self) -> bool {
-        let Some(language) = self.language.as_deref() else { return false; };
-        let Some(languages) = self.languages.as_ref() else { return false; };
-        if languages.first().map(String::as_str) != Some(language) { return false; }
-        let Some(header) = self.accept_language.as_deref() else { return false; };
-        let tags = header.split(',').map(|part| part.split(';').next().unwrap_or("").trim()).collect::<Vec<_>>();
-        if tags.first().copied() != Some(language) { return false; }
-        let mut offset = 0;
-        for language in languages {
-            let Some(index) = tags[offset..].iter().position(|tag| *tag == language) else { return false; };
-            offset += index + 1;
-        }
-        true
-    }
-
-    fn preload_script(&self) -> String {
-        format!(
-            "globalThis.__obscura_battery_charging={};\
-             globalThis.__obscura_battery_level={};\
-             globalThis.__obscura_network_rtt={};\
-             globalThis.__obscura_storage_quota={};\
-             if(globalThis.screen){{globalThis.screen._availW={};globalThis.screen._availH={};}}\
-             globalThis.outerWidth={};globalThis.outerHeight={};",
-            self.battery_charging.unwrap(), self.battery_level.unwrap(),
-            self.network_rtt.unwrap(), self.storage_quota.unwrap(),
-            self.screen_avail_width.unwrap(), self.screen_avail_height.unwrap(),
-            self.outer_width.unwrap(), self.outer_height.unwrap(),
-        )
-    }
-
-    fn device_identity(&self) -> obscura_browser::DeviceIdentity {
-        let source = serde_json::to_vec(&[
-            "autopilot-persona-v1",
-            &self.persona_id,
-            &self.revision,
-            &self.profile,
-        ])
-        .unwrap();
-        let hash = Sha256::digest(source);
-        let macos = matches!(self.profile.as_str(), "macos_chrome152" | "macos_chrome153");
-        obscura_browser::DeviceIdentity {
-            seed: u32::from_be_bytes(hash[..4].try_into().unwrap()),
-            hardware_concurrency: self.hardware_concurrency.unwrap_or(if macos { 15 } else { 8 }),
-            device_memory: self.device_memory.unwrap_or(if macos { 32.0 } else { 8.0 }),
-            screen_width: self.screen_width.unwrap_or(1920),
-            screen_height: self.screen_height.unwrap_or(1080),
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Init {
     protocol_version: String,
     runtime_sha256: String,
     initial_mode: String,
-    persona: Persona,
+    persona: obscura_net::PersonaSpec,
+    #[serde(default)]
+    privacy_policy: PrivacyPolicy,
     allowed_origins: Vec<String>,
     #[serde(default)]
     proxy_url: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivacyPolicy {
+    #[serde(default)]
+    tracker_blocking: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6350,7 +6167,7 @@ pub struct BrowserRuntime {
     workspace: PathBuf,
     sha256: String,
     context: Option<Arc<BrowserContext>>,
-    persona: Option<Persona>,
+    persona: Option<obscura_net::EffectivePersona>,
     origins: Vec<String>,
     pages: HashMap<String, OwnedPage>,
     page_counter: u64,
@@ -6439,45 +6256,14 @@ impl BrowserRuntime {
         if !matches!(init.initial_mode.as_str(), "RUNNING" | "PAUSED") {
             return Err(invalid("INVALID_MODE"));
         }
-        let mut persona = init.persona;
-        persona.apply_defaults();
-        let identifier = |v: &str| {
-            !v.is_empty()
-                && v.len() <= 64
-                && v.bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-        };
-        if persona.schema_version != "1"
-            || !(persona.profile == "windows_chrome145"
-                || (init.protocol_version == "2"
-                    && matches!(persona.profile.as_str(), "macos_chrome152" | "macos_chrome153")))
-            || !identifier(&persona.persona_id)
-            || !identifier(&persona.revision)
-            || !(320..=3840).contains(&persona.viewport.width)
-            || !(240..=2160).contains(&persona.viewport.height)
-            || persona.language.as_deref().is_none_or(|v| v.is_empty() || v.len() > 32 || !v.is_ascii())
-            || persona.languages.as_ref().is_none_or(|v| v.is_empty() || v.len() > 8 || v.iter().any(|s| s.is_empty() || s.len() > 32 || !s.is_ascii()))
-            || persona.accept_language.as_deref().is_none_or(|v| v.is_empty() || v.len() > 256 || v.contains('\r') || v.contains('\n'))
-            || !persona.locale_is_consistent()
-            || persona.timezone.as_deref().is_none_or(|v| v.is_empty() || v.len() > 64 || !v.bytes().all(|c| c.is_ascii_alphanumeric() || b"_+-/".contains(&c)))
-            || persona.do_not_track.as_deref().is_some_and(|v| !matches!(v, "0" | "1"))
-            || !(1..=256).contains(&persona.hardware_concurrency.unwrap_or(0))
-            || !persona.device_memory.is_some_and(|v| v.is_finite() && (0.25..=128.0).contains(&v))
-            || !(320..=16384).contains(&persona.screen_width.unwrap_or(0))
-            || !(240..=16384).contains(&persona.screen_height.unwrap_or(0))
-            || !(320..=persona.screen_width.unwrap_or(0)).contains(&persona.screen_avail_width.unwrap_or(0))
-            || !(240..=persona.screen_height.unwrap_or(0)).contains(&persona.screen_avail_height.unwrap_or(0))
-            || !(320..=persona.screen_width.unwrap_or(0)).contains(&persona.outer_width.unwrap_or(0))
-            || !(240..=persona.screen_height.unwrap_or(0)).contains(&persona.outer_height.unwrap_or(0))
-            || !persona.device_scale_factor.is_some_and(|v| v.is_finite() && (0.5..=4.0).contains(&v))
-            || !persona.battery_level.is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v))
-            || !(1..=10_000).contains(&persona.network_rtt.unwrap_or(0))
-            || !(1_000_000..=100_000_000_000).contains(&persona.storage_quota.unwrap_or(0))
-            || persona.webgl_vendor.as_deref().is_none_or(|v| v.is_empty() || v.len() > 256 || v.chars().any(char::is_control))
-            || persona.webgl_renderer.as_deref().is_none_or(|v| v.is_empty() || v.len() > 512 || v.chars().any(char::is_control))
+        let persona = init.persona.compile().map_err(|_| invalid("UNSUPPORTED_PERSONA"))?;
+        if init.protocol_version == "1"
+            && persona.profile() != obscura_net::StealthProfile::WindowsChrome145
         {
             return Err(invalid("UNSUPPORTED_PERSONA"));
         }
+        obscura_net::activate_process_persona(&persona)
+            .map_err(|_| invalid("UNSUPPORTED_PERSONA"))?;
         if init.allowed_origins.is_empty() || init.allowed_origins.len() > 16 {
             return Err(invalid("INVALID_ORIGINS"));
         }
@@ -6505,28 +6291,20 @@ impl BrowserRuntime {
                 return Err(invalid("INVALID_PROXY"));
             }
         }
-        let profile = persona.stealth_profile();
-        let mut context = BrowserContext::with_persona_profile(
+        let profile = persona.profile();
+        let mut context = BrowserContext::with_options(
             "autopilot".into(),
-            init.proxy_url,
-            profile,
-            None,
-            loopbacks > 0,
+            persona.clone(),
+            obscura_browser::BrowserContextOptions {
+                proxy_url: init.proxy_url,
+                allow_private_network: loopbacks > 0,
+                ..Default::default()
+            },
         );
-        context.device_identity = Some(persona.device_identity());
-        let (platform, ua_platform, version) = profile.platform();
-        context.platform = platform.into();
-        context.ua_platform = ua_platform.into();
-        context.ua_platform_version = version.into();
-        context.language = persona.language.clone().unwrap();
-        context.languages = persona.languages.clone().unwrap();
-        context.accept_language = persona.accept_language.clone().unwrap();
-        context.do_not_track = persona.do_not_track.clone();
-        context.webgl_vendor = persona.webgl_vendor.clone().unwrap();
-        context.webgl_renderer = persona.webgl_renderer.clone().unwrap();
+        let device_identity = context.device_identity();
         let client =
             Arc::get_mut(&mut context.http_client).ok_or(invalid("CONTEXT_ALREADY_SHARED"))?;
-        client.block_trackers = persona.tracker_blocking;
+        client.block_trackers = init.privacy_policy.tracker_blocking;
         *client.interceptor.write().await =
             Some(std::sync::Arc::new(OriginGuard(init.allowed_origins.clone())));
         self.protocol_version = init.protocol_version;
@@ -6535,13 +6313,13 @@ impl BrowserRuntime {
         self.persona = Some(persona.clone());
         self.context = Some(Arc::new(context));
         let mut result = json!({"ready": true, "protocol_version": self.protocol_version, "runtime_version": format!("br_{}", &self.sha256[..24]),
-            "runtime_sha256": self.sha256, "persona": persona, "device_identity": persona.device_identity(),
+            "runtime_sha256": self.sha256, "persona": persona, "device_identity": device_identity,
             "font_bundle_sha256": env!("AUTOPILOT_FONT_BUNDLE_SHA256"), "mode": self.mode, "generation": self.generation,
             "supported_methods": ["init", "new_page", "navigate", "read_text", "read_value", "read_checked", "fill", "click", "wait", "capture", "set_mode", "begin_recheck", "finish_recheck", "attach_takeover", "close"]});
         if self.uses_automation() {
             result["browser_identity"] = json!({
-                "profile": persona.profile,
-                "user_agent": profile.user_agent(),
+                "profile": persona.profile().name(),
+                "user_agent": persona.user_agent(),
                 "transport_profile": match profile {
                     obscura_net::StealthProfile::MacChrome153 => "primp_chrome153_macos",
                     obscura_net::StealthProfile::MacChrome152 => "primp_chrome152_macos",
@@ -6679,9 +6457,8 @@ impl BrowserRuntime {
                 self.page_counter += 1;
                 let id = format!("p{}", self.page_counter);
                 let mut page = Page::new(id.clone(), self.context.as_ref().unwrap().clone());
-                let viewport = &self.persona.as_ref().unwrap().viewport;
+                let viewport = self.persona.as_ref().unwrap().viewport();
                 page.set_viewport((viewport.width as f32, viewport.height as f32));
-                page.set_device_scale_factor(self.persona.as_ref().unwrap().device_scale_factor.unwrap() as f32);
                 page.add_preload_script(&self.persona.as_ref().unwrap().preload_script());
                 self.pages.insert(
                     id.clone(),

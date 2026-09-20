@@ -888,30 +888,62 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         begin_animation_task(&mut self.state.borrow_mut());
     }
-    pub fn new() -> Self {
-        Self::with_base_url("about:blank")
+    pub fn new(persona: obscura_net::EffectivePersona) -> Self {
+        Self::try_new(persona).expect("runtime persona conflicts with process identity")
     }
 
-    pub fn with_base_url(base_url: &str) -> Self {
-        Self::with_base_url_and_proxy(base_url, None)
+    pub fn try_new(
+        persona: obscura_net::EffectivePersona,
+    ) -> Result<Self, obscura_net::PersonaError> {
+        Self::try_with_base_url("about:blank", persona)
+    }
+
+    pub fn with_base_url(base_url: &str, persona: obscura_net::EffectivePersona) -> Self {
+        Self::try_with_base_url(base_url, persona)
+            .expect("runtime persona conflicts with process identity")
+    }
+
+    pub fn try_with_base_url(
+        base_url: &str,
+        persona: obscura_net::EffectivePersona,
+    ) -> Result<Self, obscura_net::PersonaError> {
+        Self::try_with_base_url_and_proxy(base_url, None, persona)
     }
 
     /// Construct a runtime whose ES-module loader routes dynamic imports
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
-    pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
-        Self::with_base_url_proxy_and_locale(base_url, proxy_url, "en-US")
-    }
-
-    pub fn with_base_url_proxy_and_locale(
+    pub fn with_base_url_and_proxy(
         base_url: &str,
         proxy_url: Option<String>,
-        locale: &str,
+        persona: obscura_net::EffectivePersona,
+    ) -> Self {
+        Self::try_with_base_url_and_proxy(base_url, proxy_url, persona)
+            .expect("runtime persona conflicts with process identity")
+    }
+
+    pub fn try_with_base_url_and_proxy(
+        base_url: &str,
+        proxy_url: Option<String>,
+        persona: obscura_net::EffectivePersona,
+    ) -> Result<Self, obscura_net::PersonaError> {
+        obscura_net::activate_process_persona(&persona)?;
+        Ok(Self::with_base_url_and_proxy_activated(
+            base_url,
+            proxy_url,
+            persona,
+        ))
+    }
+
+    fn with_base_url_and_proxy_activated(
+        base_url: &str,
+        proxy_url: Option<String>,
+        persona: obscura_net::EffectivePersona,
     ) -> Self {
         // A runtime is about to initialize the V8 platform; from here on a
         // set_v8_flags call must be refused rather than aborting the process.
         crate::v8_flags::mark_platform_started();
-        let state = Rc::new(RefCell::new(ObscuraState::new()));
+        let state = Rc::new(RefCell::new(ObscuraState::new(persona.clone())));
         // Allocate standalone policy/cookies now; create its fixed default
         // persona pool lazily, so Page can bind its own transport first.
         {
@@ -949,7 +981,7 @@ impl ObscuraJsRuntime {
             // locale the other surfaces claim (#734). Process-global and
             // idempotent; setting it under the create lock guarantees it
             // lands before the first isolate exists.
-            deno_core::v8::icu::set_default_locale(locale);
+            deno_core::v8::icu::set_default_locale(persona.language());
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
@@ -1043,15 +1075,30 @@ impl ObscuraJsRuntime {
             instance.js_runtime.v8_isolate().exit();
         }
 
-        // Use the same fixed persona as the standalone transport, including
-        // high-entropy navigator defaults. Page setup can bind its persona
-        // before any page script or network request runs.
-        let profile = obscura_net::StealthProfile::default();
-        instance.set_user_agent(profile.user_agent());
-        let (platform, ua_platform, version) = profile.platform();
-        instance.set_platform(platform, ua_platform, version);
-        instance.set_user_agent_details(profile.full_version(), "x86");
-
+        instance.set_user_agent(persona.user_agent());
+        instance.set_platform(
+            persona.platform(),
+            persona.ua_platform(),
+            persona.ua_platform_version(),
+        );
+        instance.set_user_agent_details(persona.full_version(), persona.architecture());
+        instance.set_device_identity(Some(crate::ops::DeviceIdentity {
+            seed: persona.seed(),
+            hardware_concurrency: persona.hardware_concurrency(),
+            device_memory: persona.device_memory(),
+            screen_width: persona.screen_width(),
+            screen_height: persona.screen_height(),
+        }));
+        instance.set_locale(persona.language(), persona.languages());
+        instance.set_do_not_track(persona.do_not_track());
+        instance.set_webgl_identity(persona.webgl_vendor(), persona.webgl_renderer());
+        instance.set_viewport(
+            persona.viewport().width as f64,
+            persona.viewport().height as f64,
+        );
+        if let Some(location) = persona.geolocation() {
+            instance.set_geolocation(location.latitude, location.longitude);
+        }
         instance
     }
 
@@ -1373,7 +1420,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 14] = [
+        const IDENTITY_GLOBALS: [&str; 13] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
@@ -1385,7 +1432,6 @@ impl ObscuraJsRuntime {
             "__obscura_languages",
             "__obscura_webgl_vendor",
             "__obscura_webgl_renderer",
-            "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
         ];
@@ -1431,6 +1477,7 @@ impl ObscuraJsRuntime {
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
         let mut parent = self.state.borrow_mut();
         parent.ensure_persona_transport();
+        frame.persona = parent.persona.clone();
         frame.cookie_jar = parent.cookie_jar.clone();
         frame.local_storage = parent.local_storage.clone();
         frame.session_storage = parent.session_storage.clone();
@@ -1683,13 +1730,24 @@ impl ObscuraJsRuntime {
 
     /// Install the primp HTTP client so scripted fetch()/XHR uses the same
     /// transport as the owning page (see op_fetch_url / stealth_fetch_all).
-    pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
+    pub fn set_stealth_client(
+        &self,
+        client: std::sync::Arc<obscura_net::StealthHttpClient>,
+    ) -> Result<(), String> {
         let mut state = self.state.borrow_mut();
+        if !client.matches_persona(&state.persona) {
+            return Err(format!(
+                "transport identity does not match frozen persona {}@{}",
+                state.persona.persona_id(),
+                state.persona.revision(),
+            ));
+        }
         state.cookie_jar = Some(client.cookie_jar.clone());
         state.http_client = Some(client.policy_client());
         state.stealth_client = Some(client);
         #[cfg(feature = "render")]
         state.render_resources.set_sync_loading_enabled(false);
+        Ok(())
     }
 
     /// Attach the owning Page's transport and observation registry. A
@@ -1699,17 +1757,18 @@ impl ObscuraJsRuntime {
         &self,
         client: std::sync::Arc<obscura_net::StealthHttpClient>,
         callbacks: std::sync::Arc<obscura_net::CallbackRegistry>,
-    ) {
+    ) -> Result<(), String> {
         {
             let state = self.state.borrow();
             if state.stealth_client.as_ref().is_some_and(|bound| std::sync::Arc::ptr_eq(bound, &client))
                 && state.callbacks.as_ref().is_some_and(|bound| std::sync::Arc::ptr_eq(bound, &callbacks))
             {
-                return;
+                return Ok(());
             }
         }
-        self.set_stealth_client(client);
+        self.set_stealth_client(client)?;
         self.set_callbacks(callbacks);
+        Ok(())
     }
 
     /// Advance readiness and dispatch each document lifecycle event once.
@@ -2177,25 +2236,25 @@ impl ObscuraJsRuntime {
     }
 
     /// Apply before page init; script has no setter for this native state.
-    pub fn set_device_identity(&self, identity: Option<crate::ops::DeviceIdentity>) {
+    pub(crate) fn set_device_identity(&self, identity: Option<crate::ops::DeviceIdentity>) {
         self.state.borrow_mut().device_identity = identity;
     }
 
-    pub fn set_user_agent(&mut self, ua: &str) {
+    pub(crate) fn set_user_agent(&mut self, ua: &str) {
         let _ = self.execute_runtime_script(
             "<set-ua>",
             format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
         );
     }
 
-    pub fn set_user_agent_details(&mut self, full_version: &str, architecture: &str) {
+    pub(crate) fn set_user_agent_details(&mut self, full_version: &str, architecture: &str) {
         let _ = self.execute_runtime_script("<set-ua-details>", format!(
             "globalThis.__obscura_ua_full_version={};globalThis.__obscura_ua_architecture={};",
             js_string_literal(full_version), js_string_literal(architecture),
         ));
     }
 
-    pub fn set_do_not_track(&mut self, value: Option<&str>) {
+    pub(crate) fn set_do_not_track(&mut self, value: Option<&str>) {
         let value = value.map(js_string_literal).unwrap_or_else(|| "null".into());
         let _ = self.execute_runtime_script(
             "<set-do-not-track>",
@@ -2203,7 +2262,7 @@ impl ObscuraJsRuntime {
         );
     }
 
-    pub fn set_locale(&mut self, language: &str, languages: &[String]) {
+    pub(crate) fn set_locale(&mut self, language: &str, languages: &[String]) {
         // One browser runtime process owns one Persona and one V8 isolate.
         // Keep Intl's process-wide ICU default aligned with navigator.language;
         // setting only the JS getters creates an observable locale split.
@@ -2218,7 +2277,7 @@ impl ObscuraJsRuntime {
         );
     }
 
-    pub fn set_webgl_identity(&mut self, vendor: &str, renderer: &str) {
+    pub(crate) fn set_webgl_identity(&mut self, vendor: &str, renderer: &str) {
         let _ = self.execute_runtime_script(
             "<set-webgl-identity>",
             format!(
@@ -2228,7 +2287,7 @@ impl ObscuraJsRuntime {
         );
     }
 
-    pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
+    pub(crate) fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
         let _ = self.execute_runtime_script(
             "<set-platform>",
             format!(
@@ -2237,13 +2296,6 @@ impl ObscuraJsRuntime {
                 js_string_literal(ua_platform),
                 js_string_literal(ua_platform_version),
             ),
-        );
-    }
-
-    pub fn set_stealth(&mut self, enabled: bool) {
-        let _ = self.execute_runtime_script(
-            "<set-stealth>",
-            format!("globalThis.__obscura_stealth = {};", enabled),
         );
     }
 
@@ -2283,29 +2335,6 @@ impl ObscuraJsRuntime {
                  }}",
             ),
         );
-    }
-
-    /// Override the physical screen metrics exposed to page JavaScript.
-    /// Unlike the CSS viewport, CDP only changes these when both optional
-    /// screen dimensions are supplied. Passing `None` restores the native
-    /// screen surface while keeping the viewport override intact.
-    pub fn set_screen_size_override(&mut self, size: Option<(f64, f64)>, emulated: bool) {
-        let script = match size {
-            Some((width, height))
-                if width.is_finite()
-                    && height.is_finite()
-                    && width > 0.0
-                    && height > 0.0 =>
-            {
-                format!(
-                    "globalThis.__obscura_set_screen_override({width},{height},{emulated});"
-                )
-            }
-            _ => format!(
-                "globalThis.__obscura_set_screen_override(null,null,{emulated});"
-            ),
-        };
-        let _ = self.execute_runtime_script("<set-screen-size>", script);
     }
 
     /// Current clamped root scroll offset shared by CSSOM geometry and paint.
@@ -4720,12 +4749,20 @@ impl ObscuraJsRuntime {
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
+        // Initialization creates/replaces screen and window surfaces. Apply
+        // the compiled persona afterwards, before any document script runs.
+        let persona_script = self.state.borrow().persona.preload_script();
+        let _ = self.execute_runtime_script("<obscura:persona>", persona_script);
+    }
+
+    pub(crate) fn persona(&self) -> obscura_net::EffectivePersona {
+        self.state.borrow().persona.clone()
     }
 
     /// Override the coordinates the navigator.geolocation shim reports. The
     /// values are injected as numeric globals the bootstrap reads; when unset it
     /// keeps the built-in default. Callers validate the range before calling.
-    pub fn set_geolocation(&mut self, latitude: f64, longitude: f64) {
+    pub(crate) fn set_geolocation(&mut self, latitude: f64, longitude: f64) {
         let _ = self.execute_runtime_script(
             "<set-geo>",
             format!(
@@ -6720,26 +6757,51 @@ impl ObscuraJsRuntime {
     }
 }
 
-impl Default for ObscuraJsRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
-
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use obscura_dom::parse_html;
 
+    fn test_persona() -> obscura_net::EffectivePersona {
+        obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)
+    }
+
+    fn persona_with(
+        profile: obscura_net::StealthProfile,
+        language: &str,
+        do_not_track: Option<&str>,
+    ) -> obscura_net::EffectivePersona {
+        let mut spec = obscura_net::PersonaSpec::preset(profile);
+        spec.language = Some(language.to_string());
+        spec.do_not_track = do_not_track.map(str::to_string);
+        spec.compile().unwrap()
+    }
+
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.com/test");
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn checked_runtime_constructor_rejects_process_identity_conflicts() {
+        let first = ObscuraJsRuntime::try_new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ))
+        .unwrap();
+        drop(first);
+
+        let error = match ObscuraJsRuntime::try_new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::MacChrome153,
+        )) {
+            Ok(_) => panic!("a second process timezone and locale must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("process identity is already frozen"));
     }
 
     // Capture complete header blocks and binary bodies. This proxy fixture
@@ -6783,7 +6845,7 @@ mod tests {
     }
 
     fn standalone_proxy_runtime(proxy: &str) -> ObscuraJsRuntime {
-        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy("http://standalone.test/page", Some(proxy.into()));
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy("http://standalone.test/page", Some(proxy.into()), test_persona());
         rt.set_dom(parse_html("<html><head></head><body></body></html>"));
         rt.set_url("http://standalone.test/page");
         rt.run_page_init();
@@ -7232,7 +7294,7 @@ mod tests {
         }"#, None, &[], true, true).await.unwrap();
         assert!(!result.thrown, "{result:?}");
         assert_eq!(result.value.unwrap(), serde_json::json!({"fetch":binary,"xhr":binary,"cross":binary,"cookie":"session=raw-secret",
-            "identity":["x86",obscura_net::StealthProfile::default().platform().2,obscura_net::StealthProfile::default().full_version()]}));
+            "identity":["x86",obscura_net::StealthProfile::WindowsChrome145.platform().2,obscura_net::StealthProfile::WindowsChrome145.full_version()]}));
         let events = rt.take_js_network_events();
         assert_eq!(events.len(), 5);
         assert_eq!(events.iter().filter(|event| event.method == "OPTIONS").count(), 1);
@@ -7271,52 +7333,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn page_binding_replaces_standalone_transport_and_previous_page() {
-        use std::sync::{Arc, Mutex};
+    async fn page_binding_rejects_a_transport_from_another_persona() {
+        use std::sync::Arc;
         use obscura_net::{CallbackRegistry, CookieJar, ObscuraHttpClient, StealthHttpClient, StealthProfile};
-        let mut rt = standalone_proxy_runtime("http://127.0.0.1:9");
+        let rt = standalone_proxy_runtime("http://127.0.0.1:9");
         let standalone = rt.state.borrow_mut().ensure_persona_transport();
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        for (name, profile) in [("first", StealthProfile::MacChrome152), ("second", StealthProfile::MacChrome153)] {
-            let (proxy, server) = standalone_proxy(vec![(String::new(), name.as_bytes().to_vec())]);
-            let jar = Arc::new(CookieJar::new());
-            jar.set_cookie(&format!("owner={name}; Path=/"), &url::Url::parse("http://standalone.test/").unwrap());
-            let policy = Arc::new(ObscuraHttpClient::with_options(jar.clone(), Some(&proxy)));
-            let transport = Arc::new(StealthHttpClient::with_policy_profile_persona(
-                jar, Some(&proxy), policy, profile, "fr-FR,fr;q=0.9", None,
-            ));
-            let callbacks = Arc::new(CallbackRegistry::new());
-            let seen = observed.clone();
-            callbacks.add_request(Arc::new(move |request| seen.lock().unwrap().push((name, request.url.path().to_string()))));
-            rt.bind_page_transport(transport.clone(), callbacks.clone());
-            rt.bind_page_transport(transport.clone(), callbacks);
-            assert!(Arc::ptr_eq(rt.state.borrow().stealth_client.as_ref().unwrap(), &transport));
-            assert!(!Arc::ptr_eq(rt.state.borrow().stealth_client.as_ref().unwrap(), &standalone));
-            let result = rt.call_function_on_for_cdp(
-                &format!("async () => (await fetch('/{name}')).text()"), None, &[], true, true,
-            ).await.unwrap();
-            assert_eq!(result.value.unwrap(), serde_json::json!(name));
-            let captured = server.join().unwrap();
-            let headers = std::str::from_utf8(&captured[0]).unwrap().to_ascii_lowercase();
-            assert!(headers.contains(&format!("user-agent: {}\r\n", profile.user_agent().to_ascii_lowercase())));
-            assert!(headers.contains(&format!("cookie: owner={name}\r\n")));
-        }
-        assert_eq!(*observed.lock().unwrap(), vec![("first", "/first".into()), ("second", "/second".into())]);
+        let persona = persona_with(StealthProfile::MacChrome153, "fr-FR", None);
+        let jar = Arc::new(CookieJar::new());
+        let policy = Arc::new(ObscuraHttpClient::new());
+        let transport = Arc::new(StealthHttpClient::with_policy_persona(
+            jar, None, policy, &persona,
+        ));
+        let error = rt
+            .bind_page_transport(transport, Arc::new(CallbackRegistry::new()))
+            .expect_err("mismatched transport must fail");
+        assert!(error.contains("frozen persona"), "{error}");
+        assert!(Arc::ptr_eq(
+            rt.state.borrow().stealth_client.as_ref().unwrap(),
+            &standalone,
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn standalone_policy_rebinding_preserves_bound_persona_and_new_cookies() {
+    async fn standalone_policy_rebinding_preserves_frozen_persona_and_new_cookies() {
         use obscura_net::{CookieJar, ObscuraHttpClient, StealthHttpClient, StealthProfile};
         let (proxy, server) = standalone_proxy(vec![(String::new(), b"bound".to_vec())]);
         let mut rt = standalone_proxy_runtime(&proxy);
         let policy = rt.state.borrow().http_client.clone().unwrap();
-        let profile = StealthProfile::MacChrome153;
-        rt.set_user_agent(profile.user_agent());
-        let (platform, ua_platform, version) = profile.platform();
-        rt.set_platform(platform, ua_platform, version);
-        rt.set_stealth_client(std::sync::Arc::new(StealthHttpClient::with_policy_profile_persona(
-            policy.cookie_jar.clone(), Some(&proxy), policy, profile, "fr-FR,fr;q=0.9", Some("1"),
-        )));
+        let profile = StealthProfile::WindowsChrome145;
+        let persona = test_persona();
+        rt.set_stealth_client(std::sync::Arc::new(StealthHttpClient::with_policy_persona(
+            policy.cookie_jar.clone(), Some(&proxy), policy, &persona,
+        )))
+        .unwrap();
         let jar = std::sync::Arc::new(CookieJar::new());
         jar.set_cookie("replacement=full; Path=/", &url::Url::parse("http://standalone.test/").unwrap());
         rt.set_http_client(std::sync::Arc::new(ObscuraHttpClient::with_options(jar.clone(), Some(&proxy))));
@@ -7327,9 +7376,9 @@ mod tests {
         let captured = server.join().unwrap();
         let headers = std::str::from_utf8(&captured[0]).unwrap().to_ascii_lowercase();
         assert!(headers.contains(&format!("user-agent: {}\r\n", profile.user_agent().to_ascii_lowercase())));
-        assert!(headers.contains("sec-ch-ua-platform: \"macos\"\r\n"));
-        assert!(headers.contains("accept-language: fr-fr,fr;q=0.9\r\n"));
-        assert!(headers.contains("dnt: 1\r\n"));
+        assert!(headers.contains("sec-ch-ua-platform: \"windows\"\r\n"));
+        assert!(headers.contains("accept-language: en-us,en;q=0.9\r\n"));
+        assert!(!headers.contains("\r\ndnt:"));
         assert!(headers.contains("cookie: replacement=full\r\n"));
     }
 
@@ -7341,8 +7390,10 @@ mod tests {
         // must also replace the pre-send URL gate and retain its proxy.
         rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
         let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
-        let transport = std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(jar, Some(&proxy), true));
-        rt.set_stealth_client(transport.clone());
+        let transport = std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            jar, Some(&proxy), true, &test_persona(),
+        ));
+        rt.set_stealth_client(transport.clone()).unwrap();
         let replacement = std::sync::Arc::new(obscura_net::CookieJar::new());
         replacement.set_cookie("replacement=private; Path=/", &url::Url::parse("http://127.0.0.1/").unwrap());
         rt.set_cookie_jar(replacement.clone());
@@ -7491,9 +7542,9 @@ mod tests {
 
     #[test]
     fn standalone_frame_first_network_shares_parent_transport_and_cookie_jar() {
-        let rt = ObscuraJsRuntime::with_base_url_and_proxy("http://standalone.test/", Some("http://127.0.0.1:9".into()));
+        let rt = ObscuraJsRuntime::with_base_url_and_proxy("http://standalone.test/", Some("http://127.0.0.1:9".into()), test_persona());
         assert!(rt.state.borrow().stealth_client.is_none());
-        let mut frame = ObscuraState::new();
+        let mut frame = ObscuraState::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.share_resources_with(&mut frame);
         let parent = rt.state.borrow();
         assert!(std::sync::Arc::ptr_eq(parent.cookie_jar.as_ref().unwrap(), frame.cookie_jar.as_ref().unwrap()));
@@ -7505,7 +7556,7 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
-    async fn standalone_image_warmup_and_stylesheet_use_default_persona_proxy() {
+    async fn standalone_image_warmup_and_stylesheet_use_configured_persona_proxy() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"></svg>"#.to_vec();
         let (proxy, server) = standalone_proxy(vec![
             ("Content-Type: image/svg+xml\r\n".into(), svg.clone()),
@@ -7556,7 +7607,7 @@ mod tests {
                 assert_eq!(values, vec![value], "complete raw request: {raw}");
             }
             let headers = std::str::from_utf8(&request).unwrap().to_ascii_lowercase();
-            assert!(headers.contains(&format!("user-agent: {}\r\n", obscura_net::StealthProfile::default().user_agent().to_ascii_lowercase())), "{headers}");
+            assert!(headers.contains(&format!("user-agent: {}\r\n", obscura_net::StealthProfile::WindowsChrome145.user_agent().to_ascii_lowercase())), "{headers}");
             assert!(headers.contains("sec-ch-ua-platform: \"windows\"\r\n"), "{headers}");
         }
     }
@@ -7564,7 +7615,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[test]
     fn render_resources_remain_cache_only_across_document_resets() {
-        let standalone = ObscuraJsRuntime::new();
+        let standalone = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         assert!(
             !standalone.render_resource_sync_loading_enabled(),
             "standalone render runtimes must not open an implicit HTTP path"
@@ -7580,7 +7631,7 @@ mod tests {
             "taking a document must not restore an implicit HTTP loader"
         );
 
-        let rt = ObscuraJsRuntime::new();
+        let rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
         assert!(
             !rt.render_resource_sync_loading_enabled(),
@@ -7621,7 +7672,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[test]
     fn render_resource_in_flight_set_has_a_page_wide_bound() {
-        let rt = ObscuraJsRuntime::new();
+        let rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let requests = (0..(MAX_PENDING_RENDER_RESOURCES + 4))
             .map(|index| (format!("https://assets.test/{index}.png"), None, false))
             .collect();
@@ -7646,7 +7697,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn late_channel_answer_of_a_retired_document_is_discarded() {
         let url = "https://example.test/a.svg".to_string();
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
         rt.set_dom(parse_html(&format!("<html><body><img src=\"{url}\"></body></html>")));
         rt.set_url("https://example.test/page");
@@ -7700,12 +7751,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_only_transport_starts_render_resource_loads() {
         let url = "http://127.0.0.1:9/a.svg".to_string();
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
             std::sync::Arc::new(obscura_net::CookieJar::new()),
             None,
             true,
-        )));
+            &test_persona(),
+        )))
+        .unwrap();
         assert!(rt.has_transport());
         assert!(!rt.render_resource_sync_loading_enabled());
         rt.set_dom(parse_html(&format!("<html><body><img src=\"{url}\"></body></html>")));
@@ -8054,7 +8107,7 @@ return {before,removed,reinsert,moved,cleared};
     #[test]
     fn document_domain_getter_and_valid_relaxation_match_effective_host() {
         let dom = parse_html("<html><body></body></html>");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("https://deep.assets.example.co.uk:8443/page");
         rt.run_page_init();
@@ -8086,7 +8139,7 @@ return {before,removed,reinsert,moved,cleared};
     #[test]
     fn document_domain_rejects_unrelated_child_and_public_suffix_hosts() {
         let dom = parse_html("<html><body></body></html>");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("https://app.user.github.io/page");
         rt.run_page_init();
@@ -8144,7 +8197,7 @@ return {before,removed,reinsert,moved,cleared};
         );
 
         let dom = parse_html("<html><body></body></html>");
-        let mut hostless = ObscuraJsRuntime::new();
+        let mut hostless = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         hostless.set_dom(dom);
         hostless.set_url("about:blank");
         hostless.run_page_init();
@@ -9387,10 +9440,10 @@ return {before,removed,reinsert,moved,cleared};
     /// script, cookies, and per-request tokens are deliberately not fixtures.
     #[tokio::test(flavor = "current_thread")]
     async fn southwest_style_protection_probe_remains_coherent() {
-        let mut rt = ObscuraJsRuntime::with_base_url_proxy_and_locale(
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
             "https://example.com/air-shopping",
             None,
-            "en",
+            persona_with(obscura_net::StealthProfile::MacChrome152, "en", Some("1")),
         );
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_url("https://example.com/air-shopping");
@@ -11711,7 +11764,7 @@ return {before,removed,reinsert,moved,cleared};
     #[test]
     fn explicit_viewport_is_distinct_from_fingerprinted_screen() {
         let dom = parse_html("<html><body></body></html>");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(1024.0, 768.0);
         rt.run_page_init();
@@ -11728,46 +11781,9 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     #[test]
-    fn screen_override_is_independent_live_and_preserves_screen_identity() {
-        let dom = parse_html("<html><body></body></html>");
-        let mut rt = ObscuraJsRuntime::new();
-        rt.set_dom(dom);
-        rt.set_viewport(1024.0, 768.0);
-        rt.run_page_init();
-        rt.execute_script(
-            "remember-screen",
-            "globalThis.__screenBefore = screen;\
-             globalThis.__screenSizeBefore = [screen.width, screen.height];",
-        )
-        .unwrap();
-
-        rt.set_screen_size_override(Some((1440.0, 900.0)), true);
-        assert_eq!(
-            rt.evaluate(
-                "[innerWidth, innerHeight, screen.width, screen.height,\
-                  screen.availWidth, screen.availHeight, screen === __screenBefore]"
-            )
-            .unwrap(),
-            serde_json::json!([1024, 768, 1440, 900, 1440, 900, true])
-        );
-
-        rt.set_screen_size_override(None, false);
-        assert_eq!(
-            rt.evaluate(
-                "[innerWidth, innerHeight, screen.width === __screenSizeBefore[0],\
-                  screen.height === __screenSizeBefore[1],\
-                  screen.availHeight === screen.height - 40,\
-                  screen === __screenBefore]"
-            )
-            .unwrap(),
-            serde_json::json!([1024, 768, true, true, true, true])
-        );
-    }
-
-    #[test]
     fn match_media_evaluates_query_lists_conjunctions_ranges_and_orientation() {
         let dom = parse_html("<html><body></body></html>");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(1280.0, 720.0);
         rt.run_page_init();
@@ -11799,7 +11815,7 @@ return {before,removed,reinsert,moved,cleared};
     #[test]
     fn match_media_matches_are_live_across_viewport_resizes() {
         let dom = parse_html("<html><body></body></html>");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(900.0, 600.0);
         rt.run_page_init();
@@ -11947,7 +11963,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="items"><span id="item"></span></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(400.0, 240.0);
         rt.run_page_init();
@@ -12042,7 +12058,7 @@ return {before,removed,reinsert,moved,cleared};
                 .alt { display:grid; width:150px; opacity:.8; }
             </style></head><body><div id="box" class="base"></div></body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(400.0, 200.0);
         rt.run_page_init();
@@ -12126,7 +12142,7 @@ return {before,removed,reinsert,moved,cleared};
               <span id="legacy">legacy</span>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(120.0, 200.0);
         rt.run_page_init();
@@ -12179,7 +12195,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="zero">zero</div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(400.0, 200.0);
         rt.run_page_init();
@@ -12220,7 +12236,7 @@ return {before,removed,reinsert,moved,cleared};
                 <nav id="nav"><span id="child"></span></nav>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(400.0, 200.0);
         rt.run_page_init();
@@ -12699,7 +12715,7 @@ return {before,removed,reinsert,moved,cleared};
         });
 
         let origin = format!("http://{address}");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_url(&format!("{origin}/page"));
         rt.set_http_client(std::sync::Arc::new(
@@ -12868,8 +12884,9 @@ return {before,removed,reinsert,moved,cleared};
         rt.set_http_client(policy.clone());
         let primp = std::sync::Arc::new(obscura_net::StealthHttpClient::with_policy(
             policy.cookie_jar.clone(), None, policy.clone(),
+            &test_persona(),
         ));
-        rt.set_stealth_client(primp.clone());
+        rt.set_stealth_client(primp.clone()).unwrap();
         let pre_send = rt.state.borrow().page_in_flight.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         rt.set_intercept_tx(tx);
@@ -14347,7 +14364,7 @@ return {before,removed,reinsert,moved,cleared};
                 </div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(320.0, 200.0);
         rt.run_page_init();
@@ -14424,7 +14441,7 @@ return {before,removed,reinsert,moved,cleared};
                 </div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(360.0, 240.0);
         rt.run_page_init();
@@ -14554,7 +14571,7 @@ return {before,removed,reinsert,moved,cleared};
               <span id="inline">long inline text</span>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(420.0, 700.0);
         rt.run_page_init();
@@ -14611,7 +14628,7 @@ return {before,removed,reinsert,moved,cleared};
               </div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(160.0, 120.0);
         rt.run_page_init();
@@ -14663,7 +14680,7 @@ return {before,removed,reinsert,moved,cleared};
                  <div id="wide" style="width:100.6px;height:20px"></div>
                </body></html>"#,
         );
-        let mut root_rt = ObscuraJsRuntime::new();
+        let mut root_rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         root_rt.set_dom(root_dom);
         root_rt.set_viewport(100.0, 60.0);
         root_rt.run_page_init();
@@ -14696,7 +14713,7 @@ return {before,removed,reinsert,moved,cleared};
               <div id="second"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(360.0, 240.0);
         rt.run_page_init();
@@ -14775,7 +14792,7 @@ return {before,removed,reinsert,moved,cleared};
               </div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(360.0, 240.0);
         rt.run_page_init();
@@ -14838,7 +14855,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:900px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(320.0, 200.0);
         rt.run_page_init();
@@ -14928,7 +14945,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="zero" style="display:block;width:0;height:0"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(320.0, 200.0);
         rt.run_page_init();
@@ -15025,7 +15042,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="fixed" style="position:fixed;left:600px;top:20px;width:60px;height:60px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(800.0, 513.0);
         rt.run_page_init();
@@ -15096,7 +15113,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="fixed" style="position:fixed;left:20px;top:100px;width:60px;height:30px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(800.0, 513.0);
         rt.run_page_init();
@@ -15151,7 +15168,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:400px;background:#0000ff"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/docs/page");
         rt.set_viewport(200.0, 100.0);
@@ -15266,7 +15283,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:240px;background:blue"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/page");
         rt.set_viewport(80.0, 60.0);
@@ -15343,7 +15360,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="after" style="height:10px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/page");
         rt.set_viewport(80.0, 60.0);
@@ -15420,7 +15437,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="after" style="height:10px;background:blue"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/page");
         rt.set_viewport(80.0, 60.0);
@@ -15485,7 +15502,7 @@ return {before,removed,reinsert,moved,cleared};
                      style="width:20px;height:10px">
             </div></body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/page");
         rt.state.borrow_mut().render_resources =
@@ -15516,7 +15533,7 @@ return {before,removed,reinsert,moved,cleared};
                 style="display:block;width:20px;height:10px;content:url('http://example.test/content.png')">
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/page");
         rt.state.borrow_mut().render_resources =
@@ -15553,7 +15570,7 @@ return {before,removed,reinsert,moved,cleared};
         );
         let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_loads = loads.clone();
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/page");
         rt.set_viewport(80.0, 60.0);
@@ -15729,7 +15746,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="box" style="height:300px;width:40px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -15764,7 +15781,7 @@ return {before,removed,reinsert,moved,cleared};
     #[cfg(feature = "render")]
     #[test]
     fn element_text_content_replacement_recomputes_empty_selector() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(
             r#"<style>#x { width: 10px; height: 5px } #x:empty { width: 30px }</style>
                <div id="x">text</div>"#,
@@ -15793,7 +15810,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="box" class="box" style="height:30px;width:40px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -15964,7 +15981,7 @@ return {before,removed,reinsert,moved,cleared};
     #[cfg(feature = "render")]
     #[test]
     fn forward_animation_samples_retain_static_prepared_render() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div style="width:80px;height:60px;background:#1769aa"></div>
@@ -16003,7 +16020,7 @@ return {before,removed,reinsert,moved,cleared};
     #[cfg(feature = "render")]
     #[test]
     fn forward_active_animation_sample_updates_geometry_and_paint_from_retained_frame() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><head><style>
                 @keyframes grow {
@@ -16153,7 +16170,7 @@ return {before,removed,reinsert,moved,cleared};
     #[cfg(feature = "render")]
     #[test]
     fn completed_animation_retains_forward_frame_but_backward_seek_rebuilds() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><head><style>
                 @keyframes fade { from { opacity:1 } to { opacity:0 } }
@@ -16211,7 +16228,7 @@ return {before,removed,reinsert,moved,cleared};
     #[cfg(feature = "render")]
     #[test]
     fn unsupported_custom_property_animation_does_not_keep_render_damage_active() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><head><style>
                 @property --brand-cycle { syntax:"<color>"; inherits:true; initial-value:#2dacf9 }
@@ -16265,7 +16282,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[cfg(feature = "render")]
     fn animation_epoch_runtime() -> ObscuraJsRuntime {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><head><style>
                 @keyframes grow { from { width:0px } to { width:100px } }
@@ -16388,7 +16405,7 @@ return {before,removed,reinsert,moved,cleared};
     #[test]
     fn fixed_animation_capture_is_invariant_after_geometry_flush() {
         let make_runtime = || {
-            let mut rt = ObscuraJsRuntime::new();
+            let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
             rt.set_dom(parse_html(
                 r#"<html style="margin:0"><head><style>
                     @keyframes dismiss {
@@ -16494,7 +16511,7 @@ return {before,removed,reinsert,moved,cleared};
                 <input id="field" autocomplete="on">
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -16541,7 +16558,7 @@ return {before,removed,reinsert,moved,cleared};
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0"><div id="box" class="box" style="height:30px;width:40px"></div></body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -16597,7 +16614,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="box" class="a"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -16679,7 +16696,7 @@ return {before,removed,reinsert,moved,cleared};
                 <main id="list"><div id="first" class="item"></div></main>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -16772,7 +16789,7 @@ return {before,removed,reinsert,moved,cleared};
                 </body>
             </html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(900.0, 1000.0);
         rt.run_page_init();
@@ -16805,7 +16822,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:1000px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(320.0, 200.0);
         rt.run_page_init();
@@ -16858,24 +16875,61 @@ return {before,removed,reinsert,moved,cleared};
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
-    async fn fingerprinted_screen_does_not_invent_a_device_scale_factor() {
-        let mut rt = ObscuraJsRuntime::new();
+    async fn persona_screen_and_device_scale_factor_project_independently() {
+        let mut spec = obscura_net::PersonaSpec::preset(
+            obscura_net::StealthProfile::WindowsChrome145,
+        );
+        spec.screen_width = Some(2560);
+        spec.screen_height = Some(1440);
+        spec.screen_avail_width = Some(2300);
+        spec.screen_avail_height = Some(1200);
+        spec.outer_width = Some(1000);
+        spec.outer_height = Some(700);
+        spec.device_scale_factor = Some(2.0);
+        spec.battery_charging = Some(false);
+        spec.battery_level = Some(0.42);
+        spec.network_rtt = Some(77);
+        spec.storage_quota = Some(9_876_543_210);
+        let mut rt = ObscuraJsRuntime::new(spec.compile().unwrap());
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_viewport(300.0, 200.0);
-        // Force the fingerprint seed whose screen-pool entry is 2560x1440.
-        // That physical screen must not silently turn a 1x render surface into
-        // a 2x devicePixelContentBoxSize surface.
-        rt.execute_script(
-            "deterministic-high-resolution-screen",
-            "Date.now = () => 0; Math.random = () => 2 / 0xFFFFFFFF;",
-        )
-        .unwrap();
+        // Screen dimensions and DPR are separate persona values; neither may
+        // be inferred from the other or reset by page initialization.
         rt.run_page_init();
 
+        let projected = rt
+            .call_function_on_for_cdp(
+                "async () => {\
+                   const battery = await navigator.getBattery();\
+                   const storage = await navigator.storage.estimate();\
+                   return [screen.width, screen.height, screen.availWidth, screen.availHeight,\
+                     outerWidth, outerHeight, devicePixelRatio, navigator.connection.rtt,\
+                     battery.charging, battery.level, storage.quota];\
+                 }",
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
         assert_eq!(
-            rt.evaluate("[screen.width, screen.height, devicePixelRatio]")
-                .unwrap(),
-            serde_json::json!([2560, 1440, 1])
+            projected,
+            serde_json::json!([
+                2560,
+                1440,
+                2300,
+                1200,
+                1000,
+                700,
+                2,
+                77,
+                false,
+                0.42,
+                9_876_543_210_u64,
+            ]),
         );
     }
 
@@ -16888,7 +16942,7 @@ return {before,removed,reinsert,moved,cleared};
                      padding:5px 7px;border:2px solid black"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(300.0, 200.0);
         rt.run_page_init();
@@ -16979,7 +17033,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="hidden" style="display:none;width:50px;height:20px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(400.0, 300.0);
         rt.run_page_init();
@@ -17076,7 +17130,7 @@ return {before,removed,reinsert,moved,cleared};
                      padding:4px;border:2px solid"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17130,7 +17184,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="probe" style="width:40px;height:20px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17184,7 +17238,7 @@ return {before,removed,reinsert,moved,cleared};
                 <span id="inline" style="padding:8px;border:2px solid">text</span>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17241,7 +17295,7 @@ return {before,removed,reinsert,moved,cleared};
             r#"<html><body><div id="target" style="width:40px;height:20px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17294,7 +17348,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:300px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17346,7 +17400,7 @@ return {before,removed,reinsert,moved,cleared};
                 </div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(300.0, 200.0);
         rt.run_page_init();
@@ -17440,7 +17494,7 @@ return {before,removed,reinsert,moved,cleared};
         let dom = parse_html(
             r#"<html><body><div id="first"></div><div id="second"></div></body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.run_page_init();
         rt.execute_script(
@@ -17476,7 +17530,7 @@ return {before,removed,reinsert,moved,cleared};
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn intersection_delivery_recovers_across_document_replacement() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.run_page_init();
         rt.execute_script(
@@ -17524,7 +17578,7 @@ return {before,removed,reinsert,moved,cleared};
                 </div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(300.0, 200.0);
         rt.run_page_init();
@@ -17592,7 +17646,7 @@ return {before,removed,reinsert,moved,cleared};
                 </div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(400.0, 400.0);
         rt.run_page_init();
@@ -17700,7 +17754,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:300px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17767,7 +17821,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="sentinel"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(1280.0, 720.0);
         rt.run_page_init();
@@ -17813,7 +17867,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="second" style="height:10px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17865,7 +17919,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:300px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17911,7 +17965,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:300px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -17950,7 +18004,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div id="fixed" style="position:fixed;top:10px;height:20px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -18003,7 +18057,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="height:300px"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
@@ -18787,7 +18841,7 @@ return {before,removed,reinsert,moved,cleared};
                 <div style="position:absolute;z-index:2;left:10px;top:7px;width:4px;height:4px;background:#ff00ff"></div>
             </body></html>"#,
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.test/canvas");
         rt.set_viewport(64.0, 40.0);
@@ -19410,7 +19464,7 @@ return {before,removed,reinsert,moved,cleared};
         html: &str,
         loader: impl obscura_render::RenderResourceLoader + 'static,
     ) -> ObscuraJsRuntime {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(html));
         rt.set_url("http://example.com/page/index.html");
         rt.state.borrow_mut().render_resources =
@@ -19475,7 +19529,7 @@ return {before,removed,reinsert,moved,cleared};
                 <img src="{base}/three.png"><img src="{base}/shared.png">
                 <img src="{base}/shared.png">"#
         );
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(&html));
         rt.set_url(&format!("{base}/page.html"));
         rt.set_http_client(std::sync::Arc::new(
@@ -19596,7 +19650,7 @@ return {before,removed,reinsert,moved,cleared};
         });
 
         let base = format!("http://{address}");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html(&format!(r#"<img id="image" src="{base}/plain.png">"#)));
         // Deliberately make the image cross-origin from the document.
         rt.set_url("http://127.0.0.1:1/page.html");
@@ -21464,7 +21518,7 @@ return {before,removed,reinsert,moved,cleared};
         drop(rt2);
 
         if let Some(dom) = dom1 {
-            let mut rt1b = ObscuraJsRuntime::new();
+            let mut rt1b = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
             rt1b.set_dom(dom);
             rt1b.set_url("http://example.com");
             rt1b.set_title("Page1");
@@ -21708,7 +21762,7 @@ return {before,removed,reinsert,moved,cleared};
     ) -> (ObscuraJsRuntime, std::sync::Arc<obscura_net::CookieJar>) {
         let dom = obscura_dom::parse_html(html);
         let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.com/test");
         rt.set_title("Test Page");
@@ -21956,7 +22010,7 @@ return {before,removed,reinsert,moved,cleared};
     ///   origin root        ->  /data/x.json       (a base "/" would hide this one)
     fn setup_runtime_at_deep_url(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(dom);
         rt.set_url("http://example.com/deep/page");
         rt.run_page_init();
@@ -22736,7 +22790,7 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     fn redirect_runtime_for_origin(origin: &str) -> ObscuraJsRuntime {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_url(&format!("{origin}/page"));
         rt.set_http_client(std::sync::Arc::new(
@@ -22892,8 +22946,10 @@ return {before,removed,reinsert,moved,cleared};
                 std::sync::Arc::new(obscura_net::CookieJar::new()),
                 None,
                 true,
+                &test_persona(),
             ),
-        ));
+        ))
+        .unwrap();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
@@ -23068,8 +23124,10 @@ return {before,removed,reinsert,moved,cleared};
                 std::sync::Arc::new(obscura_net::CookieJar::new()),
                 None,
                 true,
+                &test_persona(),
             ),
-        ));
+        ))
+        .unwrap();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
@@ -23971,7 +24029,7 @@ return {before,removed,reinsert,moved,cleared};
                     (ModuleGraphFixture::CookieProtected, "/child.js")
                         if lower_request.contains("\r\ncookie: session=ok\r\n")
                             && lower_request
-                                .contains(&format!("\r\nuser-agent: {}\r\n", obscura_net::StealthProfile::MacChrome153.user_agent().to_ascii_lowercase()))
+                                .contains(&format!("\r\nuser-agent: {}\r\n", obscura_net::StealthProfile::WindowsChrome145.user_agent().to_ascii_lowercase()))
                             && lower_request.contains("\r\nx-module-test: shared\r\n") =>
                     {
                         ("200 OK", "", "export const value = 'cookie-child';")
@@ -24084,31 +24142,26 @@ return {before,removed,reinsert,moved,cleared};
         rt: &mut ObscuraJsRuntime,
         policy: std::sync::Arc<obscura_net::ObscuraHttpClient>,
     ) {
-        let profile = obscura_net::StealthProfile::MacChrome153;
-        let primp = std::sync::Arc::new(obscura_net::StealthHttpClient::with_policy_profile_persona(
-            policy.cookie_jar.clone(), policy.proxy_url(), policy.clone(),
-            profile, "en-US,en;q=0.9", None,
+        let persona = rt.persona();
+        let primp = std::sync::Arc::new(obscura_net::StealthHttpClient::with_policy_persona(
+            policy.cookie_jar.clone(), policy.proxy_url(), policy.clone(), &persona,
         ));
-        rt.set_user_agent(profile.user_agent());
-        let (platform, ua_platform, version) = profile.platform();
-        rt.set_platform(platform, ua_platform, version);
-        rt.set_user_agent_details(profile.full_version(), "arm");
         rt.set_cookie_jar(policy.cookie_jar.clone());
         rt.set_http_client(policy);
-        rt.set_stealth_client(primp);
+        rt.set_stealth_client(primp).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn standalone_module_graph_initializes_default_persona_transport() {
+    async fn standalone_module_graph_initializes_configured_persona_transport() {
         let base = spawn_one_response_server("200 OK", "globalThis.moduleResult = 7;");
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/"));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/"), test_persona());
         rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
         )));
         rt.load_module(&format!("{base}/entry.js"), 1_000).await.unwrap();
         assert_eq!(rt.evaluate("globalThis.moduleResult").unwrap(), serde_json::json!(7.0));
         assert_eq!(rt.state.borrow().stealth_client.as_ref().unwrap().transport_params().profile,
-            obscura_net::StealthProfile::default());
+            obscura_net::StealthProfile::WindowsChrome145);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -24118,7 +24171,7 @@ return {before,removed,reinsert,moved,cleared};
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             jar, None, true,
         ));
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base), test_persona());
         bind_module_test_network(&mut rt, client).await;
 
         let error = rt
@@ -24139,7 +24192,7 @@ return {before,removed,reinsert,moved,cleared};
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             jar, None, true,
         ));
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base), test_persona());
         bind_module_test_network(&mut rt, client).await;
 
         // The HTML scheduler prepares all module graphs before evaluating any
@@ -24170,7 +24223,7 @@ return {before,removed,reinsert,moved,cleared};
     #[test]
     fn heap_limit_terminates_script_and_runtime_recovers() {
         crate::v8_flags::set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1");
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
         for _ in 0..2 {
             let error = rt
@@ -24217,7 +24270,7 @@ return {before,removed,reinsert,moved,cleared};
                 .push(request.url.path().to_string());
         }));
 
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base), test_persona());
         rt.set_cookie_jar(jar);
         bind_module_test_network(&mut rt, client).await;
         rt.set_callbacks(callbacks);
@@ -24249,7 +24302,7 @@ return {before,removed,reinsert,moved,cleared};
             "{child}"
         );
         assert!(
-            child_lower.contains(&format!("\r\nuser-agent: {}\r\n", obscura_net::StealthProfile::MacChrome153.user_agent().to_ascii_lowercase())),
+            child_lower.contains(&format!("\r\nuser-agent: {}\r\n", obscura_net::StealthProfile::WindowsChrome145.user_agent().to_ascii_lowercase())),
             "{child}"
         );
         assert!(
@@ -24310,7 +24363,7 @@ return {before,removed,reinsert,moved,cleared};
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             jar, None, true,
         ));
-        let mut rt = ObscuraJsRuntime::with_base_url(document_url);
+        let mut rt = ObscuraJsRuntime::with_base_url(document_url, test_persona());
         bind_module_test_network(&mut rt, client).await;
         rt.load_module(&format!("{module_base}/entry.js"), 1_000)
             .await
@@ -24350,7 +24403,7 @@ return {before,removed,reinsert,moved,cleared};
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             jar, None, true,
         ));
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base), test_persona());
         bind_module_test_network(&mut rt, client).await;
         rt.load_module(&format!("{}/entry.js", base), 1_000)
             .await
@@ -24388,7 +24441,7 @@ return {before,removed,reinsert,moved,cleared};
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             jar, None, true,
         ));
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/app/index.html", base));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/app/index.html", base), test_persona());
         bind_module_test_network(&mut rt, client).await;
         rt.add_import_map(
             r#"{
@@ -24439,7 +24492,7 @@ return {before,removed,reinsert,moved,cleared};
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             jar, None, true,
         ));
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/index.html", base));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/index.html", base), test_persona());
         bind_module_test_network(&mut rt, client).await;
         rt.add_import_map(
             &format!(r#"{{"imports":{{"{base}/entry.js":"{base}/remapped.js"}}}}"#),
@@ -24464,7 +24517,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[tokio::test(flavor = "current_thread")]
     async fn inline_modules_expose_document_base_as_import_meta_url() {
-        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/page/index.html");
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/page/index.html", test_persona());
         rt.load_inline_module(
             "globalThis.__first_inline_url = import.meta.url;",
             "https://example.com/base/",
@@ -24516,7 +24569,7 @@ return {before,removed,reinsert,moved,cleared};
         let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
             jar, None, true,
         ));
-        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/page/index.html"));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/page/index.html"), test_persona());
         bind_module_test_network(&mut rt, client).await;
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.run_page_init();
@@ -24548,7 +24601,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[test]
     fn timed_out_classic_script_leaves_runtime_reusable() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.execute_script_with_timeout(
             "https://example.test/hang.js",
             "while (true) {}",
@@ -24568,7 +24621,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[tokio::test(flavor = "current_thread")]
     async fn inline_module_graph_error_propagates() {
-        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/", test_persona());
         let error = rt
             .load_inline_module("import 'bare-specifier';", "https://example.com/", 1_000)
             .await
@@ -24582,7 +24635,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[tokio::test(flavor = "current_thread")]
     async fn inline_module_evaluation_error_propagates() {
-        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/", test_persona());
         let error = rt
             .load_inline_module(
                 "throw new Error('module-evaluation-boom');",
@@ -24600,7 +24653,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[tokio::test(flavor = "current_thread")]
     async fn inline_module_evaluation_timeout_propagates() {
-        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/", test_persona());
         let error = rt
             .load_inline_module(
                 "await new Promise(resolve => setTimeout(resolve, 10000));",
@@ -24618,7 +24671,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[tokio::test(flavor = "current_thread")]
     async fn successful_inline_module_does_not_wait_for_interval_idle() {
-        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/");
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.com/", test_persona());
         rt.load_inline_module(
             "globalThis.__module_loaded = true; setInterval(() => {}, 10000);",
             "https://example.com/",
@@ -24667,12 +24720,13 @@ return {before,removed,reinsert,moved,cleared};
         let loader = ObscuraModuleLoader::with_proxy(
             "https://example.com/",
             Some("http://proxy.test:8080".to_string()),
+            test_persona(),
         );
         assert_eq!(loader.proxy_url.as_deref(), Some("http://proxy.test:8080"));
         assert_eq!(loader.base_url, "https://example.com/");
 
         // Default constructor must keep the historical "no proxy" behaviour.
-        let direct = ObscuraModuleLoader::new("https://example.com/");
+        let direct = ObscuraModuleLoader::new("https://example.com/", test_persona());
         assert_eq!(direct.proxy_url, None);
     }
 
@@ -24681,10 +24735,11 @@ return {before,removed,reinsert,moved,cleared};
         // Sanity-check the public ctor that page.rs uses to thread proxy
         // through to the module loader. Direct (None) and proxied paths
         // must both initialise the JS environment.
-        let _direct = ObscuraJsRuntime::with_base_url_and_proxy("https://example.com/", None);
+        let _direct = ObscuraJsRuntime::with_base_url_and_proxy("https://example.com/", None, test_persona());
         let _proxied = ObscuraJsRuntime::with_base_url_and_proxy(
             "https://example.com/",
             Some("http://proxy.test:8080".to_string()),
+            test_persona(),
         );
     }
 
@@ -25615,10 +25670,10 @@ return {before,removed,reinsert,moved,cleared};
 
     #[test]
     fn intl_locale_follows_configured_persona_locale() {
-        let mut rt = ObscuraJsRuntime::with_base_url_proxy_and_locale(
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
             "http://example.com/test",
             None,
-            "en",
+            persona_with(obscura_net::StealthProfile::WindowsChrome145, "en", None),
         );
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_url("http://example.com/test");
@@ -25813,7 +25868,7 @@ return {before,removed,reinsert,moved,cleared};
             captured
         });
 
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html("<html><head></head><body></body></html>"));
         let page_origin = format!("http://{}", address);
         rt.set_url(&format!("{}/index.html", page_origin));
@@ -25980,7 +26035,7 @@ return {before,removed,reinsert,moved,cleared};
             captured
         });
 
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html("<html><head></head><body></body></html>"));
         let page_origin = format!("http://{}", address);
         rt.set_url(&format!("{}/index.html", page_origin));
@@ -25996,8 +26051,10 @@ return {before,removed,reinsert,moved,cleared};
                 std::sync::Arc::new(obscura_net::CookieJar::new()),
                 None,
                 true,
+                &test_persona(),
             ),
-        ));
+        ))
+        .unwrap();
         rt.run_page_init();
 
         // 1. Same-origin script with crossOrigin = 'anonymous' (mode: cors, dest: script)
@@ -26124,7 +26181,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[tokio::test(flavor = "current_thread")]
     async fn blob_url_create_fetch_resolve_and_revoke() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html("<html><head></head><body></body></html>"));
         rt.set_url("https://example.com/index.html");
         rt.run_page_init();
@@ -26179,7 +26236,7 @@ return {before,removed,reinsert,moved,cleared};
 
     #[tokio::test(flavor = "current_thread")]
     async fn worker_location_and_navigation_isolation() {
-        let mut rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         rt.set_dom(parse_html("<html><head></head><body></body></html>"));
         rt.set_url("https://example.com/page.html");
         rt.run_page_init();

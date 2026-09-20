@@ -1,8 +1,11 @@
-> 所有产品出站 HTTP(S) 默认使用统一 persona 和 primp；没有运行时 stealth 开关。
+> 所有产品入口必须显式选择统一 persona；没有隐式身份或运行时 stealth 开关。
 
 # 当前部署边界
 
 这里描述现有 serve 的运维要求，不构成生产资格。新宿主、安全边界和双平台发布仍在 [TODO](TODO.md) 中。
+
+除 systemd 示例直接设置外，本页 shell 命令假定已执行
+`export OBSCURA_PERSONA=windows_chrome145`。
 
 ## Container build status
 
@@ -20,6 +23,7 @@ Description=Obscura headless browser
 After=network.target
 
 [Service]
+Environment=OBSCURA_PERSONA=windows_chrome145
 ExecStart=/usr/local/bin/obscura serve --port 9222 --storage-dir /var/lib/obscura
 Restart=always
 RestartSec=5
@@ -38,7 +42,7 @@ journalctl -fu obscura
 
 ## Workers
 
-`obscura serve --workers N` runs N CDP server workers behind the listener.
+With `OBSCURA_PERSONA` set as above, `obscura serve --workers N` runs N CDP server workers behind the listener.
 
 ```bash
 obscura serve --workers 4

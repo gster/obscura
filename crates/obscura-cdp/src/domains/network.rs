@@ -237,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_cookie_without_session_targets_default_context() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let params = json!({
             "name": "sid",
             "value": "abc",
@@ -255,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_cookies_without_session_targets_default_context() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let params = json!({
             "cookies": [
                 { "name": "a", "value": "1", "domain": "example.com", "path": "/" },
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_cookies_without_session_targets_default_context() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         ctx.default_context
             .cookie_jar
             .set_cookies_from_cdp(vec![sample_cookie("sid")]);
@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_all_cookies_returns_every_cookie_in_jar() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         ctx.default_context.cookie_jar.set_cookies_from_cdp(vec![
             sample_cookie("a"),
             sample_cookie("b"),
@@ -297,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_cookies_falls_back_to_default_context_when_no_session() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         ctx.default_context
             .cookie_jar
             .set_cookies_from_cdp(vec![sample_cookie("sid")]);
@@ -311,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_browser_cookies_without_session_clears_default_context() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         ctx.default_context
             .cookie_jar
             .set_cookies_from_cdp(vec![sample_cookie("sid")]);
@@ -323,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_blocked_urls_targets_session_page_without_enabling_interception() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
@@ -356,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_blocked_urls_without_session_updates_existing_pages() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let left = ctx.create_page();
         let right = ctx.create_page();
 
@@ -381,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_blocked_urls_replaces_existing_patterns() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
@@ -411,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_response_body_returns_stored_document_body() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
@@ -438,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn response_body_large_text_binary_and_legacy_text_round_trip() {
         use base64::Engine as _;
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -499,9 +499,9 @@ mod tests {
                 stream.write_all(body).unwrap();
             }
         });
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
-            "body-resources".into(), None, false, None, None, true,
+            "body-resources".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,
         ));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
@@ -529,7 +529,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn response_body_exhausted_page_does_not_hide_another_pages_body() {
         use base64::Engine as _;
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let exhausted = ctx.create_page();
         let exhausted_session = Some(format!("{exhausted}-session"));
         ctx.sessions.insert(exhausted_session.clone().unwrap(), exhausted.clone());
@@ -559,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_body_budget_exhaustion_is_not_unknown_request() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
@@ -580,7 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_response_body_errors_for_unknown_request_id() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let err = handle(
             "getResponseBody",
             &json!({ "requestId": "missing" }),
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn network_disable_clears_stored_response_bodies() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
@@ -624,12 +624,12 @@ mod tests {
     #[tokio::test]
     async fn enable_accepts_only_empty_params() {
         for params in [Value::Null, json!({})] {
-            handle("enable", &params, &mut CdpContext::new(), &None)
+            handle("enable", &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                 .await
                 .expect("omitted and empty params are equivalent");
         }
         assert!(
-            handle("enable", &json!({"maxTotalBufferSize": 1}), &mut CdpContext::new(), &None)
+            handle("enable", &json!({"maxTotalBufferSize": 1}), &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
                 .await
                 .is_err()
         );
@@ -637,7 +637,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn extra_headers_are_applied_to_the_page_primp_transport() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("headers-session".to_string());
         ctx.sessions
@@ -686,8 +686,8 @@ mod tests {
             }
             captured
         });
-        let mut ctx = CdpContext::new();
-        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("header-context".into(), Some(proxy)));
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("header-context".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), Some(proxy)));
         ctx.default_context.http_client.set_extra_headers([
             ("X-Baseline".into(), "Both Pages".into()),
             ("X-Shared".into(), "Context Value".into()),
@@ -737,7 +737,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn extra_headers_cannot_bypass_the_immutable_persona() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("persona-headers-session".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id);

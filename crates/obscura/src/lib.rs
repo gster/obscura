@@ -1,11 +1,12 @@
 //! Rust API for the Obscura headless browser.
 //!
 //! ```rust,no_run
-//! use obscura::Browser;
+//! use obscura::{Browser, EffectivePersona, StealthProfile};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let browser = Browser::builder().build()?;
+//!     let persona = EffectivePersona::builtin(StealthProfile::MacChrome153);
+//!     let browser = Browser::builder(persona).build()?;
 //!     let mut page = browser.new_page().await?;
 //!     page.goto("https://example.com").await?;
 //!     println!("Content: {} bytes", page.content().len());
@@ -28,3 +29,4 @@ pub use page::Page;
 // Request/response interception types (issue #306).
 pub use obscura_browser::{InterceptedRequest, InterceptResolution};
 pub use obscura_net::{HeaderCapture, RawHeader, RequestCallback, RequestInfo, ResourceType, Response, ResponseCallback};
+pub use obscura_net::{EffectivePersona, PersonaError, PersonaSpec, StealthProfile};

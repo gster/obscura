@@ -325,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_snapshot_matches_getdocument_and_flags_clickable() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let session = navigate(&mut ctx, "<button id=go>Go</button><a href=/x>L</a>").await;
 
         // DOM.getDocument is the structural source; the snapshot must use the
@@ -410,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_domsnapshot_method_errors() {
-        let mut ctx = CdpContext::new();
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let error = handle("getSnapshot", &json!({}), &mut ctx, &None)
             .await
             .expect_err("unknown DOMSnapshot methods must fail explicitly");

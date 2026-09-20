@@ -3,11 +3,12 @@
 > The qualified client path is unmodified official Playwright Python through
 > `connect_over_cdp`. Method presence does not imply full Playwright or Chrome
 > compatibility; see [SUMMARY](SUMMARY.md) and [TODO](TODO.md).
+> The server command must select a persona explicitly.
 
 ## Setup
 
 ```bash
-obscura serve --port 9222
+obscura --persona windows_chrome145 serve --port 9222
 python -m pip install playwright==1.60.0
 ```
 

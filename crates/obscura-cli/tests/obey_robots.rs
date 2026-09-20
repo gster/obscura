@@ -102,6 +102,7 @@ fn serve(mut stream: TcpStream, requests: &Arc<Mutex<Vec<Vec<u8>>>>) {
 fn obscura(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_obscura"))
         .args(args)
+        .env("OBSCURA_PERSONA", "windows_chrome145")
         .output()
         .expect("run obscura CLI")
 }

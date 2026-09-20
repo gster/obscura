@@ -17,6 +17,11 @@ struct Args {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Built-in persona name or path to a PersonaSpec JSON file. May also be
+    /// supplied as OBSCURA_PERSONA. There is intentionally no implicit default.
+    #[arg(long, global = true, value_name = "PRESET_OR_JSON")]
+    persona: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -313,30 +318,46 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+fn load_persona(input: &str) -> anyhow::Result<obscura_net::EffectivePersona> {
+    if let Some(profile) = obscura_net::StealthProfile::from_name(input) {
+        return Ok(obscura_net::EffectivePersona::builtin(profile));
+    }
+    let path = std::path::Path::new(input);
+    let json = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("failed to read persona {}: {}", path.display(), error))?;
+    obscura_net::PersonaSpec::from_json(&json)?
+        .compile()
+        .map_err(Into::into)
+}
+
+fn resolve_persona(
+    persona_input: Option<&str>,
+    persona_json: Option<&str>,
+) -> anyhow::Result<obscura_net::EffectivePersona> {
+    if let Some(input) = persona_input {
+        load_persona(input)
+    } else if let Some(json) = persona_json {
+        obscura_net::PersonaSpec::from_json(json)?.compile().map_err(Into::into)
+    } else {
+        anyhow::bail!(
+            "a persona is required; pass --persona <preset-or-json> or set OBSCURA_PERSONA"
+        )
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
-    // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
-    // unset it defaults to UTC for Date while the page layer advertised a different
-    // zone, a cross-surface mismatch fingerprinting scripts flag. Default to
-    // Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's region. An existing
-    // TZ from the host is respected.
-    // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
-    // effectively single threaded here.
-    if let Some(tz) = std::env::var("OBSCURA_TIMEZONE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        unsafe {
-            std::env::set_var("TZ", tz);
-        }
-    } else if std::env::var_os("TZ").is_none() {
-        unsafe {
-            std::env::set_var("TZ", "Europe/Berlin");
-        }
-    }
+    let persona_input = args
+        .persona
+        .as_deref()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("OBSCURA_PERSONA").ok());
+    let persona_json = std::env::var("OBSCURA_PERSONA_JSON").ok();
+    let persona = resolve_persona(persona_input.as_deref(), persona_json.as_deref())?;
+
+    obscura_net::activate_process_persona(&persona)?;
 
     let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
@@ -409,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
                     workers,
                     proxy,
                     font_dirs,
+                    persona.clone(),
                 )
                 .await?;
             } else {
@@ -420,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    persona.clone(),
                 )
                 .await?;
             }
@@ -462,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     output,
                     quiet,
+                    persona.clone(),
                 )
                 .await?;
             } else {
@@ -487,6 +511,7 @@ async fn main() -> anyhow::Result<()> {
                     args.allow_private_network,
                     obey_robots,
                     screenshot,
+                    persona.clone(),
                 )
                 .await?;
             }
@@ -508,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
                 quiet,
                 global_proxy,
                 obey_robots,
+                persona.clone(),
             )
             .await?;
         }
@@ -519,9 +545,9 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(host, port, mcp_proxy).await?;
+                obscura_mcp::http::run(host, port, mcp_proxy, persona.clone()).await?;
             } else {
-                obscura_mcp::run(mcp_proxy).await?;
+                obscura_mcp::run(mcp_proxy, persona.clone()).await?;
             }
         }
         None => {
@@ -529,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy).await?;
+            obscura_cdp::start_with_options(args.port, args.proxy, persona).await?;
         }
     }
 
@@ -542,6 +568,7 @@ async fn run_multi_worker_serve(
     workers: u16,
     proxy: Option<String>,
     font_dirs: Vec<std::path::PathBuf>,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -553,6 +580,11 @@ async fn run_multi_worker_serve(
         let worker_port = port + 1 + i;
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        // Internal workers must consume the already-compiled snapshot. An
+        // inherited selector could otherwise win in resolve_persona and make
+        // the child reread a preset or mutable JSON file.
+        cmd.env_remove("OBSCURA_PERSONA");
+        cmd.env("OBSCURA_PERSONA_JSON", serde_json::to_string(&persona.to_spec())?);
         if let Some(ref p) = proxy {
             // Pass the proxy (which may embed credentials) via the environment,
             // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
@@ -691,6 +723,7 @@ async fn run_fetch(
     allow_private_network: bool,
     obey_robots: bool,
     screenshot: Option<std::path::PathBuf>,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     // Whether the user explicitly passed --dump. With --eval also present this
     // decides whether we return the eval value or read the page after the
@@ -703,21 +736,23 @@ async fn run_fetch(
     // payloads (images, fonts, …) and any non-HTML resource where parsing the
     // body through the DOM/JS layer would corrupt or discard data.
     if dump == DumpFormat::Original {
-        let bytes = fetch_original_bytes(url_str, proxy, timeout_secs)
+        let bytes = fetch_original_bytes(url_str, proxy, timeout_secs, &persona)
         .await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
         return Ok(());
     }
 
-    let mut context = BrowserContext::with_storage_and_network(
+    let context = BrowserContext::with_options(
         "fetch".to_string(),
-        proxy,
-        true,
-        None,
-        storage_dir.clone(),
-        allow_private_network,
+        persona,
+        obscura_browser::BrowserContextOptions {
+            proxy_url: proxy,
+            storage_dir: storage_dir.clone(),
+            allow_private_network,
+            obey_robots,
+            ..Default::default()
+        },
     );
-    context.obey_robots = obey_robots;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -1080,6 +1115,7 @@ async fn fetch_original_response(
     url_str: &str,
     proxy: Option<String>,
     timeout_secs: u64,
+    persona: &obscura_net::EffectivePersona,
 ) -> anyhow::Result<obscura_net::Response> {
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
@@ -1090,6 +1126,7 @@ async fn fetch_original_response(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
         false,
+        persona,
     );
     match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
         Ok(Ok(resp)) => Ok(resp),
@@ -1102,9 +1139,10 @@ async fn fetch_original_bytes(
     url_str: &str,
     proxy: Option<String>,
     timeout_secs: u64,
+    persona: &obscura_net::EffectivePersona,
 ) -> anyhow::Result<Vec<u8>> {
     Ok(
-        fetch_original_response(url_str, proxy, timeout_secs)
+        fetch_original_response(url_str, proxy, timeout_secs, persona)
             .await?
             .body,
     )
@@ -1145,6 +1183,7 @@ async fn run_batch_fetch(
     proxy: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     if total == 0 {
@@ -1161,11 +1200,13 @@ async fn run_batch_fetch(
     let start = Instant::now();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let proxy = Arc::new(proxy);
+    let persona = Arc::new(persona);
 
     let mut handles = Vec::with_capacity(total);
     for (i, url) in urls.into_iter().enumerate() {
         let sem = semaphore.clone();
         let proxy = proxy.clone();
+        let persona = persona.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -1174,6 +1215,7 @@ async fn run_batch_fetch(
                 &url,
                 (*proxy).clone(),
                 timeout_secs,
+                &persona,
             )
             .await;
             let elapsed_ms = task_start.elapsed().as_millis();
@@ -1498,6 +1540,7 @@ async fn run_parallel_scrape(
     quiet: bool,
     proxy: Option<String>,
     obey_robots: bool,
+    persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -1536,6 +1579,7 @@ async fn run_parallel_scrape(
     let worker_timeout = Duration::from_secs(timeout_secs);
     let read_timeout = Duration::from_secs(timeout_secs.min(30));
     let shutdown_timeout = Duration::from_secs(5);
+    let persona_json = Arc::new(serde_json::to_string(&persona.to_spec())?);
 
     let mut handles = Vec::new();
 
@@ -1544,6 +1588,7 @@ async fn run_parallel_scrape(
         let eval = eval.clone();
         let worker_path = worker_path.clone();
         let proxy = proxy.clone();
+        let persona_json = persona_json.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -1555,6 +1600,7 @@ async fn run_parallel_scrape(
                 .stderr(std::process::Stdio::null())
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
+                .env("OBSCURA_PERSONA_JSON", persona_json.as_str())
                 .spawn()
             {
                 Ok(c) => c,
@@ -1896,10 +1942,25 @@ mod tests {
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
         merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
-        write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
+        resolve_persona, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
+        DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn startup_persona_is_required_and_compiled_before_work_begins() {
+        assert!(resolve_persona(None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("persona is required"));
+
+        let builtin = resolve_persona(Some("macos_chrome153"), None).unwrap();
+        assert_eq!(builtin.profile(), obscura_net::StealthProfile::MacChrome153);
+
+        let invalid = r#"{"schema_version":"99","persona_id":"bad","revision":"1","profile":"windows_chrome145"}"#;
+        assert!(resolve_persona(None, Some(invalid)).is_err());
+    }
 
     // Issue #117 — `--dump original` short-circuits the browser stack and
     // streams the raw response body verbatim, including for binary payloads.
@@ -2035,7 +2096,14 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, 5)
+        let bytes = fetch_original_bytes(
+            &file_url,
+            None,
+            5,
+            &obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        )
             .await
             .expect("fetch_original_bytes should round-trip the file body");
 
@@ -2069,7 +2137,14 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, 5)
+        let bytes = fetch_original_bytes(
+            &file_url,
+            None,
+            5,
+            &obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        )
             .await
             .expect("fetch_original_bytes should round-trip file://");
 
@@ -2362,8 +2437,9 @@ mod tests {
         let context = std::sync::Arc::new(
             obscura_browser::BrowserContext::with_storage_and_network(
                 "cli-timeout-test".to_string(),
-                None,
-                false,
+                obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
                 None,
                 None,
                 true,

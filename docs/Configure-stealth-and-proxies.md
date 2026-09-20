@@ -1,10 +1,10 @@
 ## Browser identity baseline
 
 ```bash
-obscura fetch https://example.com
-obscura serve
-obscura scrape url1 url2
-obscura mcp
+obscura --persona windows_chrome145 fetch https://example.com
+obscura --persona windows_chrome145 serve
+obscura --persona windows_chrome145 scrape url1 url2
+obscura --persona windows_chrome145 mcp
 ```
 
 All product entry points always use the same baseline:
@@ -32,20 +32,20 @@ Transport presets and resource blocking do not guarantee website acceptance or f
 HTTP proxy:
 
 ```bash
-obscura fetch https://example.com --proxy http://proxy.example.com:8080
-obscura serve --proxy http://proxy.example.com:8080
+obscura --persona windows_chrome145 fetch https://example.com --proxy http://proxy.example.com:8080
+obscura --persona windows_chrome145 serve --proxy http://proxy.example.com:8080
 ```
 
 With auth:
 
 ```bash
-obscura fetch https://example.com --proxy http://user:pass@proxy.example.com:8080
+obscura --persona windows_chrome145 fetch https://example.com --proxy http://user:pass@proxy.example.com:8080
 ```
 
 SOCKS5:
 
 ```bash
-obscura fetch https://example.com --proxy socks5://proxy.example.com:1080
+obscura --persona windows_chrome145 fetch https://example.com --proxy socks5://proxy.example.com:1080
 ```
 
 ## Browser identity
@@ -63,31 +63,51 @@ and DNT headers. Create a new context when those identity fields must change.
 Current primp presets include Windows Chrome 145 and macOS Chrome 152/153;
 these are implementation choices, not certified Linux/macOS personas.
 
-## Browser profile, timezone, and geolocation
+## Persona, timezone, and geolocation
 
-The CLI's environment-selected profile and the isolated runtime's Persona are different configuration paths. Do not transfer a setting between them without checking its consumer. WebGL has a limited shim and renderer metadata; the old statement that every `getContext('webgl')` returns null is obsolete. Neither metadata nor a working clear/readPixels subset establishes complete GPU emulation.
+All entry points consume the same versioned PersonaSpec. A built-in preset name
+is the shortest valid input; a JSON file can override optional fields such as
+timezone, geolocation, viewport and WebGL metadata while retaining a supported
+transport profile:
 
-A single stable profile is used by the product entry points. Persona selection
-will move to the unified configuration tracked by OB-015/016; the old
-`OBSCURA_PROFILE` and `OBSCURA_ROTATE_PROFILE` selectors are not product knobs.
+The built-in `windows_chrome145` preset includes `Europe/Berlin`; the macOS
+presets include `Asia/Shanghai`. These values are fields of those complete
+personas, not independent global defaults. Use an external PersonaSpec when the
+identity needs a different timezone.
 
-Timezone is driven by the process zone so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report the same region. Default is `Europe/Berlin`; set it to match the exit IP:
-
-```bash
-OBSCURA_TIMEZONE=America/New_York obscura serve
+```json
+{
+  "schema_version": "1",
+  "persona_id": "new-york-worker",
+  "revision": "2026-09-20",
+  "profile": "windows_chrome145",
+  "timezone": "America/New_York",
+  "geolocation": {"latitude": 40.7128, "longitude": -74.0060}
+}
 ```
 
-`navigator.geolocation` reports configurable coordinates. Set them as `lat,lon` and keep them consistent with the timezone and proxy region:
-
 ```bash
-OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
+obscura --persona ./persona-new-york.json serve
 ```
 
-Keep these aligned. A rotated or mismatched profile carries no matching TLS or timezone fingerprint, so when you pin a proxy region or TLS fingerprint, leave rotation off and set the timezone and geolocation to the same region. See [Environment variables](Environment-variables.md) for the full list.
+The compiler rejects unknown schema versions, unknown fields, unsupported
+profiles and incoherent locale values before a context becomes usable. The
+Persona v1 locale grammar is a canonical BCP47 subset: language, optional
+Script, optional REGION and ordinary variants (for example `en-US` or
+`zh-Hant-TW`). Non-canonical casing, extensions and private-use tags are
+rejected until their V8 and HTTP projections are explicitly supported. The
+compiled result is immutable and drives primp, HTTP headers, JavaScript,
+frames, workers,
+screen geometry and CDP diagnostics. Because V8 timezone state is process-wide,
+one process accepts only personas with the startup timezone and ICU primary
+language; a conflicting CDP context is rejected before registration. Use
+separate processes for different timezone/locale combinations.
+`OBSCURA_PROFILE`, `OBSCURA_ROTATE_PROFILE`, `OBSCURA_TIMEZONE` and
+`OBSCURA_GEOLOCATION` are not runtime identity sources.
 
 ## Combine
 
 ```bash
-obscura serve \
+obscura --persona windows_chrome145 serve \
   --proxy http://user:pass@proxy.example.com:8080
 ```

@@ -48,7 +48,7 @@ async fn page_intercepts_and_observes_js_fetch() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_echo_server();
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
 
     // Passive on_request counter (fires for navigation + the JS fetch).
@@ -116,7 +116,7 @@ async fn callbacks_do_not_bleed_across_pages() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_echo_server();
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page_a = browser.new_page().await.unwrap();
     let mut page_b = browser.new_page().await.unwrap();
 
@@ -161,7 +161,7 @@ async fn page_rewrites_request_url_via_interception() {
     let base = spawn_echo_server();
     let modified = format!("{}/modified", base);
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
 
     let captured = Arc::new(Mutex::new(String::new()));
@@ -221,7 +221,7 @@ async fn on_response_callback_can_be_detached() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_echo_server();
 
-    let browser = Browser::new().unwrap();
+    let browser = Browser::new(obscura::EffectivePersona::builtin(obscura::StealthProfile::WindowsChrome145)).unwrap();
     let mut page = browser.new_page().await.unwrap();
 
     let hits = Arc::new(AtomicU32::new(0));

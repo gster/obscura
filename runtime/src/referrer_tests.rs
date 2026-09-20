@@ -4,6 +4,10 @@ use obscura_net::{
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
+fn test_persona() -> obscura_net::EffectivePersona {
+    obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)
+}
+
 #[test]
 fn referrer_policy_matrix_strips_credentials_fragments_and_respects_origins() {
     use ReferrerPolicy::*;
@@ -111,7 +115,9 @@ async fn referrer_policy_redirects_do_not_restore_discarded_source() {
             true,
         ));
         let extra = HashMap::from([("Referer".into(), "https://forged.invalid/private".into())]);
-        let transport = StealthHttpClient::with_policy(client.cookie_jar.clone(), None, client.clone());
+        let transport = StealthHttpClient::with_policy(
+            client.cookie_jar.clone(), None, client.clone(), &test_persona(),
+        );
         if page_headers {
             transport.set_extra_headers(extra).await;
         } else {
@@ -151,7 +157,9 @@ async fn referrer_policy_partitions_the_resource_cache() {
         ok_response("Cache-Control: max-age=60\r\n", "origin"),
     ])
     .await;
-    let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+    let client = StealthHttpClient::with_proxy(
+        Arc::new(CookieJar::new()), None, true, &test_persona(),
+    );
     let source = Url::parse("https://source.example/path").unwrap();
     for (policy, body) in [
         (ReferrerPolicy::NoReferrer, b"no-referrer".as_slice()),
@@ -187,7 +195,9 @@ async fn navigation_post_keeps_request_context_through_redirect() {
     request.referrer = Some(source.clone());
     request.initiator = Some(source);
     request.referrer_policy = ReferrerPolicy::UnsafeUrl;
-    let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+    let client = StealthHttpClient::with_proxy(
+        Arc::new(CookieJar::new()), None, true, &test_persona(),
+    );
     let response = client
         .post_form_resource_with_callbacks(&target, "field=value", request, None)
         .await
@@ -235,7 +245,7 @@ async fn fulfilled_response_cannot_supply_navigation_referrer() {
         true,
     ));
     *client.interceptor.write().await = Some(std::sync::Arc::new(Fixture));
-    let transport = StealthHttpClient::with_policy(jar, None, client.clone());
+    let transport = StealthHttpClient::with_policy(jar, None, client.clone(), &test_persona());
     let source = Url::parse("https://source.example/private").unwrap();
     let target = Url::parse("https://target.example/page").unwrap();
     for policy in [ReferrerPolicy::Origin, ReferrerPolicy::NoReferrer] {
@@ -282,7 +292,7 @@ async fn fulfilled_file_response_has_no_navigation_referrer() {
         true,
     ));
     *client.interceptor.write().await = Some(std::sync::Arc::new(Fixture));
-    let transport = StealthHttpClient::with_policy(jar, None, client);
+    let transport = StealthHttpClient::with_policy(jar, None, client, &test_persona());
     let response = transport
         .fetch(&Url::parse("file:///fixture-not-read").unwrap())
         .await
@@ -292,7 +302,6 @@ async fn fulfilled_file_response_has_no_navigation_referrer() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn scripted_transports_follow_document_and_redirect_policies() {
-    for stealth in [false, true] {
         let html = "<!doctype html><pre id='result'>pending</pre><script>fetch('/redirect',{headers:{Referer:'https://forged.invalid/'}}).then(r=>r.text()).then(text=>document.getElementById('result').textContent=text)</script>";
         let mut responses = vec![ok_response("Content-Type: text/html\r\nReferrer-Policy: no-referrer\r\nReferrer-Policy: unsafe-url, future\r\n", html)];
         for policy in ["origin", "no-referrer", "unsafe-url"] {
@@ -302,8 +311,7 @@ async fn scripted_transports_follow_document_and_redirect_policies() {
         let (url, mut received) = http_fixture(responses).await;
         let context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
             "script-referrer".into(),
-            None,
-            stealth,
+            test_persona(),
             None,
             None,
             true,
@@ -325,10 +333,9 @@ async fn scripted_transports_follow_document_and_redirect_policies() {
             let actual = raw
                 .lines()
                 .find_map(|line| line.strip_prefix("referer: ").map(str::trim));
-            assert_eq!(actual, expected, "stealth={stealth}");
+            assert_eq!(actual, expected);
             assert!(!raw.contains("forged.invalid"));
         }
-    }
 }
 
 async fn http_fixture(
