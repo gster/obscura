@@ -80,9 +80,13 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 状态：未关闭。
 
 依赖：OB-001；网络接入与 OB-012 协作。入口：obscura-net/src/cookies.rs、CDP cookie_params/Storage/Network、BrowserContext。
-现状：Cookie 键已含 domain/name/path，过期 CDP 导入已有回归；save/load 使用缺 host-only 的 CookieInfo，导入设为 domain-scoped。
-动作：区分内部持久化与协议视图；修复 host-only 往返，审计 Max-Age/Expires 优先级、同名多 Path 顺序、SameSite/分区、旧格式迁移；覆盖 clone、save/load、导入导出、HTTP 与 document.cookie。
+现状：Cookie 键已含 domain/name/path，内部 CookieEntry 已保留 host_only；version 1 envelope 直接持久化内部记录，历史裸 CookieInfo 数组仍可加载。CookieJar 已提供保留内部字段的 snapshot/from_snapshot/apply_snapshot_delta，CDP 连接关闭时按初始/当前快照差异合并新增、替换和删除。HTTP 与 document.cookie 的有效 Max-Age 已固定优先于 Expires，与属性排列顺序无关；后续非法值不会抹掉先前有效 Max-Age。
+动作：继续区分内部持久化与协议视图；完成同名多 Path 发送排序（长 path 优先及 creation tie-breaker）、SameSite 完整请求上下文、分区、旧格式迁移及 CDP/MCP 对外状态往返；覆盖 clone、save/load、导入导出、HTTP 与 document.cookie。保留 version 1 envelope 与旧裸数组兼容，不删字段、不做脱敏。
 完成：状态往返不改变原语义；同等属性不同顺序结果一致；匹配使用完整请求上下文；原有多 Path 与 HttpOnly 写保护回归保持通过。分区能力未实现则不得宣称支持。
+
+本轮验证：Cookie/context/server 相关 release 回归在 render 根门禁中 **53/53**，no-render 聚焦 **53/53**；最终根 release nextest **1926/1926**，4 skipped。render 与 no-default-features exact CLI release build 均成功；冻结 render 二进制通过 CI 固定 benchmark 障碍课 **33/33**、官方 Playwright Python **1.60.0** smoke 和 **37-method** 协议画像校验。二进制 SHA-256 为 `722ef38dcb23e1627271bb24809c2bf93855e652fc54eb9dd0438fe78c559ca4`（119072256 bytes）。Astra light 最终复核 0 blockers；`git diff --check` 通过。首轮根门禁曾出现 MCP `test_evaluate` 空标题失败，未改源码的单项重放 **1/1** 和完整复跑均通过；该测试忽略导航响应，现有证据不足以确定偶发根因，未将重跑通过称作修复。
+
+额外真实 CLI 回归使用本地 HTTP fixture 和四个全新进程：HTTP Set-Cookie 的 `hostonly=alpha=beta` 与 document.cookie 的 `docvalue=from-document` 均经 version 1 文件恢复并出现在后续服务端 Cookie 请求头；持久化记录保留 host_only 和 HttpOnly。该探针验证产品存储入口，子域作用域由上述 Cookie 回归覆盖。
 
 ### OB-034 · P0 · CDP 访问、背压、断连与不重放
 

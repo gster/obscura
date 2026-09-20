@@ -562,7 +562,7 @@ fn run_connection(
             let default_context = Arc::new(
                 context_template.isolated_copy("default".to_string(), true),
             );
-            let initial_cookies = default_context.cookie_jar.get_all_cookies();
+            let initial_cookies = default_context.cookie_jar.snapshot();
             let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -609,10 +609,9 @@ fn run_connection(
             // updates, while explicit deletes and replacements still persist.
             if persistence_context.storage_dir.is_some() {
                 let _guard = persistence_lock.lock().unwrap_or_else(|e| e.into_inner());
-                merge_cookie_delta(
-                    &persistence_context.cookie_jar,
+                persistence_context.cookie_jar.apply_snapshot_delta(
                     &initial_cookies,
-                    &persisted_context.cookie_jar.get_all_cookies(),
+                    &persisted_context.cookie_jar.snapshot(),
                 );
                 persistence_context.save_cookies();
             }
@@ -629,53 +628,6 @@ fn run_connection(
         error!("connection thread spawn failed: {}", e);
         live_connections.fetch_sub(1, Ordering::AcqRel);
     }
-}
-
-fn cookie_key(cookie: &obscura_net::CookieInfo) -> (String, String, String) {
-    (
-        cookie.domain.clone(),
-        cookie.name.clone(),
-        cookie.path.clone(),
-    )
-}
-
-fn cookie_values_match(
-    left: &obscura_net::CookieInfo,
-    right: &obscura_net::CookieInfo,
-) -> bool {
-    left.value == right.value
-        && left.secure == right.secure
-        && left.http_only == right.http_only
-        && left.same_site == right.same_site
-        && left.expires == right.expires
-}
-
-fn merge_cookie_delta(
-    destination: &obscura_net::CookieJar,
-    initial: &[obscura_net::CookieInfo],
-    current: &[obscura_net::CookieInfo],
-) {
-    let initial: HashMap<_, _> = initial.iter().map(|cookie| (cookie_key(cookie), cookie)).collect();
-    let current: HashMap<_, _> = current.iter().map(|cookie| (cookie_key(cookie), cookie)).collect();
-
-    for (key, cookie) in &initial {
-        if !current.contains_key(key) {
-            destination.delete_cookies_filtered(
-                &cookie.name,
-                &cookie.domain,
-                Some(&cookie.path),
-            );
-        }
-    }
-
-    let changed: Vec<_> = current
-        .iter()
-        .filter_map(|(key, cookie)| match initial.get(key) {
-            Some(previous) if cookie_values_match(previous, cookie) => None,
-            _ => Some((*cookie).clone()),
-        })
-        .collect();
-    destination.set_cookies_from_cdp(changed);
 }
 
 /// Turn away a connection that arrived while the server was at its limit.
@@ -2195,7 +2147,7 @@ async fn handle_connection_ws(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        browser_close_response, handle_fetch_resolution, is_navigate_method, merge_cookie_delta,
+        browser_close_response, handle_fetch_resolution, is_navigate_method,
         parse_cdp_headers, raw_header_bytes_to_cdp_string, websocket_authority, InterceptedPause,
     };
     #[cfg(feature = "render")]
@@ -2402,11 +2354,19 @@ pub(crate) mod tests {
     #[test]
     fn cookie_delta_merges_changes_without_reverting_other_connections() {
         let destination = CookieJar::new();
-        destination.set_cookies_from_cdp(vec![cookie("sid", "newer"), cookie("other", "kept")]);
-        let initial = vec![cookie("sid", "old"), cookie("removed", "old")];
-        let current = vec![cookie("sid", "old"), cookie("added", "value")];
+        destination.set_cookies_from_cdp(vec![cookie("sid", "newer"), cookie("other", "kept"), cookie("removed", "old")]);
+        let connection = CookieJar::new();
+        connection.set_cookies_from_cdp(vec![cookie("sid", "old"), cookie("removed", "old")]);
+        let initial = connection.snapshot();
+        connection.delete_cookies_filtered("removed", "example.com", Some("/"));
+        connection.set_cookies_from_cdp(vec![cookie("added", "value")]);
+        let host = url::Url::parse("https://example.com/").unwrap();
+        connection.set_cookie("host=private; Path=/", &host);
 
-        merge_cookie_delta(&destination, &initial, &current);
+        destination.apply_snapshot_delta(&initial, &connection.snapshot());
+        assert!(destination.get_cookie_header(&host).contains("host=private"));
+        assert!(!destination.get_cookie_header(&url::Url::parse("https://sub.example.com/").unwrap())
+            .contains("host=private"));
 
         let cookies = destination.get_all_cookies();
         assert!(cookies.iter().any(|c| c.name == "sid" && c.value == "newer"));

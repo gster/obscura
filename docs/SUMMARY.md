@@ -118,8 +118,8 @@ OBSCURA_BIN=/absolute/obscura/target/release/obscura python3 obstacle-course/run
 | Beacon 空成功 | bootstrap 两处 sendBeacon 直接 true；同源本地 POST 接收数为 0 | OB-039：真实排队/发送、body、配额和生命周期 |
 | localStorage 没有落盘 | BrowserContext 仅加载/保存 cookies.json；同一 storage-dir 两次 CLI，第一次写入，第二次读出 null | OB-019：明确状态范围和持久化 |
 | viewer 跨连接假设错误 | server 为连接创建 isolated_copy 和独立 processor；第二条连接 getTargets 返回空 | 修正文档；OB-028/034 定义 owner/断连/诊断模型 |
-| Cookie 往返失真 | CookieInfo 不含 host_only；save/load 经该视图，导入写 host_only=false | 源码确认，未另运行子域往返探针；OB-011 |
-| Cookie 上下文不完整 | get_cookie_header 仅接收 URL；SameSite 字段存在但该选择路径无 site/method 上下文；未捆绑完整 PSL，HashMap 遍历不保证发送顺序 | 源码确认；不能只因能读写 Cookie 就宣称完整语义；OB-011/012 |
+| Cookie 持久化格式与连接合并 | version 1 envelope 直接保存内部 CookieEntry，保留 host_only；load 兼容历史裸 CookieInfo 数组；CookieJar 提供 lossless snapshot/from_snapshot/apply_snapshot_delta，CDP 连接关闭时按快照差异合并 | render/no-render Cookie 相关回归各 53/53，根 release nextest 1926/1926；SameSite 完整请求上下文、分区及 CDP/MCP 对外状态往返资格仍未完成；OB-011 |
+| Cookie 请求上下文不完整 | get_cookie_header 仅接收 URL；SameSite 字段存在但该选择路径无 site/method/请求类型上下文；分区能力也未完成 | 源码确认；不能只因 version 1 能无损保存内部 CookieEntry 就宣称完整 Cookie 语义；OB-011/012 |
 | IndexedDB 部分实现 | 请求、upgrade transaction、索引/游标已有代码与回归；abort/commit 空体，数据库存于 JS realm 的 Map | 源码确认，完整事务/生命周期未验证；OB-041 |
 | 身份配置分叉 | BrowserContext 网络与 JS 已收敛到同一 `StealthProfile`，但独立 runtime Persona、CDP Browser.getVersion 和平台 preset 仍有各自字段 | OB-014/015/016/031；还没有完整 persona 编译器或已认证的 Linux/macOS persona |
 | 控制面边界 | CDP 无内建鉴权；server 有 unbounded_channel，连接限制不等于消息/队列预算 | OB-034；不以 loopback 替代完整授权/背压 |
@@ -170,3 +170,7 @@ shopping 不再 403 且有有效航班/报价结果现已列为 OB-046 的重要
 | [First fetch](Your-first-fetch.md)、[Extract](Extract-data.md)、[Markdown](Markdown-extraction.md)、[MCP](Use-the-MCP-server.md) | 保留的 CLI/MCP 使用参考；与尚未实现的统一身份/传输目标分开 |
 
 外部契约核查：官方 [Playwright CDP](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp) 明确连接模式及保真度限制；[Cargo features](https://doc.rust-lang.org/cargo/reference/features.html) 的 additive 语义用于裁剪设计。它们不认证 Obscura，也不代替固定版本运行。
+
+本轮验证：Cookie/context/server 相关 release 回归在 render 根门禁中 **53/53**，no-render 聚焦 **53/53**；最终根 release nextest **1926/1926**，4 skipped。render 与 no-default-features exact CLI release build 均成功；冻结 render 二进制通过 CI 固定 benchmark 障碍课 **33/33**、官方 Playwright Python **1.60.0** smoke 和 **37-method** 协议画像校验。二进制 SHA-256 为 `722ef38dcb23e1627271bb24809c2bf93855e652fc54eb9dd0438fe78c559ca4`（119072256 bytes）。Astra light 最终复核 0 blockers；`git diff --check` 通过。首轮根门禁曾出现 MCP `test_evaluate` 空标题失败，未改源码的单项重放 **1/1** 和完整复跑均通过；该测试忽略导航响应，现有证据不足以确定偶发根因，未将重跑通过称作修复。
+
+额外真实 CLI 回归使用本地 HTTP fixture 和四个全新进程：HTTP Set-Cookie 的 `hostonly=alpha=beta` 与 document.cookie 的 `docvalue=from-document` 均经 version 1 文件恢复并出现在后续服务端 Cookie 请求头；持久化记录保留 host_only 和 HttpOnly。该探针验证产品存储入口，子域作用域由上述 Cookie 回归覆盖。

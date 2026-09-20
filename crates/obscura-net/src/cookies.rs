@@ -3,6 +3,7 @@ use std::sync::RwLock;
 use url::Url;
 
 const DEFAULT_SAME_SITE: &str = "Lax";
+const COOKIE_STORE_VERSION: u32 = 1;
 
 /// SameSite is case-insensitive per RFC 6265bis; normalize a present value to
 /// title-case so stored cookies compare equal regardless of how they were sent.
@@ -32,21 +33,72 @@ pub struct CookieJar {
     cookies: RwLock<HashMap<String, HashMap<(String, String), CookieEntry>>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CookieEntry {
     name: String,
     value: String,
     path: String,
     domain: String,
     /// Cookies set without a Domain attribute are host-only: sent to the exact
-    /// origin host and never to subdomains. `serde(default)` keeps persisted
-    /// cookie files from before this field existed loadable.
-    #[serde(default)]
+    /// origin host and never to subdomains.
     host_only: bool,
     secure: bool,
     http_only: bool,
     expires: Option<u64>,
     same_site: String,
+}
+
+type CookieKey = (String, String, String);
+
+/// An opaque, lossless copy of the effective cookies in a jar. Unlike
+/// `CookieInfo`, this retains internal matching state such as `host_only`.
+#[derive(Debug, Clone)]
+pub struct CookieSnapshot {
+    entries: HashMap<CookieKey, CookieEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedCookieStore {
+    version: u32,
+    cookies: Vec<CookieEntry>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PersistedCookieFile {
+    Versioned(PersistedCookieStore),
+    /// Before version 1, `cookies.json` was a bare CDP `CookieInfo` array. It
+    /// did not record host-only state, so these cookies retain the historical
+    /// domain-scoped import semantics.
+    Legacy(Vec<CookieInfo>),
+}
+
+fn cookie_key(entry: &CookieEntry) -> CookieKey {
+    (
+        entry.domain.clone(),
+        entry.name.clone(),
+        entry.path.clone(),
+    )
+}
+
+fn unix_time_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cookie_is_expired(entry: &CookieEntry, now: u64) -> bool {
+    entry.expires.is_some_and(|expires| expires <= now)
+}
+
+fn parse_max_age(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 impl CookieJar {
@@ -70,6 +122,7 @@ impl CookieJar {
         let mut secure = false;
         let mut http_only = false;
         let mut expires: Option<u64> = None;
+        let mut max_age: Option<i64> = None;
         let mut same_site = "Lax".to_string();
 
         if parts.len() > 1 {
@@ -89,16 +142,8 @@ impl CookieJar {
                             }
                         }
                         "max-age" => {
-                            if let Ok(secs) = val.trim().parse::<i64>() {
-                                if secs <= 0 {
-                                    expires = Some(0);
-                                } else {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    expires = Some(now + secs as u64);
-                                }
+                            if let Some(secs) = parse_max_age(val) {
+                                max_age = Some(secs);
                             }
                         }
                         "samesite" => {
@@ -114,6 +159,14 @@ impl CookieJar {
                     }
                 }
             }
+        }
+
+        if let Some(secs) = max_age {
+            expires = Some(if secs <= 0 {
+                0
+            } else {
+                unix_time_secs().saturating_add(secs as u64)
+            });
         }
 
         // Validate Domain against the response origin (RFC 6265): an unrelated
@@ -220,6 +273,76 @@ impl CookieJar {
         result
     }
 
+    /// Capture every stored entry without projecting it through the lossy CDP
+    /// cookie representation. Expired entries remain in snapshots so elapsed
+    /// time cannot be mistaken for an explicit deletion when computing a
+    /// connection delta. Consumers that materialize state filter them.
+    pub fn snapshot(&self) -> CookieSnapshot {
+        let cookies = self.cookies.read().unwrap();
+        let mut entries = HashMap::new();
+        for domain_cookies in cookies.values() {
+            for entry in domain_cookies.values() {
+                entries.insert(cookie_key(entry), entry.clone());
+            }
+        }
+        CookieSnapshot { entries }
+    }
+
+    /// Create an independent jar from a snapshot, preserving every field of
+    /// each non-expired entry.
+    pub fn from_snapshot(snapshot: &CookieSnapshot) -> Self {
+        let jar = Self::new();
+        jar.merge_entries(snapshot.entries.values().cloned());
+        jar
+    }
+
+    /// Apply the changes between two snapshots without overwriting destination
+    /// entries that were unchanged by the snapshot owner. Deletions and
+    /// replacements remain explicit, matching the connection persistence merge
+    /// contract.
+    pub fn apply_snapshot_delta(
+        &self,
+        initial: &CookieSnapshot,
+        current: &CookieSnapshot,
+    ) {
+        let now = unix_time_secs();
+        let mut jar = self.cookies.write().unwrap();
+
+        for (key, entry) in &initial.entries {
+            if !current.entries.contains_key(key) {
+                if let Some(domain_cookies) = jar.get_mut(&entry.domain) {
+                    domain_cookies.remove(&(entry.name.clone(), entry.path.clone()));
+                }
+            }
+        }
+
+        for (key, entry) in &current.entries {
+            if cookie_is_expired(entry, now) || initial.entries.get(key) == Some(entry) {
+                continue;
+            }
+            jar.entry(entry.domain.clone())
+                .or_default()
+                .insert((entry.name.clone(), entry.path.clone()), entry.clone());
+        }
+    }
+
+    fn merge_entries(&self, entries: impl IntoIterator<Item = CookieEntry>) {
+        let now = unix_time_secs();
+        let mut jar = self.cookies.write().unwrap();
+        for mut entry in entries {
+            let domain = canonical_domain(&entry.domain);
+            entry.domain = domain.clone();
+            let key = (entry.name.clone(), entry.path.clone());
+            if cookie_is_expired(&entry, now) {
+                if let Some(domain_cookies) = jar.get_mut(&domain) {
+                    domain_cookies.remove(&key);
+                }
+                continue;
+            }
+            jar.entry(domain).or_default().insert(key, entry);
+        }
+    }
+
     pub fn set_cookies_from_cdp(&self, cookies: Vec<CookieInfo>) {
         let mut jar = self.cookies.write().unwrap();
         let now = std::time::SystemTime::now()
@@ -318,6 +441,7 @@ impl CookieJar {
         let mut path = default_cookie_path(url.path());
         let mut secure = false;
         let mut expires: Option<u64> = None;
+        let mut max_age: Option<i64> = None;
         let mut same_site = "Lax".to_string();
 
         if parts.len() > 1 {
@@ -337,16 +461,8 @@ impl CookieJar {
                             }
                         }
                         "max-age" => {
-                            if let Ok(secs) = val.trim().parse::<i64>() {
-                                if secs <= 0 {
-                                    expires = Some(0);
-                                } else {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    expires = Some(now + secs as u64);
-                                }
+                            if let Some(secs) = parse_max_age(val) {
+                                max_age = Some(secs);
                             }
                         }
                         "samesite" => {
@@ -361,6 +477,14 @@ impl CookieJar {
                     }
                 }
             }
+        }
+
+        if let Some(secs) = max_age {
+            expires = Some(if secs <= 0 {
+                0
+            } else {
+                unix_time_secs().saturating_add(secs as u64)
+            });
         }
 
         let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
@@ -448,34 +572,17 @@ impl CookieJar {
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         use std::io::Write;
 
-        let cookies = self.cookies.read().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut all: Vec<CookieInfo> = Vec::new();
-        for domain_cookies in cookies.values() {
-            for entry in domain_cookies.values() {
-                if let Some(exp) = entry.expires {
-                    if exp <= now {
-                        continue;
-                    }
-                }
-                all.push(CookieInfo {
-                    name: entry.name.clone(),
-                    value: entry.value.clone(),
-                    domain: entry.domain.clone(),
-                    path: entry.path.clone(),
-                    secure: entry.secure,
-                    http_only: entry.http_only,
-                    same_site: entry.same_site.clone(),
-                    expires: entry.expires.map(|e| e as i64),
-                });
-            }
-        }
-
-        let json = serde_json::to_string_pretty(&all).map_err(|e| {
+        let snapshot = self.snapshot();
+        let now = unix_time_secs();
+        let store = PersistedCookieStore {
+            version: COOKIE_STORE_VERSION,
+            cookies: snapshot
+                .entries
+                .into_values()
+                .filter(|entry| !cookie_is_expired(entry, now))
+                .collect(),
+        };
+        let json = serde_json::to_string_pretty(&store).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
         if let Some(parent) = path.parent() {
@@ -497,13 +604,27 @@ impl CookieJar {
             return Ok(0);
         }
         let data = std::fs::read_to_string(path)?;
-        let cookies: Vec<CookieInfo> =
-            serde_json::from_str(&data).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            })?;
-        let count = cookies.len();
-        self.set_cookies_from_cdp(cookies);
-        Ok(count)
+        let file: PersistedCookieFile = serde_json::from_str(&data).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        match file {
+            PersistedCookieFile::Versioned(store) => {
+                if store.version != COOKIE_STORE_VERSION {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unsupported cookie store version {}", store.version),
+                    ));
+                }
+                let count = store.cookies.len();
+                self.merge_entries(store.cookies);
+                Ok(count)
+            }
+            PersistedCookieFile::Legacy(cookies) => {
+                let count = cookies.len();
+                self.set_cookies_from_cdp(cookies);
+                Ok(count)
+            }
+        }
     }
 }
 
@@ -836,6 +957,65 @@ mod tests {
     }
 
     #[test]
+    fn max_age_precedes_expires_independent_of_attribute_order() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let setters: [fn(&CookieJar, &str, &Url); 2] = [
+            CookieJar::set_cookie,
+            CookieJar::set_cookie_from_js,
+        ];
+        let past = "Expires=Thu, 01 Jan 2020 00:00:00 GMT";
+        let future = "Expires=Thu, 01 Jan 2099 00:00:00 GMT";
+
+        for set in setters {
+            for attributes in [
+                format!("Max-Age=3600; {past}"),
+                format!("{past}; Max-Age=3600"),
+            ] {
+                let jar = CookieJar::new();
+                set(&jar, &format!("kept=value; {attributes}"), &url);
+                assert!(
+                    jar.get_cookie_header(&url).contains("kept=value"),
+                    "valid Max-Age must override Expires for {attributes:?}"
+                );
+            }
+
+            let jar = CookieJar::new();
+            let before = unix_time_secs();
+            set(
+                &jar,
+                &format!("kept=value; Max-Age=3600; Max-Age=+7200; {past}"),
+                &url,
+            );
+            let after = unix_time_secs();
+            let expires = jar.get_all_cookies()[0].expires.unwrap() as u64;
+            assert!(
+                (before + 3600..=after + 3600).contains(&expires),
+                "an invalid later Max-Age must not replace the last valid value: {expires}"
+            );
+
+            let jar = CookieJar::new();
+            set(&jar, &format!("gone=value; {past}; Max-Age=invalid"), &url);
+            assert!(
+                !jar.get_cookie_header(&url).contains("gone="),
+                "invalid Max-Age must fall back to Expires"
+            );
+
+            for attributes in [
+                format!("Max-Age=0; {future}"),
+                format!("{future}; Max-Age=-1"),
+            ] {
+                let jar = CookieJar::new();
+                set(&jar, "delete=current; Path=/", &url);
+                set(&jar, &format!("delete=gone; Path=/; {attributes}"), &url);
+                assert!(
+                    !jar.get_cookie_header(&url).contains("delete="),
+                    "non-positive Max-Age must delete for {attributes:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_expired_cookie_not_sent() {
         let jar = CookieJar::new();
         let url = Url::parse("https://example.com/").unwrap();
@@ -1140,6 +1320,315 @@ mod tests {
         let header = jar2.get_cookie_header(&url);
         assert!(header.contains("session=abc123"));
         assert!(header.contains("token=xyz"));
+    }
+
+    #[test]
+    fn versioned_save_load_is_lossless_for_http_and_document_cookies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        let origin = Url::parse("https://www.example.com/account/login").unwrap();
+        let jar = CookieJar::new();
+
+        jar.set_cookie(
+            "server_host=opaque==value; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=3600",
+            &origin,
+        );
+        jar.set_cookie(
+            "server_domain=domain-value; Domain=example.com; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=3600",
+            &origin,
+        );
+        jar.set_cookie_from_js(
+            "js_host=host-value; Path=/account; Secure; SameSite=Lax; Max-Age=3600",
+            &origin,
+        );
+        jar.set_cookie_from_js(
+            "js_domain=domain-value; Domain=example.com; Path=/; Secure; SameSite=Strict; Max-Age=3600",
+            &origin,
+        );
+        jar.set_cookie("same=root; Domain=example.com; Path=/", &origin);
+        jar.set_cookie("same=account; Domain=example.com; Path=/account", &origin);
+
+        let expected = jar.snapshot();
+        jar.save_to_file(&path).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["version"], COOKIE_STORE_VERSION);
+        assert!(json["cookies"].as_array().unwrap().iter().any(|cookie| {
+            cookie["name"] == "server_host"
+                && cookie["value"] == "opaque==value"
+                && cookie["host_only"] == true
+                && cookie["http_only"] == true
+                && cookie["secure"] == true
+                && cookie["same_site"] == "Strict"
+        }));
+
+        let restored = CookieJar::new();
+        assert_eq!(restored.load_from_file(&path).unwrap(), 6);
+        assert_eq!(restored.snapshot().entries, expected.entries);
+
+        let same_origin = Url::parse("https://www.example.com/account/page").unwrap();
+        let host_child = Url::parse("https://sub.www.example.com/account/page").unwrap();
+        let domain_sibling = Url::parse("https://api.example.com/account/page").unwrap();
+        let root = Url::parse("https://example.com/").unwrap();
+        let account = Url::parse("https://example.com/account/page").unwrap();
+
+        let same_origin_header = restored.get_cookie_header(&same_origin);
+        assert!(same_origin_header.contains("server_host=opaque==value"));
+        assert!(same_origin_header.contains("js_host=host-value"));
+        let child_header = restored.get_cookie_header(&host_child);
+        assert!(!child_header.contains("server_host=opaque==value"));
+        assert!(!child_header.contains("js_host=host-value"));
+        let sibling_header = restored.get_cookie_header(&domain_sibling);
+        assert!(sibling_header.contains("server_domain=domain-value"));
+        assert!(sibling_header.contains("js_domain=domain-value"));
+
+        let visible = restored.get_js_visible_cookies(&same_origin);
+        assert!(!visible.contains("server_host="));
+        assert!(!visible.contains("server_domain="));
+        assert!(visible.contains("js_host=host-value"));
+        assert_eq!(restored.get_cookie_header(&root).matches("same=").count(), 1);
+        assert_eq!(restored.get_cookie_header(&account).matches("same=").count(), 2);
+    }
+
+    #[test]
+    fn legacy_cookie_array_keeps_domain_scoped_import_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        let future = unix_time_secs() as i64 + 3600;
+        let legacy = serde_json::json!([{
+            "name": "legacy",
+            "value": "opaque==value",
+            "domain": "example.com",
+            "path": "/account",
+            "secure": true,
+            "httpOnly": true,
+            "sameSite": "None",
+            "expires": future
+        }]);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let jar = CookieJar::new();
+        assert_eq!(jar.load_from_file(&path).unwrap(), 1);
+        let snapshot = jar.snapshot();
+        let entry = snapshot.entries.values().next().unwrap();
+        assert!(!entry.host_only, "legacy files never encoded host-only state");
+        assert_eq!(entry.value, "opaque==value");
+        assert_eq!(entry.path, "/account");
+        assert!(entry.secure);
+        assert!(entry.http_only);
+        assert_eq!(entry.same_site, "None");
+        assert_eq!(entry.expires, Some(future as u64));
+
+        let child = Url::parse("https://sub.example.com/account/page").unwrap();
+        assert!(jar.get_cookie_header(&child).contains("legacy=opaque==value"));
+        assert!(!jar.get_js_visible_cookies(&child).contains("legacy="));
+        let insecure = Url::parse("http://sub.example.com/account/page").unwrap();
+        assert!(!jar.get_cookie_header(&insecure).contains("legacy="));
+    }
+
+    #[test]
+    fn versioned_load_rejects_unknown_versions_without_mutating_the_jar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        std::fs::write(&path, r#"{"version":2,"cookies":[]}"#).unwrap();
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("kept=value; Path=/", &url);
+
+        let error = jar.load_from_file(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(jar.get_cookie_header(&url).contains("kept=value"));
+    }
+
+    #[test]
+    fn versioned_load_requires_host_only_without_mutating_the_jar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "cookies": [{
+                    "name": "ambiguous",
+                    "value": "value",
+                    "path": "/",
+                    "domain": "example.com",
+                    "secure": false,
+                    "http_only": false,
+                    "expires": null,
+                    "same_site": "Lax"
+                }]
+            }"#,
+        )
+        .unwrap();
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("kept=value; Path=/", &url);
+
+        let error = jar.load_from_file(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(jar.get_cookie_header(&url).contains("kept=value"));
+        assert!(!jar.get_cookie_header(&url).contains("ambiguous="));
+    }
+
+    #[test]
+    fn versioned_load_does_not_restore_expired_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        let store = PersistedCookieStore {
+            version: COOKIE_STORE_VERSION,
+            cookies: vec![CookieEntry {
+                name: "gone".to_string(),
+                value: "stale".to_string(),
+                path: "/".to_string(),
+                domain: "example.com".to_string(),
+                host_only: true,
+                secure: false,
+                http_only: false,
+                expires: Some(0),
+                same_site: "Lax".to_string(),
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("gone=current; Path=/", &url);
+
+        assert_eq!(jar.load_from_file(&path).unwrap(), 1);
+        assert!(!jar.get_cookie_header(&url).contains("gone="));
+    }
+
+    #[test]
+    fn snapshot_clone_preserves_scope_and_is_independent() {
+        let origin = Url::parse("https://www.example.com/").unwrap();
+        let child = Url::parse("https://sub.www.example.com/").unwrap();
+        let source = CookieJar::new();
+        source.set_cookie("host=source; Path=/", &origin);
+
+        let snapshot = source.snapshot();
+        let copied = CookieJar::from_snapshot(&snapshot.clone());
+        assert!(copied.get_cookie_header(&origin).contains("host=source"));
+        assert!(!copied.get_cookie_header(&child).contains("host=source"));
+
+        copied.set_cookie("host=copied; Path=/", &origin);
+        assert!(copied.get_cookie_header(&origin).contains("host=copied"));
+        assert!(source.get_cookie_header(&origin).contains("host=source"));
+    }
+
+    #[test]
+    fn snapshot_delta_compares_host_only_and_preserves_unchanged_concurrent_values() {
+        let apex = Url::parse("https://example.com/").unwrap();
+        let setter = Url::parse("https://www.example.com/").unwrap();
+        let child = Url::parse("https://sub.example.com/").unwrap();
+
+        let connection = CookieJar::new();
+        connection.set_cookie("scope=one; Path=/", &apex);
+        connection.set_cookie("unchanged=old; Path=/", &apex);
+        let initial = connection.snapshot();
+        connection.set_cookie("scope=one; Domain=example.com; Path=/", &setter);
+
+        let destination = CookieJar::from_snapshot(&initial);
+        destination.set_cookie("unchanged=concurrent; Path=/", &apex);
+        destination.apply_snapshot_delta(&initial, &connection.snapshot());
+
+        assert!(
+            destination.get_cookie_header(&child).contains("scope=one"),
+            "a host-only to domain-scoped change must count as a replacement"
+        );
+        assert!(
+            destination.get_cookie_header(&apex).contains("unchanged=concurrent"),
+            "an unchanged snapshot entry must not overwrite a concurrent value"
+        );
+    }
+
+    #[test]
+    fn snapshot_delta_does_not_treat_natural_expiry_as_an_explicit_delete() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let connection = CookieJar::new();
+        let expired = CookieEntry {
+            name: "sid".to_string(),
+            value: "old".to_string(),
+            path: "/".to_string(),
+            domain: "example.com".to_string(),
+            host_only: true,
+            secure: false,
+            http_only: false,
+            expires: Some(0),
+            same_site: "Lax".to_string(),
+        };
+        connection
+            .cookies
+            .write()
+            .unwrap()
+            .entry(expired.domain.clone())
+            .or_default()
+            .insert((expired.name.clone(), expired.path.clone()), expired);
+
+        let initial = connection.snapshot();
+        let current = connection.snapshot();
+        assert_eq!(initial.entries.len(), 1, "snapshots retain stored expired entries");
+        assert!(
+            CookieJar::from_snapshot(&initial).get_all_cookies().is_empty(),
+            "materializing a snapshot must still filter expired entries"
+        );
+
+        let destination = CookieJar::new();
+        destination.set_cookie("sid=refreshed; Path=/; Max-Age=3600", &url);
+        destination.apply_snapshot_delta(&initial, &current);
+        assert!(
+            destination.get_cookie_header(&url).contains("sid=refreshed"),
+            "an unchanged entry that naturally expired must not delete a concurrent refresh"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        connection.save_to_file(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(saved["cookies"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_delta_keeps_explicit_deletes_and_ignores_expired_changes() {
+        let url = Url::parse("https://example.com/").unwrap();
+
+        let deleted_connection = CookieJar::new();
+        deleted_connection.set_cookie("sid=old; Path=/; Max-Age=3600", &url);
+        let deleted_initial = deleted_connection.snapshot();
+        deleted_connection.set_cookie("sid=gone; Path=/; Max-Age=0", &url);
+        let destination = CookieJar::new();
+        destination.set_cookie("sid=refreshed; Path=/; Max-Age=3600", &url);
+        destination.apply_snapshot_delta(&deleted_initial, &deleted_connection.snapshot());
+        assert!(
+            !destination.get_cookie_header(&url).contains("sid="),
+            "a setter-driven removal remains an explicit delete"
+        );
+
+        let changed_connection = CookieJar::new();
+        changed_connection.set_cookie("sid=old; Path=/; Max-Age=3600", &url);
+        let changed_initial = changed_connection.snapshot();
+        let mut expired_change = changed_initial.entries.values().next().unwrap().clone();
+        expired_change.value = "expired-change".to_string();
+        expired_change.expires = Some(0);
+        changed_connection
+            .cookies
+            .write()
+            .unwrap()
+            .entry(expired_change.domain.clone())
+            .or_default()
+            .insert(
+                (expired_change.name.clone(), expired_change.path.clone()),
+                expired_change,
+            );
+
+        let destination = CookieJar::new();
+        destination.set_cookie("sid=refreshed; Path=/; Max-Age=3600", &url);
+        destination.apply_snapshot_delta(&changed_initial, &changed_connection.snapshot());
+        assert!(
+            destination.get_cookie_header(&url).contains("sid=refreshed"),
+            "an expired changed entry must not erase or overwrite a concurrent refresh"
+        );
     }
 
     #[test]

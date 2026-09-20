@@ -191,10 +191,11 @@ impl BrowserContext {
     /// current cookies; incognito copies start empty and never write to the
     /// template's storage directory.
     pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
-        let cookie_jar = Arc::new(CookieJar::new());
-        if persistent {
-            cookie_jar.set_cookies_from_cdp(self.cookie_jar.get_all_cookies());
-        }
+        let cookie_jar = Arc::new(if persistent {
+            CookieJar::from_snapshot(&self.cookie_jar.snapshot())
+        } else {
+            CookieJar::new()
+        });
 
         let mut client = ObscuraHttpClient::with_full_options(
             cookie_jar.clone(),
@@ -326,6 +327,9 @@ mod tests {
         assert_eq!(serde_json::to_value(&persistent.device_identity).unwrap(), serde_json::to_value(&source.device_identity).unwrap());
         assert_eq!(serde_json::to_value(&incognito.device_identity).unwrap(), serde_json::to_value(&source.device_identity).unwrap());
         assert_eq!(persistent.cookie_jar.get_all_cookies().len(), 1);
+        let subdomain = url::Url::parse("https://sub.example.com/").unwrap();
+        assert!(persistent.cookie_jar.get_cookie_header(&subdomain).is_empty(),
+            "a persistent context copy must retain host-only cookie scope");
         assert!(incognito.cookie_jar.get_all_cookies().is_empty());
         persistent.cookie_jar.clear();
         persistent.http_client.set_user_agent("Changed-UA/2.0").await;

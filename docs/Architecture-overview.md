@@ -32,7 +32,7 @@ render 消费共享 DOM/样式状态，以 Taffy 和原生浏览器布局逻辑�
 
 ## 状态与保护
 
-BrowserContext 维护内存 localStorage，Page 维护相应 sessionStorage。当前 `storage_dir` 只加载/保存 Cookie，不能保证完整浏览器状态恢复。Cookie 磁盘格式丢失 host-only 元数据，详见 [存储说明](Persist-cookies-and-storage.md)。
+BrowserContext 维护内存 localStorage，Page 维护相应 sessionStorage。当前 `storage_dir` 只加载/保存 Cookie，不能保证完整浏览器状态恢复。Cookie 磁盘格式为 version 1 envelope，内部记录保留 `host_only`；新程序兼容读取历史裸 `CookieInfo` 数组，但旧程序不保证可读新版 envelope。连接级 Cookie 状态通过 lossless snapshot/delta 合并。SameSite 完整请求上下文、分区以及 CDP/MCP 对外状态往返资格仍未完成，详见 [存储说明](Persist-cookies-and-storage.md)。
 
 V8 watchdog、CLI 硬截止时间、panic=unwind、ops 防 panic、DOM 防环和 URL/DNS 校验均是要保留的保护，不是永不崩溃或 OS sandbox 保证。见 [SECURITY](../SECURITY.md)。
 
