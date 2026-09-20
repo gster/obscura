@@ -164,7 +164,7 @@ pub(super) fn get_response_body(
 }
 
 /// A session never falls through to another Page, even if IDs overlap or its
-/// capture failed. Sessionless reads search all Pages, retaining diagnostics.
+/// capture failed. Sessionless reads require a unique owner, including consumed/error captures.
 pub(super) fn response_body_page<'a>(
     ctx: &'a CdpContext,
     session_id: &Option<String>,
@@ -177,15 +177,16 @@ pub(super) fn response_body_page<'a>(
         page.response_body_size(request_id).ok_or_else(missing)??;
         return Ok(page);
     }
-    let mut diagnostic = None;
-    let found = ctx.pages.iter().find(|page| {
-        match page.response_body_size(request_id) {
-            Some(Ok(_)) => true,
-            Some(Err(error)) => { diagnostic.get_or_insert(error); false },
-            None => false,
-        }
-    });
-    found.ok_or_else(|| diagnostic.unwrap_or_else(missing))
+    let mut candidates = ctx.pages.iter().filter(|page| page.has_response_body(request_id));
+    let page = candidates.next().ok_or_else(|| {
+        ctx.pages.iter().find_map(|page| page.response_body_size(request_id).and_then(Result::err))
+            .unwrap_or_else(missing)
+    })?;
+    if candidates.next().is_some() {
+        return Err(format!("Ambiguous requestId {request_id}; supply sessionId"));
+    }
+    page.response_body_size(request_id).unwrap()?;
+    Ok(page)
 }
 
 #[cfg(test)]

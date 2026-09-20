@@ -4,6 +4,29 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+/// CDP ownership is attached at Fetch.enable, before Page/Worker requests enter
+/// the shared connection channel. The embedded Page API keeps its local IDs.
+pub struct RoutedInterceptedRequest {
+    pub page_id: String,
+    pub frame_id: String,
+    pub session_id: Option<String>,
+    pub request: obscura_js::ops::InterceptedRequest,
+}
+
+// A relay can be cancelled when the owning connection runtime exits. Never
+// drop queued resolvers: the JS interception API treats a dropped sender as
+// continuation, so cancellation must explicitly resolve Fail instead.
+struct PendingIntercepts(tokio::sync::mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>);
+
+impl Drop for PendingIntercepts {
+    fn drop(&mut self) {
+        self.0.close();
+        while let Ok(request) = self.0.try_recv() {
+            let _ = request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+        }
+    }
+}
+
 pub struct PausedRequest {
     pub request_id: String,
     pub url: String,
@@ -40,6 +63,7 @@ pub struct FetchInterceptState {
     pub enabled: bool,
     pub patterns: Vec<String>,
     pub paused: HashMap<String, PausedRequest>,
+    pub owners: HashMap<String, Option<String>>,
     request_counter: u64,
 }
 
@@ -49,6 +73,7 @@ impl FetchInterceptState {
             enabled: false,
             patterns: Vec::new(),
             paused: HashMap::new(),
+            owners: HashMap::new(),
             request_counter: 0,
         }
     }
@@ -81,13 +106,40 @@ pub async fn handle(
                 })
                 .unwrap_or_else(|| vec!["*".to_string()]);
 
+            let page_id = match session_id {
+                Some(session) => ctx.sessions.get(session).cloned()
+                    .ok_or_else(|| format!("No page found for sessionId {session}"))?,
+                None if ctx.page_count() == 1 => ctx.single_page_id().unwrap().to_string(),
+                None => return Err("Fetch.enable requires a sessionId unless exactly one Page exists".into()),
+            };
+            if ctx.get_page(&page_id).is_none() {
+                return Err("Fetch.enable requires a Page session".into());
+            }
+            if ctx.fetch_intercept.owners.get(&page_id).is_some_and(|owner| owner != session_id) {
+                return Err("Fetch is already enabled by another session on this Page".into());
+            }
+            ctx.fetch_intercept.owners.insert(page_id.clone(), session_id.clone());
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.clone();
             let tx_clone = ctx.intercept_tx.clone();
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
+            if let Some(page) = ctx.get_page_mut(&page_id) {
                 page.intercept_block_patterns = patterns.clone();
                 if let Some(tx) = tx_clone {
-                    page.set_intercept_tx(tx);
+                    let (page_tx, page_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let mut pending = PendingIntercepts(page_rx);
+                    let frame_id = page.frame_id.clone();
+                    let session_id = session_id.clone();
+                    tokio::spawn(async move {
+                        while let Some(request) = pending.0.recv().await {
+                            if let Err(error) = tx.send(RoutedInterceptedRequest {
+                                page_id: page_id.clone(), frame_id: frame_id.clone(),
+                                session_id: session_id.clone(), request,
+                            }) {
+                                let _ = error.0.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+                            }
+                        }
+                    });
+                    page.set_intercept_tx(page_tx);
                 }
                 page.enable_intercept(true);
             }
@@ -96,9 +148,20 @@ pub async fn handle(
             Ok(json!({}))
         }
         "disable" => {
-            ctx.fetch_intercept.enabled = false;
-            ctx.fetch_intercept.patterns.clear();
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
+            let page_id = match session_id {
+                Some(session) => ctx.sessions.get(session).cloned()
+                    .ok_or_else(|| format!("No page found for sessionId {session}"))?,
+                None if ctx.page_count() == 1 => ctx.single_page_id().unwrap().to_string(),
+                None => return Err("Fetch.disable requires a sessionId unless exactly one Page exists".into()),
+            };
+            if ctx.fetch_intercept.owners.get(&page_id).is_some_and(|owner| owner != session_id)
+                && session_id.is_some() {
+                return Err("Fetch is enabled by another session on this Page".into());
+            }
+            ctx.fetch_intercept.owners.remove(&page_id);
+            ctx.fetch_intercept.enabled = !ctx.fetch_intercept.owners.is_empty();
+            if !ctx.fetch_intercept.enabled { ctx.fetch_intercept.patterns.clear(); }
+            if let Some(page) = ctx.get_page_mut(&page_id) {
                 page.intercept_block_patterns.clear();
                 page.enable_intercept(false);
             }
@@ -637,8 +700,8 @@ mod tests {
             let error = handle(method, &json!({"requestId": "shared-id"}), &mut ctx, &Some("unknown-session".into())).await.unwrap_err();
             assert!(error.contains("No page found for sessionId"), "{error}");
         }
-        let body = handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, &None).await.unwrap();
-        assert_eq!(body["body"], "second");
+        let error = handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, &None).await.unwrap_err();
+        assert!(error.contains("Ambiguous requestId"), "{error}");
         let body = handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, &sessions[1]).await.unwrap();
         assert_eq!(body["body"], "second");
     }
@@ -741,6 +804,30 @@ mod tests {
                 assert_eq!(raw_headers.capture_stage, "cdpFulfillResponse");
             }
             _ => panic!("expected FetchResolution::Fulfill"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_pause_relay_aborts_every_queued_resolver() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending = PendingIntercepts(rx);
+        let mut receivers = Vec::new();
+        for id in ["intercept-1", "intercept-2"] {
+            let (resolver, receiver) = tokio::sync::oneshot::channel();
+            tx.send(obscura_js::ops::InterceptedRequest {
+                request_id: id.into(), url: "https://example.test/".into(), method: "GET".into(),
+                headers: HashMap::new(), resource_type: "Fetch".into(), resolver,
+            }).unwrap();
+            receivers.push(receiver);
+        }
+        drop(pending);
+        for mut receiver in receivers {
+            assert!(matches!(receiver.try_recv(), Ok(obscura_js::ops::InterceptResolution::Fail { reason }) if reason == "Aborted"));
         }
     }
 }

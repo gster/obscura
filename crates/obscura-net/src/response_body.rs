@@ -178,6 +178,11 @@ impl ResponseBodyStore {
         Ok(())
     }
 
+    /// Includes consumed entries and aliases, but not a store-wide failure.
+    pub fn contains(&self, request_id: &str) -> bool {
+        self.entries.contains_key(request_id)
+    }
+
     pub fn get(&self, request_id: &str) -> Option<Result<(ResponseBody, bool), ResponseBodyError>> {
         let Some(entry) = self.entries.get(request_id) else {
             return self.failure.clone().map(Err);

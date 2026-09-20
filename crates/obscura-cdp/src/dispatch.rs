@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
-use obscura_js::ops::InterceptedRequest;
+use crate::domains::fetch::RoutedInterceptedRequest;
 use serde_json::{json, Value};
 
 use crate::domains;
@@ -50,6 +50,7 @@ pub(crate) struct ExecutionContextRecord {
 
 pub struct CdpContext {
     pub pages: Vec<Page>,
+    pub(crate) navigating_page_id: Option<String>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
     /// Current document loader per page. Navigation events and later
     /// script-initiated Network events must share this id; inventing a loader
@@ -108,7 +109,7 @@ pub struct CdpContext {
     page_contexts: HashMap<String, Vec<i64>>,
     page_isolated_worlds: HashMap<String, Vec<String>>,
     pub fetch_intercept: FetchInterceptState,
-    pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<RoutedInterceptedRequest>>,
     // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
     // body taken out of the page cache so a large download is streamed
     // chunk-by-chunk via IO.read and freed on IO.close (issue #360). The store
@@ -159,6 +160,7 @@ impl CdpContext {
         let valid_context_ids = HashSet::new();
         CdpContext {
             pages: Vec::new(),
+            navigating_page_id: None,
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
@@ -493,6 +495,19 @@ impl CdpContext {
         // Never wrap a delayed acknowledgement onto a replacement stream.
         self.next_screencast_session_id = self.next_screencast_session_id.saturating_add(1);
         self.next_screencast_session_id
+    }
+
+    pub(crate) fn page_count(&self) -> usize {
+        self.pages.len() + usize::from(self.navigating_page_id.is_some())
+    }
+
+    pub(crate) fn single_page_id(&self) -> Option<&str> {
+        if self.page_count() != 1 { return None; }
+        self.navigating_page_id.as_deref().or_else(|| self.pages.first().map(|page| page.id.as_str()))
+    }
+
+    pub(crate) fn has_page(&self, page_id: &str) -> bool {
+        self.navigating_page_id.as_deref() == Some(page_id) || self.get_page(page_id).is_some()
     }
 
     pub fn get_session_page(&self, session_id: &Option<String>) -> Option<&Page> {

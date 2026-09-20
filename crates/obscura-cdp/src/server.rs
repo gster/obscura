@@ -888,16 +888,18 @@ fn websocket_authority(request_head: &str, port: u16) -> String {
 /// per-thread, so two connections' isolates can never collide. All processors
 /// own isolated `BrowserContext` (cookie jar and HTTP client). Cookie deltas are
 /// merged into the persistence template when the connection thread exits.
+type InterceptedPauses = HashMap<(Option<String>, String), tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>;
+
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
 ) {
     let mut ctx = CdpContext::new_with_shared_context(default_context);
-    let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
+    let (itx, irx) = mpsc::unbounded_channel::<crate::domains::fetch::RoutedInterceptedRequest>();
     ctx.intercept_tx = Some(itx);
-    let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut intercept_rx: Option<mpsc::UnboundedReceiver<crate::domains::fetch::RoutedInterceptedRequest>> = Some(irx);
+    let mut intercepted_paused: InterceptedPauses = HashMap::new();
 
     // Issue #19 follow-up: messages deferred from inside
     // `process_with_interception` because routing them through
@@ -929,6 +931,7 @@ async fn cdp_processor(
     let mut runtime_pump_error_streak = 0_u8;
 
     loop {
+        cleanup_detached_fetch_owners(&mut ctx, &mut intercepted_paused);
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
@@ -937,16 +940,6 @@ async fn cdp_processor(
             Some(d)
         } else {
             let screencast_active = has_active_screencast(&ctx);
-            let live_page_route = ctx
-                .pages
-                .iter()
-                .find(|page| page.has_js())
-                .and_then(|page| {
-                    ctx.sessions
-                        .iter()
-                        .find(|(_, page_id)| *page_id == &page.id)
-                        .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
-                });
             let has_intercept_rx = intercept_rx.is_some();
             tokio::select! {
                 biased;
@@ -1011,22 +1004,10 @@ async fn cdp_processor(
                         std::future::pending().await
                     }
                 }, if has_intercept_rx => {
-                    if let (Some((session_id, frame_id)), Some(reply_tx)) =
-                        (live_page_route.as_ref(), connection_reply_tx.as_ref())
-                    {
-                        emit_intercepted_request(
-                            intercepted,
-                            frame_id,
-                            Some(session_id.clone()),
-                            reply_tx,
-                            &mut intercepted_paused,
-                        );
+                    if let Some(reply_tx) = connection_reply_tx.as_ref() {
+                        emit_routed_intercepted_request(intercepted, &ctx, reply_tx, &mut intercepted_paused);
                     } else {
-                        let _ = intercepted.resolver.send(
-                            obscura_js::ops::InterceptResolution::Fail {
-                                reason: "Aborted".into(),
-                            },
-                        );
+                        let _ = intercepted.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
                     }
                     None
                 },
@@ -1070,7 +1051,7 @@ async fn cdp_processor(
                         &mut deferred, true,
                     ).await;
                 } else {
-                    let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
+                    let fetch_was_resolved = (cdp_msg.text.contains("Fetch.") || cdp_msg.text.contains("Network.getResponseBody"))
                         && handle_fetch_resolution(
                             &cdp_msg.text,
                             &mut ctx,
@@ -1092,9 +1073,62 @@ async fn cdp_processor(
 
     }
 
+    if let Some(receiver) = intercept_rx.as_mut() {
+        receiver.close();
+        while let Ok(routed) = receiver.try_recv() {
+            let _ = routed.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+        }
+    }
+    for (_, resolver) in intercepted_paused.drain() {
+        let _ = resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+    }
+
     // The connection thread merges this context's cookie delta into the
     // persistence template after the processor stops.
     let _ = &ctx;
+}
+
+fn cleanup_detached_fetch_owners(ctx: &mut CdpContext, paused: &mut InterceptedPauses) {
+    let detached: Vec<_> = ctx.fetch_intercept.owners.iter().filter(|(page_id, session)| {
+        !ctx.has_page(page_id) || session.as_ref().is_some_and(|sid| ctx.sessions.get(sid) != Some(*page_id))
+    }).map(|(page_id, session)| (page_id.clone(), session.clone())).collect();
+    for (page_id, session) in detached {
+        ctx.fetch_intercept.owners.remove(&page_id);
+        if let Some(page) = ctx.get_page_mut(&page_id) {
+            page.intercept_block_patterns.clear();
+            page.enable_intercept(false);
+        }
+        let keys: Vec<_> = paused.keys().filter(|(sid, _)| sid == &session).cloned().collect();
+        for key in keys {
+            if let Some(resolver) = paused.remove(&key) {
+                let _ = resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+            }
+        }
+    }
+    ctx.fetch_intercept.enabled = !ctx.fetch_intercept.owners.is_empty();
+}
+
+fn emit_routed_intercepted_request(
+    routed: crate::domains::fetch::RoutedInterceptedRequest,
+    ctx: &CdpContext,
+    reply_tx: &mpsc::UnboundedSender<String>,
+    paused: &mut InterceptedPauses,
+) {
+    // The navigating Page may temporarily be outside ctx.pages. Its session
+    // mapping remains authoritative; never substitute another live Page.
+    let valid = match &routed.session_id {
+        Some(session) => ctx.sessions.get(session) == Some(&routed.page_id),
+        None => ctx.has_page(&routed.page_id),
+    };
+    if valid && ctx.fetch_intercept.owners.get(&routed.page_id) != Some(&routed.session_id) {
+        let _ = routed.request.resolver.send(obscura_js::ops::InterceptResolution::Continue {
+            url: None, method: None, headers: None, body: None,
+        });
+    } else if valid {
+        emit_intercepted_request(routed.request, &routed.frame_id, routed.session_id, reply_tx, paused);
+    } else {
+        let _ = routed.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+    }
 }
 
 fn emit_intercepted_request(
@@ -1102,10 +1136,7 @@ fn emit_intercepted_request(
     frame_id: &str,
     session_id: Option<String>,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<
-        String,
-        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
-    >,
+    intercepted_paused: &mut InterceptedPauses,
 ) {
     tracing::info!(
         "INTERCEPTION: requestPaused for {} {} (sending to client)",
@@ -1138,7 +1169,10 @@ fn emit_intercepted_request(
         },
         "sessionId": session_id,
     });
-    let _ = reply_tx.send(request_will_be_sent.to_string());
+    if reply_tx.send(request_will_be_sent.to_string()).is_err() {
+        let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+        return;
+    }
 
     let request_paused = json!({
         "method": "Fetch.requestPaused",
@@ -1154,8 +1188,11 @@ fn emit_intercepted_request(
         },
         "sessionId": session_id,
     });
-    let _ = reply_tx.send(request_paused.to_string());
-    intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
+    if reply_tx.send(request_paused.to_string()).is_err() {
+        let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+        return;
+    }
+    intercepted_paused.insert((session_id, intercepted.request_id), intercepted.resolver);
 }
 
 async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
@@ -1383,17 +1420,75 @@ pub(crate) fn parse_fulfill_resolution(params: &serde_json::Value) -> Result<obs
 
 fn handle_fetch_resolution(
     text: &str,
-    _ctx: &mut CdpContext,
+    ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut InterceptedPauses,
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
+        if method == "Fetch.disable" {
+            let allowed = match &req.session_id {
+                Some(sid) => ctx.sessions.get(sid).is_some_and(|pid|
+                    ctx.fetch_intercept.owners.get(pid).is_none_or(|owner| owner == &req.session_id)),
+                None => ctx.page_count() == 1,
+            };
+            if allowed {
+                let page_id = req.session_id.as_ref().and_then(|sid| ctx.sessions.get(sid))
+                    .map(String::as_str).or_else(|| ctx.single_page_id()).map(str::to_string);
+                let owner = page_id.and_then(|pid| ctx.fetch_intercept.owners.remove(&pid));
+                let keys: Vec<_> = intercepted_paused.keys()
+                    .filter(|(sid, _)| owner.as_ref() == Some(sid)).cloned().collect();
+                for key in keys {
+                    if let Some(resolver) = intercepted_paused.remove(&key) {
+                        let _ = resolver.send(obscura_js::ops::InterceptResolution::Continue {
+                            url: None, method: None, headers: None, body: None,
+                        });
+                    }
+                }
+            }
+            if !allowed {
+                let response = CdpResponse::error(req.id, -32000,
+                    "Fetch.disable requires the owning sessionId".into(), req.session_id);
+                if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+                return true;
+            }
+            // The normal handler updates the owning Page's interception policy.
+            return false;
+        }
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+        if method == "Network.getResponseBody" && !request_id.starts_with("intercept-") { return false; }
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if matches!(method, "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream")
-            && intercepted_paused.contains_key(request_id)
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest"
+            | "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody") { return false; }
+        let mut key = (req.session_id.clone(), request_id.to_string());
+        let routing_error = if req.session_id.is_none() && ctx.page_count() > 1 {
+            Some("Fetch request requires a sessionId when multiple Pages exist".to_string())
+        } else if req.session_id.as_ref().is_some_and(|sid| !ctx.sessions.contains_key(sid)) {
+            Some("Unknown Fetch sessionId".to_string())
+        } else {
+            if req.session_id.is_none() && !intercepted_paused.contains_key(&key) {
+                let matches: Vec<_> = intercepted_paused.keys().filter(|(_, id)| id == request_id).cloned().collect();
+                if matches.len() == 1 { key = matches[0].clone(); }
+            }
+            if !intercepted_paused.contains_key(&key)
+                && intercepted_paused.keys().any(|(_, id)| id == request_id)
+                // A completed alias on this Page must remain readable even
+                // while another Page is paused on the same local ID.
+                && !(matches!(method, "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody")
+                    && ctx.get_session_page(&req.session_id).is_some_and(|page| page.has_response_body(request_id)))
+            {
+                Some("Fetch requestId does not belong to this sessionId".to_string())
+            } else { None }
+        };
+        if let Some(message) = routing_error {
+            let response = CdpResponse::error(req.id, -32000, message, req.session_id);
+            if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+            return true;
+        }
+
+        if matches!(method, "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody")
+            && intercepted_paused.contains_key(&key)
         {
             let response = crate::types::CdpResponse::error(
                 req.id, -32000, crate::domains::fetch::response_body_not_ready(request_id), req.session_id,
@@ -1407,9 +1502,16 @@ fn handle_fetch_resolution(
             return false;
         }
 
+        if request_id.starts_with("intercept-") && !intercepted_paused.contains_key(&key) {
+            let response = CdpResponse::error(req.id, -32000,
+                "Fetch requestId is not paused in this session".into(), req.session_id);
+            if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+            return true;
+        }
+
         // Validate fields before consuming the pause so malformed input can
         // be corrected without stranding the in-flight fetch.
-        let parsed_resolution = if intercepted_paused.contains_key(request_id) {
+        let parsed_resolution = if intercepted_paused.contains_key(&key) {
             let result = match method {
                 "Fetch.continueRequest" => parse_continue_post_data(&req.params).map(|body| {
                     obscura_js::ops::InterceptResolution::Continue {
@@ -1433,7 +1535,7 @@ fn handle_fetch_resolution(
                 }
             }
         } else { None };
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
+        if let Some(resolver) = intercepted_paused.remove(&key) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let _ = resolver.send(parsed_resolution.expect("validated fetch resolution"));
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
@@ -1451,8 +1553,8 @@ async fn process_with_interception(
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
-    intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercept_rx: &mut Option<mpsc::UnboundedReceiver<crate::domains::fetch::RoutedInterceptedRequest>>,
+    intercepted_paused: &mut InterceptedPauses,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
     send_command_response: bool,
 ) {
@@ -1489,6 +1591,8 @@ async fn process_with_interception(
         }
     };
 
+    ctx.navigating_page_id = Some(page_id.clone());
+
     // V8 allows only ONE *entered* isolate per OS thread, but many *live*
     // ones. Since #756 every op enters its isolate only transiently (never
     // across an `.await`) and construction leaves the entry stack empty, so a
@@ -1505,10 +1609,6 @@ async fn process_with_interception(
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
-
-    if let Some(tx) = &ctx.intercept_tx {
-        page.set_intercept_tx(tx.clone());
-    }
 
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
@@ -1562,6 +1662,7 @@ async fn process_with_interception(
     // outer `cdp_processor` loop processes them after this nav fully
     // completes (and its JsRuntime is no longer in flight on the
     // LocalSet).
+    let mut connection_open = true;
     loop {
         let has_irx = intercept_rx.is_some();
 
@@ -1578,16 +1679,21 @@ async fn process_with_interception(
                     std::future::pending().await
                 }
             }, if has_irx => {
-                emit_intercepted_request(
-                    intercepted,
-                    &frame_id,
-                    session_for_events.clone(),
-                    reply_tx,
-                    intercepted_paused,
-                );
+                if connection_open {
+                    emit_routed_intercepted_request(intercepted, ctx, reply_tx, intercepted_paused);
+                } else {
+                    let _ = intercepted.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
-            Some(msg) = rx.recv() => {
+            msg = rx.recv(), if connection_open => {
+                let Some(msg) = msg else {
+                    connection_open = false;
+                    for (_, resolver) in intercepted_paused.drain() {
+                        let _ = resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+                    }
+                    continue;
+                };
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
                 match msg {
                     ServerMessage::NewConnection { reply_tx: new_tx } => {
@@ -1598,7 +1704,7 @@ async fn process_with_interception(
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
-                        if msg.text.contains("Fetch.") && handle_fetch_resolution(
+                        if (msg.text.contains("Fetch.") || msg.text.contains("Network.getResponseBody")) && handle_fetch_resolution(
                             &msg.text, ctx, &msg.reply_tx, intercepted_paused,
                         ) {
                             // Safe: resolves the pause or rejects a premature
@@ -1649,6 +1755,7 @@ async fn process_with_interception(
     let reached_network_idle = page.lifecycle.is_network_idle();
 
     ctx.pages.push(page);
+    ctx.navigating_page_id = None;
 
     #[cfg(feature = "render")]
     let navigation_succeeded = navigate_result.is_ok();
@@ -2100,15 +2207,15 @@ mod tests {
         for (value, expected) in [(Some(json!("AP8A/w==")), Some(vec![0, 255, 0, 255])),
             (Some(json!("")), Some(vec![])), (None, None)] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-            let mut paused = HashMap::from([("continued".to_string(), resolver)]);
+            let mut paused = HashMap::from([((None, "continued".to_string()), resolver)]);
             for invalid in [json!("%"), json!("AP8"), json!("AP8=\n"), json!("AP9="), json!(7), json!(null), json!("%") ] {
-                let command = json!({"id":1,"sessionId":"session","method":"Fetch.continueRequest",
+                let command = json!({"id":1,"method":"Fetch.continueRequest",
                     "params":{"requestId":"continued","postData":invalid}}).to_string();
                 assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
                 let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
                 assert_eq!(reply["error"]["code"], -32602);
-                assert_eq!(reply["sessionId"], "session");
-                assert!(paused.contains_key("continued"));
+                assert!(reply.get("sessionId").is_none());
+                assert!(paused.contains_key(&(None, "continued".into())));
                 assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
             }
             let mut params = json!({"requestId":"continued","url":"https://example.com/new","method":"PUT",
@@ -2203,7 +2310,7 @@ mod tests {
                     params["headers"] = json!([{"name":"Authorization","value":"Bearer complete-secret"}]);
                     params["postData"] = json!(base64::engine::general_purpose::STANDARD.encode(&binary));
                 } else if request.url.ends_with("/empty") { params["postData"] = json!(""); }
-                let mut paused = HashMap::from([(request.request_id.clone(), request.resolver)]);
+                let mut paused = HashMap::from([((None, request.request_id.clone()), request.resolver)]);
                 // Retrying invalid data must neither send nor lose the actual JS/Worker request.
                 for _ in 0..2 {
                     let command = json!({"id":1,"method":"Fetch.continueRequest","params":{
@@ -2254,7 +2361,7 @@ mod tests {
             json!({"binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(binary)}),
         ] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-            let mut paused = HashMap::from([("fulfilled".to_string(), resolver)]);
+            let mut paused = HashMap::from([((None, "fulfilled".to_string()), resolver)]);
             let mut params = params;
             params["requestId"] = json!("fulfilled"); params["body"] = json!("AP8="); params["responseCode"] = json!(201);
             let command = json!({"id":1,"method":"Fetch.fulfillRequest","params":params}).to_string();
@@ -2287,7 +2394,7 @@ mod tests {
         let mut ctx = crate::dispatch::CdpContext::new();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("fulfilled".to_string(), resolver)]);
+        let mut paused = HashMap::from([((None, "fulfilled".to_string()), resolver)]);
         for params in [json!({"binaryResponseHeaders":"%"}), json!({"body":"%"}), json!({"body":7}),
             json!({"binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(b"missing colon")}),
             json!({"responseHeaders":{},"binaryResponseHeaders":""}),
@@ -2298,7 +2405,7 @@ mod tests {
             assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
             let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
             assert_eq!(reply["error"]["code"], -32602);
-            assert!(paused.contains_key("fulfilled"));
+            assert!(paused.contains_key(&(None, "fulfilled".into())));
             assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
         }
         let command = json!({"id":2,"method":"Fetch.fulfillRequest","params":{"requestId":"fulfilled","body":""}}).to_string();
@@ -2312,20 +2419,20 @@ mod tests {
         let mut ctx = crate::dispatch::CdpContext::new();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("paused".to_string(), resolver)]);
+        let mut paused = HashMap::from([((None, "paused".to_string()), resolver)]);
         for method in ["Fetch.getResponseBody", "Fetch.takeResponseBodyAsStream"] {
-            let command = json!({"id": 1, "method": method, "params": {"requestId": "paused"}, "sessionId": "session"}).to_string();
+            let command = json!({"id": 1, "method": method, "params": {"requestId": "paused"}}).to_string();
             assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
             let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
             assert_eq!(reply["id"], 1);
-            assert_eq!(reply["sessionId"], "session");
+            assert!(reply.get("sessionId").is_none());
             assert!(reply["error"]["message"].as_str().unwrap().contains("response_body_not_ready"));
-            assert!(paused.contains_key("paused"));
+            assert!(paused.contains_key(&(None, "paused".into())));
             assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
         }
         let unrelated = json!({"id": 2, "method": "Fetch.unsupported", "params": {"requestId": "paused"}}).to_string();
         assert!(!handle_fetch_resolution(&unrelated, &mut ctx, &reply_tx, &mut paused));
-        assert!(paused.contains_key("paused"));
+        assert!(paused.contains_key(&(None, "paused".into())));
         let command = json!({"id": 3, "method": "Fetch.continueRequest", "params": {"requestId": "paused"}}).to_string();
         assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
         assert!(matches!(resolved.try_recv().unwrap(), obscura_js::ops::InterceptResolution::Continue { .. }));
@@ -2334,7 +2441,7 @@ mod tests {
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([((None, "request-1".to_string()), resolution_tx)]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut ctx = crate::dispatch::CdpContext::new();
 
@@ -2514,3 +2621,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "server/fetch_isolation_tests.rs"]
+mod fetch_isolation_tests;

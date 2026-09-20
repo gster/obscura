@@ -4555,6 +4555,11 @@ impl Page {
         })
     }
 
+    /// Whether this Page owns a retained or consumed capture/alias.
+    pub fn has_response_body(&self, request_id: &str) -> bool {
+        self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).contains(request_id)
+    }
+
     pub fn response_body_size(&self, request_id: &str) -> Option<Result<usize, String>> {
         self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).get(request_id).map(|body| {
             body.map(|(body, _)| body.len()).map_err(|error| error.to_string())
