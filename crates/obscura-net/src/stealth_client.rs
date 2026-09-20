@@ -369,6 +369,7 @@ impl StealthHttpClient {
         &self,
         info: &mut RequestInfo,
         body: Option<&[u8]>,
+        fields: Option<&mut Vec<(String, String)>>,
     ) -> Result<Option<Response>, ObscuraNetError> {
         validate_url(&info.url, self.allow_private_network)?;
         if let Some(policy) = &self.policy {
@@ -376,6 +377,14 @@ impl StealthHttpClient {
             if let Some(interceptor) = interceptor {
                 if let Some(body) = body {
                     info.body.extend_from_slice(body);
+                }
+                if let Some(fields) = fields.as_ref() {
+                    info.raw_headers = Some(crate::HeaderCapture {
+                        capture_stage: "requestPolicy", encoding: "base64",
+                        fields: fields.iter().map(|(name, value)| crate::RawHeader {
+                            name: name.as_bytes().to_vec(), value: value.as_bytes().to_vec(),
+                        }).collect(),
+                    });
                 }
                 let action = interceptor.intercept(info).await;
                 // Request bodies can be large. The interceptor has already
@@ -385,7 +394,13 @@ impl StealthHttpClient {
                     crate::interceptor::InterceptAction::Continue => {}
                     crate::interceptor::InterceptAction::Block => return Err(ObscuraNetError::Blocked(info.url.to_string())),
                     crate::interceptor::InterceptAction::Fulfill(response) => return Ok(Some(response)),
-                    crate::interceptor::InterceptAction::ModifyHeaders(headers) => info.headers.extend(headers),
+                    crate::interceptor::InterceptAction::ModifyHeaders(headers) => {
+                        if let Some(fields) = fields {
+                            fields.retain(|(name, _)| !headers.keys().any(|key| key.eq_ignore_ascii_case(name)));
+                            fields.extend(headers.iter().map(|(name, value)| (name.clone(), value.clone())));
+                        }
+                        info.headers.extend(headers);
+                    }
                 }
             }
         }
@@ -574,7 +589,7 @@ impl StealthHttpClient {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
-            if let Some(mut response) = self.intercept(&mut RequestInfo {raw_headers: None, body: Vec::new(), url: url.clone(), method: "GET".into(), headers: HashMap::new(), resource_type: request.resource_type}, None).await? {
+            if let Some(mut response) = self.intercept(&mut RequestInfo {raw_headers: None, body: Vec::new(), url: url.clone(), method: "GET".into(), headers: HashMap::new(), resource_type: request.resource_type}, None, None).await? {
                 response.request_referrer = None;
                 return Ok(response);
             }
@@ -613,7 +628,7 @@ impl StealthHttpClient {
                 url: current_url.clone(), method: method.to_string(),
                 headers: self.request_headers().await, resource_type: request.resource_type,
             };
-            if let Some(mut response) = self.intercept(&mut request_info, Some(&request_body)).await? {
+            if let Some(mut response) = self.intercept(&mut request_info, Some(&request_body), None).await? {
                 response.request_referrer = request.referrer_policy.referrer(request.referrer.as_ref(), &current_url);
                 return Ok(response);
             }
@@ -784,6 +799,19 @@ impl StealthHttpClient {
         timeout: std::time::Duration,
         observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
     ) -> Result<Response, ObscuraNetError> {
+        let fields: Vec<_> = headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        self.send_single_observed_fields(method, url, &fields, body, send_cookies, store_cookies,
+            max_response_bytes, timeout, observation).await
+    }
+
+    /// Ordered request overrides. Repeated values survive case-insensitive
+    /// context/Page overlay; HTTP names/order normalize at the primp boundary.
+    pub async fn send_single_observed_fields(
+        &self, method: &str, url: &Url, fields: &[(String, String)], body: &[u8],
+        send_cookies: bool, store_cookies: bool, max_response_bytes: usize,
+        timeout: std::time::Duration,
+        observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
+    ) -> Result<Response, ObscuraNetError> {
         let in_flight = InFlightGuard::new(&self.in_flight);
         if let Some(host) = url.host_str() {
             if self.block_trackers() && crate::blocklist::is_blocked(host) {
@@ -802,9 +830,12 @@ impl StealthHttpClient {
         }
 
         let mut request_headers = self.request_headers().await;
-        overlay_headers(&mut request_headers, headers);
-        let mut info = RequestInfo {raw_headers: None, body: Vec::new(), url: url.clone(), method: method.to_string(), headers: request_headers, resource_type: crate::client::ResourceType::Fetch};
-        if let Some(response) = self.intercept(&mut info, Some(body)).await? { return Ok(response); }
+        request_headers.retain(|name, _| !fields.iter().any(|(key, _)| key.eq_ignore_ascii_case(name)));
+        let mut request_fields: Vec<_> = request_headers.into_iter().collect();
+        request_fields.extend_from_slice(fields);
+        let mut info = RequestInfo {raw_headers: None, body: Vec::new(), url: url.clone(), method: method.to_string(),
+            headers: request_fields.iter().cloned().collect(), resource_type: crate::client::ResourceType::Fetch};
+        if let Some(response) = self.intercept(&mut info, Some(body), Some(&mut request_fields)).await? { return Ok(response); }
 
         let req_method = method
             .parse::<http::Method>()
@@ -817,10 +848,10 @@ impl StealthHttpClient {
                 header(&mut headers, "cookie", &cookie_header)?;
             }
         }
-        for (k, v) in info.headers.iter() {
+        for (k, v) in &request_fields {
             header(&mut headers, k, v)?;
         }
-        let request_referrer = info.headers.iter()
+        let request_referrer = request_fields.iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
             .and_then(|(_, value)| Url::parse(value).ok());
         let (transport, prepared) = self.client.request(req_method, url, headers, body, timeout)?;
@@ -987,6 +1018,65 @@ mod tests {
         ].into_iter().collect());
     }
 
+    struct CaptureOrderedHeaders;
+
+    #[async_trait::async_trait]
+    impl crate::interceptor::RequestInterceptor for CaptureOrderedHeaders {
+        async fn intercept(&self, request: &RequestInfo) -> crate::interceptor::InterceptAction {
+            let raw = request.raw_headers.as_ref().unwrap();
+            assert_eq!(raw.capture_stage, "requestPolicy");
+            let fields: Vec<_> = raw.fields.iter().filter(|field| field.name.eq_ignore_ascii_case(b"x-test"))
+                .map(|field| (field.name.as_slice(), field.value.as_slice())).collect();
+            assert_eq!(fields, [(b"X-Test".as_slice(), b"one".as_slice()), (b"x-test".as_slice(), b"two".as_slice())]);
+            assert_eq!(request.body, b"complete body");
+            crate::interceptor::InterceptAction::ModifyHeaders(HashMap::from([("X-POLICY".into(), "new".into())]))
+        }
+    }
+
+    #[tokio::test]
+    async fn ordered_request_fields_preserve_context_page_and_native_policy_overlays() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 2048];
+                let count = socket.read(&mut buf).unwrap(); assert!(count > 0);
+                request.extend_from_slice(&buf[..count]);
+                if let Some(end) = request.windows(4).position(|s| s == b"\r\n\r\n") {
+                    if request.len() >= end + 4 + b"complete body".len() { break; }
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let policy = Arc::new(crate::client::ObscuraHttpClient::new());
+        policy.set_extra_headers(HashMap::from([
+            ("X-Context".into(), "retained".into()), ("x-test".into(), "context".into()),
+        ])).await;
+        *policy.interceptor.write().await = Some(Arc::new(CaptureOrderedHeaders));
+        let client = StealthHttpClient::with_policy(Arc::new(CookieJar::new()), Some(&proxy), policy);
+        client.set_extra_headers(HashMap::from([("X-TEST".into(), "page".into())])).await;
+        let fields = [("X-Test", "one"), ("x-test", "two"), ("X-Policy", "old"), ("x-policy", "also-old")]
+            .map(|(name, value)| (name.into(), value.into()));
+        let response = client.send_single_observed_fields("POST", &Url::parse("http://headers.test/").unwrap(),
+            &fields, b"complete body", false, false, 1024, Duration::from_secs(5), None).await.unwrap();
+        let raw = response.request_raw_headers.unwrap();
+        let values = |name: &[u8]| raw.fields.iter().filter(|field| field.name == name)
+            .map(|field| field.value.as_slice()).collect::<Vec<_>>();
+        assert_eq!(values(b"x-test"), [b"one".as_slice(), b"two".as_slice()]);
+        assert_eq!(values(b"x-context"), [b"retained".as_slice()]);
+        assert_eq!(values(b"x-policy"), [b"new".as_slice()]);
+        let wire = server.join().unwrap();
+        assert!(wire.contains("x-test: one\r\nx-test: two\r\n"));
+        assert!(wire.contains("x-context: retained\r\n"));
+        assert!(wire.contains("x-policy: new\r\n"));
+        assert!(!wire.contains("old"));
+    }
+
     struct CaptureBody(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     #[async_trait::async_trait]
@@ -1095,7 +1185,7 @@ mod tests {
             resource_type: crate::client::ResourceType::Fetch,
             body: Vec::new(),
         };
-        assert!(client.intercept(&mut info, Some(payload)).await.is_err());
+        assert!(client.intercept(&mut info, Some(payload), None).await.is_err());
         assert_eq!(captured.lock().unwrap().as_slice(), payload);
         assert!(info.body.is_empty());
         assert_eq!(info.body.capacity(), 0, "the temporary observation copy must release its allocation");
@@ -1241,7 +1331,8 @@ mod tests {
     use url::Url;
 
     use super::StealthHttpClient;
-    use crate::client::{ObscuraNetError, SsrfGuardResolver};
+    use crate::client::{ObscuraNetError, RequestInfo, SsrfGuardResolver};
+    use std::collections::HashMap;
     use crate::cookies::CookieJar;
     use primp::dns::{Name, Resolve};
 

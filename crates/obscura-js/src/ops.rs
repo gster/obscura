@@ -40,6 +40,14 @@ pub enum InterceptResolution {
         /// Exact request body bytes; None leaves the original body unchanged.
         body: Option<Vec<u8>>,
     },
+    /// Ordered CDP request fields. HTTP normalizes names and field ordering at
+    /// the transport boundary; repeated values retain their relative order.
+    ContinueWithHeaders {
+        url: Option<String>,
+        method: Option<String>,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    },
     Fulfill {
         status: u16,
         headers: HashMap<String, String>,
@@ -3854,7 +3862,7 @@ async fn op_fetch_url(
     // can rewrite url/method/headers/body before the request goes out.
     let mut override_url: Option<String> = None;
     let mut override_method: Option<String> = None;
-    let mut override_headers: Option<HashMap<String, String>> = None;
+    let mut override_headers: Option<Vec<(String, String)>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
     if let Some((tx, request_id)) = intercept_tx {
@@ -3933,7 +3941,7 @@ async fn op_fetch_url(
                 }) => {
                     override_url = url;
                     override_method = method;
-                    override_headers = headers;
+                    override_headers = headers.map(|headers| headers.into_iter().collect());
                     override_body = body;
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
@@ -3942,6 +3950,12 @@ async fn op_fetch_url(
                         override_headers.is_some(),
                         override_body.is_some()
                     );
+                }
+                Ok(InterceptResolution::ContinueWithHeaders { url, method, headers, body }) => {
+                    override_url = url;
+                    override_method = method;
+                    override_headers = Some(headers);
+                    override_body = body;
                 }
                 Err(_) => {}
             }
@@ -3984,12 +3998,21 @@ async fn op_fetch_url(
 
     let req_method: http::Method = method.parse().unwrap_or(http::Method::GET);
 
-    let mut custom_headers: std::collections::HashMap<String, String> =
-        override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
-    custom_headers.retain(|key, _| !key.eq_ignore_ascii_case("referer") && !key.eq_ignore_ascii_case("origin") && !key.to_ascii_lowercase().starts_with("sec-"));
+    let mut custom_headers = override_headers.unwrap_or_else(|| {
+        serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default().into_iter().collect()
+    });
+    custom_headers.retain(|(key, _)| !key.eq_ignore_ascii_case("referer") && !key.eq_ignore_ascii_case("origin") && !key.to_ascii_lowercase().starts_with("sec-"));
 
     let unsafe_header_names = if is_cross_origin && mode == "cors" {
-        cors_unsafe_request_header_names(&custom_headers)
+        // CORS classifies the combined value of repeated, case-insensitive
+        // names. Keep this derived view separate from the outgoing field list.
+        let mut combined = HashMap::<String, String>::new();
+        for (name, value) in &custom_headers {
+            combined.entry(name.to_ascii_lowercase()).and_modify(|previous| {
+                previous.push_str(", "); previous.push_str(value);
+            }).or_insert_with(|| value.clone());
+        }
+        cors_unsafe_request_header_names(&combined)
     } else {
         Vec::new()
     };
@@ -4105,7 +4128,7 @@ async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
-    custom_headers: HashMap<String, String>,
+    custom_headers: Vec<(String, String)>,
     body: Vec<u8>,
     page_origin: String,
     mode: String,
@@ -4148,21 +4171,18 @@ async fn stealth_fetch_all(
             req_headers.insert("origin".to_string(), origin.into());
         }
         if !custom_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("accept"))
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept"))
         {
             req_headers.insert("accept".to_string(), "*/*".to_string());
         }
-        for (k, v) in &custom_headers {
-            if k.eq_ignore_ascii_case("referer") { continue; }
-            req_headers.insert(k.to_lowercase(), v.clone());
-        }
-
         referrer = referrer_policy.referrer(referrer.as_ref(), &parsed_current);
         if let Some(value) = &referrer { req_headers.insert("referer".into(), value.to_string()); }
+        let mut req_headers: Vec<(String, String)> = req_headers.into_iter().collect();
+        req_headers.extend(custom_headers.iter().cloned());
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let r = tokio::time::timeout(fetch_timeout(), stealth
-            .send_single_observed(
+            .send_single_observed_fields(
                 &current_method,
                 &parsed_current,
                 &req_headers,

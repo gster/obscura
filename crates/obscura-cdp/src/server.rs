@@ -1342,22 +1342,29 @@ fn is_navigate_method(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-// Parse a CDP header list (`[{"name":..,"value":..}, ..]`, as used by
-// Fetch.continueRequest / fulfillRequest) into a map. Returns None when the
-// `headers` field is absent, so the caller can leave the request's headers
-// untouched rather than clearing them.
-pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
-    let arr = params.get("headers")?.as_array()?;
-    Some(
-        arr.iter()
-            .filter_map(|h| {
-                Some((
-                    h.get("name")?.as_str()?.to_string(),
-                    h.get("value")?.as_str()?.to_string(),
-                ))
-            })
-            .collect(),
-    )
+// Keep CDP field order, spelling and full values until the HTTP boundary.
+// Validate before taking the resolver so malformed input remains retryable.
+pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Result<Option<Vec<(String, String)>>, String> {
+    params.get("headers").map(|headers| {
+        headers.as_array().ok_or("headers must be an array")?.iter().map(|header| {
+            let name = header.get("name").and_then(|v| v.as_str()).ok_or("headers require a string name")?;
+            let value = header.get("value").and_then(|v| v.as_str()).ok_or("headers require a string value")?;
+            http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "invalid header name")?;
+            http::header::HeaderValue::from_bytes(value.as_bytes()).map_err(|_| "invalid header value")?;
+            Ok((name.to_string(), value.to_string()))
+        }).collect()
+    }).transpose()
+}
+
+pub(crate) fn parse_continue_resolution(params: &serde_json::Value) -> Result<obscura_js::ops::InterceptResolution, String> {
+    let body = parse_continue_post_data(params)?;
+    let headers = parse_cdp_headers(params)?;
+    let url = params.get("url").and_then(|v| v.as_str()).map(str::to_string);
+    let method = params.get("method").and_then(|v| v.as_str()).map(str::to_string);
+    Ok(match headers {
+        Some(headers) => obscura_js::ops::InterceptResolution::ContinueWithHeaders { url, method, headers, body },
+        None => obscura_js::ops::InterceptResolution::Continue { url, method, headers: None, body },
+    })
 }
 
 // CDP binary fields use standard base64. Validate before taking the resolver
@@ -1513,14 +1520,7 @@ fn handle_fetch_resolution(
         // be corrected without stranding the in-flight fetch.
         let parsed_resolution = if intercepted_paused.contains_key(&key) {
             let result = match method {
-                "Fetch.continueRequest" => parse_continue_post_data(&req.params).map(|body| {
-                    obscura_js::ops::InterceptResolution::Continue {
-                        url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        headers: parse_cdp_headers(&req.params),
-                        body,
-                    }
-                }),
+                "Fetch.continueRequest" => parse_continue_resolution(&req.params),
                 "Fetch.fulfillRequest" => parse_fulfill_resolution(&req.params),
                 _ => Ok(obscura_js::ops::InterceptResolution::Fail {
                     reason: req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string(),
@@ -1943,7 +1943,7 @@ async fn handle_connection_ws(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         browser_close_response, handle_fetch_resolution, is_navigate_method, merge_cookie_delta,
         parse_cdp_headers, websocket_authority,
@@ -2188,16 +2188,69 @@ mod tests {
                 {"name": "X-B", "value": "2"},
             ]
         });
-        let headers = parse_cdp_headers(&params).expect("headers present");
-        assert_eq!(headers.get("X-A").map(String::as_str), Some("1"));
-        assert_eq!(headers.get("X-B").map(String::as_str), Some("2"));
+        let headers = parse_cdp_headers(&params).unwrap().expect("headers present");
+        assert_eq!(headers, vec![("X-A".into(), "1".into()), ("X-B".into(), "2".into())]);
     }
 
     // No `headers` field means "leave the request's headers untouched", which is
     // None, not an empty map that would clear them.
     #[test]
     fn parse_cdp_headers_absent_is_none() {
-        assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
+        assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).unwrap().is_none());
+    }
+
+    pub(crate) fn continue_header_fields() -> serde_json::Value {
+        json!([
+            {"name":"X-Test","value":"first"},
+            {"name":"Authorization","value":"Bearer complete-secret+/="},
+            {"name":"x-test","value":"second"},
+            {"name":"X-Test","value":""},
+            {"name":"Cookie","value":"explicit=complete-secret+/="},
+            {"name":"X-Empty","value":""},
+            {"name":"cOoKiE","value":"second=keep; third=all"},
+            {"name":"X-Unicode","value":"完整值"},
+            {"name":"X-Complete","value":format!(" \t{} complete-secret+/=\t ", "full".repeat(2048))},
+            {"name":"Accept-Language","value":"fr"},
+            {"name":"accept-language","value":"de"}
+        ])
+    }
+
+    pub(crate) fn malformed_continue_headers() -> Vec<serde_json::Value> {
+        vec![json!(null), json!({}), json!(42), json!("headers"), json!([null]), json!([1]),
+            json!([{}]), json!([{"name":"X"}]), json!([{"value":"v"}]),
+            json!([{"name":1,"value":"v"}]), json!([{"name":"X","value":null}]),
+            json!([{"name":"X","value":1}]), json!([{"name":"","value":"v"}]),
+            json!([{"name":"Bad Name","value":"v"}]), json!([{"name":"é","value":"v"}]),
+            json!([{"name":"X","value":"a\r\nb"}]), json!([{"name":"X","value":"a\0b"}]),
+            json!([{"name":"Good","value":"keep"},{"name":"Bad:","value":"v"}])]
+    }
+
+    #[test]
+    fn continue_headers_server_preserves_order_case_values_and_retry() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        for supplied in [continue_header_fields(), json!([])] {
+            let (resolver, mut resolved) = tokio::sync::oneshot::channel();
+            let mut paused = HashMap::from([((None, "continued".to_string()), resolver)]);
+            for invalid in malformed_continue_headers() {
+                let command = json!({"id":1,"method":"Fetch.continueRequest",
+                    "params":{"requestId":"continued","headers":invalid}}).to_string();
+                assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+                let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32602);
+                assert_eq!(paused.len(), 1);
+                assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            }
+            let command = json!({"id":2,"method":"Fetch.continueRequest",
+                "params":{"requestId":"continued","headers":supplied}}).to_string();
+            assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
+            let obscura_js::ops::InterceptResolution::ContinueWithHeaders { headers, .. } = resolved.try_recv().unwrap() else { panic!("expected ordered continue") };
+            let roundtrip: Vec<_> = headers.into_iter().map(|(name, value)| json!({"name":name,"value":value})).collect();
+            assert_eq!(json!(roundtrip), supplied);
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert!(reply.get("error").is_none());
+            assert!(paused.is_empty());
+        }
     }
 
     #[test]
@@ -2223,11 +2276,11 @@ mod tests {
             if let Some(value) = value { params["postData"] = value; }
             let command = json!({"id":2,"method":"Fetch.continueRequest","params":params}).to_string();
             assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
-            let obscura_js::ops::InterceptResolution::Continue { body, url, method, headers } = resolved.try_recv().unwrap() else { panic!("expected continue") };
+            let obscura_js::ops::InterceptResolution::ContinueWithHeaders { body, url, method, headers } = resolved.try_recv().unwrap() else { panic!("expected continue") };
             assert_eq!(body, expected);
             assert_eq!(url.as_deref(), Some("https://example.com/new"));
             assert_eq!(method.as_deref(), Some("PUT"));
-            assert_eq!(headers.unwrap()["Authorization"], "Bearer complete-secret");
+            assert_eq!(headers, vec![("Authorization".into(), "Bearer complete-secret".into())]);
             let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
             assert!(reply.get("error").is_none());
             assert!(paused.is_empty());
@@ -2235,7 +2288,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn continue_post_data_js_and_worker_send_exact_transport_bytes() {
+    async fn continue_post_data_and_headers_js_and_worker_send_exact_transport_bytes() {
         use base64::Engine as _;
         use std::io::{Read, Write};
         use std::sync::Arc;
@@ -2276,12 +2329,26 @@ mod tests {
                 let body = &request[header_end..header_end + length];
                 if path.ends_with("/binary") {
                     assert!(headers.starts_with("PUT "));
-                    assert!(headers.to_ascii_lowercase().contains("authorization: bearer complete-secret\r\n"));
+                    assert!(headers.contains("authorization: Bearer complete-secret+/=\r\n"));
+                    let values = |name: &str| headers.lines().filter_map(|line| line.split_once(':'))
+                        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.strip_prefix(' ').unwrap_or(value).to_string()).collect::<Vec<_>>();
+                    assert_eq!(values("x-test"), ["first", "second", ""]);
+                    assert_eq!(values("cookie"), ["session=complete-secret", "explicit=complete-secret+/=", "second=keep; third=all"]);
+                    assert_eq!(values("x-empty"), [""]);
+                    assert_eq!(values("x-unicode"), ["完整值"]);
+                    assert_eq!(values("x-complete"), [format!(" \t{} complete-secret+/=\t ", "full".repeat(2048))]);
+                    assert!(values("x-original").is_empty());
+                    assert_eq!(values("accept-language"), ["fr", "de"]);
+                    assert_eq!(values("x-page"), ["retained"]);
                     assert_eq!(body, expected_binary);
                 } else if path.ends_with("/empty") {
                     assert!(headers.starts_with("POST ")); assert!(body.is_empty());
+                    assert!(!headers.to_ascii_lowercase().contains("x-original:"));
+                    assert!(headers.to_ascii_lowercase().contains("x-test: page-default\r\n"));
                 } else if path.ends_with("/original") {
                     assert!(headers.starts_with("POST ")); assert_eq!(body, [0, 254, 255, 65]);
+                    assert!(headers.to_ascii_lowercase().contains("x-original: keep\r\n"));
                 } else { assert_eq!(path, "http://continue.test/"); assert!(body.is_empty()); }
                 if seen.len() > 0 { assert!(headers.to_ascii_lowercase().contains("cookie: session=complete-secret\r\n")); }
                 seen.push(path.to_string());
@@ -2296,6 +2363,9 @@ mod tests {
         page_ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_proxy("continue-body".into(), Some(proxy)));
         let page_id = page_ctx.create_page();
         let page = page_ctx.get_page_mut(&page_id).unwrap();
+        page.stealth_client.set_extra_headers(HashMap::from([
+            ("x-test".into(), "page-default".into()), ("X-Page".into(), "retained".into()),
+        ])).await;
         page.navigate("http://continue.test/").await.unwrap();
         let mut requests = page.enable_interception();
         let mut resolver_ctx = crate::dispatch::CdpContext::new();
@@ -2307,11 +2377,18 @@ mod tests {
                 if request.url.ends_with("/rewrite") {
                     params["url"] = json!("http://continue.test/binary");
                     params["method"] = json!("PUT");
-                    params["headers"] = json!([{"name":"Authorization","value":"Bearer complete-secret"}]);
+                    params["headers"] = continue_header_fields();
                     params["postData"] = json!(base64::engine::general_purpose::STANDARD.encode(&binary));
-                } else if request.url.ends_with("/empty") { params["postData"] = json!(""); }
+                } else if request.url.ends_with("/empty") { params["postData"] = json!(""); params["headers"] = json!([]); }
                 let mut paused = HashMap::from([((None, request.request_id.clone()), request.resolver)]);
-                // Retrying invalid data must neither send nor lose the actual JS/Worker request.
+                // Invalid fields must neither send nor lose the actual Page/Worker request.
+                for invalid in malformed_continue_headers() {
+                    let command = json!({"id":1,"method":"Fetch.continueRequest","params":{
+                        "requestId":request.request_id,"headers":invalid}}).to_string();
+                    assert!(handle_fetch_resolution(&command, &mut resolver_ctx, &reply_tx, &mut paused));
+                    let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+                    assert_eq!(reply["error"]["code"], -32602); assert_eq!(paused.len(), 1);
+                }
                 for _ in 0..2 {
                     let command = json!({"id":1,"method":"Fetch.continueRequest","params":{
                         "requestId":request.request_id,"postData":"%"}}).to_string();
@@ -2330,7 +2407,7 @@ mod tests {
                 const results = [];
                 for (const path of ['rewrite', 'empty', 'original']) {
                     results.push(await (await fetch('http://continue.test/' + path,
-                        {method:'POST', credentials:'include', body:new Uint8Array([0,254,255,65])})).text());
+                        {method:'POST', credentials:'include', headers:{'X-Original':'keep'}, body:new Uint8Array([0,254,255,65])})).text());
                 }
                 return results;
             }

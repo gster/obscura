@@ -40,7 +40,7 @@ pub enum FetchResolution {
     Continue {
         url: Option<String>,
         method: Option<String>,
-        headers: Option<HashMap<String, String>>,
+        headers: Option<Vec<(String, String)>>,
         post_data: Option<Vec<u8>>,
     },
     Fulfill {
@@ -183,6 +183,7 @@ pub async fn handle(
                 .ok_or("requestId required")?;
 
             let post_data = crate::server::parse_continue_post_data(params)?;
+            let headers = crate::server::parse_cdp_headers(params)?;
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
                     url: params
@@ -195,7 +196,7 @@ pub async fn handle(
                         .map(|s| s.to_string()),
                     // Honor client header overrides (route.continue({ headers }))
                     // — parity with server.rs handle_fetch_resolution (#919).
-                    headers: crate::server::parse_cdp_headers(params),
+                    headers,
                     post_data,
                 });
             }
@@ -724,11 +725,33 @@ mod tests {
 
         match rx.await.expect("resolver should fire") {
             FetchResolution::Continue { headers, .. } => {
-                let mut expected = HashMap::new();
-                expected.insert("X-Test".to_string(), "42".to_string());
+                let expected = vec![("X-Test".to_string(), "42".to_string())];
                 assert_eq!(headers, Some(expected), "continue must forward header overrides");
             }
             _ => panic!("expected FetchResolution::Continue"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn continue_headers_domain_preserves_order_case_values_and_retry() {
+        let mut ctx = CdpContext::new();
+        for supplied in [crate::server::tests::continue_header_fields(), json!([])] {
+            let mut rx = pause(&mut ctx, "continued");
+            for invalid in crate::server::tests::malformed_continue_headers() {
+                let request = serde_json::from_value(json!({"id":1,"method":"Fetch.continueRequest",
+                    "params":{"requestId":"continued","headers":invalid}})).unwrap();
+                let response = crate::dispatch::dispatch(&request, &mut ctx).await;
+                assert_eq!(response.error.unwrap().code, -32602);
+                assert!(ctx.fetch_intercept.paused.contains_key("continued"));
+                assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            }
+            let request = serde_json::from_value(json!({"id":2,"method":"Fetch.continueRequest",
+                "params":{"requestId":"continued","headers":supplied}})).unwrap();
+            assert!(crate::dispatch::dispatch(&request, &mut ctx).await.error.is_none());
+            let FetchResolution::Continue { headers, .. } = rx.try_recv().unwrap() else { panic!("expected continue") };
+            let roundtrip: Vec<_> = headers.unwrap().into_iter().map(|(name, value)| json!({"name":name,"value":value})).collect();
+            assert_eq!(json!(roundtrip), supplied);
+            assert!(ctx.fetch_intercept.paused.is_empty());
         }
     }
 
@@ -755,7 +778,7 @@ mod tests {
             assert_eq!(post_data, expected);
             assert_eq!(url.as_deref(), Some("https://example.com/new"));
             assert_eq!(method.as_deref(), Some("PUT"));
-            assert_eq!(headers.unwrap()["Authorization"], "Bearer complete-secret");
+            assert_eq!(headers.unwrap(), vec![("Authorization".into(), "Bearer complete-secret".into())]);
             assert!(ctx.fetch_intercept.paused.is_empty());
         }
     }

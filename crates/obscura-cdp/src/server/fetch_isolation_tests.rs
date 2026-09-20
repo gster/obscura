@@ -150,14 +150,14 @@ async fn active_multi_page_fetch_pauses_keep_session_ownership_and_body_aliases(
                 }
             }
             for _ in 0..2 {
-                for (method, field) in [("Fetch.continueRequest", "postData"), ("Fetch.fulfillRequest", "body")] {
+                for (method, field) in [("Fetch.continueRequest", "postData"), ("Fetch.continueRequest", "headers"), ("Fetch.fulfillRequest", "body")] {
                     let mut params = json!({"requestId":id}); params[field] = json!("%");
                     let response = client.command(Some(&left), method, params).await;
                     assert_eq!(response["error"]["code"], -32602);
                 }
             }
             if round == 1 {
-                client.ok(Some(&left), "Fetch.continueRequest", json!({"requestId":id})).await;
+                client.ok(Some(&left), "Fetch.continueRequest", json!({"requestId":id,"headers":super::tests::continue_header_fields()})).await;
                 assert_eq!(client.result(&left).await, "/left-1");
                 // Resolving left must leave the right resolver alive.
                 client.ok(Some(&right), "Fetch.continueRequest", json!({"requestId":id})).await;

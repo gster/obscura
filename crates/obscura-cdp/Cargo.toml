@@ -29,6 +29,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 futures-util = "0.3"
 obscura-net = { workspace = true }
+http = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 png = { version = "0.18", optional = true }
 
