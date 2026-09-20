@@ -255,7 +255,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 ### OB-006 · P0 · 清理自有 Python SDK 与配套私有 runtime
 
-状态：未关闭。
+状态：已完成（2026-09-20，删除提交 `be486cc4fc392f4bdcf536683ddd9ee7de795bf3` 已推送远端 main 并快进本地 main，SHA 与 clean 状态均核对）。
 
 2026-09-20 前置修复（Owner: Codex，基线 `9eccdc7`）：工具子进程 stdout/stderr 原始字节保留（`cf258a2`）和历史 source lock 摘要校验（`9eccdc7`）已完成，该批实际删除 SDK/runtime 文件 **0 个**。
 
@@ -265,10 +265,10 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 取消语义核验（2026-09-20）：官方 Playwright Python 的 `asyncio.Task.cancel()` 仅停止本地等待。实测取消缺失 locator 后插入同 selector，服务器副作用计数从 0 变为 1；不能将 `CancelledError` 当作远端动作撤销。此负面证据与 `client-scope.json` 的 indeterminate-write 边界一致，旧 SDK 取消时杀自有进程的策略不迁回私有包装。迁移门禁分别验证本地取消后不自动重放、官方 action timeout 和显式 page close 的停止边界、已执行 click 后 response timeout 仍恰一次；不以弱化计数断言掩盖差异。
 
-实际删除批次（Owner: Codex，实施基线 `ca40d0b`）：官方客户端三项迁移门禁通过，生命周期计数为 task-cancel=1、official-timeout=0、page-close=0、sibling-control=1、post-dispatch=1；显式 2000ms watchdog 后原 page 恢复，五项 dynamic-script CORS 符合矩阵。移除 `runtime/`、`bindings/python/`、`examples/zg/` 共 27 个旧路径，完整清单见 SUMMARY。旧构建脚本中唯一的字体成员/声明/bytes/SHA-256 门禁迁入 `obscura-render/build.rs`，一项正常和五项篡改实测符合预期；不保留私有进程协议。冻结 baseline 未改，历史 runtime toolchain 与两份 lock 从 source Git blob 校验。最终构建与全量门禁确认前保持未关闭。
+实际删除批次（Owner: Codex，实施基线 `ca40d0b`）：官方客户端三项迁移门禁通过，生命周期计数为 task-cancel=1、official-timeout=0、page-close=0、sibling-control=1、post-dispatch=1；显式 2000ms watchdog 后原 page 恢复，五项 dynamic-script CORS 符合矩阵。移除 `runtime/`、`bindings/python/`、`examples/zg/` 共 27 个旧路径，完整清单见 SUMMARY。旧构建脚本中唯一的字体成员/声明/bytes/SHA-256 门禁迁入 `obscura-render/build.rs`，一项正常和五项篡改实测符合预期；不保留私有进程协议。冻结 baseline 未改，历史 runtime toolchain 与两份 lock 从 source Git blob 校验。最终门禁：根 render nextest **2127/2127**（2 测试并发，4 skipped），no-render 网络/CLI **227/227**，两种 exact CLI release build、障碍课 **33/33**、官方 smoke/三项迁移门禁/合并 **37-method** 校验、Python **45/45**、字体 **6 项正负校验** 均通过。独立 Spec/Standards 审核无未解决阻断项；默认并发两轮既有失败和错误启动记录完整保留在 SUMMARY，不宣称其根因已修复。
 
 依赖：OB-021、OB-005、OB-025；按调用点完成 OB-027/028/029 的替代 smoke。现行入口：根 browser 回归、`tools/unblocked/migration_smoke.py`、render 字体构建门禁；私有 NDJSON/RPC 与专属 examples 仅保留 Git 历史。
-动作：完成删除批次的最终审核与验证；共享 native input 的 CDP 接线及完整 world/句柄资格仍由 OB-021/027/028/029 验收，不将它们混同于私有包装删除。
+收口：删除批次已审核、验证并同步 main；共享 native input 的 CDP 接线及完整 world/句柄资格仍由 OB-021/027/028/029 验收，不将它们混同于私有包装删除。
 完成：官方 Playwright Python/CDP 接替需要保留的调用，产品与发布不再依赖自有 SDK/IPC；根测试承接有用回归后移除独立 workspace/锁文件/专属 CI。保留 V8/JS runtime、Web Worker、MCP 和有用 CLI；不以私有 runtime 旧测试总数阻止删除。
 
 ### OB-007 · P0 · 删除非目标平台产品配置

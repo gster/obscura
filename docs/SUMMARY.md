@@ -1,5 +1,7 @@
 # 项目现状与文档核验摘要
 
+OB-006 已于 2026-09-20 完成：删除提交 `be486cc4fc392f4bdcf536683ddd9ee7de795bf3` 已推送远端 main，并快进本地 main；远端实查 SHA 一致，两处工作区 clean 后更新任务状态。独立 Spec/Standards 审核无未解决阻断项。当前 `ob-027-cdp-profile/obscura` worktree 保留，本批未新增临时 worktree；未清理其他任务的 worktree。
+
 OB-006 私有 SDK/runtime 删除（2026-09-20，实施基线 `ca40d0b`，macOS arm64）：删除配套 NDJSON workspace、自有 Python SDK 和专属 `examples/zg`，共移除 27 个旧路径、8350 行旧文件内容。根九个 crate 及 V8/JS runtime、Web Worker、MCP、CLI 和不可变 Persona 运行逻辑保留。旧 `runtime/build.rs` 的字体成员、嵌入声明、字节数与 SHA-256 构建门禁迁入 `obscura-render/build.rs`，对应 build dependencies 沿用既有版本，根锁文件仅记录新增依赖边。字体和渲染运行逻辑没有改动。此前迁出的 183 个共享 Rust 回归保留；原 runtime 剩余两个仅服务私有包装的测试随包装删除。实际移除文件如下，较早切片中的原路径和测试数字继续作为历史证据保留。
 
 - `runtime/`：`.gitignore`、`Cargo.lock`、`Cargo.toml`、`README.md`、`build.rs`、`rust-toolchain.toml`、`src/automation.rs`、`src/browser.rs`、`src/main.rs`、`src/manual.rs`、`src/network.rs`、`src/protocol.rs`、`src/takeover.rs`。
