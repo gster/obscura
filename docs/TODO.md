@@ -257,6 +257,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 状态：未关闭。
 
+2026-09-20 进度（Owner: Codex，基线 `9eccdc7`）：本轮实际删除 SDK/runtime 文件 **0 个**。已完成工具子进程 stdout/stderr 原始字节保留（`cf258a2`）和历史 source lock 摘要校验（`9eccdc7`），两者是迁移前置修复，不代表 SDK removal 完成。后续先把 13 个 Page-only 原生输入/几何回归迁入根共享 tests，验证覆盖等价后删除旧测试副本，再继续实际移除 `bindings/python/` 与私有 `runtime/`。保持强制且不可变的 Persona 契约，不恢复默认身份或独立配置入口。
+
 依赖：OB-021、OB-005、OB-025；按调用点完成 OB-027/028/029 的替代 smoke。入口：runtime/、bindings/python/、私有 NDJSON/RPC、专属 examples/scripts/CI/发行配置。
 动作：下一步清理主项；清点消费者，迁出独有输入、等待、persona、启动保护与回归，再删除配套进程/协议/SDK 和无消费者依赖。
 完成：官方 Playwright Python/CDP 接替需要保留的调用，产品与发布不再依赖自有 SDK/IPC；根测试承接有用回归后移除独立 workspace/锁文件/专属 CI。保留 V8/JS runtime、Web Worker、MCP 和有用 CLI；不以私有 runtime 旧测试总数阻止删除。
