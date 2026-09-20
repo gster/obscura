@@ -7848,8 +7848,12 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
 const _workerFetchInits = new WeakSet();
 const _markWorkerFetchInit = _workerFetchInits.add.bind(_workerFetchInits);
 const _consumeWorkerFetchInit = _workerFetchInits.delete.bind(_workerFetchInits);
+const _xhrFetchInits = new WeakSet();
+const _markXhrFetchInit = _xhrFetchInits.add.bind(_xhrFetchInits);
+const _consumeXhrFetchInit = _xhrFetchInits.delete.bind(_xhrFetchInits);
 globalThis.fetch = async (input, init = {}) => {
   const destination = _consumeWorkerFetchInit(init) ? "worker" : undefined;
+  const resourceType = _consumeXhrFetchInit(init) ? "XHR" : undefined;
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -7911,7 +7915,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (alreadyAborted) abort();
   let raw;
   try {
-    raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, JSON.stringify({destination, requestId}));
+    raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, JSON.stringify({destination, requestId, resourceType}));
   } catch (error) {
     if (signal && signal.aborted) throw signal.reason;
     throw error;
@@ -8090,14 +8094,16 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     const timeoutId = this._timeoutId = this.timeout > 0 ? setTimeout(() => {
       controller.abort(new DOMException('XMLHttpRequest timed out', 'TimeoutError'));
     }, this.timeout) : null;
-    fetch(url, {
+    const requestInit = {
       signal: controller.signal,
       method: this._method,
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
-    }).then(async (resp) => {
+    };
+    _markXhrFetchInit(requestInit);
+    fetch(url, requestInit).then(async (resp) => {
       if (xhr._aborted || xhr._requestGeneration !== generation) return;
 
       xhr.status = resp.status;

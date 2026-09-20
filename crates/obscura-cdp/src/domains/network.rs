@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use obscura_net::CookieJar;
@@ -157,36 +158,63 @@ pub(super) fn get_response_body(
     session_id: &Option<String>,
     request_id: &str,
 ) -> Result<Value, String> {
-    let body = response_body_page(ctx, session_id, request_id)?
-        .get_response_body_result(request_id)
-        .ok_or_else(|| format!("No response body found for requestId {request_id}"))??;
-    Ok(json!({ "body": body.body, "base64Encoded": body.base64_encoded }))
+    let (_, store) = response_body_owner(ctx, session_id, request_id)?;
+    let body = store.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
+        .ok_or_else(|| format!("No response body found for requestId {request_id}"))?
+        .map_err(|error| error.to_string())?;
+    let (body, binary) = body;
+    let encoded = body.with_bytes(|bytes| {
+        if !binary {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return (text.to_owned(), false);
+            }
+        }
+        (base64::engine::general_purpose::STANDARD.encode(bytes), true)
+    }).map_err(|error| error.to_string())?;
+    Ok(json!({ "body": encoded.0, "base64Encoded": encoded.1 }))
 }
 
-/// A session never falls through to another Page, even if IDs overlap or its
-/// capture failed. Sessionless reads require a unique owner, including consumed/error captures.
-pub(super) fn response_body_page<'a>(
-    ctx: &'a CdpContext,
+/// A session never falls through to another Page, even while that Page is
+/// moved into the navigation task. Sessionless reads require a unique owner.
+pub(crate) fn response_body_owner(
+    ctx: &CdpContext,
     session_id: &Option<String>,
     request_id: &str,
-) -> Result<&'a obscura_browser::Page, String> {
+) -> Result<(String, Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>), String> {
     let missing = || format!("No response body found for requestId {request_id}");
     if let Some(session) = session_id {
-        let page = ctx.get_session_page(session_id)
+        let page_id = ctx.sessions.get(session)
+            .ok_or_else(|| format!("No page found for sessionId {session}"))?.clone();
+        let store = ctx.get_page(&page_id).map(|page| page.response_body_store())
+            .or_else(|| ctx.navigating_response_bodies.as_ref()
+                .filter(|(navigating_id, _)| navigating_id == &page_id).map(|(_, store)| store.clone()))
             .ok_or_else(|| format!("No page found for sessionId {session}"))?;
-        page.response_body_size(request_id).ok_or_else(missing)??;
-        return Ok(page);
+        store.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
+            .ok_or_else(missing)?
+            .map_err(|error| error.to_string())?;
+        return Ok((page_id, store));
     }
-    let mut candidates = ctx.pages.iter().filter(|page| page.has_response_body(request_id));
-    let page = candidates.next().ok_or_else(|| {
-        ctx.pages.iter().find_map(|page| page.response_body_size(request_id).and_then(Result::err))
-            .unwrap_or_else(missing)
-    })?;
-    if candidates.next().is_some() {
+    let mut owners: Vec<_> = ctx.pages.iter().filter(|page| page.has_response_body(request_id))
+        .map(|page| (page.id.clone(), page.response_body_store())).collect();
+    if let Some((page_id, store)) = &ctx.navigating_response_bodies {
+        if store.lock().unwrap_or_else(|e| e.into_inner()).contains(request_id) {
+            owners.push((page_id.clone(), store.clone()));
+        }
+    }
+    if owners.len() > 1 {
         return Err(format!("Ambiguous requestId {request_id}; supply sessionId"));
     }
-    page.response_body_size(request_id).unwrap()?;
-    Ok(page)
+    if let Some((page_id, store)) = owners.pop() {
+        store.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
+            .ok_or_else(missing)?
+            .map_err(|error| error.to_string())?;
+        return Ok((page_id, store));
+    }
+    let error = ctx.pages.iter().find_map(|page| page.response_body_size(request_id).and_then(Result::err))
+        .or_else(|| ctx.navigating_response_bodies.as_ref().and_then(|(_, store)| {
+            store.lock().unwrap_or_else(|e| e.into_inner()).get(request_id).and_then(Result::err).map(|e| e.to_string())
+        }));
+    Err(error.unwrap_or_else(missing))
 }
 
 #[cfg(test)]
@@ -520,7 +548,7 @@ mod tests {
             let error = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &exhausted_session).await.unwrap_err();
             assert!(error.contains("response_body_budget_exhausted"));
             let result = super::super::fetch::handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &None).await.unwrap();
-            let result = super::super::io::handle("read", &json!({"handle": result["stream"]}), &mut ctx).await.unwrap();
+            let result = super::super::io::handle("read", &json!({"handle": result["stream"]}), &mut ctx, &None).await.unwrap();
             assert_eq!(base64::engine::general_purpose::STANDARD.decode(result["data"].as_str().unwrap()).unwrap(), b"retained");
         }
         let error = handle("getResponseBody", &json!({"requestId": "missing"}), &mut ctx, &None).await.unwrap_err();

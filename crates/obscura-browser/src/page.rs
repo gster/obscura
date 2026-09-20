@@ -186,6 +186,7 @@ pub struct NetworkEvent {
     pub method: String,
     pub resource_type: String,
     pub status: u16,
+    pub status_text: String,
     pub headers: std::collections::HashMap<String, String>,
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
     pub raw_headers: Option<obscura_net::HeaderCapture>,
@@ -305,6 +306,8 @@ pub struct Page {
     pub network_teardown_notify: Arc<tokio::sync::Notify>,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
+    pub intercept_request_patterns: Vec<obscura_js::ops::FetchRequestPattern>,
+    pub intercept_response_patterns: Vec<obscura_js::ops::FetchRequestPattern>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
@@ -1159,6 +1162,8 @@ impl Page {
             network_teardown_notify: Arc::new(tokio::sync::Notify::new()),
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
+            intercept_request_patterns: Vec::new(),
+            intercept_response_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
@@ -1846,6 +1851,8 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_intercept_request_patterns(self.intercept_request_patterns.clone());
+        rt.set_intercept_response_patterns(self.intercept_response_patterns.clone());
         #[cfg(feature = "render")]
         rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
@@ -4250,6 +4257,7 @@ impl Page {
                 method: ev.method,
                 resource_type: if ev.initiator_request_id.is_some() { "Preflight".into() } else { format!("{:?}", ev.resource_type) },
                 status: ev.status,
+                status_text: ev.status_text,
                 headers: ev.request_raw_headers.as_ref().map(|h| h.text_headers()).unwrap_or_default(),
                 response_headers: Arc::new(ev.response_headers),
                 raw_headers: ev.raw_headers,
@@ -4560,6 +4568,7 @@ impl Page {
             method: method.to_string(),
             resource_type: resource_type.to_string(),
             status,
+            status_text: String::new(),
             headers: request_raw_headers.map(|h| h.text_headers()).unwrap_or_default(),
             raw_headers: raw_headers.cloned(),
             request_raw_headers: request_raw_headers.cloned(),
@@ -4600,6 +4609,20 @@ impl Page {
         })
     }
 
+    pub fn get_fetch_response_body_result(&self, request_id: &str) -> Option<Result<StoredResponseBody, String>> {
+        let stored = self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).get_for_fetch(request_id);
+        stored.map(|stored| {
+            stored.and_then(|(body, binary)| body.with_bytes(|bytes| {
+                if !binary {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        return StoredResponseBody { body: text.to_owned(), base64_encoded: false };
+                    }
+                }
+                StoredResponseBody { body: BASE64.encode(bytes), base64_encoded: true }
+            })).map_err(|error| error.to_string())
+        })
+    }
+
     /// Whether this Page owns a retained or consumed capture/alias.
     pub fn has_response_body(&self, request_id: &str) -> bool {
         self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).contains(request_id)
@@ -4619,6 +4642,10 @@ impl Page {
     /// CDP transfers the backing storage instead of materializing its contents.
     pub fn take_response_body_result(&mut self, request_id: &str) -> Option<Result<obscura_net::response_body::ResponseBody, String>> {
         self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).take(request_id).map(|body| body.map_err(|error| error.to_string()))
+    }
+
+    pub fn response_body_store(&self) -> Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>> {
+        self.response_bodies.clone()
     }
 
     /// Navigation's loaderId and internal request ID share storage and take state.
@@ -4844,10 +4871,18 @@ impl Page {
         self.intercept_enabled = enabled;
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
+            js.set_intercept_request_patterns(self.intercept_request_patterns.clone());
             // `Fetch.enable` assigns the patterns right before this call;
             // the renderer's loads follow the same interception policy.
             #[cfg(feature = "render")]
             js.set_intercept_block_patterns(self.intercept_block_patterns.clone());
+        }
+    }
+
+    pub fn set_intercept_response_patterns(&mut self, patterns: Vec<obscura_js::ops::FetchRequestPattern>) {
+        self.intercept_response_patterns = patterns.clone();
+        if let Some(js) = &self.js {
+            js.set_intercept_response_patterns(patterns);
         }
     }
 }

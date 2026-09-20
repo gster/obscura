@@ -1440,6 +1440,7 @@ impl ObscuraJsRuntime {
         frame.device_identity = parent.device_identity.clone();
         frame.blocked_urls = parent.blocked_urls.clone();
         frame.intercept_enabled = parent.intercept_enabled;
+        frame.intercept_response_patterns = parent.intercept_response_patterns.clone();
         frame.page_in_flight = parent.page_in_flight.clone();
         frame.stealth_client = parent.stealth_client.clone();
         // A frame realm shares the page transport, so its renderer cache must
@@ -2150,6 +2151,20 @@ impl ObscuraJsRuntime {
     pub fn set_intercept_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.intercept_enabled = enabled;
+        drop(state);
+        crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
+    }
+
+    pub fn set_intercept_request_patterns(&self, patterns: Vec<crate::ops::FetchRequestPattern>) {
+        let mut state = self.state.borrow_mut();
+        state.intercept_request_patterns = patterns;
+        drop(state);
+        crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
+    }
+
+    pub fn set_intercept_response_patterns(&self, patterns: Vec<crate::ops::FetchRequestPattern>) {
+        let mut state = self.state.borrow_mut();
+        state.intercept_response_patterns = patterns;
         drop(state);
         crate::worker::sync_policy(&self.js_runtime.op_state().borrow());
     }
@@ -6865,6 +6880,7 @@ mod tests {
                 headers: HashMap::from([("Set-Cookie".into(), "secret=complete".into())]),
                 body: String::from_utf8_lossy(&bytes).into_owned(),
                 body_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                body_supplied: true,
             }).unwrap();
             id
         };
@@ -7024,7 +7040,7 @@ mod tests {
         assert!(old.resolver.is_closed());
         assert!(!new.resolver.is_closed(), "old timeout must not abort the reopened request");
         assert_eq!(rt.evaluate("[xhr.readyState,xhr.status,xhrEvents]").unwrap(), serde_json::json!([1,0,[]]));
-        new.resolver.send(crate::ops::InterceptResolution::Fulfill {status:200,headers:HashMap::new(),body:"new-body".into(),body_base64:String::new()}).unwrap();
+        new.resolver.send(crate::ops::InterceptResolution::Fulfill {status:200,headers:HashMap::new(),body:"new-body".into(),body_base64:String::new(),body_supplied:true}).unwrap();
         rt.run_event_loop_bounded(1000).await.unwrap();
         assert_eq!(rt.evaluate("[xhr.status,xhr.responseText,xhrEvents]").unwrap(), serde_json::json!([200,"new-body",["load","loadend"]]));
         assert_eq!(rt.active_network_requests(),0);
@@ -8419,7 +8435,7 @@ return {before,removed,reinsert,moved,cleared};
             while let Some(request) = rx.recv().await {
                 intercepted.push(request.url.clone());
                 request.resolver.send(crate::ops::InterceptResolution::Fulfill {
-                    status:200, headers:HashMap::new(), body:"policy-applied".into(), body_base64:String::new(),
+                    status:200, headers:HashMap::new(), body:"policy-applied".into(), body_base64:String::new(), body_supplied:true,
                 }).unwrap();
             }
         };

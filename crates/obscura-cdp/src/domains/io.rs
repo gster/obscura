@@ -30,11 +30,34 @@ fn io_stream_max_bytes() -> usize {
 /// streams fail explicitly when the context entry/byte budget is exhausted.
 /// File-backed bodies stay on disk and are released on close/context drop.
 pub struct IoStreamStore {
-    streams: HashMap<String, (ResponseBody, usize)>,
+    streams: HashMap<String, IoStream>,
     total_bytes: usize,
     counter: u64,
     max_entries: usize,
     max_bytes: usize,
+}
+
+struct IoStream {
+    body: ResponseBody,
+    cursor: usize,
+    owner: Option<IoStreamOwner>,
+    sequential_only: bool,
+}
+
+#[derive(Clone)]
+struct IoStreamOwner {
+    session_id: Option<String>,
+    #[allow(dead_code)]
+    page_id: String,
+}
+
+impl IoStream {
+    fn belongs_to_session(&self, session_id: &Option<String>) -> bool {
+        match &self.owner {
+            Some(owner) => &owner.session_id == session_id,
+            None => session_id.is_none(),
+        }
+    }
 }
 
 /// Holds exclusive access until the body is taken from its Page. Dropping a
@@ -44,13 +67,17 @@ pub(crate) struct IoStreamReservation<'a> {
     handle: String,
     next_counter: u64,
     total_bytes: usize,
+    owner: Option<IoStreamOwner>,
+    sequential_only: bool,
 }
 
 impl IoStreamReservation<'_> {
     pub(crate) fn commit(self, body: ResponseBody) -> String {
         self.store.counter = self.next_counter;
         self.store.total_bytes = self.total_bytes;
-        self.store.streams.insert(self.handle.clone(), (body, 0));
+        self.store.streams.insert(self.handle.clone(), IoStream {
+            body, cursor: 0, owner: self.owner, sequential_only: self.sequential_only,
+        });
         self.handle
     }
 }
@@ -89,11 +116,41 @@ impl IoStreamStore {
     }
 
     pub(crate) fn reserve(&mut self, len: usize) -> Result<IoStreamReservation<'_>, String> {
+        self.reserve_with_owner(len, None, false)
+    }
+
+    pub(crate) fn reserve_fetch(
+        &mut self, len: usize, session_id: Option<String>, page_id: String,
+    ) -> Result<IoStreamReservation<'_>, String> {
+        self.reserve_with_owner(len, Some(IoStreamOwner { session_id, page_id }), true)
+    }
+
+    pub(crate) fn insert_pdf(
+        &mut self,
+        bytes: impl Into<ResponseBody>,
+        session_id: Option<String>,
+        page_id: String,
+    ) -> Result<String, String> {
+        let bytes = bytes.into();
+        Ok(self
+            .reserve_with_owner(
+                bytes.len(),
+                Some(IoStreamOwner { session_id, page_id }),
+                false,
+            )?
+            .commit(bytes))
+    }
+
+    fn reserve_with_owner(
+        &mut self, len: usize, owner: Option<IoStreamOwner>, sequential_only: bool,
+    ) -> Result<IoStreamReservation<'_>, String> {
         self.ensure_capacity(len)?;
         Ok(IoStreamReservation {
             handle: format!("stream-{}", self.counter),
             next_counter: self.counter + 1,
             total_bytes: self.total_bytes + len,
+            owner,
+            sequential_only,
             store: self,
         })
     }
@@ -117,17 +174,26 @@ impl IoStreamStore {
         offset: Option<usize>,
         size: usize,
     ) -> Option<(String, bool)> {
-        self.read_result(handle, offset, size)?.ok()
+        self.read_result(handle, &None, offset, size)?.ok()
     }
 
     /// CDP retains I/O failures so a failed spool read is not an unknown handle.
     pub fn read_result(
         &mut self,
         handle: &str,
+        session_id: &Option<String>,
         offset: Option<usize>,
         size: usize,
     ) -> Option<Result<(String, bool), String>> {
-        let (bytes, cursor) = self.streams.get_mut(handle)?;
+        let stream = self.streams.get_mut(handle)?;
+        if !stream.belongs_to_session(session_id) {
+            return Some(Err("IO stream handle does not belong to this session".into()));
+        }
+        if stream.sequential_only && offset.is_some() {
+            return Some(Err("Fetch response streams do not support IO.read offset".into()));
+        }
+        let bytes = &stream.body;
+        let cursor = &mut stream.cursor;
         if let Some(offset) = offset {
             *cursor = offset.min(bytes.len());
         }
@@ -144,16 +210,27 @@ impl IoStreamStore {
 
     /// Free a stream's buffer (IO.close). A no-op for an unknown handle.
     pub fn remove(&mut self, handle: &str) {
-        if let Some((b, _)) = self.streams.remove(handle) {
-            self.total_bytes -= b.len();
+        let _ = self.remove_owned(handle, &None);
+    }
+
+    pub fn remove_owned(&mut self, handle: &str, session_id: &Option<String>) -> Result<(), String> {
+        let stream = self.streams.get(handle).ok_or_else(|| format!("IO.close: unknown handle {handle}"))?;
+        if !stream.belongs_to_session(session_id) {
+            return Err("IO stream handle does not belong to this session".into());
         }
+        if let Some(stream) = self.streams.remove(handle) {
+            self.total_bytes -= stream.body.len();
+        }
+        Ok(())
     }
 }
 
 /// CDP IO domain. Streams a response body handed out by
 /// Fetch.takeResponseBodyAsStream: IO.read returns the next base64 chunk and
 /// IO.close frees the buffer. Nothing here runs unless a client opened a stream.
-pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Result<Value, String> {
+pub async fn handle(
+    method: &str, params: &Value, ctx: &mut CdpContext, session_id: &Option<String>,
+) -> Result<Value, String> {
     match method {
         "read" => {
             let handle = params
@@ -184,7 +261,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
 
             let (data, eof) = ctx
                 .io_streams
-                .read_result(handle, offset, size)
+                .read_result(handle, session_id, offset, size)
                 .ok_or_else(|| format!("IO.read: unknown handle {handle}"))??;
 
             Ok(json!({ "data": data, "eof": eof, "base64Encoded": true }))
@@ -194,7 +271,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                 .get("handle")
                 .and_then(|v| v.as_str())
                 .ok_or("IO.close requires handle")?;
-            ctx.io_streams.remove(handle);
+            ctx.io_streams.remove_owned(handle, session_id)?;
             Ok(json!({}))
         }
         _ => Err(format!("Unknown IO method: {}", method)),
@@ -259,7 +336,7 @@ mod tests {
             json!({"handle": handle_id.clone(), "size": -1}),
             json!({"handle": handle_id, "offset": 1.5}),
         ] {
-            assert!(handle("read", &params, &mut ctx).await.is_err(), "{params}");
+            assert!(handle("read", &params, &mut ctx, &None).await.is_err(), "{params}");
         }
     }
 
@@ -287,11 +364,54 @@ mod tests {
     fn requested_read_size_is_capped() {
         let mut store = IoStreamStore::with_limits(2, MAX_READ_CHUNK * 2);
         let handle = store.insert(vec![7u8; MAX_READ_CHUNK + 17]).unwrap();
-        let (first, eof) = store.read_result(&handle, None, usize::MAX).unwrap().unwrap();
+        let (first, eof) = store.read_result(&handle, &None, None, usize::MAX).unwrap().unwrap();
         assert_eq!(decode(&first).len(), MAX_READ_CHUNK);
         assert!(!eof);
-        let (second, eof) = store.read_result(&handle, None, usize::MAX).unwrap().unwrap();
+        let (second, eof) = store.read_result(&handle, &None, None, usize::MAX).unwrap().unwrap();
         assert_eq!(decode(&second).len(), 17);
         assert!(eof);
+    }
+
+    #[test]
+    fn stream_ownership_and_offset_policy_are_preserved_by_kind() {
+        let mut store = IoStreamStore::with_limits(4, 1024);
+        let owner = Some("owner-session".to_string());
+        let other = Some("other-session".to_string());
+
+        let sessionless = store
+            .insert_pdf(
+                b"sessionless".to_vec(),
+                None,
+                "sessionless-page".to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.streams[&sessionless].owner.as_ref().unwrap().page_id,
+            "sessionless-page"
+        );
+        assert!(store.read_result(&sessionless, &None, None, 4).unwrap().is_ok());
+        assert!(store.read_result(&sessionless, &owner, None, 4).unwrap().is_err());
+        assert!(store.remove_owned(&sessionless, &owner).is_err());
+
+        let pdf = store
+            .insert_pdf(b"abcdef".to_vec(), owner.clone(), "pdf-page".to_string())
+            .unwrap();
+        assert_eq!(store.streams[&pdf].owner.as_ref().unwrap().page_id, "pdf-page");
+        assert!(store.read_result(&pdf, &None, None, 2).unwrap().is_err());
+        assert!(store.read_result(&pdf, &other, None, 2).unwrap().is_err());
+        let (chunk, _) = store.read_result(&pdf, &owner, Some(2), 2).unwrap().unwrap();
+        assert_eq!(decode(&chunk), b"cd");
+
+        let fetch = store
+            .reserve_fetch(6, owner.clone(), "fetch-page".to_string())
+            .unwrap()
+            .commit(b"abcdef".to_vec().into());
+        assert!(store.read_result(&fetch, &owner, Some(1), 2).unwrap().is_err());
+        let (chunk, _) = store.read_result(&fetch, &owner, None, 2).unwrap().unwrap();
+        assert_eq!(decode(&chunk), b"ab");
+
+        assert!(store.remove_owned(&pdf, &other).is_err());
+        assert!(store.remove_owned(&pdf, &owner).is_ok());
+        assert!(store.remove_owned(&sessionless, &None).is_ok());
     }
 }

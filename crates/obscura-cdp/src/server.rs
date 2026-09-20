@@ -888,7 +888,12 @@ fn websocket_authority(request_head: &str, port: u16) -> String {
 /// per-thread, so two connections' isolates can never collide. All processors
 /// own isolated `BrowserContext` (cookie jar and HTTP client). Cookie deltas are
 /// merged into the persistence template when the connection thread exits.
-type InterceptedPauses = HashMap<(Option<String>, String), tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>;
+struct InterceptedPause {
+    stage: obscura_js::ops::InterceptionStage,
+    redirect_response: bool,
+    resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+}
+type InterceptedPauses = HashMap<(Option<String>, String), InterceptedPause>;
 
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
@@ -931,7 +936,7 @@ async fn cdp_processor(
     let mut runtime_pump_error_streak = 0_u8;
 
     loop {
-        intercepted_paused.retain(|_, resolver| !resolver.is_closed());
+        intercepted_paused.retain(|_, pause| !pause.resolver.is_closed());
         cleanup_detached_fetch_owners(&mut ctx, &mut intercepted_paused);
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
@@ -1086,8 +1091,8 @@ async fn cdp_processor(
             let _ = routed.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
         }
     }
-    for (_, resolver) in intercepted_paused.drain() {
-        let _ = resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+    for (_, pause) in intercepted_paused.drain() {
+        let _ = pause.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
     }
 
     // The connection thread merges this context's cookie delta into the
@@ -1103,16 +1108,49 @@ fn cleanup_detached_fetch_owners(ctx: &mut CdpContext, paused: &mut InterceptedP
         ctx.fetch_intercept.owners.remove(&page_id);
         if let Some(page) = ctx.get_page_mut(&page_id) {
             page.intercept_block_patterns.clear();
+            page.intercept_request_patterns.clear();
+            page.set_intercept_response_patterns(Vec::new());
             page.enable_intercept(false);
         }
         let keys: Vec<_> = paused.keys().filter(|(sid, _)| sid == &session).cloned().collect();
         for key in keys {
-            if let Some(resolver) = paused.remove(&key) {
-                let _ = resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+            if let Some(pause) = paused.remove(&key) {
+                let _ = pause.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
             }
         }
     }
     ctx.fetch_intercept.enabled = !ctx.fetch_intercept.owners.is_empty();
+}
+
+fn abort_navigating_fetch_owner_for_lifecycle(
+    text: &str,
+    ctx: &mut CdpContext,
+    paused: &mut InterceptedPauses,
+) -> bool {
+    let Ok(request) = serde_json::from_str::<CdpRequest>(text) else { return false; };
+    let Some(page_id) = ctx.navigating_page_id.clone() else { return false; };
+    let affects_owner = match request.method.as_str() {
+        "Target.closeTarget" => request.params.as_object().is_some_and(|params|
+            params.len() == 1 && params.get("targetId").and_then(serde_json::Value::as_str) == Some(page_id.as_str())),
+        "Target.detachFromTarget" => {
+            let session = request.params.get("sessionId").and_then(serde_json::Value::as_str);
+            ctx.fetch_intercept.owners.get(&page_id).and_then(Option::as_deref) == session
+                && session.is_some()
+        }
+        _ => false,
+    };
+    if !affects_owner { return false; }
+    let Some(owner) = ctx.fetch_intercept.owners.remove(&page_id) else { return false; };
+    ctx.pending_fetch_policy_cleanup.insert(page_id);
+    ctx.fetch_intercept.enabled = !ctx.fetch_intercept.owners.is_empty();
+    if !ctx.fetch_intercept.enabled { ctx.fetch_intercept.patterns.clear(); }
+    let keys: Vec<_> = paused.keys().filter(|(session, _)| session == &owner).cloned().collect();
+    for key in keys {
+        if let Some(pause) = paused.remove(&key) {
+            let _ = pause.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+        }
+    }
+    true
 }
 
 fn emit_routed_intercepted_request(
@@ -1151,6 +1189,13 @@ fn emit_routed_intercepted_request(
     }
 }
 
+fn raw_header_bytes_to_cdp_string(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(value) => value.to_owned(),
+        Err(_) => bytes.iter().map(|byte| char::from(*byte)).collect(),
+    }
+}
+
 fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     frame_id: &str,
@@ -1160,8 +1205,16 @@ fn emit_intercepted_request(
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut InterceptedPauses,
 ) -> bool {
-    if intercepted.resolver.is_closed() || intercepted.network_start.compare_exchange(0, 1,
-        std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() { return false; }
+    if intercepted.resolver.is_closed() { return false; }
+    let emit_request_start = match intercepted.stage {
+        obscura_js::ops::InterceptionStage::Request => {
+            if intercepted.network_start.compare_exchange(0, 1,
+                std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() { return false; }
+            true
+        }
+        obscura_js::ops::InterceptionStage::Response => intercepted.network_start.compare_exchange(0, 1,
+            std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok(),
+    };
     tracing::info!(
         "INTERCEPTION: requestPaused for {} {} (sending to client)",
         intercepted.method,
@@ -1202,10 +1255,19 @@ fn emit_intercepted_request(
         },
         "sessionId": session_id,
     });
-    if reply_tx.send(request_will_be_sent.to_string()).is_err() {
+    if emit_request_start && reply_tx.send(request_will_be_sent.to_string()).is_err() {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
         return false;
     }
+
+    let response_headers = intercepted.response_raw_headers.as_ref().map(|capture| capture.fields.iter()
+        .map(|field| json!({
+            "name": raw_header_bytes_to_cdp_string(&field.name),
+            "value": raw_header_bytes_to_cdp_string(&field.value),
+        })).collect::<Vec<_>>()).or_else(|| intercepted.response_headers.as_ref().map(|headers| headers.iter()
+            .map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>()));
+    let redirect_response = intercepted.response_status_code.is_some_and(|status| (300..400).contains(&status))
+        && intercepted.response_headers.as_ref().is_some_and(|headers| headers.keys().any(|name| name.eq_ignore_ascii_case("location")));
 
     let request_paused = json!({
         "method": "Fetch.requestPaused",
@@ -1215,9 +1277,13 @@ fn emit_intercepted_request(
             "frameId": frame_id,
             "resourceType": intercepted.resource_type,
             "networkId": intercepted.network_id,
+            "redirectedRequestId": intercepted.redirected_request_id,
             "responseErrorReason": null,
-            "responseStatusCode": null,
-            "responseHeaders": null,
+            "responseStatusCode": intercepted.response_status_code,
+            "responseStatusText": intercepted.response_status_code.map(|_| ""),
+            "responseHeaders": response_headers,
+            "responseRawHeaders": intercepted.response_raw_headers,
+            "responseBodyRequestId": intercepted.response_body_request_id,
         },
         "sessionId": session_id,
     });
@@ -1225,7 +1291,11 @@ fn emit_intercepted_request(
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
         return false;
     }
-    intercepted_paused.insert((session_id, intercepted.request_id), intercepted.resolver);
+    intercepted_paused.insert((session_id, intercepted.request_id), InterceptedPause {
+        stage: intercepted.stage,
+        redirect_response,
+        resolver: intercepted.resolver,
+    });
     true
 }
 
@@ -1381,6 +1451,11 @@ fn is_navigate_method(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_navigation_safe_body_command(text: &str) -> bool {
+    serde_json::from_str::<CdpRequest>(text).is_ok_and(|request| matches!(request.method.as_str(),
+        "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody" | "IO.read" | "IO.close"))
+}
+
 // Keep CDP field order, spelling and full values until the HTTP boundary.
 // Validate before taking the resolver so malformed input remains retryable.
 pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Result<Option<Vec<(String, String)>>, String> {
@@ -1396,10 +1471,21 @@ pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Result<Option<Vec
 }
 
 pub(crate) fn parse_continue_resolution(params: &serde_json::Value) -> Result<obscura_js::ops::InterceptResolution, String> {
+    let object = params.as_object().ok_or("continueRequest params must be an object")?;
+    if let Some(name) = object.keys().find(|name| !matches!(name.as_str(),
+        "requestId" | "url" | "method" | "postData" | "headers" | "interceptResponse"))
+    {
+        return Err(format!("unsupported continueRequest parameter: {name}"));
+    }
+    if object.contains_key("interceptResponse") {
+        return Err("continueRequest interceptResponse is not supported".into());
+    }
     let body = parse_continue_post_data(params)?;
     let headers = parse_cdp_headers(params)?;
-    let url = params.get("url").and_then(|v| v.as_str()).map(str::to_string);
-    let method = params.get("method").and_then(|v| v.as_str()).map(str::to_string);
+    let url = params.get("url").map(|value| value.as_str()
+        .ok_or("url must be a string").map(str::to_string)).transpose()?;
+    let method = params.get("method").map(|value| value.as_str()
+        .ok_or("method must be a string").map(str::to_string)).transpose()?;
     Ok(match headers {
         Some(headers) => obscura_js::ops::InterceptResolution::ContinueWithHeaders { url, method, headers, body },
         None => obscura_js::ops::InterceptResolution::Continue { url, method, headers: None, body },
@@ -1449,6 +1535,7 @@ fn parse_fulfill_headers(params: &serde_json::Value) -> Result<obscura_net::Head
 pub(crate) fn parse_fulfill_resolution(params: &serde_json::Value) -> Result<obscura_js::ops::InterceptResolution, String> {
     use base64::Engine as _;
     let raw_headers = parse_fulfill_headers(params)?;
+    let body_supplied = params.get("body").is_some();
     let body_base64 = match params.get("body") {
         Some(body) => body.as_str().ok_or("body must be a base64 string")?,
         None => "",
@@ -1456,11 +1543,57 @@ pub(crate) fn parse_fulfill_resolution(params: &serde_json::Value) -> Result<obs
     let bytes = base64::engine::general_purpose::STANDARD.decode(body_base64)
         .map_err(|_| "body must be valid base64")?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
+    let status_text = params.get("responsePhrase").map(|value| value.as_str()
+        .ok_or("responsePhrase must be a string").map(str::to_string)).transpose()?;
     let mut text_projection = raw_headers.clone();
     for field in &mut text_projection.fields { field.name.make_ascii_lowercase(); }
     Ok(obscura_js::ops::InterceptResolution::FulfillWithHeaders {
-        status: params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16,
-        headers: text_projection.text_headers(), raw_headers, body, body_base64: body_base64.to_string(),
+        status: parse_response_code(params.get("responseCode").ok_or("fulfillRequest requires responseCode")?)?, status_text,
+        headers: text_projection.text_headers(), raw_headers, body, body_base64: body_base64.to_string(), body_supplied,
+    })
+}
+
+pub(crate) fn parse_error_reason(params: &serde_json::Value) -> Result<String, String> {
+    let reason = params.get("errorReason").and_then(|value| value.as_str())
+        .ok_or("failRequest requires a string errorReason")?;
+    match reason {
+        "Failed" | "Aborted" | "TimedOut" | "AccessDenied" | "ConnectionClosed"
+        | "ConnectionReset" | "ConnectionRefused" | "ConnectionAborted" | "ConnectionFailed"
+        | "NameNotResolved" | "InternetDisconnected" | "AddressUnreachable"
+        | "BlockedByClient" | "BlockedByResponse" => Ok(reason.to_string()),
+        _ => Err(format!("unsupported failRequest errorReason: {reason}")),
+    }
+}
+
+fn parse_response_code(value: &serde_json::Value) -> Result<u16, String> {
+    let value = value.as_u64().ok_or("responseCode must be an integer")?;
+    let status = u16::try_from(value).map_err(|_| "responseCode is out of range")?;
+    if !(100..=599).contains(&status) { return Err("responseCode must be between 100 and 599".into()); }
+    Ok(status)
+}
+
+fn parse_continue_response_resolution(params: &serde_json::Value) -> Result<obscura_js::ops::InterceptResolution, String> {
+    let object = params.as_object().ok_or("continueResponse params must be an object")?;
+    if let Some(name) = object.keys().find(|name| !matches!(name.as_str(),
+        "requestId" | "responseCode" | "responsePhrase" | "responseHeaders" | "binaryResponseHeaders"))
+    {
+        return Err(format!("unsupported continueResponse parameter: {name}"));
+    }
+    let status = params.get("responseCode").map(parse_response_code).transpose()?;
+    let has_headers = params.get("responseHeaders").is_some() || params.get("binaryResponseHeaders").is_some();
+    let phrase = params.get("responsePhrase").map(|value| value.as_str().ok_or("responsePhrase must be a string")).transpose()?;
+    let overrides = status.is_some() || phrase.is_some() || has_headers;
+    if overrides && (status.is_none() || !has_headers) {
+        return Err("responseCode and responseHeaders or binaryResponseHeaders must be supplied together; responsePhrase is optional".into());
+    }
+    let (headers, raw_headers) = if has_headers {
+        let raw_headers = parse_fulfill_headers(params)?;
+        let mut text_projection = raw_headers.clone();
+        for field in &mut text_projection.fields { field.name.make_ascii_lowercase(); }
+        (Some(text_projection.text_headers()), Some(raw_headers))
+    } else { (None, None) };
+    Ok(obscura_js::ops::InterceptResolution::ContinueResponse {
+        status, status_text: phrase.map(str::to_string), headers, raw_headers,
     })
 }
 
@@ -1470,7 +1603,7 @@ fn handle_fetch_resolution(
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut InterceptedPauses,
 ) -> bool {
-    intercepted_paused.retain(|_, resolver| !resolver.is_closed());
+    intercepted_paused.retain(|_, pause| !pause.resolver.is_closed());
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
         if method == "Fetch.disable" {
@@ -1482,14 +1615,27 @@ fn handle_fetch_resolution(
             if allowed {
                 let page_id = req.session_id.as_ref().and_then(|sid| ctx.sessions.get(sid))
                     .map(String::as_str).or_else(|| ctx.single_page_id()).map(str::to_string);
-                let owner = page_id.and_then(|pid| ctx.fetch_intercept.owners.remove(&pid));
+                let owner = page_id.as_ref().and_then(|pid| ctx.fetch_intercept.owners.remove(pid));
+                if let Some(page_id) = &page_id {
+                    if ctx.get_page(page_id).is_none() && ctx.navigating_page_id.as_ref() == Some(page_id) {
+                        ctx.pending_fetch_policy_cleanup.insert(page_id.clone());
+                    }
+                }
                 let keys: Vec<_> = intercepted_paused.keys()
                     .filter(|(sid, _)| owner.as_ref() == Some(sid)).cloned().collect();
                 for key in keys {
-                    if let Some(resolver) = intercepted_paused.remove(&key) {
-                        let _ = resolver.send(obscura_js::ops::InterceptResolution::Continue {
+                    if let Some(pause) = intercepted_paused.remove(&key) {
+                        let body_taken = crate::domains::network::response_body_owner(ctx, &key.0, &key.1)
+                            .err().is_some_and(|error| error.contains("response_body_already_consumed")
+                                || error.contains("response_body_access_conflict"));
+                        let resolution = if body_taken {
+                            obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() }
+                        } else if pause.stage == obscura_js::ops::InterceptionStage::Response {
+                            obscura_js::ops::InterceptResolution::ContinueResponse { status: None, status_text: None, headers: None, raw_headers: None }
+                        } else { obscura_js::ops::InterceptResolution::Continue {
                             url: None, method: None, headers: None, body: None,
-                        });
+                        }};
+                        let _ = pause.resolver.send(resolution);
                     }
                 }
             }
@@ -1506,7 +1652,7 @@ fn handle_fetch_resolution(
         if method == "Network.getResponseBody" && !request_id.starts_with("intercept-") { return false; }
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest"
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.continueResponse" | "Fetch.fulfillRequest" | "Fetch.failRequest"
             | "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody") { return false; }
         let mut key = (req.session_id.clone(), request_id.to_string());
         let routing_error = if req.session_id.is_none() && ctx.page_count() > 1 {
@@ -1535,7 +1681,7 @@ fn handle_fetch_resolution(
         }
 
         if matches!(method, "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody")
-            && intercepted_paused.contains_key(&key)
+            && intercepted_paused.get(&key).is_some_and(|pause| pause.stage == obscura_js::ops::InterceptionStage::Request)
         {
             let response = crate::types::CdpResponse::error(
                 req.id, -32000, crate::domains::fetch::response_body_not_ready(request_id), req.session_id,
@@ -1545,7 +1691,16 @@ fn handle_fetch_resolution(
             }
             return true;
         }
-        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest") {
+        if matches!(method, "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream")
+            && intercepted_paused.get(&key).is_some_and(|pause| pause.redirect_response)
+        {
+            let response = crate::types::CdpResponse::error(
+                req.id, -32000, "response body is unavailable for a redirect response".into(), req.session_id,
+            );
+            if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+            return true;
+        }
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.continueResponse" | "Fetch.fulfillRequest" | "Fetch.failRequest") {
             return false;
         }
 
@@ -1556,15 +1711,45 @@ fn handle_fetch_resolution(
             return true;
         }
 
+        if matches!(method, "Fetch.continueRequest" | "Fetch.continueResponse")
+            && intercepted_paused.get(&key).is_some_and(|pause| pause.stage == obscura_js::ops::InterceptionStage::Response)
+        {
+            if crate::domains::network::response_body_owner(ctx, &req.session_id, request_id)
+                .err().is_some_and(|error| error.contains("response_body_already_consumed")
+                    || error.contains("response_body_access_conflict"))
+            {
+                let response = CdpResponse::error(req.id, -32000,
+                    "response body was taken as a stream; only failRequest or fulfillRequest may resolve this pause".into(), req.session_id);
+                if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+                return true;
+            }
+        }
+
         // Validate fields before consuming the pause so malformed input can
         // be corrected without stranding the in-flight fetch.
         let parsed_resolution = if intercepted_paused.contains_key(&key) {
+            let stage = intercepted_paused[&key].stage;
+            if method == "Fetch.continueResponse" && stage == obscura_js::ops::InterceptionStage::Request {
+                let expected = if stage == obscura_js::ops::InterceptionStage::Response { "Fetch.continueResponse" } else { "Fetch.continueRequest" };
+                let response = CdpResponse::error(req.id, -32000,
+                    format!("{expected} is required for this Fetch pause stage"), req.session_id);
+                if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+                return true;
+            }
             let result = match method {
-                "Fetch.continueRequest" => parse_continue_resolution(&req.params),
+                "Fetch.continueRequest" => {
+                    parse_continue_resolution(&req.params).and_then(|resolution| {
+                        if stage == obscura_js::ops::InterceptionStage::Response && !matches!(&resolution,
+                            obscura_js::ops::InterceptResolution::Continue { url: None, method: None, headers: None, body: None })
+                        {
+                            Err("response-stage continueRequest does not accept request overrides".into())
+                        } else { Ok(resolution) }
+                    })
+                },
+                "Fetch.continueResponse" => parse_continue_response_resolution(&req.params),
                 "Fetch.fulfillRequest" => parse_fulfill_resolution(&req.params),
-                _ => Ok(obscura_js::ops::InterceptResolution::Fail {
-                    reason: req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string(),
-                }),
+                _ => parse_error_reason(&req.params)
+                    .map(|reason| obscura_js::ops::InterceptResolution::Fail { reason }),
             };
             match result {
                 Ok(resolution) => Some(resolution),
@@ -1575,9 +1760,9 @@ fn handle_fetch_resolution(
                 }
             }
         } else { None };
-        if let Some(resolver) = intercepted_paused.remove(&key) {
+        if let Some(pause) = intercepted_paused.remove(&key) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
-            let resp = if resolver.send(parsed_resolution.expect("validated fetch resolution")).is_ok() {
+            let resp = if pause.resolver.send(parsed_resolution.expect("validated fetch resolution")).is_ok() {
                 crate::types::CdpResponse::success(req.id, json!({}), req.session_id)
             } else {
                 crate::types::CdpResponse::error(req.id, -32000, "requestId is no longer paused".into(), req.session_id)
@@ -1635,6 +1820,7 @@ async fn process_with_interception(
     };
 
     ctx.navigating_page_id = Some(page_id.clone());
+    ctx.navigating_response_bodies = Some((page_id.clone(), page.response_body_store()));
 
     // V8 allows only ONE *entered* isolate per OS thread, but many *live*
     // ones. Since #756 every op enters its isolate only transiently (never
@@ -1736,8 +1922,8 @@ async fn process_with_interception(
             msg = rx.recv(), if connection_open => {
                 let Some(msg) = msg else {
                     connection_open = false;
-                    for (_, resolver) in intercepted_paused.drain() {
-                        let _ = resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+                    for (_, pause) in intercepted_paused.drain() {
+                        let _ = pause.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
                     }
                     continue;
                 };
@@ -1751,11 +1937,16 @@ async fn process_with_interception(
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
+                        let lifecycle_released = abort_navigating_fetch_owner_for_lifecycle(
+                            &msg.text, ctx, intercepted_paused,
+                        );
                         if (msg.text.contains("Fetch.") || msg.text.contains("Network.getResponseBody")) && handle_fetch_resolution(
                             &msg.text, ctx, &msg.reply_tx, intercepted_paused,
                         ) {
                             // Safe: resolves the pause or rejects a premature
                             // body read without entering V8.
+                        } else if is_navigation_safe_body_command(&msg.text) {
+                            process_cdp_message(&msg.text, ctx, &msg.reply_tx).await;
                         } else {
                             // UNSAFE during nav: would route through dispatch,
                             // which can `suspend_js` other pages and trip the
@@ -1763,7 +1954,7 @@ async fn process_with_interception(
                             // pushed to the outer `cdp_processor` queue so
                             // it's processed sequentially with no nav task
                             // in flight.
-                            if deferred.len() >= MAX_DEFERRED_MESSAGES {
+                            if deferred.len() >= MAX_DEFERRED_MESSAGES && !lifecycle_released {
                                 tracing::warn!("INTERCEPTION: deferred queue full ({}), returning error to client", MAX_DEFERRED_MESSAGES);
                                 if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
                                     let resp = crate::types::CdpResponse::error(
@@ -1791,6 +1982,12 @@ async fn process_with_interception(
     // (it drains `deferred` before pulling the next message off `rx`).
 
     let mut page = page_back.expect("navigation task should return the page");
+    if ctx.pending_fetch_policy_cleanup.remove(&page.id) {
+        page.intercept_block_patterns.clear();
+        page.intercept_request_patterns.clear();
+        page.set_intercept_response_patterns(Vec::new());
+        page.enable_intercept(false);
+    }
 
     // Fold in network events for script-initiated requests (fetch/XHR/dynamic
     // resource) so they emit as Network.requestWillBeSent / responseReceived
@@ -1803,6 +2000,7 @@ async fn process_with_interception(
 
     ctx.pages.push(page);
     ctx.navigating_page_id = None;
+    ctx.navigating_response_bodies = None;
     ctx.navigating_document_loader = None;
 
     let navigation_succeeded = navigate_result.is_ok();
@@ -1998,13 +2196,26 @@ async fn handle_connection_ws(
 pub(crate) mod tests {
     use super::{
         browser_close_response, handle_fetch_resolution, is_navigate_method, merge_cookie_delta,
-        parse_cdp_headers, websocket_authority,
+        parse_cdp_headers, raw_header_bytes_to_cdp_string, websocket_authority, InterceptedPause,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn request_pause(resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>) -> InterceptedPause {
+        InterceptedPause { stage: obscura_js::ops::InterceptionStage::Request, redirect_response: false, resolver }
+    }
+
+    #[test]
+    fn raw_header_projection_keeps_every_byte() {
+        let projected = raw_header_bytes_to_cdp_string(b"\xff\xfeA");
+        assert_eq!(
+            projected.chars().map(u32::from).collect::<Vec<_>>(),
+            vec![255, 254, 65]
+        );
+    }
 
     #[test]
     fn invalid_browser_close_is_an_error_and_keeps_the_connection_open() {
@@ -2283,7 +2494,7 @@ pub(crate) mod tests {
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         for supplied in [continue_header_fields(), json!([])] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-            let mut paused = HashMap::from([((None, "continued".to_string()), resolver)]);
+            let mut paused = HashMap::from([((None, "continued".to_string()), request_pause(resolver))]);
             for invalid in malformed_continue_headers() {
                 let command = json!({"id":1,"method":"Fetch.continueRequest",
                     "params":{"requestId":"continued","headers":invalid}}).to_string();
@@ -2312,7 +2523,7 @@ pub(crate) mod tests {
         for (value, expected) in [(Some(json!("AP8A/w==")), Some(vec![0, 255, 0, 255])),
             (Some(json!("")), Some(vec![])), (None, None)] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-            let mut paused = HashMap::from([((None, "continued".to_string()), resolver)]);
+            let mut paused = HashMap::from([((None, "continued".to_string()), request_pause(resolver))]);
             for invalid in [json!("%"), json!("AP8"), json!("AP8=\n"), json!("AP9="), json!(7), json!(null), json!("%") ] {
                 let command = json!({"id":1,"method":"Fetch.continueRequest",
                     "params":{"requestId":"continued","postData":invalid}}).to_string();
@@ -2432,7 +2643,7 @@ pub(crate) mod tests {
                     params["headers"] = continue_header_fields();
                     params["postData"] = json!(base64::engine::general_purpose::STANDARD.encode(&binary));
                 } else if request.url.ends_with("/empty") { params["postData"] = json!(""); params["headers"] = json!([]); }
-                let mut paused = HashMap::from([((None, request.request_id.clone()), request.resolver)]);
+                let mut paused = HashMap::from([((None, request.request_id.clone()), request_pause(request.resolver))]);
                 // Invalid fields must neither send nor lose the actual Page/Worker request.
                 for invalid in malformed_continue_headers() {
                     let command = json!({"id":1,"method":"Fetch.continueRequest","params":{
@@ -2490,7 +2701,7 @@ pub(crate) mod tests {
             json!({"binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(binary)}),
         ] {
             let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-            let mut paused = HashMap::from([((None, "fulfilled".to_string()), resolver)]);
+            let mut paused = HashMap::from([((None, "fulfilled".to_string()), request_pause(resolver))]);
             let mut params = params;
             params["requestId"] = json!("fulfilled"); params["body"] = json!("AP8="); params["responseCode"] = json!(201);
             let command = json!({"id":1,"method":"Fetch.fulfillRequest","params":params}).to_string();
@@ -2523,13 +2734,13 @@ pub(crate) mod tests {
         let mut ctx = crate::dispatch::CdpContext::new();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([((None, "fulfilled".to_string()), resolver)]);
+        let mut paused = HashMap::from([((None, "fulfilled".to_string()), request_pause(resolver))]);
         for params in [json!({"binaryResponseHeaders":"%"}), json!({"body":"%"}), json!({"body":7}),
             json!({"binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(b"missing colon")}),
             json!({"responseHeaders":{},"binaryResponseHeaders":""}),
             json!({"responseHeaders":[{"name":"missing-value"}]}),
         ] {
-            let mut params = params; params["requestId"] = json!("fulfilled");
+            let mut params = params; params["requestId"] = json!("fulfilled"); params["responseCode"] = json!(200);
             let command = json!({"id":1,"method":"Fetch.fulfillRequest","params":params}).to_string();
             assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
             let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
@@ -2537,7 +2748,7 @@ pub(crate) mod tests {
             assert!(paused.contains_key(&(None, "fulfilled".into())));
             assert!(matches!(resolved.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
         }
-        let command = json!({"id":2,"method":"Fetch.fulfillRequest","params":{"requestId":"fulfilled","body":""}}).to_string();
+        let command = json!({"id":2,"method":"Fetch.fulfillRequest","params":{"requestId":"fulfilled","responseCode":200,"body":""}}).to_string();
         assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
         let obscura_js::ops::InterceptResolution::FulfillWithHeaders { body, body_base64, .. } = resolved.try_recv().unwrap() else { panic!("missing captured fulfill") };
         assert!(body.is_empty()); assert!(body_base64.is_empty());
@@ -2548,7 +2759,7 @@ pub(crate) mod tests {
         let mut ctx = crate::dispatch::CdpContext::new();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolver, mut resolved) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([((None, "paused".to_string()), resolver)]);
+        let mut paused = HashMap::from([((None, "paused".to_string()), request_pause(resolver))]);
         for method in ["Fetch.getResponseBody", "Fetch.takeResponseBodyAsStream"] {
             let command = json!({"id": 1, "method": method, "params": {"requestId": "paused"}}).to_string();
             assert!(handle_fetch_resolution(&command, &mut ctx, &reply_tx, &mut paused));
@@ -2570,7 +2781,7 @@ pub(crate) mod tests {
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([((None, "request-1".to_string()), resolution_tx)]);
+        let mut paused = HashMap::from([((None, "request-1".to_string()), request_pause(resolution_tx))]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut ctx = crate::dispatch::CdpContext::new();
 

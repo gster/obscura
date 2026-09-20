@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine as _;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -93,6 +94,10 @@ async fn fixture_with_requests() -> (String, tokio::task::JoinHandle<()>, Arc<st
                 let body = if path == "/" { "<html>ready</html>" } else { path };
                 let status = if path == "/redirect-preflight" {
                     format!("302 Found\r\nLocation: {cross_origin}/final")
+                } else if path == "/redirect-chain/one" {
+                    "302 Found\r\nLocation: /redirect-chain/two".into()
+                } else if path == "/redirect-chain/two" {
+                    "302 Found\r\nLocation: /final".into()
                 } else if path.starts_with("/redirect/") { "302 Found\r\nLocation: /final".into() } else { "200 OK".into() };
                 let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization\r\nSet-Cookie: session=complete-secret; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                 socket.write_all(response.as_bytes()).await.unwrap();
@@ -120,6 +125,212 @@ async fn page(client: &mut Client, base: &str) -> (String, String) {
     let session = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
     client.ok(Some(&session), "Fetch.enable", json!({})).await;
     (target, session)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn response_stage_pause_exposes_complete_body_and_enforces_stage_lifecycle() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base, fixture_task) = fixture().await;
+        let (mut client, processor) = client().await;
+        let target = client.ok(None, "Target.createTarget", json!({"url":format!("{base}/")})).await["targetId"].as_str().unwrap().to_string();
+        let session = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        assert!(client.command(Some(&session), "Fetch.enable", json!({"handleAuthRequests":true})).await["error"]["message"]
+            .as_str().unwrap().contains("not supported"));
+        assert!(client.command(Some(&session), "Fetch.enable", json!({"handleAuthRequests":"false"})).await["error"]["message"]
+            .as_str().unwrap().contains("boolean"));
+        client.ok(Some(&session), "Fetch.enable", json!({"handleAuthRequests":false,
+            "patterns":[{"urlPattern":format!("{base}/response-stage"),"requestStage":"Response"}]})).await;
+        for invalid in [json!({"patterns":[null]}), json!({"patterns":["*"]}),
+            json!({"patterns":[{"requestStage":42}]}), json!({"patterns":[{"urlPattern":42}]})]
+        {
+            assert!(client.command(Some(&session), "Fetch.enable", invalid).await.get("error").is_some());
+        }
+        client.start_fetch(&session, &format!("{base}/malformed-pattern-must-not-expand-policy"), false).await;
+        assert_eq!(client.result(&session).await, "/malformed-pattern-must-not-expand-policy");
+        client.ok(Some(&session), "Fetch.enable", json!({"patterns":[{
+            "urlPattern":"*","requestStage":"Response"
+        }]})).await;
+
+        client.ok(Some(&session), "Runtime.evaluate", json!({"expression":format!(
+            "globalThis.result=fetch('{base}/response-stage').then(async r=>[r.status,r.headers.get('x-replaced'),await r.text()]);'started'"),
+            "returnByValue":true})).await;
+        let pause = client.pause(&session).await;
+        let id = pause["params"]["requestId"].as_str().unwrap();
+        let network_id = pause["params"]["networkId"].clone();
+        assert_eq!(pause["params"]["responseStatusCode"], 200);
+        assert_eq!(pause["params"]["responseStatusText"], "");
+        assert_eq!(pause["params"]["responseHeaders"].as_array().unwrap().iter()
+            .filter(|field| field["name"].as_str().is_some_and(|name| name.eq_ignore_ascii_case("set-cookie"))).count(), 1);
+        assert!(pause["params"]["responseRawHeaders"]["fields"].as_array().is_some());
+        assert_eq!(client.ok(Some(&session), "Fetch.getResponseBody", json!({"requestId":id})).await["body"], "/response-stage");
+        for invalid in [json!({"requestId":id,"url":format!("{base}/other")}), json!({"requestId":id,"url":42}),
+            json!({"requestId":id,"interceptResponse":false}), json!({"requestId":id,"unknown":true})]
+        {
+            assert!(client.command(Some(&session), "Fetch.continueRequest", invalid).await.get("error").is_some());
+        }
+        assert!(client.command(Some(&session), "Fetch.continueResponse", json!({"requestId":id,"unknown":true})).await.get("error").is_some());
+        client.ok(Some(&session), "Fetch.continueResponse", json!({"requestId":id,"responseCode":201,"responsePhrase":"Created by fixture",
+            "responseHeaders":[{"name":"Content-Type","value":"text/plain"},{"name":"X-Replaced","value":"yes"}]})).await;
+        assert_eq!(client.result(&session).await, json!([201,"yes","/response-stage"]));
+        while !client.events.iter().any(|event| event["method"] == "Network.loadingFinished" && event["params"]["requestId"] == network_id) {
+            let event = client.recv().await; client.events.push(event);
+        }
+        let response = client.events.iter().find(|event| event["method"] == "Network.responseReceived"
+            && event["params"]["requestId"] == network_id).unwrap();
+        assert_eq!(response["params"]["response"]["status"], 201);
+        assert_eq!(response["params"]["response"]["statusText"], "Created by fixture");
+        assert_eq!(response["params"]["response"]["headers"]["x-replaced"], "yes");
+
+        client.start_fetch(&session, &format!("{base}/redirect/response-stage"), false).await;
+        let redirect = client.pause(&session).await;
+        assert_eq!(redirect["params"]["responseStatusCode"], 302);
+        for method in ["Fetch.getResponseBody", "Fetch.takeResponseBodyAsStream"] {
+            let error = client.command(Some(&session), method, json!({"requestId":redirect["params"]["requestId"]})).await;
+            assert!(error["error"]["message"].as_str().unwrap().contains("redirect response"), "{error}");
+        }
+        client.ok(Some(&session), "Fetch.continueResponse", json!({"requestId":redirect["params"]["requestId"]})).await;
+        let final_pause = client.pause(&session).await;
+        assert_eq!(final_pause["params"]["networkId"], redirect["params"]["networkId"]);
+        assert_eq!(final_pause["params"]["redirectedRequestId"], redirect["params"]["requestId"]);
+        assert_eq!(final_pause["params"]["responseStatusCode"], 200);
+        let stream = client.ok(Some(&session), "Fetch.takeResponseBodyAsStream", json!({"requestId":final_pause["params"]["requestId"]})).await["stream"].clone();
+        let other_target = client.ok(None, "Target.createTarget", json!({"url":"about:blank"})).await["targetId"].as_str().unwrap().to_string();
+        let other_session = client.ok(None, "Target.attachToTarget", json!({"targetId":other_target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        assert!(client.command(Some(&other_session), "IO.read", json!({"handle":stream})).await.get("error").is_some());
+        assert!(client.command(Some(&other_session), "IO.close", json!({"handle":stream})).await.get("error").is_some());
+        assert!(client.command(None, "IO.read", json!({"handle":stream})).await.get("error").is_some());
+        assert!(client.command(None, "IO.close", json!({"handle":stream})).await.get("error").is_some());
+        assert!(client.command(Some(&session), "IO.read", json!({"handle":stream,"offset":0})).await.get("error").is_some());
+        for method in ["Fetch.continueRequest", "Fetch.continueResponse"] {
+            assert!(client.command(Some(&session), method, json!({"requestId":final_pause["params"]["requestId"]})).await["error"]["message"]
+                .as_str().unwrap().contains("only failRequest or fulfillRequest"));
+        }
+        client.ok(Some(&session), "Fetch.fulfillRequest", json!({"requestId":final_pause["params"]["requestId"],
+            "responseCode":200,"responsePhrase":"Stream Replacement"})).await;
+        assert_eq!(client.result(&session).await, "/final", "omitted fulfill body preserves the captured body");
+        while !client.events.iter().any(|event| event["method"] == "Network.loadingFinished"
+            && event["params"]["requestId"] == final_pause["params"]["networkId"]) {
+            let event = client.recv().await; client.events.push(event);
+        }
+        let stream_response = client.events.iter().find(|event| event["method"] == "Network.responseReceived"
+            && event["params"]["requestId"] == final_pause["params"]["networkId"]).unwrap();
+        assert_eq!(stream_response["params"]["response"]["statusText"], "Stream Replacement");
+        assert_eq!(client.ok(Some(&session), "Network.getResponseBody", json!({"requestId":final_pause["params"]["networkId"]})).await["body"], "/final",
+            "fulfilled request aliases must point at the replacement Page body");
+        let old = client.ok(Some(&session), "IO.read", json!({"handle":stream})).await;
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(old["data"].as_str().unwrap()).unwrap(), b"/final");
+        client.ok(Some(&session), "IO.close", json!({"handle":stream})).await;
+
+        client.start_fetch(&session, &format!("{base}/response-stage"), false).await;
+        let continue_pause = client.pause(&session).await;
+        client.ok(Some(&session), "Fetch.continueRequest", json!({"requestId":continue_pause["params"]["requestId"]})).await;
+        assert_eq!(client.result(&session).await, "/response-stage");
+
+        client.start_fetch(&session, &format!("{base}/redirect-chain/one"), false).await;
+        let first = client.pause(&session).await;
+        let chain_network_id = first["params"]["networkId"].clone();
+        assert_eq!(first["params"]["responseStatusCode"], 302);
+        assert!(first["params"]["redirectedRequestId"].is_null());
+        assert_eq!(client.events.iter().filter(|event| event["method"] == "Network.requestWillBeSent"
+            && event["params"]["requestId"] == chain_network_id).count(), 1);
+        client.ok(Some(&session), "Fetch.continueResponse", json!({"requestId":first["params"]["requestId"]})).await;
+
+        let second = client.pause(&session).await;
+        assert_eq!(second["params"]["networkId"], chain_network_id);
+        assert_eq!(second["params"]["responseStatusCode"], 302);
+        assert_eq!(second["params"]["redirectedRequestId"], first["params"]["requestId"]);
+        assert_eq!(client.events.iter().filter(|event| event["method"] == "Network.requestWillBeSent"
+            && event["params"]["requestId"] == chain_network_id).count(), 2);
+        client.ok(Some(&session), "Fetch.continueResponse", json!({"requestId":second["params"]["requestId"]})).await;
+
+        let third = client.pause(&session).await;
+        assert_eq!(third["params"]["networkId"], chain_network_id);
+        assert_eq!(third["params"]["responseStatusCode"], 200);
+        assert_eq!(third["params"]["redirectedRequestId"], second["params"]["requestId"]);
+        assert_eq!(client.events.iter().filter(|event| event["method"] == "Network.requestWillBeSent"
+            && event["params"]["requestId"] == chain_network_id).count(), 3,
+            "the third request start must precede its response pause");
+        client.ok(Some(&session), "Fetch.continueResponse", json!({"requestId":third["params"]["requestId"]})).await;
+        assert_eq!(client.result(&session).await, "/final");
+
+        let starts = client.events.iter().filter(|event| event["method"] == "Network.requestWillBeSent"
+            && event["params"]["requestId"] == chain_network_id).collect::<Vec<_>>();
+        assert_eq!(starts.len(), 3, "every response-only redirect hop needs its own request start: {starts:?}");
+        assert!(starts.iter().all(|event| event["sessionId"] == session));
+        assert!(starts[0]["params"]["redirectResponse"].is_null());
+        assert_eq!(starts[1]["params"]["redirectResponse"]["status"], 302);
+        assert_eq!(starts[1]["params"]["redirectResponse"]["url"], format!("{base}/redirect-chain/one"));
+        assert_eq!(starts[2]["params"]["redirectResponse"]["status"], 302);
+        assert_eq!(starts[2]["params"]["redirectResponse"]["url"], format!("{base}/redirect-chain/two"));
+
+        for expected in ["XHR", "Fetch"] {
+            client.ok(Some(&session), "Fetch.disable", json!({})).await;
+            client.ok(Some(&session), "Fetch.enable", json!({"patterns":[{
+                "urlPattern":format!("{base}/resource-type"), "resourceType":expected, "requestStage":"Response"
+            }]})).await;
+            let expression = format!(r#"
+                globalThis.result = Promise.all([
+                  fetch('{base}/resource-type', {{__obscuraResourceType:'XHR'}}).then(r => r.text()),
+                  new Promise((resolve, reject) => {{ const x = new XMLHttpRequest();
+                    x.open('GET', '{base}/resource-type'); x.onload = () => resolve(x.responseText);
+                    x.onerror = reject; x.send(); }})
+                ]); 'started'
+            "#);
+            client.ok(Some(&session), "Runtime.evaluate", json!({"expression":expression,"returnByValue":true})).await;
+            let typed = client.pause(&session).await;
+            assert_eq!(typed["params"]["resourceType"], expected);
+            client.ok(Some(&session), "Fetch.continueResponse", json!({"requestId":typed["params"]["requestId"]})).await;
+            assert_eq!(client.result(&session).await, json!(["/resource-type", "/resource-type"]),
+                "only the selected resource type should pause");
+        }
+
+        client.ok(Some(&session), "Fetch.disable", json!({})).await;
+        client.ok(Some(&session), "Fetch.enable", json!({"patterns":[{
+            "urlPattern":"*","resourceType":"XHR","requestStage":"Request"
+        }]})).await;
+        client.start_fetch(&session, &format!("{base}/redirect/xhr-pattern-must-ignore-fetch"), false).await;
+        assert_eq!(client.result(&session).await, "/final",
+            "a Fetch redirect chain must not pause for an XHR-only request pattern");
+
+        client.ok(Some(&session), "Fetch.enable", json!({"patterns":[{
+            "urlPattern":format!("{base}/redirect/url-pattern"),"resourceType":"Fetch","requestStage":"Request"
+        }]})).await;
+        client.start_fetch(&session, &format!("{base}/redirect/url-pattern"), false).await;
+        let matched_redirect_start = client.pause(&session).await;
+        client.ok(Some(&session), "Fetch.continueRequest", json!({
+            "requestId":matched_redirect_start["params"]["requestId"]
+        })).await;
+        assert_eq!(client.result(&session).await, "/final",
+            "a redirect target outside the URL pattern must not pause");
+
+        client.ok(Some(&session), "Fetch.disable", json!({})).await;
+        client.ok(Some(&session), "Fetch.enable", json!({})).await;
+        client.start_fetch(&session, &format!("{base}/request-synthetic"), false).await;
+        let synthetic = client.pause(&session).await;
+        for invalid in [json!({"requestId":synthetic["params"]["requestId"],"url":42}),
+            json!({"requestId":synthetic["params"]["requestId"],"method":42}),
+            json!({"requestId":synthetic["params"]["requestId"],"interceptResponse":true}),
+            json!({"requestId":synthetic["params"]["requestId"],"unknown":true})]
+        {
+            assert_eq!(client.command(Some(&session), "Fetch.continueRequest", invalid).await["error"]["code"], -32602);
+        }
+        assert_eq!(client.command(Some(&session), "Fetch.failRequest", json!({"requestId":synthetic["params"]["requestId"],
+            "errorReason":"Invented"})).await["error"]["code"], -32602);
+        assert_eq!(client.command(Some(&session), "Fetch.fulfillRequest", json!({"requestId":synthetic["params"]["requestId"],
+            "responseCode":203,"responsePhrase":42})).await["error"]["code"], -32602);
+        client.ok(Some(&session), "Fetch.fulfillRequest", json!({"requestId":synthetic["params"]["requestId"],
+            "responseCode":203,"responsePhrase":"Synthetic Complete","body":"c3ludGhldGlj"})).await;
+        assert_eq!(client.result(&session).await, "synthetic");
+        while !client.events.iter().any(|event| event["method"] == "Network.loadingFinished"
+            && event["params"]["requestId"] == synthetic["params"]["networkId"]) {
+            let event = client.recv().await; client.events.push(event);
+        }
+        let response = client.events.iter().find(|event| event["method"] == "Network.responseReceived"
+            && event["params"]["requestId"] == synthetic["params"]["networkId"]).unwrap();
+        assert_eq!(response["params"]["response"]["statusText"], "Synthetic Complete");
+
+        drop(client); processor.await.unwrap(); fixture_task.abort();
+    }).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -184,10 +395,8 @@ async fn active_multi_page_fetch_pauses_keep_session_ownership_and_body_aliases(
                     assert_eq!(client.ok(Some(&right), method, json!({"requestId":id})).await["body"], "right-secret");
                     assert!(client.command(None, method, json!({"requestId":id})).await.get("error").is_some());
                 }
-                let stream = client.ok(Some(&left), "Fetch.takeResponseBodyAsStream", json!({"requestId":id})).await["stream"].clone();
-                assert_eq!(client.ok(Some(&left), "IO.read", json!({"handle":stream})).await["data"], "bGVmdC1zZWNyZXQ=");
-                client.ok(Some(&left), "IO.close", json!({"handle":stream})).await;
-                assert!(client.command(Some(&left), "Fetch.getResponseBody", json!({"requestId":id})).await["error"]["message"].as_str().unwrap().contains("consumed"));
+                assert!(client.command(Some(&left), "Fetch.takeResponseBodyAsStream", json!({"requestId":id})).await["error"]["message"]
+                    .as_str().unwrap().contains("response_body_access_conflict"));
                 assert_eq!(client.ok(Some(&right), "Fetch.getResponseBody", json!({"requestId":id})).await["body"], "right-secret");
             }
         }
@@ -241,7 +450,7 @@ async fn single_page_sessionless_pause_resolution_and_navigation_disconnect() {
         for method in ["Fetch.getResponseBody", "Fetch.takeResponseBodyAsStream"] {
             assert!(client.command(None, method, json!({"requestId":id})).await["error"]["message"].as_str().unwrap().contains("not_ready"));
         }
-        client.ok(None, "Fetch.fulfillRequest", json!({"requestId":id,"body":"c2luZ2xl"})).await;
+        client.ok(None, "Fetch.fulfillRequest", json!({"requestId":id,"responseCode":200,"body":"c2luZ2xl"})).await;
         assert_eq!(client.result(&session).await, "single");
         assert_eq!(client.ok(None, "Fetch.getResponseBody", json!({"requestId":id})).await["body"], "single");
         client.ok(None, "Fetch.disable", json!({})).await;
@@ -260,7 +469,30 @@ async fn single_page_sessionless_pause_resolution_and_navigation_disconnect() {
         client.ok(None, "Fetch.continueRequest", json!({"requestId":id})).await;
         assert_eq!(client.result(&session).await, "/sessionless-owner");
         client.ok(None, "Fetch.disable", json!({})).await;
-        client.ok(Some(&session), "Fetch.enable", json!({})).await;
+        client.ok(None, "Fetch.enable", json!({"patterns":[{
+            "urlPattern":format!("{base}/sessionless-stream"),"requestStage":"Response"
+        }]})).await;
+        client.start_fetch(&session, &format!("{base}/sessionless-stream"), false).await;
+        let stream_pause = loop {
+            if let Some(index) = client.events.iter().position(|event| event["method"] == "Fetch.requestPaused"
+                && event["sessionId"].is_null() && event["params"]["responseStatusCode"] == 200) {
+                break client.events.remove(index);
+            }
+            let event = client.recv().await; client.events.push(event);
+        };
+        let stream_counter = stream_pause["params"]["requestId"].as_str().unwrap()
+            .strip_prefix("intercept-").unwrap().parse::<u64>().unwrap();
+        let stream = client.ok(None, "Fetch.takeResponseBodyAsStream", json!({
+            "requestId":stream_pause["params"]["requestId"]
+        })).await["stream"].clone();
+        for method in ["Fetch.continueRequest", "Fetch.continueResponse"] {
+            assert!(client.command(None, method, json!({"requestId":stream_pause["params"]["requestId"]})).await
+                ["error"]["message"].as_str().unwrap().contains("only failRequest or fulfillRequest"));
+        }
+        client.ok(None, "Fetch.disable", json!({})).await;
+        assert_eq!(client.result(&session).await, "failed", "disable must abort a sessionless pause after stream transfer");
+        client.ok(None, "IO.close", json!({"handle":stream})).await;
+        client.ok(Some(&session), "Fetch.enable", json!({"patterns":[{"urlPattern":"*","requestStage":"Response"}]})).await;
         // A script pauses while its Page is temporarily removed from ctx.pages
         // by the navigation task. Route using the enable owner, not ctx.pages.
         let html = format!("<script>globalThis.result=fetch('{base}/during-nav').then(r=>r.text())</script>");
@@ -270,9 +502,70 @@ async fn single_page_sessionless_pause_resolution_and_navigation_disconnect() {
             reply_tx:client.reply_tx.clone(),
         })).unwrap();
         let pause = client.pause(&session).await;
-        assert_eq!(pause["params"]["requestId"], "intercept-5", "navigation retains Page pause and capture counter");
+        let navigation_counter = pause["params"]["requestId"].as_str().unwrap()
+            .strip_prefix("intercept-").unwrap().parse::<u64>().unwrap();
+        // op_fetch_start reserves a request-stage ID before the response-stage
+        // match is known, so only monotonic Page ownership is observable here.
+        assert!(navigation_counter > stream_counter, "navigation retains the monotonic Page pause counter");
+        assert_eq!(client.ok(Some(&session), "Fetch.getResponseBody", json!({"requestId":pause["params"]["requestId"]})).await["body"], "/during-nav",
+            "navigation-time response pause must retain access to its Page body store");
+        client.ok(Some(&session), "Fetch.disable", json!({})).await;
+        assert_eq!(client.result(&session).await, "/during-nav");
+        client.start_fetch(&session, &format!("{base}/after-nav-disable"), false).await;
+        assert_eq!(client.result(&session).await, "/after-nav-disable",
+            "disable during navigation must clear the returned Page policy");
         drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(3), processor).await.expect("close during navigation must release pause").unwrap();
+        fixture_task.abort();
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn target_lifecycle_commands_release_navigation_fetch_pauses_before_defer() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base, fixture_task) = fixture().await;
+        let (mut client, processor) = client().await;
+
+        let (detached_target, detached_session) = page(&mut client, &base).await;
+        let html = format!("<script>globalThis.result=fetch('{base}/detach-during-nav').then(r=>r.text()).catch(()=> 'failed')</script>");
+        client.id += 1;
+        client.tx.send(ServerMessage::Cdp(CdpMessage {
+            text:json!({"id":client.id,"method":"Page.navigate","sessionId":detached_session,
+                "params":{"url":format!("data:text/html,{html}")}}).to_string(),
+            reply_tx:client.reply_tx.clone(),
+        })).unwrap();
+        let request_pause = client.pause(&detached_session).await;
+        assert!(request_pause["params"]["responseStatusCode"].is_null());
+        tokio::time::timeout(std::time::Duration::from_secs(3),
+            client.ok(None, "Target.detachFromTarget", json!({"sessionId":detached_session})))
+            .await.expect("detach must abort the navigating request pause");
+        let reattached = client.ok(None, "Target.attachToTarget", json!({"targetId":detached_target,"flatten":true})).await
+            ["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(client.result(&reattached).await, "failed");
+
+        let close_target = client.ok(None, "Target.createTarget", json!({"url":format!("{base}/")})).await
+            ["targetId"].as_str().unwrap().to_string();
+        let close_session = client.ok(None, "Target.attachToTarget", json!({"targetId":close_target,"flatten":true})).await
+            ["sessionId"].as_str().unwrap().to_string();
+        client.ok(Some(&close_session), "Fetch.enable", json!({"patterns":[{
+            "urlPattern":"*","requestStage":"Response"
+        }]})).await;
+        let html = format!("<script>globalThis.result=fetch('{base}/close-during-nav').then(r=>r.text()).catch(()=> 'failed')</script>");
+        client.id += 1;
+        client.tx.send(ServerMessage::Cdp(CdpMessage {
+            text:json!({"id":client.id,"method":"Page.navigate","sessionId":close_session,
+                "params":{"url":format!("data:text/html,{html}")}}).to_string(),
+            reply_tx:client.reply_tx.clone(),
+        })).unwrap();
+        let response_pause = client.pause(&close_session).await;
+        assert_eq!(response_pause["params"]["responseStatusCode"], 200);
+        tokio::time::timeout(std::time::Duration::from_secs(3),
+            client.ok(None, "Target.closeTarget", json!({"targetId":close_target})))
+            .await.expect("closeTarget must abort the navigating response pause");
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(3), processor).await
+            .expect("processor exits after lifecycle navigation coverage").unwrap();
         fixture_task.abort();
     }).await;
 }
@@ -368,12 +661,15 @@ fn closed_reply_channel_aborts_instead_of_registering_a_pause() {
     drop(reply_rx);
     let (resolver, mut resolved) = tokio::sync::oneshot::channel();
     let request = obscura_js::ops::InterceptedRequest {
+                stage: obscura_js::ops::InterceptionStage::Request,
                 document_generation: 0, document_url: "https://example.test/".into(), redirect_response: None,
+                redirected_request_id: None,
                 network_id: "fixture-network-id".into(),
                 network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 request_raw_headers: None, request_body_size: 0,
         request_id: "intercept-1".into(), url: "https://example.test/".into(), method: "GET".into(),
-        headers: HashMap::new(), resource_type: "Fetch".into(), resolver,
+        headers: HashMap::new(), resource_type: "Fetch".into(), response_status_code: None,
+        response_headers: None, response_raw_headers: None, response_body_request_id: None, resolver,
     };
     let mut paused = InterceptedPauses::new();
     emit_intercepted_request(request, "frame", "loader", "https://example.test/", Some("session".into()), &reply_tx, &mut paused);
@@ -391,12 +687,15 @@ fn closed_routed_pause_does_not_restore_a_retired_network_owner() {
     let (resolver, resolved) = tokio::sync::oneshot::channel();
     drop(resolved);
     let request = obscura_js::ops::InterceptedRequest {
+        stage: obscura_js::ops::InterceptionStage::Request,
         document_generation: 0, document_url: "https://example.test/".into(), redirect_response: None,
+        redirected_request_id: None,
         network_id: "retired-network-id".into(),
         network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         request_raw_headers: None, request_body_size: 0,
         request_id: "intercept-retired".into(), url: "https://example.test/".into(), method: "GET".into(),
-        headers: HashMap::new(), resource_type: "Fetch".into(), resolver,
+        headers: HashMap::new(), resource_type: "Fetch".into(), response_status_code: None,
+        response_headers: None, response_raw_headers: None, response_body_request_id: None, resolver,
     };
     let routed = crate::domains::fetch::RoutedInterceptedRequest {
         page_id: page_id.clone(), frame_id: "frame".into(), session_id: session, request,
@@ -540,7 +839,7 @@ async fn failure_observation_navigation_pause_uses_pending_document_loader() {
         let start=client.events.iter().find(|event|event["method"]=="Network.requestWillBeSent" && event["params"]["requestId"]==network).unwrap();
         let loader=start["params"]["loaderId"].clone();
         assert_eq!(start["params"]["documentURL"],url);
-        client.ok(Some(&session),"Fetch.fulfillRequest",json!({"requestId":pause["params"]["requestId"],"body":"b2s="})).await;
+        client.ok(Some(&session),"Fetch.fulfillRequest",json!({"requestId":pause["params"]["requestId"],"responseCode":200,"body":"b2s="})).await;
         loop {
             if let Some(response)=client.events.iter().find(|event|event["id"]==command_id) {
                 assert_eq!(response["result"]["loaderId"],loader);break;

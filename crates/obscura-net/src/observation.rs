@@ -38,6 +38,15 @@ impl RequestTrace {
         self.exchanges.lock().unwrap_or_else(|e| e.into_inner()).last().cloned()
     }
 
+    pub fn previous(&self) -> Option<Exchange> {
+        let exchanges = self.exchanges.lock().unwrap_or_else(|e| e.into_inner());
+        exchanges.len().checked_sub(2).and_then(|index| exchanges.get(index)).cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.exchanges.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     pub fn update_request(&self, url: &str, method: &str, headers: HeaderCapture, body_size: usize) {
         if let Some(exchange) = self.exchanges.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
             exchange.url = url.into(); exchange.method = method.into();
@@ -57,19 +66,25 @@ impl RequestTrace {
         if let Some(exchange) = exchanges.last_mut() {
             // Spool now rather than retaining every redirect body in memory.
             // Header-only captures never register an empty successful body.
-            if body_complete {
+            let body_stored = if body_complete {
                 let body_id = format!("{}-hop-{}", self.request_id, index);
-                let _ = self.bodies.lock().unwrap_or_else(|e| e.into_inner())
-                    .insert(body_id.clone(), &response.body, false);
-                exchange.body_request_id = Some(body_id);
-            }
+                match self.bodies.lock().unwrap_or_else(|e| e.into_inner())
+                    .insert(body_id.clone(), &response.body, false)
+                {
+                    Ok(()) => {
+                        exchange.body_request_id = Some(body_id);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            } else { false };
             exchange.response = Some(Response {
                 url: response.url.clone(), status: response.status, headers: response.headers.clone(), body: Vec::new(),
                 raw_headers: response.raw_headers.clone(), request_raw_headers: response.request_raw_headers.clone(),
                 redirected_from: response.redirected_from.clone(), request_referrer: response.request_referrer.clone(),
             });
             exchange.body_size = response.body.len();
-            exchange.body_complete = body_complete;
+            exchange.body_complete = body_stored;
         }
     }
 
@@ -86,5 +101,41 @@ impl RequestTrace {
 
     pub fn take(&self) -> Vec<Exchange> {
         std::mem::take(&mut *self.exchanges.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response_body::{ResponseBodyLimits, ResponseBodyStore};
+
+    #[test]
+    fn failed_body_admission_never_marks_an_exchange_complete() {
+        let bodies = Arc::new(Mutex::new(ResponseBodyStore::new(ResponseBodyLimits {
+            memory_threshold: 1,
+            total_bytes: 1,
+            entries: 1,
+        })));
+        let trace = RequestTrace::new(bodies.clone(), "budget".into());
+        trace.begin("https://example.test/body", "GET", None, 0);
+        trace.response(&Response {
+            url: url::Url::parse("https://example.test/body").unwrap(),
+            status: 200,
+            headers: Default::default(),
+            body: b"too large".to_vec(),
+            raw_headers: None,
+            request_raw_headers: None,
+            redirected_from: Vec::new(),
+            request_referrer: None,
+        }, true);
+
+        let exchange = trace.last().unwrap();
+        assert!(!exchange.body_complete);
+        assert!(exchange.body_request_id.is_none());
+        let error = match bodies.lock().unwrap_or_else(|e| e.into_inner()).get("budget-hop-0") {
+            Some(Err(error)) => error,
+            _ => panic!("failed admission must retain the body-store diagnostic"),
+        };
+        assert!(error.to_string().contains("response_body_budget_exhausted"));
     }
 }

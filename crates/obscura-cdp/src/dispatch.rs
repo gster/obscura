@@ -51,6 +51,12 @@ pub(crate) struct ExecutionContextRecord {
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub(crate) navigating_page_id: Option<String>,
+    /// The Page is temporarily moved into the navigation task, but response
+    /// pause commands still need its page-owned capture store.
+    pub(crate) navigating_response_bodies: Option<(String, Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>)>,
+    /// Fetch.disable/detach may arrive while the Page is in the navigation
+    /// task. Apply the policy reset before returning that Page to `pages`.
+    pub(crate) pending_fetch_policy_cleanup: HashSet<String>,
     pub(crate) navigating_document_loader: Option<(u64, String)>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
     /// Current document loader per page. Navigation events and later
@@ -164,6 +170,8 @@ impl CdpContext {
         CdpContext {
             pages: Vec::new(),
             navigating_page_id: None,
+            navigating_response_bodies: None,
+            pending_fetch_policy_cleanup: HashSet::new(),
             navigating_document_loader: None,
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
@@ -820,7 +828,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
-        "IO" => domains::io::handle(method, &req.params, ctx).await,
+        "IO" => domains::io::handle(method, &req.params, ctx, &req.session_id).await,
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
         "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,

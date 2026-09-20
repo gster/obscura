@@ -225,6 +225,7 @@ pub async fn print_to_pdf(
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
+        let page_id = page.id.clone();
         crate::domains::page::prepare_capture_resources_if_requested(page).await;
         let animation_sample = page.live_animation_sample();
         let pdf = page
@@ -267,7 +268,7 @@ pub async fn print_to_pdf(
             PdfTransferMode::ReturnAsStream => {
                 let handle = ctx
                     .io_streams
-                    .insert(pdf)
+                    .insert_pdf(pdf, session_id.clone(), page_id)
                     .map_err(|error| format!("Page.printToPDF could not open stream: {error}"))?;
                 response["data"] = Value::String(String::new());
                 response["stream"] = Value::String(handle);
@@ -398,7 +399,7 @@ mod tests {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = format!("{page_id}-session");
-        ctx.sessions.insert(session_id.clone(), page_id);
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
         let session = Some(session_id);
         ctx.get_session_page_mut(&session)
             .unwrap()
@@ -482,35 +483,6 @@ mod tests {
             json!(["generateTaggedPDF"])
         );
         let handle = streamed["stream"].as_str().expect("protocol stream handle");
-        let mut streamed_bytes = Vec::new();
-        loop {
-            let chunk = crate::domains::io::handle(
-                "read",
-                &json!({"handle": handle, "size": 1024}),
-                &mut ctx,
-            )
-            .await
-            .expect("read PDF stream");
-            streamed_bytes.extend(
-                base64::engine::general_purpose::STANDARD
-                    .decode(chunk["data"].as_str().unwrap())
-                    .unwrap(),
-            );
-            if chunk["eof"] == true {
-                break;
-            }
-        }
-        assert!(streamed_bytes.starts_with(b"%PDF-1.4"));
-        assert!(streamed_bytes.ends_with(b"%%EOF\n"));
-        crate::domains::io::handle("close", &json!({"handle": handle}), &mut ctx)
-            .await
-            .expect("close PDF stream");
-        assert!(
-            crate::domains::io::handle("read", &json!({"handle": handle}), &mut ctx,)
-                .await
-                .is_err(),
-            "closed PDF handles must release their buffer"
-        );
 
         let ranged = print_to_pdf(
             &json!({
@@ -531,5 +503,79 @@ mod tests {
         let ranged_text = String::from_utf8_lossy(&ranged_bytes);
         assert!(ranged_text.contains("/Count 1"));
         assert_eq!(ranged_text.matches("/Subtype /Image").count(), 1);
+
+        let other_page_id = ctx.create_page();
+        let other_session = Some(format!("{other_page_id}-session"));
+        ctx.sessions
+            .insert(other_session.clone().unwrap(), other_page_id);
+        for unauthorized_session in [None, other_session.clone()] {
+            assert!(
+                crate::domains::io::handle(
+                    "read",
+                    &json!({"handle": handle, "size": 8}),
+                    &mut ctx,
+                    &unauthorized_session,
+                )
+                .await
+                .is_err(),
+                "PDF stream must reject a non-owner session"
+            );
+            assert!(
+                crate::domains::io::handle(
+                    "close",
+                    &json!({"handle": handle}),
+                    &mut ctx,
+                    &unauthorized_session,
+                )
+                .await
+                .is_err(),
+                "a non-owner session must not close the PDF stream"
+            );
+        }
+
+        ctx.remove_page(&page_id);
+        let mut streamed_bytes = Vec::new();
+        let first = crate::domains::io::handle(
+            "read",
+            &json!({"handle": handle, "offset": 0, "size": 8}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("owner session can seek in PDF stream after page close");
+        streamed_bytes.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(first["data"].as_str().unwrap())
+                .unwrap(),
+        );
+        loop {
+            let chunk = crate::domains::io::handle(
+                "read",
+                &json!({"handle": handle, "size": 1024}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .expect("read PDF stream");
+            streamed_bytes.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk["data"].as_str().unwrap())
+                    .unwrap(),
+            );
+            if chunk["eof"] == true {
+                break;
+            }
+        }
+        assert!(streamed_bytes.starts_with(b"%PDF-1.4"));
+        assert!(streamed_bytes.ends_with(b"%%EOF\n"));
+        crate::domains::io::handle("close", &json!({"handle": handle}), &mut ctx, &session)
+            .await
+            .expect("close PDF stream");
+        assert!(
+            crate::domains::io::handle("read", &json!({"handle": handle}), &mut ctx, &session)
+                .await
+                .is_err(),
+            "closed PDF handles must release their buffer"
+        );
     }
 }

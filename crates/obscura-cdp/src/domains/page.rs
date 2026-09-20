@@ -1150,7 +1150,7 @@ pub(crate) fn emit_runtime_network_events(
 }
 
 fn network_response_value(event: &obscura_browser::NetworkEvent) -> Value {
-    json!({"url": event.url, "status": event.status, "statusText": "",
+    json!({"url": event.url, "status": event.status, "statusText": event.status_text,
         "headers": &*event.response_headers, "rawHeaders": event.raw_headers,
         "bodyRequestId": event.response_body_request_id,
         "mimeType": event.response_headers.get("content-type").cloned().unwrap_or_default()})
@@ -1178,7 +1178,7 @@ fn emit_network_result(
             method: "Network.responseReceived".into(),
             params: json!({"requestId": request_id, "loaderId": loader_id,
                 "timestamp": event.timestamp, "type": event.resource_type, "frameId": frame_id, "hasExtraInfo": false,
-                "response": {"url": event.url, "status": event.status, "statusText": "",
+                "response": {"url": event.url, "status": event.status, "statusText": event.status_text,
                     "headers": &*event.response_headers, "rawHeaders": event.raw_headers,
                     "bodyRequestId": event.response_body_request_id,
                     "mimeType": event.response_headers.get("content-type").cloned().unwrap_or_default()}}),
@@ -2415,6 +2415,7 @@ mod tests {
             method: "GET".into(),
             resource_type: "Fetch".into(),
             status: 200,
+            status_text: String::new(),
             headers: std::collections::HashMap::new(),
             response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
                 "content-type".into(),

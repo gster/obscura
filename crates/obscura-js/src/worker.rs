@@ -27,6 +27,8 @@ struct WorkerPolicy {
     blocked_urls: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>>,
     intercept_enabled: bool,
+    intercept_request_patterns: Vec<crate::ops::FetchRequestPattern>,
+    intercept_response_patterns: Vec<crate::ops::FetchRequestPattern>,
     console_enabled: bool,
     runtime_events_enabled: bool,
 }
@@ -38,6 +40,8 @@ pub(crate) fn sync_policy(state: &OpState) {
     policy.blocked_urls = page.blocked_urls.clone();
     policy.intercept_tx = page.intercept_tx.clone();
     policy.intercept_enabled = page.intercept_enabled;
+    policy.intercept_request_patterns = page.intercept_request_patterns.clone();
+    policy.intercept_response_patterns = page.intercept_response_patterns.clone();
     policy.console_enabled = page.console_messages_enabled;
     policy.runtime_events_enabled = page.runtime_events_enabled;
 }
@@ -50,6 +54,8 @@ pub(crate) fn refresh_policy(state: &OpState) {
     page.blocked_urls = policy.blocked_urls.clone();
     page.intercept_tx = policy.intercept_tx.clone();
     page.intercept_enabled = policy.intercept_enabled;
+    page.intercept_request_patterns = policy.intercept_request_patterns.clone();
+    page.intercept_response_patterns = policy.intercept_response_patterns.clone();
     page.console_messages_enabled = policy.console_enabled;
     page.runtime_events_enabled = policy.runtime_events_enabled;
 }
@@ -208,6 +214,8 @@ struct WorkerConfig {
     referrer_policy: obscura_net::ReferrerPolicy,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>>,
     intercept_enabled: bool,
+    intercept_request_patterns: Vec<crate::ops::FetchRequestPattern>,
+    intercept_response_patterns: Vec<crate::ops::FetchRequestPattern>,
     intercept_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     response_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     response_bodies: std::sync::Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
@@ -900,6 +908,8 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         stealth: worker_stealth,
         blocked_urls: parent.blocked_urls.clone(), referrer_policy: parent.referrer_policy,
         intercept_tx: parent.intercept_tx.clone(), intercept_enabled: parent.intercept_enabled,
+        intercept_request_patterns: parent.intercept_request_patterns.clone(),
+        intercept_response_patterns: parent.intercept_response_patterns.clone(),
         intercept_counter: parent.intercept_counter.clone(), response_counter: parent.network_response_body_counter.clone(),
         response_bodies: parent.network_response_bodies.clone(),
         in_flight: parent.page_in_flight.clone(), console_enabled: parent.console_messages_enabled,
@@ -952,6 +962,8 @@ async fn run_worker(id: u32, config: WorkerConfig,
         state.referrer_policy = config.referrer_policy;
         state.intercept_tx = config.intercept_tx;
         state.intercept_enabled = config.intercept_enabled;
+        state.intercept_request_patterns = config.intercept_request_patterns;
+        state.intercept_response_patterns = config.intercept_response_patterns;
         state.intercept_counter = config.intercept_counter;
         state.network_response_body_counter = config.response_counter;
         state.network_response_bodies = config.response_bodies;
@@ -1211,6 +1223,7 @@ mod tests {
             pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
             request_id: "fetch-1".into(), url: "http://example.test/".into(), method: "GET".into(),
             resource_type: obscura_net::ResourceType::Fetch, status: 200,
+            status_text: String::new(),
             response_headers: HashMap::new(), raw_headers: None, request_raw_headers: None,
             body_size: 256 * 1024 * 1024, timestamp: 0.0,
         };

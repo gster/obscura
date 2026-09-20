@@ -50,6 +50,7 @@ pub enum FetchResolution {
     },
     FulfillWithHeaders {
         status: u16,
+        status_text: Option<String>,
         raw_headers: obscura_net::HeaderCapture,
         body: String,
         body_base64: String,
@@ -92,19 +93,35 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
-            let patterns = params
-                .get("patterns")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|p| {
-                            p.get("urlPattern")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec!["*".to_string()]);
+            if let Some(handle_auth_requests) = params.get("handleAuthRequests") {
+                match handle_auth_requests.as_bool() {
+                    Some(false) => {}
+                    Some(true) => return Err("Fetch.enable handleAuthRequests=true is not supported".into()),
+                    None => return Err("Fetch.enable handleAuthRequests must be a boolean".into()),
+                }
+            }
+            let mut request_patterns = Vec::new();
+            let mut response_patterns = Vec::new();
+            if let Some(patterns) = params.get("patterns") {
+                for pattern in patterns.as_array().ok_or("Fetch.enable patterns must be an array")? {
+                    let pattern = pattern.as_object().ok_or("Fetch.enable patterns entries must be objects")?;
+                    let stage = pattern.get("requestStage").map(|value| value.as_str()
+                        .ok_or("Fetch pattern requestStage must be a string")).transpose()?.unwrap_or("Request");
+                    let url = pattern.get("urlPattern").map(|value| value.as_str()
+                        .ok_or("Fetch pattern urlPattern must be a string")).transpose()?.unwrap_or("*").to_string();
+                    let resource_type = pattern.get("resourceType").map(|value| value.as_str()
+                        .ok_or("Fetch pattern resourceType must be a string")
+                        .and_then(validate_resource_type)).transpose()?.map(str::to_string);
+                    let pattern = obscura_js::ops::FetchRequestPattern { url_pattern: url, resource_type };
+                    match stage {
+                        "Request" => request_patterns.push(pattern),
+                        "Response" => response_patterns.push(pattern),
+                        stage => return Err(format!("Unsupported Fetch requestStage: {stage}")),
+                    }
+                }
+            } else {
+                request_patterns.push(obscura_js::ops::FetchRequestPattern { url_pattern: "*".into(), resource_type: None });
+            }
 
             let page_id = match session_id {
                 Some(session) => ctx.sessions.get(session).cloned()
@@ -120,10 +137,12 @@ pub async fn handle(
             }
             ctx.fetch_intercept.owners.insert(page_id.clone(), session_id.clone());
             ctx.fetch_intercept.enabled = true;
-            ctx.fetch_intercept.patterns = patterns.clone();
+            ctx.fetch_intercept.patterns = request_patterns.iter().map(|pattern| pattern.url_pattern.clone()).collect();
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_page_mut(&page_id) {
-                page.intercept_block_patterns = patterns.clone();
+                page.intercept_block_patterns = request_patterns.iter().map(|pattern| pattern.url_pattern.clone()).collect();
+                page.intercept_request_patterns = request_patterns.clone();
+                page.set_intercept_response_patterns(response_patterns);
                 if let Some(tx) = tx_clone {
                     let (page_tx, page_rx) = tokio::sync::mpsc::unbounded_channel();
                     let mut pending = PendingIntercepts(page_rx);
@@ -141,7 +160,7 @@ pub async fn handle(
                     });
                     page.set_intercept_tx(page_tx);
                 }
-                page.enable_intercept(true);
+                page.enable_intercept(!request_patterns.is_empty());
             }
 
             tracing::info!("Fetch interception enabled");
@@ -163,6 +182,8 @@ pub async fn handle(
             if !ctx.fetch_intercept.enabled { ctx.fetch_intercept.patterns.clear(); }
             if let Some(page) = ctx.get_page_mut(&page_id) {
                 page.intercept_block_patterns.clear();
+                page.intercept_request_patterns.clear();
+                page.set_intercept_response_patterns(Vec::new());
                 page.enable_intercept(false);
             }
             let paused: Vec<_> = ctx.fetch_intercept.paused.drain().collect();
@@ -182,18 +203,20 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
-            let post_data = crate::server::parse_continue_post_data(params)?;
-            let headers = crate::server::parse_cdp_headers(params)?;
+            let resolution = crate::server::parse_continue_resolution(params)?;
+            let (url, method, headers, post_data) = match resolution {
+                obscura_js::ops::InterceptResolution::Continue { url, method, headers, body } => {
+                    (url, method, headers.map(|headers| headers.into_iter().collect()), body)
+                }
+                obscura_js::ops::InterceptResolution::ContinueWithHeaders { url, method, headers, body } => {
+                    (url, method, Some(headers), body)
+                }
+                _ => unreachable!("continue parser returns a request continuation"),
+            };
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
-                    url: params
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    method: params
-                        .get("method")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    url,
+                    method,
                     // Honor client header overrides (route.continue({ headers }))
                     // — parity with server.rs handle_fetch_resolution (#919).
                     headers,
@@ -208,12 +231,12 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
-            let obscura_js::ops::InterceptResolution::FulfillWithHeaders { status, raw_headers, body, body_base64, .. } =
+            let obscura_js::ops::InterceptResolution::FulfillWithHeaders { status, status_text, raw_headers, body, body_base64, .. } =
                 crate::server::parse_fulfill_resolution(params)? else { unreachable!("fulfill parser returns captured response") };
 
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::FulfillWithHeaders {
-                    status, raw_headers, body, body_base64,
+                    status, status_text, raw_headers, body, body_base64,
                 });
             }
             Ok(json!({}))
@@ -224,11 +247,7 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
-            let reason = params
-                .get("errorReason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Failed")
-                .to_string();
+            let reason = crate::server::parse_error_reason(params)?;
 
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Fail { reason });
@@ -246,7 +265,18 @@ pub async fn handle(
             // Obscura accepts completed capture IDs, as takeResponseBodyAsStream
             // does. This is not response-stage interception: an active request
             // pause has no complete response body and must remain paused.
-            super::network::get_response_body(ctx, session_id, request_id)
+            let (_, store) = super::network::response_body_owner(ctx, session_id, request_id)?;
+            let (body, binary) = store.lock().unwrap_or_else(|e| e.into_inner()).get_for_fetch(request_id)
+                .ok_or_else(|| format!("No response body found for requestId {request_id}"))?
+                .map_err(|error| error.to_string())?;
+            use base64::Engine as _;
+            let encoded = body.with_bytes(|bytes| {
+                if !binary {
+                    if let Ok(text) = std::str::from_utf8(bytes) { return (text.to_owned(), false); }
+                }
+                (base64::engine::general_purpose::STANDARD.encode(bytes), true)
+            }).map_err(|error| error.to_string())?;
+            Ok(json!({ "body": encoded.0, "base64Encoded": encoded.1 }))
         },
         "takeResponseBodyAsStream" => {
             // Move raw storage into IO; file-backed bodies are read in chunks.
@@ -258,17 +288,27 @@ pub async fn handle(
             if ctx.fetch_intercept.paused.contains_key(request_id) {
                 return Err(response_body_not_ready(request_id));
             }
-            let page = super::network::response_body_page(ctx, session_id, request_id)?;
-            let page_id = page.id.clone();
-            let size = page.response_body_size(request_id).unwrap()?;
-            let page = ctx.pages.iter_mut().find(|page| page.id == page_id).unwrap();
-            let reservation = ctx.io_streams.reserve(size)?;
-            let bytes = page.take_response_body_result(request_id)
-                .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))??;
+            let (page_id, store) = super::network::response_body_owner(ctx, session_id, request_id)?;
+            let size = store.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
+                .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))?
+                .map_err(|error| error.to_string())?.0.len();
+            let reservation = ctx.io_streams.reserve_fetch(size, session_id.clone(), page_id)?;
+            let bytes = store.lock().unwrap_or_else(|e| e.into_inner()).take(request_id)
+                .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))?
+                .map_err(|error| error.to_string())?;
             let handle = reservation.commit(bytes);
             Ok(json!({ "stream": handle }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
+    }
+}
+
+fn validate_resource_type(resource_type: &str) -> Result<&str, &'static str> {
+    match resource_type {
+        "Document" | "Stylesheet" | "Image" | "Media" | "Font" | "Script" | "TextTrack"
+        | "XHR" | "Fetch" | "Prefetch" | "EventSource" | "WebSocket" | "Manifest"
+        | "SignedExchange" | "Ping" | "CSPViolationReport" | "Preflight" | "Other" => Ok(resource_type),
+        _ => Err("unsupported Fetch pattern resourceType"),
     }
 }
 
@@ -330,6 +370,7 @@ mod tests {
                     ]),
                     body: String::from_utf8_lossy(bytes).into_owned(),
                     body_base64: if index == 3 { String::new() } else { base64::engine::general_purpose::STANDARD.encode(bytes) },
+                    body_supplied: true,
                 };
                 let resolution = if index == 0 {
                     let InterceptResolution::Fulfill { status, body_base64, .. } = legacy else { unreachable!() };
@@ -368,7 +409,7 @@ mod tests {
         for (index, (event, bytes)) in events.iter().zip(&bodies).enumerate() {
             assert_eq!(event.status, if index == 4 { 302 } else { 201 });
             assert_eq!(event.method, if index == 0 { "POST" } else { "GET" });
-            assert_eq!(event.resource_type, "Fetch");
+            assert_eq!(event.resource_type, if index == 1 { "Xhr" } else { "Fetch" });
             assert_eq!(event.body_size, bytes.len());
             assert!(event.url.starts_with("https://synthetic.test/"));
             if index == 0 {
@@ -389,11 +430,13 @@ mod tests {
                 assert_eq!(event.response_headers["X-Complete"], "unaltered");
             }
             let body = super::super::network::handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
-            let fetched = handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
-            assert_eq!(fetched, body);
-            for _ in 0..2 {
-                let alias = handle("getResponseBody", &json!({"requestId": pause_ids[index]}), &mut ctx, &session).await.unwrap();
-                assert_eq!(alias, body);
+            if index != 0 {
+                let fetched = handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
+                assert_eq!(fetched, body);
+                for _ in 0..2 {
+                    let alias = handle("getResponseBody", &json!({"requestId": pause_ids[index]}), &mut ctx, &session).await.unwrap();
+                    assert_eq!(alias, body);
+                }
             }
             let actual = if body["base64Encoded"] == true {
                 base64::engine::general_purpose::STANDARD.decode(body["body"].as_str().unwrap()).unwrap()
@@ -407,7 +450,7 @@ mod tests {
             let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
             assert!(error.contains("response_body_already_consumed"), "{error}");
         }
-        super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx).await.unwrap();
+        super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx, &session).await.unwrap();
         let other_id = ctx.create_page();
         let other_session = Some(format!("{other_id}-session"));
         ctx.sessions.insert(other_session.clone().unwrap(), other_id.clone());
@@ -417,7 +460,7 @@ mod tests {
         let respond = async {
             let request = other_requests.recv().await.unwrap();
             let id = request.request_id.clone();
-            request.resolver.send(InterceptResolution::Fulfill { status: 200, headers: HashMap::new(), body: "other-page".into(), body_base64: String::new() }).unwrap();
+            request.resolver.send(InterceptResolution::Fulfill { status: 200, headers: HashMap::new(), body: "other-page".into(), body_base64: String::new(), body_supplied: true }).unwrap();
             id
         };
         let (other_result, other_pause_id) = tokio::join!(other.evaluate_for_cdp("fetch('https://synthetic.test/other').then(r=>r.text())", true, true), respond);
@@ -432,7 +475,7 @@ mod tests {
         let respond = async {
             let request = requests.recv().await.unwrap();
             let id = request.request_id.clone();
-            request.resolver.send(InterceptResolution::Fulfill { status: 200, headers: HashMap::new(), body: "after-navigation".into(), body_base64: String::new() }).unwrap();
+            request.resolver.send(InterceptResolution::Fulfill { status: 200, headers: HashMap::new(), body: "after-navigation".into(), body_base64: String::new(), body_supplied: true }).unwrap();
             id
         };
         let (result, rebuilt_pause_id) = tokio::join!(page.evaluate_for_cdp("fetch('https://synthetic.test/rebuilt').then(r=>r.text())", true, true), respond);
@@ -450,6 +493,7 @@ mod tests {
             let id = request.request_id.clone();
             request.resolver.send(InterceptResolution::Fulfill {
                 status: 200, headers: HashMap::new(), body: "uncaptured".into(), body_base64: String::new(),
+                body_supplied: true,
             }).unwrap();
             id
         };
@@ -526,10 +570,6 @@ mod tests {
         for (event, bytes) in events.iter().zip([&text, &binary, &module]) {
             assert_eq!(event.body_size, bytes.len());
             let value = super::super::network::handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
-            for _ in 0..2 {
-                let fetched = handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
-                assert_eq!(fetched, value, "Fetch reads must be repeatable and match Network");
-            }
             let actual = if value["base64Encoded"] == true {
                 base64::engine::general_purpose::STANDARD.decode(value["body"].as_str().unwrap()).unwrap()
             } else { value["body"].as_str().unwrap().as_bytes().to_vec() };
@@ -560,12 +600,12 @@ mod tests {
         ctx.remove_page(&page_id);
         let mut received = Vec::new();
         loop {
-            let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx).await.unwrap();
+            let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx, &session).await.unwrap();
             received.extend(base64::engine::general_purpose::STANDARD.decode(result["data"].as_str().unwrap()).unwrap());
             if result["eof"] == true { break; }
         }
         assert_eq!(received, binary);
-        super::super::io::handle("close", &json!({"handle": stream}), &mut ctx).await.unwrap();
+        super::super::io::handle("close", &json!({"handle": stream}), &mut ctx, &session).await.unwrap();
         server.join().unwrap();
     }
 
@@ -583,11 +623,9 @@ mod tests {
         let request_id = page.network_events.last().unwrap().request_id.clone();
         page.alias_response_body(&request_id, "loader");
         for id in [&request_id, "loader"] {
-            for _ in 0..2 {
-                let body = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap();
-                assert_eq!(body["base64Encoded"], true);
-                assert_eq!(base64::engine::general_purpose::STANDARD.decode(body["body"].as_str().unwrap()).unwrap(), bytes);
-            }
+            let body = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap();
+            assert_eq!(body["base64Encoded"], true);
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(body["body"].as_str().unwrap()).unwrap(), bytes);
         }
         let result = handle("takeResponseBodyAsStream", &json!({"requestId": "loader"}), &mut ctx, &session).await.unwrap();
         let stream = result["stream"].as_str().unwrap();
@@ -603,13 +641,13 @@ mod tests {
         ctx.remove_page(&page_id);
         let mut received = Vec::new();
         loop {
-            let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx).await.unwrap();
+            let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx, &session).await.unwrap();
             received.extend(base64::engine::general_purpose::STANDARD.decode(result["data"].as_str().unwrap()).unwrap());
             if result["eof"] == true { break; }
         }
         assert_eq!(received, bytes);
-        super::super::io::handle("close", &json!({"handle": stream}), &mut ctx).await.unwrap();
-        assert!(super::super::io::handle("read", &json!({"handle": stream}), &mut ctx).await.is_err());
+        super::super::io::handle("close", &json!({"handle": stream}), &mut ctx, &session).await.unwrap();
+        assert!(super::super::io::handle("read", &json!({"handle": stream}), &mut ctx, &session).await.is_err());
     }
 
     #[tokio::test]
@@ -667,6 +705,8 @@ mod tests {
         assert!(matches!(rx.await.unwrap(), FetchResolution::Continue { .. }));
         let body = handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(body, json!({"body": "complete", "base64Encoded": false}));
+        let error = handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
+        assert!(error.contains("response_body_access_conflict"), "{error}");
         let error = handle("getResponseBody", &json!({}), &mut ctx, &session).await.unwrap_err();
         assert_eq!(error, "Fetch.getResponseBody requires requestId");
         let error = handle("getResponseBody", &json!({"requestId": "unfinished-or-unknown"}), &mut ctx, &session).await.unwrap_err();
@@ -692,14 +732,14 @@ mod tests {
             ids.push(request_id);
         }
         for (session, expected) in sessions.iter().zip(["first", "second"]) {
-            let body = handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, session).await.unwrap();
+            let body = super::super::network::handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, session).await.unwrap();
             assert_eq!(body["body"], expected);
         }
         let stream = handle("takeResponseBodyAsStream", &json!({"requestId": "shared-id"}), &mut ctx, &sessions[0]).await.unwrap();
-        super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx).await.unwrap();
+        super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx, &sessions[0]).await.unwrap();
         for method in ["getResponseBody", "takeResponseBodyAsStream"] {
             let error = handle(method, &json!({"requestId": "shared-id"}), &mut ctx, &sessions[0]).await.unwrap_err();
-            assert!(error.contains("response_body_already_consumed"), "{error}");
+            assert!(error.contains("response_body_already_consumed") || error.contains("response_body_access_conflict"), "{error}");
             let error = handle(method, &json!({"requestId": ids[1]}), &mut ctx, &sessions[0]).await.unwrap_err();
             assert!(error.contains("No response body found"), "{error}");
             let error = handle(method, &json!({"requestId": "shared-id"}), &mut ctx, &Some("unknown-session".into())).await.unwrap_err();
@@ -734,6 +774,41 @@ mod tests {
             }
             _ => panic!("expected FetchResolution::Continue"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_protocol_validation_is_strict_and_retryable() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("strict-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        assert!(handle("enable", &json!({"handleAuthRequests":true}), &mut ctx, &session).await
+            .unwrap_err().contains("not supported"));
+        assert!(handle("enable", &json!({"handleAuthRequests":"false"}), &mut ctx, &session).await
+            .unwrap_err().contains("boolean"));
+        handle("enable", &json!({"handleAuthRequests":false}), &mut ctx, &session).await.unwrap();
+
+        let mut failed = pause(&mut ctx, "strict");
+        for params in [json!({"requestId":"strict","url":42}), json!({"requestId":"strict","method":42}),
+            json!({"requestId":"strict","interceptResponse":false}), json!({"requestId":"strict","unknown":true})]
+        {
+            assert!(handle("continueRequest", &params, &mut ctx, &session).await.is_err());
+            assert!(ctx.fetch_intercept.paused.contains_key("strict"));
+            assert!(matches!(failed.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        }
+        assert!(handle("failRequest", &json!({"requestId":"strict","errorReason":"Invented"}), &mut ctx, &session).await.is_err());
+        assert!(ctx.fetch_intercept.paused.contains_key("strict"));
+        handle("failRequest", &json!({"requestId":"strict","errorReason":"BlockedByResponse"}), &mut ctx, &session).await.unwrap();
+        assert!(matches!(failed.try_recv().unwrap(), FetchResolution::Fail { reason } if reason == "BlockedByResponse"));
+
+        let mut fulfilled = pause(&mut ctx, "phrase");
+        assert!(handle("fulfillRequest", &json!({"requestId":"phrase","responseCode":203,"responsePhrase":42}),
+            &mut ctx, &session).await.is_err());
+        assert!(ctx.fetch_intercept.paused.contains_key("phrase"));
+        handle("fulfillRequest", &json!({"requestId":"phrase","responseCode":203,"responsePhrase":"Synthetic Complete"}),
+            &mut ctx, &session).await.unwrap();
+        assert!(matches!(fulfilled.try_recv().unwrap(), FetchResolution::FulfillWithHeaders { status_text, .. }
+            if status_text.as_deref() == Some("Synthetic Complete")));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -792,13 +867,13 @@ mod tests {
         use base64::Engine as _;
         let mut ctx = CdpContext::new();
         let rx = pause(&mut ctx, "binary-headers");
-        for params in [json!({"requestId":"binary-headers","binaryResponseHeaders":"%"}), json!({"requestId":"binary-headers","body":"%"})] {
+        for params in [json!({"requestId":"binary-headers","responseCode":200,"binaryResponseHeaders":"%"}), json!({"requestId":"binary-headers","responseCode":200,"body":"%"})] {
             let result = handle("fulfillRequest", &params, &mut ctx, &None).await;
             assert!(result.is_err());
             assert!(ctx.fetch_intercept.paused.contains_key("binary-headers"));
         }
         let headers = b"Set-Cookie: a=full\0Set-Cookie: b=full\0X-Bytes: \xff\0";
-        handle("fulfillRequest", &json!({"requestId":"binary-headers","body":"AP8=",
+        handle("fulfillRequest", &json!({"requestId":"binary-headers","responseCode":200,"body":"AP8=",
             "binaryResponseHeaders":base64::engine::general_purpose::STANDARD.encode(headers)}), &mut ctx, &None).await.unwrap();
         let FetchResolution::FulfillWithHeaders { raw_headers, body_base64, .. } = rx.await.unwrap() else { panic!("missing raw fulfill") };
         assert_eq!(body_base64, "AP8=");
@@ -847,12 +922,15 @@ mod relay_cleanup_tests {
         for id in ["intercept-1", "intercept-2"] {
             let (resolver, receiver) = tokio::sync::oneshot::channel();
             tx.send(obscura_js::ops::InterceptedRequest {
+                stage: obscura_js::ops::InterceptionStage::Request,
                 document_generation: 0, document_url: "https://example.test/".into(), redirect_response: None,
+                redirected_request_id: None,
                 network_id: "fixture-network-id".into(),
                 network_start: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 request_raw_headers: None, request_body_size: 0,
                 request_id: id.into(), url: "https://example.test/".into(), method: "GET".into(),
-                headers: HashMap::new(), resource_type: "Fetch".into(), resolver,
+                headers: HashMap::new(), resource_type: "Fetch".into(), response_status_code: None,
+                response_headers: None, response_raw_headers: None, response_body_request_id: None, resolver,
             }).unwrap();
             receivers.push(receiver);
         }

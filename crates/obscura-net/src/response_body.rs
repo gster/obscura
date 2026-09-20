@@ -34,6 +34,8 @@ pub enum ResponseBodyError {
     Io(String),
     #[error("response_body_already_consumed")]
     Consumed,
+    #[error("response_body_access_conflict: Fetch.getResponseBody and Fetch.takeResponseBodyAsStream are mutually exclusive")]
+    AccessConflict,
 }
 
 impl From<std::io::Error> for ResponseBodyError {
@@ -106,8 +108,11 @@ impl From<Vec<u8>> for ResponseBody {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FetchAccess { None, Get }
+
 enum Entry {
-    Ready { body: ResponseBody, binary: bool },
+    Ready { body: ResponseBody, binary: bool, fetch_access: FetchAccess },
     Taken { len: usize },
 }
 
@@ -168,7 +173,7 @@ impl ResponseBodyStore {
         let body = ResponseBody::from_bytes(bytes, self.limits.memory_threshold)
             .map_err(|error| self.fail(&request_id, error))?;
         self.total_bytes = total.unwrap();
-        let replacement = Entry::Ready { body, binary };
+        let replacement = Entry::Ready { body, binary, fetch_access: FetchAccess::None };
         if let Some(entry) = existing {
             *entry.lock().unwrap_or_else(|e| e.into_inner()) = replacement;
         } else {
@@ -188,8 +193,24 @@ impl ResponseBodyStore {
             return self.failure.clone().map(Err);
         };
         Some(match &*entry.lock().unwrap_or_else(|e| e.into_inner()) {
-            Entry::Ready { body, binary } => Ok((body.clone(), *binary)),
+            Entry::Ready { body, binary, .. } => Ok((body.clone(), *binary)),
             Entry::Taken { .. } => Err(ResponseBodyError::Consumed),
+        })
+    }
+
+    /// Fetch whole-body reads and stream transfer are mutually exclusive.
+    /// Repeated whole-body reads are allowed and share the retained storage.
+    pub fn get_for_fetch(&mut self, request_id: &str) -> Option<Result<(ResponseBody, bool), ResponseBodyError>> {
+        let Some(entry) = self.entries.get(request_id) else {
+            return self.failure.clone().map(Err);
+        };
+        let mut entry = entry.lock().unwrap_or_else(|e| e.into_inner());
+        Some(match &mut *entry {
+            Entry::Ready { body, binary, fetch_access } => {
+                *fetch_access = FetchAccess::Get;
+                Ok((body.clone(), *binary))
+            }
+            Entry::Taken { .. } => Err(ResponseBodyError::AccessConflict),
         })
     }
 
@@ -201,7 +222,8 @@ impl ResponseBodyStore {
         };
         let mut entry = entry.lock().unwrap_or_else(|e| e.into_inner());
         let result = match &*entry {
-            Entry::Ready { body, .. } => Ok(body.clone()),
+            Entry::Ready { body, fetch_access: FetchAccess::None, .. } => Ok(body.clone()),
+            Entry::Ready { fetch_access: FetchAccess::Get, .. } => Err(ResponseBodyError::AccessConflict),
             Entry::Taken { .. } => Err(ResponseBodyError::Consumed),
         };
         if let Ok(body) = &result { *entry = Entry::Taken { len: body.len() }; }

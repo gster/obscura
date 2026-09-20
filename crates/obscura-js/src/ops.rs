@@ -48,6 +48,14 @@ pub enum InterceptResolution {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     },
+    /// Resume a response-stage pause. The body has already been captured in
+    /// full; CDP may replace only the response status and headers here.
+    ContinueResponse {
+        status: Option<u16>,
+        status_text: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        raw_headers: Option<obscura_net::HeaderCapture>,
+    },
     Fulfill {
         status: u16,
         headers: HashMap<String, String>,
@@ -59,25 +67,58 @@ pub enum InterceptResolution {
         /// (`_base64ToUint8Array`) instead of a `from_utf8_lossy` corruption
         /// of any non-UTF-8 payload (image, font, protobuf). See #912.
         body_base64: String,
+        body_supplied: bool,
     },
     /// CDP-supplied response fields, preserving repeats and original bytes.
     /// This is a synthetic capture, not headers observed at the transport.
     FulfillWithHeaders {
         status: u16,
+        status_text: Option<String>,
         headers: HashMap<String, String>,
         raw_headers: obscura_net::HeaderCapture,
         body: String,
         body_base64: String,
+        body_supplied: bool,
     },
     Fail {
         reason: String,
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptionStage {
+    Request,
+    Response,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchRequestPattern {
+    pub url_pattern: String,
+    pub resource_type: Option<String>,
+}
+
+fn cdp_resource_type(resource_type: ResourceType) -> &'static str {
+    match resource_type {
+        ResourceType::Document => "Document", ResourceType::Script => "Script",
+        ResourceType::Stylesheet => "Stylesheet", ResourceType::Image => "Image",
+        ResourceType::Font => "Font", ResourceType::Xhr => "XHR",
+        ResourceType::Fetch => "Fetch", ResourceType::Other => "Other",
+    }
+}
+
+fn request_patterns_match(patterns: &[FetchRequestPattern], url: &str, resource_type: ResourceType) -> bool {
+    let resource_type = cdp_resource_type(resource_type);
+    patterns.is_empty() || patterns.iter().any(|pattern|
+        pattern.resource_type.as_deref().is_none_or(|expected| expected == resource_type)
+            && glob_match(&pattern.url_pattern, url))
+}
+
 pub struct InterceptedRequest {
+    pub stage: InterceptionStage,
     pub document_generation: u64,
     pub document_url: String,
     pub redirect_response: Option<obscura_net::observation::Exchange>,
+    pub redirected_request_id: Option<String>,
     pub network_id: String,
     pub network_start: Arc<std::sync::atomic::AtomicU8>,
     pub request_raw_headers: Option<obscura_net::HeaderCapture>,
@@ -87,6 +128,10 @@ pub struct InterceptedRequest {
     pub method: String,
     pub headers: HashMap<String, String>,
     pub resource_type: String,
+    pub response_status_code: Option<u16>,
+    pub response_headers: Option<HashMap<String, String>>,
+    pub response_raw_headers: Option<obscura_net::HeaderCapture>,
+    pub response_body_request_id: Option<String>,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
 
@@ -133,6 +178,7 @@ pub struct JsNetworkEvent {
     pub method: String,
     pub resource_type: ResourceType,
     pub status: u16,
+    pub status_text: String,
     pub response_headers: HashMap<String, String>,
     pub raw_headers: Option<obscura_net::HeaderCapture>,
     pub request_raw_headers: Option<obscura_net::HeaderCapture>,
@@ -331,6 +377,10 @@ pub struct ObscuraState {
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: Arc<std::sync::atomic::AtomicU64>,
     pub intercept_enabled: bool,
+    pub intercept_request_patterns: Vec<FetchRequestPattern>,
+    /// URL patterns enabled specifically at the CDP Fetch response stage.
+    /// Empty keeps the old request-only interception behavior.
+    pub intercept_response_patterns: Vec<FetchRequestPattern>,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
@@ -588,6 +638,8 @@ impl ObscuraState {
             intercept_tx: None,
             intercept_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             intercept_enabled: false,
+            intercept_request_patterns: Vec::new(),
+            intercept_response_patterns: Vec::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
             runtime_events_enabled: false,
@@ -3762,6 +3814,8 @@ pub(crate) struct NetworkRequest {
     hop_starts: Vec<Arc<std::sync::atomic::AtomicU8>>,
     hop_interceptions: Vec<Option<String>>,
     pub interception_id: Option<String>,
+    response_interception_id: Option<String>,
+    response_status_texts: Vec<String>,
     pub initiator_request_id: Option<String>,
     resource_type: ResourceType,
     finished: bool,
@@ -3783,7 +3837,15 @@ impl NetworkRequest {
         trace.begin(url, method, headers, body_size);
         let document_generation = state.borrow().network_document_generation;
         let document_url = state.borrow().network_document_url.clone();
-        Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 }
+        Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, response_interception_id: None, response_status_texts: Vec::new(), initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 }
+    }
+
+    fn set_response_status_text(&mut self, index: usize, status_text: Option<String>) {
+        let Some(status_text) = status_text else { return; };
+        while self.response_status_texts.len() <= index {
+            self.response_status_texts.push(String::new());
+        }
+        self.response_status_texts[index] = status_text;
     }
 
     fn start_before_preflight(&mut self) {
@@ -3802,7 +3864,7 @@ impl NetworkRequest {
             document_generation: self.document_generation, document_url: self.document_url.clone(),
             initiator_request_id: None,
             pending: true, error: None, request_id: self.id.clone(), url: exchange.url.clone(), method: exchange.method.clone(),
-            resource_type: self.resource_type, status: 0, response_headers: HashMap::new(), raw_headers: None,
+            resource_type: self.resource_type, status: 0, status_text: String::new(), response_headers: HashMap::new(), raw_headers: None,
             request_raw_headers: exchange.request_headers.clone(), request_body_size: exchange.request_body_size,
             request_started: false, redirect: false, response_body_request_id: None, body_size: 0,
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
@@ -3865,6 +3927,7 @@ impl NetworkRequest {
             request_id: self.id.clone(), url: exchange.url, method: exchange.method,
             resource_type: self.resource_type,
             status: response.as_ref().map_or(0, |r| r.status),
+            status_text: self.response_status_texts.get(index).cloned().unwrap_or_default(),
             response_headers: response.as_ref().map(|r| r.headers.clone()).unwrap_or_default(),
             raw_headers: response.as_ref().and_then(|r| r.raw_headers.clone()),
             request_raw_headers: exchange.request_headers.or_else(|| response.as_ref().and_then(|r| r.request_raw_headers.clone())),
@@ -3938,7 +4001,11 @@ async fn op_fetch_url(
         .or_else(|| options.filter(|value| !value.starts_with('{')));
     let request_id = options_json.as_ref().and_then(|value| value["requestId"].as_str()).map(str::to_owned);
     let shared = state.borrow().borrow::<SharedState>().clone();
-    let resource_type = if matches!(destination.as_deref(), Some("script" | "worker")) { ResourceType::Script } else { ResourceType::Fetch };
+    let resource_type = if options_json.as_ref().and_then(|value| value["resourceType"].as_str()) == Some("XHR") {
+        ResourceType::Xhr
+    } else if matches!(destination.as_deref(), Some("script" | "worker")) {
+        ResourceType::Script
+    } else { ResourceType::Fetch };
     let fields = serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default();
     let mut observation = NetworkRequest::new(shared.clone(), request_id, &url, &method,
         Some(request_header_capture(fields)), body.len(), resource_type);
@@ -3946,7 +4013,7 @@ async fn op_fetch_url(
     let mut cancel = shared.borrow().fetch_cancellations.get(&observation.id).map(|(sender, _)| sender.subscribe());
     let result = {
         let operation = fetch_url_inner(state.clone(), url, method, headers_json, body.to_vec(), origin,
-            mode, credentials, destination, &mut observation);
+            mode, credentials, destination, resource_type, &mut observation);
         tokio::pin!(operation);
         if let Some(cancel) = cancel.as_mut() {
             tokio::select! {
@@ -3977,14 +4044,10 @@ async fn op_fetch_url(
 
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String, body: Vec<u8>,
-    origin: String, mode: String, credentials: String, destination: Option<String>,
+    origin: String, mode: String, credentials: String, destination: Option<String>, resource_type: ResourceType,
     observation: &mut NetworkRequest,
 ) -> Result<String, deno_error::JsErrorBox> {
     crate::worker::refresh_policy(&state.borrow());
-    let resource_type = match destination.as_deref() {
-        Some("script" | "worker") => ResourceType::Script,
-        _ => ResourceType::Fetch,
-    };
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -4016,7 +4079,8 @@ async fn fetch_url_inner(
             gs.intercept_enabled,
             gs.intercept_tx.is_some()
         );
-        let itx = if gs.intercept_enabled {
+        let request_matches = request_patterns_match(&gs.intercept_request_patterns, &url, resource_type);
+        let itx = if gs.intercept_enabled && request_matches {
             let id = observation.interception_id.clone().unwrap_or_else(|| {
                 let id = gs.intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 format!("intercept-{id}")
@@ -4070,7 +4134,9 @@ async fn fetch_url_inner(
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
+            stage: InterceptionStage::Request,
             document_generation: observation.document_generation, document_url: observation.document_url.clone(), redirect_response: None,
+            redirected_request_id: None,
             network_id: observation.id.clone(),
             network_start: observation.network_start.clone(),
             request_raw_headers: Some(request_header_capture(custom_headers.clone())),
@@ -4079,15 +4145,19 @@ async fn fetch_url_inner(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
-            resource_type: format!("{:?}", resource_type),
+            resource_type: cdp_resource_type(resource_type).into(),
+            response_status_code: None, response_headers: None, response_raw_headers: None,
+            response_body_request_id: None,
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
             observation.interception_id = Some(request_id.clone());
             let resolution = resolve_rx.await;
-            let raw_headers = match &resolution {
-                Ok(InterceptResolution::FulfillWithHeaders { raw_headers, .. }) => Some(raw_headers.clone()),
-                _ => None,
+            let (raw_headers, status_text) = match &resolution {
+                Ok(InterceptResolution::FulfillWithHeaders { raw_headers, status_text, .. }) => {
+                    (Some(raw_headers.clone()), status_text.clone())
+                }
+                _ => (None, None),
             };
             match resolution {
                 Ok(InterceptResolution::Fulfill {
@@ -4095,6 +4165,7 @@ async fn fetch_url_inner(
                     headers: h,
                     body: b,
                     body_base64: bb,
+                    ..
                 } | InterceptResolution::FulfillWithHeaders {
                     status,
                     headers: h,
@@ -4115,6 +4186,9 @@ async fn fetch_url_inner(
                             raw_headers, request_raw_headers: None,
                             redirected_from: Vec::new(), request_referrer: None,
                         };
+                        observation.set_response_status_text(
+                            observation.trace.len().saturating_sub(1), status_text,
+                        );
                         observation.trace.response(&response, status != 0);
                         observation.finish(None);
                         let shared = state.borrow().borrow::<SharedState>().clone();
@@ -4158,6 +4232,9 @@ async fn fetch_url_inner(
                     override_method = method;
                     override_headers = Some(headers);
                     override_body = body;
+                }
+                Ok(InterceptResolution::ContinueResponse { .. }) => {
+                    return Err(deno_error::JsErrorBox::generic("continueResponse cannot resolve a request-stage pause"));
                 }
                 Err(_) => return Err(deno_error::JsErrorBox::generic("Aborted: interception resolver closed")),
             }
@@ -4270,11 +4347,12 @@ async fn scripted_preflight(
             Some(request_header_capture(fields.clone())), 0, ResourceType::Other);
         preflight.initiator_request_id = Some(observation.id.clone());
         let preflight_result: Result<(), deno_error::JsErrorBox> = async {
-        let response = tokio::time::timeout(fetch_timeout(), stealth_client.send_single_traced_fields(
+        let mut response = tokio::time::timeout(fetch_timeout(), stealth_client.send_single_traced_fields(
             "OPTIONS", &parsed_url, &fields, &[], false, false, fetch_max_body_bytes(), fetch_timeout(), None, Some(&preflight.trace)))
             .await.map_err(|_| deno_error::JsErrorBox::generic("CORS preflight timed out"))?
             .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
         preflight.trace.response(&response, true);
+        pause_response_hop(&state, &mut preflight, &mut response).await?;
         let preflight_status = response.status;
         let mut preflight_headers = http::header::HeaderMap::new();
         for (name, value) in response.headers {
@@ -4357,6 +4435,122 @@ impl Drop for PageInFlightGuard {
     }
 }
 
+/// Pause after an actual transport response has been read and its exact body
+/// has been admitted to the page body store. This runs once per hop, including
+/// CORS preflights and redirects, before redirect/CORS processing can hide the
+/// response from the CDP client.
+async fn pause_response_hop(
+    state: &Rc<RefCell<OpState>>,
+    observation: &mut NetworkRequest,
+    response: &mut obscura_net::Response,
+) -> Result<(), deno_error::JsErrorBox> {
+    let shared = state.borrow().borrow::<SharedState>().clone();
+    let response_bodies = shared.borrow().network_response_bodies.clone();
+    let (tx, matches) = {
+        let state = shared.borrow();
+        let resource_type = if observation.initiator_request_id.is_some() { "Preflight" } else {
+            match observation.resource_type {
+                ResourceType::Xhr => "XHR",
+                ResourceType::Fetch => "Fetch",
+                ResourceType::Script => "Script",
+                ResourceType::Document => "Document",
+                ResourceType::Stylesheet => "Stylesheet",
+                ResourceType::Image => "Image",
+                ResourceType::Font => "Font",
+                ResourceType::Other => "Other",
+            }
+        };
+        (state.intercept_tx.clone(), state.intercept_response_patterns.iter().any(|pattern|
+            pattern.resource_type.as_deref().is_none_or(|expected| expected == resource_type)
+                && glob_match(&pattern.url_pattern, response.url.as_str())))
+    };
+    let Some(tx) = tx.filter(|_| matches) else { return Ok(()); };
+    let page_in_flight = shared.borrow().page_in_flight.clone();
+    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _page_in_flight_guard = PageInFlightGuard(page_in_flight);
+
+    let exchange = observation.trace.last().expect("response trace exists before response-stage pause");
+    let exchange_index = observation.trace.len().saturating_sub(1);
+    let start = if exchange_index == 0 {
+        observation.network_start.clone()
+    } else {
+        while observation.hop_starts.len() < exchange_index {
+            let start = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            observation.hop_starts.push(start.clone());
+            observation.hop_interceptions.push(None);
+        }
+        observation.hop_starts[exchange_index - 1].clone()
+    };
+    let id = shared.borrow().intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let request_id = format!("intercept-{id}");
+    let body_id = exchange.body_request_id.as_ref().ok_or_else(|| {
+        let canonical_id = format!("{}-hop-{exchange_index}", observation.id);
+        let error = response_bodies.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&canonical_id).and_then(Result::err)
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "response_body_capture_incomplete".to_string());
+        deno_error::JsErrorBox::generic(error)
+    })?;
+    response_bodies.lock().unwrap_or_else(|e| e.into_inner())
+        .alias(body_id, &request_id)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    let redirected_request_id = observation.response_interception_id.replace(request_id.clone());
+    let (resolver, resolution) = tokio::sync::oneshot::channel();
+    tx.send(InterceptedRequest {
+        stage: InterceptionStage::Response,
+        document_generation: observation.document_generation,
+        document_url: observation.document_url.clone(),
+        redirect_response: observation.trace.previous(),
+        redirected_request_id,
+        network_id: observation.id.clone(), network_start: start,
+        request_raw_headers: exchange.request_headers.clone(),
+        request_body_size: exchange.request_body_size,
+        request_id, url: exchange.url, method: exchange.method,
+        headers: exchange.request_headers.as_ref().map(|headers| headers.text_headers()).unwrap_or_default(),
+        resource_type: if observation.initiator_request_id.is_some() { "Preflight".into() } else { cdp_resource_type(observation.resource_type).into() },
+        response_status_code: Some(response.status),
+        response_headers: Some(response.headers.clone()),
+        response_raw_headers: response.raw_headers.clone(),
+        response_body_request_id: exchange.body_request_id,
+        resolver,
+    }).map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception channel closed"))?;
+
+    match resolution.await.map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception resolver closed"))? {
+        InterceptResolution::ContinueResponse { status, status_text, headers, raw_headers } => {
+            if let Some(status) = status { response.status = status; }
+            observation.set_response_status_text(exchange_index, status_text);
+            if let Some(headers) = headers { response.headers = headers; }
+            if let Some(raw_headers) = raw_headers { response.raw_headers = Some(raw_headers); }
+        }
+        InterceptResolution::Continue { url: None, method: None, headers: None, body: None } => {}
+        InterceptResolution::Fail { reason } => return Err(deno_error::JsErrorBox::generic(reason)),
+        fulfillment @ (InterceptResolution::Fulfill { .. } | InterceptResolution::FulfillWithHeaders { .. }) => {
+            let (raw_headers, status_text) = match &fulfillment {
+                InterceptResolution::FulfillWithHeaders { raw_headers, status_text, .. } => {
+                    (Some(raw_headers.clone()), status_text.clone())
+                }
+                _ => (None, None),
+            };
+            let (InterceptResolution::Fulfill { status, headers, body, body_base64, body_supplied }
+                | InterceptResolution::FulfillWithHeaders { status, headers, body, body_base64, body_supplied, .. }) = fulfillment else { unreachable!() };
+            response.status = status;
+            observation.set_response_status_text(exchange_index, status_text);
+            response.headers = headers;
+            response.raw_headers = raw_headers;
+            if body_supplied {
+                response.body = if body_base64.is_empty() { body.into_bytes() } else {
+                    BASE64.decode(body_base64).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
+                };
+            }
+        }
+        _ => return Err(deno_error::JsErrorBox::generic("request overrides cannot resolve a response-stage pause")),
+    }
+    // Replacing status/headers/body must also replace the retained exchange so
+    // Network events and body reads report exactly what the page receives.
+    observation.trace.response(response, response.status != 0);
+    Ok(())
+}
+
 async fn pause_redirect_hop(
     state: &Rc<RefCell<OpState>>, observation: &mut NetworkRequest,
     previous: obscura_net::observation::Exchange,
@@ -4364,12 +4558,18 @@ async fn pause_redirect_hop(
     allow_private_network: bool,
 ) -> Result<Option<obscura_net::Response>, deno_error::JsErrorBox> {
     let start = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let redirected_request_id = observation.hop_interceptions.iter().rev().find_map(Clone::clone)
+        .or_else(|| observation.interception_id.clone());
     observation.hop_starts.push(start.clone());
     observation.hop_interceptions.push(None);
     let shared = state.borrow().borrow::<SharedState>().clone();
     let intercept = {
         let state = shared.borrow();
-        if state.intercept_enabled { state.intercept_tx.clone() } else { None }
+        if state.intercept_enabled
+            && request_patterns_match(&state.intercept_request_patterns, url, observation.resource_type)
+        {
+            state.intercept_tx.clone()
+        } else { None }
     };
     let Some(tx) = intercept else { return Ok(None); };
     let page_in_flight = shared.borrow().page_in_flight.clone();
@@ -4380,11 +4580,15 @@ async fn pause_redirect_hop(
     *observation.hop_interceptions.last_mut().unwrap() = Some(request_id.clone());
     let (resolver, resolution) = tokio::sync::oneshot::channel();
     tx.send(InterceptedRequest {
+        stage: InterceptionStage::Request,
         document_generation: observation.document_generation, document_url: observation.document_url.clone(),
-        redirect_response: Some(previous), network_id: observation.id.clone(), network_start: start,
+        redirect_response: Some(previous), redirected_request_id,
+        network_id: observation.id.clone(), network_start: start,
         request_raw_headers: Some(request_header_capture(headers.clone())), request_body_size: body.len(),
         request_id, url: url.clone(), method: method.clone(), headers: headers.iter().cloned().collect(),
-        resource_type: format!("{:?}", observation.resource_type), resolver,
+        resource_type: cdp_resource_type(observation.resource_type).into(),
+        response_status_code: None, response_headers: None, response_raw_headers: None,
+        response_body_request_id: None, resolver,
     }).map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception channel closed"))?;
     let resolution = resolution.await.map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception resolver closed"))?;
     match resolution {
@@ -4409,16 +4613,24 @@ async fn pause_redirect_hop(
             validate_fetch_url(&parsed, allow_private_network).map_err(deno_error::JsErrorBox::generic)?;
             Ok(None)
         }
+        InterceptResolution::ContinueResponse { .. } => {
+            Err(deno_error::JsErrorBox::generic("continueResponse cannot resolve a request-stage pause"))
+        }
         fulfillment => {
-            let raw_headers = match &fulfillment {
-                InterceptResolution::FulfillWithHeaders { raw_headers, .. } => Some(raw_headers.clone()),
-                _ => None,
+            let (raw_headers, status_text) = match &fulfillment {
+                InterceptResolution::FulfillWithHeaders { raw_headers, status_text, .. } => {
+                    (Some(raw_headers.clone()), status_text.clone())
+                }
+                _ => (None, None),
             };
-            let (InterceptResolution::Fulfill { status, headers, body, body_base64 }
+            let (InterceptResolution::Fulfill { status, headers, body, body_base64, .. }
                 | InterceptResolution::FulfillWithHeaders { status, headers, body, body_base64, .. }) = fulfillment else { unreachable!() };
             let bytes = if body_base64.is_empty() { body.into_bytes() } else {
                 BASE64.decode(body_base64).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
             };
+            observation.set_response_status_text(
+                observation.trace.len().saturating_sub(1), status_text,
+            );
             Ok(Some(obscura_net::Response {
                 url: url::Url::parse(url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?,
                 status, headers, body: bytes, raw_headers, request_raw_headers: None,
@@ -4493,7 +4705,7 @@ async fn stealth_fetch_all(
         let mut req_headers: Vec<(String, String)> = req_headers.into_iter().collect();
         req_headers.extend(custom_headers.iter().cloned());
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
-        let r = tokio::time::timeout(fetch_timeout(), stealth
+        let mut r = tokio::time::timeout(fetch_timeout(), stealth
             .send_single_traced_fields(
                 &current_method,
                 &parsed_current,
@@ -4514,6 +4726,7 @@ async fn stealth_fetch_all(
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
         observation.trace.response(&r, r.status != 0);
+        pause_response_hop(&state, observation, &mut r).await?;
         if !(300..400).contains(&r.status) {
             break r;
         }
