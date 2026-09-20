@@ -18,7 +18,7 @@ pub use obscura_js::{
     CaptureError, CaptureRegion,
 };
 pub use obscura_dom::NodeId;
-pub use page::{AutomationWait, AutomationWaitError, DocumentIdentity, NetworkEvent, Page, PageError};
+pub use page::{AutomationWait, AutomationWaitError, DocumentIdentity, NetworkEvent, NetworkEventPhase, Page, PageError};
 #[cfg(feature = "render")]
 pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,

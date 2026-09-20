@@ -649,10 +649,19 @@ fn test_network_requests() {
 
     let resp = c.tool("browser_network_requests", serde_json::json!({}));
     let text = content_text(&resp);
-    assert!(
-        text.contains("127.0.0.1") || text.contains("No network"),
-        "unexpected: {text}"
-    );
+    let observation: serde_json::Value =
+        serde_json::from_str(&text).expect("network tool must return JSON");
+    assert!(observation.is_object(), "network tool must return an object");
+    let events = observation["events"]
+        .as_array()
+        .expect("network tool must return an events array");
+    for event in events {
+        assert!(event["phase"].is_string(), "event must include phase: {event}");
+        assert!(
+            event["request_id"].is_string(),
+            "event must include request_id: {event}"
+        );
+    }
 }
 
 #[test]

@@ -12,7 +12,7 @@ use anyhow::Result;
 #[cfg(feature = "render")]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_browser::{
-    AutomationWait, AutomationWaitError, BrowserContext, DocumentIdentity, Page,
+    AutomationWait, AutomationWaitError, BrowserContext, DocumentIdentity, NetworkEvent, NetworkEventPhase, Page,
 };
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
@@ -443,7 +443,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_network_requests",
-                "description": "Return the list of network requests made by the current page",
+                "description": "Return pretty JSON network lifecycle events currently retained by the active page, without consuming them or response bodies. This is a page buffer, not persistent history; upstream JS/Worker queues drop oldest entries beyond 4096.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
@@ -1195,17 +1195,43 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
 fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     let page = state.page_mut();
     page.sync_js_network_events();
-    let events = &page.network_events;
+    serde_json::to_string_pretty(&json!({
+        "events": page.network_events.iter().map(network_event_projection).collect::<Vec<_>>()
+    })).map_err(|error| error.to_string())
+}
 
-    if events.is_empty() {
-        return Ok("No network requests recorded.".to_string());
-    }
-
-    let lines: Vec<String> = events.iter().map(|e| {
-        format!("[{}] {} {} ({}B)", e.status, e.method, e.url, e.body_size)
-    }).collect();
-
-    Ok(lines.join("\n"))
+fn network_event_projection(event: &NetworkEvent) -> Value {
+    let phase = match event.phase() {
+        NetworkEventPhase::Started => "started",
+        NetworkEventPhase::Redirect => "redirect",
+        NetworkEventPhase::Completed => "completed",
+        NetworkEventPhase::Failed => "failed",
+    };
+    json!({
+        "phase": phase,
+        "document_generation": event.document_generation,
+        "document_url": event.document_url,
+        "retired_document_url": event.retired_document_url,
+        "initiator_request_id": event.initiator_request_id,
+        "pending": event.pending,
+        "error": event.error,
+        "request_started": event.request_started,
+        "redirect": event.redirect,
+        "request_id": event.request_id,
+        "url": event.url,
+        "method": event.method,
+        "resource_type": event.resource_type,
+        "request_body_size": event.request_body_size,
+        "headers": event.headers,
+        "request_raw_headers": event.request_raw_headers,
+        "status": event.status,
+        "status_text": event.status_text,
+        "response_headers": &*event.response_headers,
+        "raw_headers": event.raw_headers,
+        "response_body_request_id": event.response_body_request_id,
+        "body_size": event.body_size,
+        "timestamp": event.timestamp,
+    })
 }
 
 fn tool_console_messages(state: &mut BrowserState) -> Result<String, String> {
@@ -2301,6 +2327,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn network_projection_preserves_lifecycle_and_lossless_headers() {
+        fn observation() -> NetworkEvent {
+            NetworkEvent {
+                document_generation: 7, document_url: "https://example.test/".into(),
+                retired_document_url: Some("https://example.test/old".into()),
+                initiator_request_id: None, pending: false, error: None,
+                request_body_size: 3, request_started: true, redirect: false,
+                response_body_request_id: Some("fetch-1-hop-0".into()),
+                request_id: "fetch-1".into(), url: "https://example.test/api".into(),
+                method: "POST".into(), resource_type: "Fetch".into(), status: 200,
+                status_text: "OK".into(), headers: Default::default(),
+                response_headers: Default::default(), raw_headers: None,
+                request_raw_headers: None, body_size: 4, timestamp: 123.5,
+            }
+        }
+        let mut event = observation();
+        let capture = obscura_net::HeaderCapture {
+            capture_stage: "transportResponse", encoding: "base64",
+            fields: vec![
+                obscura_net::RawHeader { name: b"Set-Cookie".to_vec(), value: b"secret=one".to_vec() },
+                obscura_net::RawHeader { name: b"Set-Cookie".to_vec(), value: vec![0, 255, 128] },
+            ],
+        };
+        event.raw_headers = Some(capture.clone());
+        event.request_raw_headers = Some(obscura_net::HeaderCapture {
+            capture_stage: "transportRequest", ..capture.clone()
+        });
+        event.headers.insert("Authorization".into(), "Bearer secret".into());
+        let projected = network_event_projection(&event);
+        assert_eq!(projected["phase"], "completed");
+        assert_eq!(projected["headers"]["Authorization"], "Bearer secret");
+        assert_eq!(projected["raw_headers"], serde_json::to_value(&capture).unwrap());
+        assert_eq!(projected["request_raw_headers"]["fields"][1]["valueBase64"], "AP+A");
+        assert_eq!(projected["raw_headers"]["fields"].as_array().unwrap().len(), 2);
+        assert_eq!(projected["document_generation"], 7);
+        assert_eq!(projected["response_body_request_id"], "fetch-1-hop-0");
+        assert_eq!(projected["timestamp"], 123.5);
+        assert_eq!(projected.as_object().unwrap().len(), 23);
+        event.pending = true;
+        let started = network_event_projection(&event);
+        assert_eq!(started["phase"], "started");
+        assert_eq!(started["request_id"], projected["request_id"]);
+        event.pending = false;
+        event.redirect = true;
+        assert_eq!(network_event_projection(&event)["phase"], "redirect");
+        event.redirect = false;
+        event.pending = true;
+        event.resource_type = "Preflight".into();
+        event.initiator_request_id = Some("fetch-parent".into());
+        let preflight = network_event_projection(&event);
+        assert_eq!(preflight["phase"], "started");
+        assert_eq!(preflight["initiator_request_id"], "fetch-parent");
+        assert_eq!(preflight["resource_type"], "Preflight");
+        event.pending = false;
+        event.error = Some("CORS denied".into());
+        let failed = network_event_projection(&event);
+        assert_eq!(failed["phase"], "failed");
+        assert_eq!(failed["error"], "CORS denied");
+    }
+
+    #[test]
+    fn network_tool_empty_history_has_stable_shape() {
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let first = tool_network_requests(&mut state).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&first).unwrap(), json!({"events": []}));
+        assert_eq!(tool_network_requests(&mut state).unwrap(), first);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn network_tool_includes_completed_script_fetches() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -2332,10 +2427,18 @@ mod tests {
         assert!(request.starts_with("GET /script-request"), "got {request}");
 
         let output = tool_network_requests(&mut state).expect("network tool should succeed");
-        assert!(
-            output.contains("/script-request"),
-            "completed script fetch missing from network history: {output}"
-        );
+        let result: Value = serde_json::from_str(&output).unwrap();
+        let events: Vec<_> = result["events"].as_array().unwrap().iter()
+            .filter(|event| event["url"].as_str().unwrap().ends_with("/script-request"))
+            .collect();
+        assert_eq!(events.len(), 1, "{output}");
+        assert_eq!(events[0]["phase"], "completed");
+        let request_id = events[0]["request_id"].as_str().unwrap();
+        let body_before = state.page_mut().get_response_body_result(request_id).unwrap().unwrap();
+        assert_eq!(tool_network_requests(&mut state).unwrap(), output);
+        let body_after = state.page_mut().get_response_body_result(request_id).unwrap().unwrap();
+        assert_eq!(body_before.body, body_after.body);
+        assert_eq!(body_before.base64_encoded, body_after.base64_encoded);
     }
 
     #[tokio::test(flavor = "current_thread")]

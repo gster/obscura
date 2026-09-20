@@ -79,6 +79,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 进展（2026-09-21，条件等待切片）：selector/text 条件等待已归口 `obscura-browser::Page` 的共享原生 DOM probe 与 `advance_automation`，CLI、MCP 和公开 Rust API 只保留参数及结果适配。单一绝对 deadline 覆盖首次 probe、timer/microtask/frame 推进、排队导航和同步脚本 watchdog；超时、非法 selector、导航失败和取消后的页面可恢复均有 Rust 回归。页面覆盖公开 selector/text getter 不影响结果；MCP 支持有限非负小数秒 timeout，并在两项等待工具中用 document identity 清理等待期间同 URL reload 和 `document.open` 后的旧引用。公开 Rust wait 有意从 `&self` 改为 `&mut self`，要求调用方持有独占页面所有权，作为已接受并记录的源代码兼容性变更。固定 `--wait`、自适应 settle、导航 lifecycle/network-idle、资源观察、容量限额和旧启动保护仍按独立契约继续处理，本项保持未关闭。
 
+进展（MCP 资源观察投影切片）：共享 `NetworkEventPhase` 提供生命周期分类，MCP 网络工具以 pretty JSON `events` 数组输出全部现有事件事实，明确 start/redirect/terminal、失败原因、文档与 preflight 关联及原始 headers。该格式替换旧文本行，读取不消费事件或响应 body。当前只承诺 active Page buffer，上游 JS/Worker 的 4096 条 oldest-drop、导航历史保留差异、请求正文保留与 CDP session 分发仍未收敛；本项保持未关闭。
+
 ### OB-011 · P0 · Cookie 请求上下文与无损状态往返
 
 状态：未关闭。

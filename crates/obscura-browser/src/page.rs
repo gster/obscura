@@ -186,6 +186,24 @@ pub struct NetworkEvent {
     pub timestamp: f64,
 }
 
+/// Lifecycle phase of one observation, not a deduplicated request summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkEventPhase {
+    Started,
+    Redirect,
+    Completed,
+    Failed,
+}
+
+impl NetworkEvent {
+    pub fn phase(&self) -> NetworkEventPhase {
+        if self.error.is_some() { NetworkEventPhase::Failed }
+        else if self.redirect { NetworkEventPhase::Redirect }
+        else if self.pending { NetworkEventPhase::Started }
+        else { NetworkEventPhase::Completed }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredResponseBody {
     pub body: String,

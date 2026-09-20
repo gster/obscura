@@ -21,3 +21,5 @@
 后续交付顺序：mouse、wheel、键盘/文本有界资格完成后，明确执行推进与等待契约、观察与限额资格、旧启动保护逐项终态。上述清单全部获得实现或明确终态及相应证据之前，OB-021 保持未关闭。
 
 原始采集数据与工具日志完整保存，不脱敏、不删字段。产品响应 body 的容量失败与工具证据采集不是同一契约，不应通过静默删减原始证据来满足产品限额。
+
+MCP 资源观察投影切片：`NetworkEvent::phase` 在共享 browser 层区分 started、redirect、completed、failed；`browser_network_requests` 改为 pretty JSON 的 `events` 数组，空记录仍返回同一结构。此输出格式有意替换旧文本行。投影保留当前事件的全部字段、原始 header bytes 和关联 ID，不消费事件或响应正文。它只表示 active Page buffer：导航替换 static 记录但 scripted 记录可以保留，上游 JS/Worker 队列超过 4096 条仍丢弃最旧记录。未因此完成 persistent history、queue overflow、请求正文保留、callback 并发注册或 CDP 多 session 观察资格。

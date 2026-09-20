@@ -98,3 +98,32 @@ a fresh snapshot or interactive-element listing before acting again.
 
 MCP exposes still-image and PDF output. It does not stream video frames; use
 CDP `Page.startScreencast` for activity-driven screencasting.
+
+### Network observations
+
+`browser_network_requests` returns pretty JSON with an `events` array, including
+`{"events": []}` for an empty buffer. This deliberately replaces the previous
+human-readable request lines; callers must parse the JSON object. Each entry is
+one lifecycle observation (`started`, `redirect`, `completed`, or `failed`), not
+one deduplicated request. Use `request_id` and document identity fields to relate
+entries; preflight records retain `initiator_request_id`. A standalone started
+record is not guaranteed: ordinary successful fetches may have only a completed
+record, while preflight paths can publish a separate start.
+
+The output preserves every current `NetworkEvent` field, including errors,
+request/response compatibility header maps and lossless raw header captures.
+Raw header fields retain repeated values and arbitrary bytes as base64, including
+Cookie and Authorization. `headers` is the request compatibility map;
+`response_headers` is the response compatibility map; `request_raw_headers` and
+`raw_headers` are their respective lossless captures. `request_body_size` is a
+byte count, not retained request payload; `body_size` describes the response and
+`response_body_request_id` identifies a captured response body where available.
+Capture stages describe their source, not HTTP wire framing.
+
+This is a snapshot of the active Page's current event buffer. Reading it neither
+consumes events nor reads or consumes response bodies. Repeated reads retain the
+same entries until page activity changes the buffer. It is not complete persistent
+history: navigation replaces static resource records while scripted records can
+remain, Page close discards its buffer, and upstream JS/Worker queues currently
+drop oldest entries beyond 4096. Those retention and capacity boundaries remain
+separate OB-021 work.
