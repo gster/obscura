@@ -225,3 +225,34 @@ This gate covers the listed mouse fixtures. Wheel, keyboard/text lifecycle,
 pen input, pointer capture, hover boundary events, multi-button gestures and
 user activation require their own qualification. Coordinate mouse input needs
 a render build; a no-render build reports that capability as unsupported.
+
+
+## Native wheel qualification
+
+`native_wheel_smoke.py` uses the official Playwright mouse API against nine
+isolated local fixture cases: metadata, horizontal and vertical nested
+saturation/handoff, active/passive/default-root cancellation, public API
+poisoning, zero deltas, and a raw CDP request missing both deltas. Both engines
+use a 1280 by 720 viewport and wait for stable offsets. The default run checks
+the frozen Chrome behavior contract; `--with-chrome` also compares observations
+with a fresh Chromium run.
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+uv run --project tools/unblocked --frozen --python 3.12 \
+  python tools/unblocked/native_wheel_smoke.py \
+    --obscura-bin target/release/obscura \
+    --persona windows_chrome145 \
+    --with-chrome \
+    --output "$RUN_ROOT/wheel"
+```
+
+Each run retains a separate raw-data directory, browser and worker byte streams,
+complete `pw:protocol`, fixture request/response bytes and per-case checkpoints.
+`wheel-result.json` records the chosen directory and all outcomes. An unfinished
+settle, missing observation, unexpected protocol error or failed worker fails
+the gate. CI runs all nine cases and uploads the complete evidence directory.
+Event timestamps and scroll-event counts are retained but are not exact paired
+assertions. This gate does not qualify gesture latching, inertia, scroll snap,
+zoom, complete CSSOM overflow strings or a full wheel implementation on all
+platforms. Native coordinate input requires the render build.

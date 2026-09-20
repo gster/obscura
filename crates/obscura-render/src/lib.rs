@@ -1451,12 +1451,21 @@ pub struct LayoutStyle {
     pub overflow_clip_x: bool,
     pub overflow_clip_y: bool,
     pub(crate) overflow_axes_set: bool,
+    /// Authored overflow values before the cross-axis computed-value rules:
+    /// visible=0, clip=1, hidden=2, and auto/scroll/overlay=3.
     pub(crate) overflow_specified_x: u8,
     pub(crate) overflow_specified_y: u8,
+    /// Computed overflow values using the same compact representation. Keep
+    /// hidden distinct from the user-scrollable values even though both form
+    /// a layout scroll container.
+    pub(crate) overflow_computed_x: u8,
+    pub(crate) overflow_computed_y: u8,
     pub(crate) overflow_inherit_x: bool,
     pub(crate) overflow_inherit_y: bool,
     pub(crate) overflow_scroll_x: bool,
     pub(crate) overflow_scroll_y: bool,
+    pub(crate) overflow_user_scroll_x: bool,
+    pub(crate) overflow_user_scroll_y: bool,
     /// This element's authored overflow is propagated to the viewport. Its
     /// own box therefore behaves as `overflow: visible` for layout/BFC
     /// purposes while the capture viewport supplies the paint clip.

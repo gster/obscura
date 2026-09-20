@@ -10858,7 +10858,7 @@ globalThis.InputEvent = class extends UIEvent {
 // WheelEvent inherits all MouseEvent coordinates and modifier state. CDP
 // Input.dispatchMouseEvent supplies those fields and automation libraries use
 // them to distinguish wheel gestures over nested panes.
-globalThis.WheelEvent = class extends MouseEvent {
+globalThis.WheelEvent = class WheelEvent extends MouseEvent {
   constructor(t,o={}) { super(t,o);this.deltaX=o.deltaX||0;this.deltaY=o.deltaY||0;this.deltaZ=o.deltaZ||0;this.deltaMode=o.deltaMode||0; }
 };
 
@@ -18734,6 +18734,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _markNative(Element.prototype.click);
   const NativeMouseEvent = MouseEvent;
   const NativePointerEvent = PointerEvent;
+  const NativeWheelEvent = WheelEvent;
   const NativeFocusEvent = FocusEvent;
   const NativeInputEvent = InputEvent;
   const NativeKeyboardEvent = KeyboardEvent;
@@ -18742,6 +18743,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   const NativePopStateEvent = PopStateEvent, NativeHashChangeEvent = HashChangeEvent;
   const NativePageTransitionEvent = PageTransitionEvent;
   const NativeNumber = Number;
+  const nativeDocumentQuerySelector = Document.prototype.querySelector;
   const enqueueMicrotask = queueMicrotask;
   const resolveInline = Element.prototype._resolveInlineHandler;
   const listeners = new WeakMap();
@@ -18781,8 +18783,24 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       }
       const signal = typeof options === 'object' ? options?.signal : null;
       if (signal?.aborted) return;
+      const passiveValue = options !== null && typeof options === 'object'
+        ? options.passive : undefined;
+      const explicitPassive = passiveValue !== undefined;
+      let passive = explicitPassive ? !!passiveValue : false;
+      if (!explicitPassive && (type === 'wheel' || type === 'mousewheel')) {
+        let currentDocument = null;
+        try { currentDocument = _wrap(_domParse('document_node_id')); }
+        catch (_error) {}
+        let rootWheelTarget = owner === globalThis || owner === currentDocument;
+        if (!rootWheelTarget && currentDocument) {
+          try {
+            rootWheelTarget = apply(nativeDocumentQuerySelector, currentDocument, ['body']) === owner;
+          } catch (_error) {}
+        }
+        passive = rootWheelTarget;
+      }
       const record = { owner, list, type, callback, capture, once: !!options?.once,
-        passive: !!options?.passive, signal, removed: false, remove: originalRemove };
+        passive, signal, removed: false, remove: originalRemove };
       record.wrapper = event => invoke(record, event);
       list.push(record);
       apply(add, owner, [type, record.wrapper, capture]);
@@ -18862,11 +18880,12 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     if (phase===4) dispatch('pageshow',[globalThis],{...init,bubbles:true,cancelable:true,persisted:false},NativePageTransitionEvent,false,doc);
   }});
   let scrollEvents=[];
-  _queueScrollEvent = node => {
-    const identity=_domParse('scroll_event_identity',node);
+  _queueScrollEvent = (node, exact=false) => {
+    const identity=_domParse(exact ? 'scroll_event_identity_exact' : 'scroll_event_identity',node);
     if (!identity) return;
     for (const item of scrollEvents) {
-      if (item[0]===identity[0] && item[1]===identity[1] && item[2]===identity[2]) return;
+      if (item[0]===identity[0] && item[1]===identity[1]
+          && item[2]===identity[2] && item[3]===identity[3]) return;
     }
     scrollEvents[scrollEvents.length]=identity;
     _scrollEventsPending=true;
@@ -18875,12 +18894,17 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _runScrollEvents = () => {
     const pending=scrollEvents;scrollEvents=[];_scrollEventsPending=false;
     for(const item of pending) {
-      const identity=_domParse('scroll_event_identity',item[1]);
-      if(!identity || identity[0]!==item[0] || identity[1]!==item[1] || identity[2]!==item[2]) continue;
+      const identity=_domParse('scroll_event_identity_exact',item[1]);
+      if(!identity || identity[0]!==item[0] || identity[1]!==item[1]
+          || identity[2]!==item[2] || identity[3]!==item[3]) continue;
       const path=pathFor(item[1]);
       dispatch('scroll',path,{bubbles:_domParse('node_type',item[1])===9,cancelable:false,composed:false},NativeEvent);
     }
   };
+  define(globalThis,'__obscura_native_scroll_handoff',{configurable:true,value(node) {
+    _queueScrollEvent(node,true);
+    _scheduleIntersectionRenderCheckpoint();
+  }});
   _historyEvent = (type, init) => dispatch(type, [globalThis],
     {bubbles:false,cancelable:false,composed:false,...init},
     type === 'popstate' ? NativePopStateEvent : NativeHashChangeEvent);
@@ -18894,6 +18918,16 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       metaKey: !!(modifiers & 4), shiftKey: !!(modifiers & 8)};
     if (pointer) init.pressure = force;
     return dispatch(type, path, init, pointer ? NativePointerEvent : NativeMouseEvent, pointer);
+  }
+  function wheel(path, x, y, deltaX, deltaY, button, buttons, modifiers) {
+    return dispatch('wheel', path, {
+      bubbles: true, cancelable: true, composed: true, view: globalThis,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      button: button < 0 ? 0 : button, buttons, detail: 0,
+      deltaX, deltaY, deltaZ: 0, deltaMode: 0,
+      altKey: !!(modifiers & 1), ctrlKey: !!(modifiers & 2),
+      metaKey: !!(modifiers & 4), shiftKey: !!(modifiers & 8)
+    }, NativeWheelEvent);
   }
   function pathFor(node) {
     const path = [];
@@ -19286,6 +19320,12 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     const suffix = phase === 0 ? 'move' : phase === 1 ? 'down' : 'up';
     return mouse((pointer ? 'pointer' : 'mouse') + suffix, path, x, y,
       button, buttons, clickCount, modifiers, force, pointer);
+  }});
+  define(globalThis, '__obscura_native_wheel_handoff', {configurable: true, value(nodes, x, y, deltaX, deltaY, button, buttons, modifiers) {
+    const path = [];
+    for (const id of nodes) path.push(_wrap(id));
+    path.push(globalThis);
+    return wheel(path, x, y, deltaX, deltaY, button, buttons, modifiers);
   }});
 })();
 

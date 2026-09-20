@@ -4233,6 +4233,15 @@ impl Page {
             .dispatch_mouse_input(input)
     }
 
+    /// Dispatch one wheel input through the shared hit-test and scroll path.
+    pub fn dispatch_wheel_input(
+        &mut self,
+        input: obscura_js::runtime::WheelInput,
+    ) -> Result<(), String> {
+        self.js.as_mut().ok_or_else(|| "INPUT_RUNTIME_UNAVAILABLE".to_string())?
+            .dispatch_wheel_input(input)
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {
         if let Some(js) = &mut self.js {
             match js.evaluate(expression) {

@@ -1540,6 +1540,59 @@ impl PreparedRender {
             .filter_map(|container| container.node)
     }
 
+    /// Axes on which a wheel gesture may user-scroll this element. CSS keeps
+    /// `overflow:hidden` programmatically scrollable, so it remains in the
+    /// scroll topology but is deliberately false here. Viewport-propagated
+    /// root/body overflow is handled by `wheel_viewport_scroll_axes` instead.
+    pub fn wheel_scroll_axes(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<(bool, bool)> {
+        let style = self.layout.styles.get(&id)?;
+        if style.overflow_propagated_to_viewport {
+            return None;
+        }
+        Some((
+            style.overflow_user_scroll_x,
+            style.overflow_user_scroll_y,
+        ))
+    }
+
+    /// User-scrollable viewport axes after HTML root/body overflow
+    /// propagation. Visible and auto/scroll axes accept wheel defaults;
+    /// `clip` and `hidden` axes do not.
+    pub fn wheel_viewport_scroll_axes(&self, tree: &DomTree) -> (bool, bool) {
+        let Some(root) = tree
+            .descendants(tree.document())
+            .into_iter()
+            .find(|id| tree.get_node(*id).is_some_and(|node| node.is_element()))
+        else {
+            return (true, true);
+        };
+        let root_style = self.layout.styles.get(&root);
+        let source = if root_style.is_some_and(|style| style.overflow_hidden) {
+            root_style
+        } else {
+            tree.children(root)
+                .into_iter()
+                .find(|id| {
+                    tree.get_node(*id).is_some_and(|node| {
+                        node.as_element()
+                            .is_some_and(|element| element.local.as_ref() == "body")
+                    })
+                })
+                .and_then(|body| self.layout.styles.get(&body))
+                .or(root_style)
+        };
+        let user_axis = |computed: u8| matches!(computed, 0 | 3);
+        source.map_or((true, true), |style| {
+            (
+                user_axis(style.overflow_computed_x),
+                user_axis(style.overflow_computed_y),
+            )
+        })
+    }
+
     /// Resolve persistent NodeId-keyed offsets into this layout's dense scroll
     /// topology. Unknown/removed nodes are ignored; every retained offset is
     /// clamped against the final local scrolling overflow.
@@ -2012,9 +2065,9 @@ impl PreparedRender {
 
         let overflow_axis = |specified: u8, clipped: bool, scroll: bool| {
             if scroll {
-                // The compact layout model intentionally merges
-                // hidden/auto/scroll for clipping. `auto` is the least
-                // surprising computed scroll-container value.
+                // The compact layout model exposes every layout scroll
+                // container as auto through CSSOM. Native user scrolling
+                // retains the hidden/auto distinction separately.
                 "auto"
             } else if specified == 1 || clipped {
                 "clip"

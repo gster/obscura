@@ -5021,20 +5021,8 @@ fn layout_dom_once(
                             inh.table_vertical_align = Some(value);
                         }
                     }
-                    inh.overflow_x = if style.overflow_scroll_x {
-                        2
-                    } else if style.overflow_clip_x {
-                        1
-                    } else {
-                        0
-                    };
-                    inh.overflow_y = if style.overflow_scroll_y {
-                        2
-                    } else if style.overflow_clip_y {
-                        1
-                    } else {
-                        0
-                    };
+                    inh.overflow_x = style.overflow_computed_x;
+                    inh.overflow_y = style.overflow_computed_y;
                     child_cb_height_definite = matches!(
                         style.height,
                         crate::Dimension::Px(_) | crate::Dimension::Percent(_)
@@ -5200,20 +5188,8 @@ fn layout_dom_once(
                     style.overflow_inherit_y = false;
                 }
                 crate::style::recompute_overflow(style);
-                inh.overflow_x = if style.overflow_scroll_x {
-                    2
-                } else if style.overflow_clip_x {
-                    1
-                } else {
-                    0
-                };
-                inh.overflow_y = if style.overflow_scroll_y {
-                    2
-                } else if style.overflow_clip_y {
-                    1
-                } else {
-                    0
-                };
+                inh.overflow_x = style.overflow_computed_x;
+                inh.overflow_y = style.overflow_computed_y;
                 if let Some(expression) = style.row_gap_expression.as_deref() {
                     style.row_gap = crate::style::resolve_contextual_length(
                         expression,
@@ -5586,20 +5562,8 @@ fn layout_dom_once(
                 let host_grid_auto_rows = style.grid_auto_rows.clone();
                 let host_grid_auto_column_calcs = style.grid_calc_expressions[2].clone();
                 let host_grid_auto_row_calcs = style.grid_calc_expressions[3].clone();
-                let host_overflow_x = if style.overflow_scroll_x {
-                    2
-                } else if style.overflow_clip_x {
-                    1
-                } else {
-                    0
-                };
-                let host_overflow_y = if style.overflow_scroll_y {
-                    2
-                } else if style.overflow_clip_y {
-                    1
-                } else {
-                    0
-                };
+                let host_overflow_x = style.overflow_computed_x;
+                let host_overflow_y = style.overflow_computed_y;
                 let settle_pseudo = |pseudo: &mut crate::LayoutStyle| {
                     if pseudo.direction.is_none() {
                         pseudo.direction = Some(host_direction);

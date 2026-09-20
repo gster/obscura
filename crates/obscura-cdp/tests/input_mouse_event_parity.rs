@@ -700,3 +700,111 @@ async fn mouse_force_and_native_event_interfaces_match_the_wire_metadata() {
         {"type":"click","constructor":"PointerEvent","detail":1,"pressure":0,"hasPressure":true,"view":true}
     ]));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_wheel_overrides_cannot_redirect_native_scroll() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.wheelEvents = [];
+        document.getElementById('inner').addEventListener('wheel', e => {
+            wheelEvents.push([e.type, e.target.id, e.constructor.name, e.isTrusted,
+                e.deltaX, e.deltaY, e.deltaZ, e.deltaMode]);
+        });
+        const poison = () => { throw new Error('public wheel hook used'); };
+        document.elementFromPoint = poison;
+        globalThis.WheelEvent = poison;
+        Element.prototype.dispatchEvent = poison;
+        Element.prototype.scrollBy = poison;
+        globalThis.scrollBy = poison;
+        globalThis.getComputedStyle = poison;
+    })()"#, &sid).await;
+    wheel(&mut ctx, 3, &sid, 50.0, 50.0, 35.0, 75.0).await;
+    let state = scroll_state(&mut ctx, 4, &sid).await;
+    assert_eq!(state["boxX"], 35.0);
+    assert_eq!(state["boxY"], 75.0);
+    assert_eq!(state["rootY"], 0.0);
+    let observed = evaluate(&mut ctx, 5, "JSON.stringify(wheelEvents)", &sid).await;
+    let observed: Value = serde_json::from_str(observed["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(observed, json!([["wheel", "inner", "WheelEvent", true, 35, 75, 0, 0]]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passive_wheel_listener_cannot_cancel_native_scroll() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.prevented = null;
+        document.getElementById('inner').addEventListener('wheel', e => {
+            e.preventDefault(); prevented = e.defaultPrevented;
+        }, {passive:true});
+    })()"#, &sid).await;
+    wheel(&mut ctx, 3, &sid, 50.0, 50.0, 0.0, 75.0).await;
+    assert_eq!(scroll_state(&mut ctx, 4, &sid).await["boxY"], 75.0);
+    assert_eq!(evaluate(&mut ctx, 5, "prevented", &sid).await["result"]["value"], false);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wheel_skips_overflow_hidden_container() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, "document.getElementById('box').style.overflow = 'hidden'", &sid).await;
+    wheel(&mut ctx, 3, &sid, 50.0, 50.0, 0.0, 75.0).await;
+    let state = scroll_state(&mut ctx, 4, &sid).await;
+    assert_eq!(state["boxY"], 0.0);
+    assert_eq!(state["rootY"], 75.0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wheel_document_open_does_not_scroll_the_replacement_document() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        document.getElementById('inner').addEventListener('wheel', () => {
+            document.open();
+            document.write('<!doctype html><body style="margin:0"><div style="height:5000px">replacement</div></body>');
+            document.close();
+        });
+    })()"#, &sid).await;
+    wheel(&mut ctx, 3, &sid, 50.0, 50.0, 0.0, 75.0).await;
+    let state = evaluate(&mut ctx, 4,
+        "JSON.stringify([document.body.textContent, scrollX, scrollY])", &sid).await;
+    let state: Value = serde_json::from_str(state["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(state, json!(["replacement", 0, 0]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wheel_defaults_and_zero_delta_match_native_metadata() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.wheelMetadata = [];
+        document.getElementById('inner').addEventListener('wheel', e => {
+            wheelMetadata.push([e.constructor.name, e.button, e.buttons, e.detail,
+                e.deltaX, e.deltaY, e.deltaMode, e.isTrusted]);
+        });
+    })()"#, &sid).await;
+    wheel(&mut ctx, 3, &sid, 50.0, 50.0, 0.0, 0.0).await;
+    let result = evaluate(&mut ctx, 4, "JSON.stringify(wheelMetadata)", &sid).await;
+    let metadata: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata, json!([["WheelEvent", 0, 0, 0, 0, 0, 0, true]]));
+    let state = scroll_state(&mut ctx, 5, &sid).await;
+    assert_eq!(state["rootY"], 0.0);
+    assert_eq!(state["boxY"], 0.0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn document_wheel_listener_defaults_to_passive_but_explicit_false_cancels() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(&mut ctx, 2, r#"(() => {
+        globalThis.wheelCancelled = [];
+        document.addEventListener('wheel', e => {
+            e.preventDefault(); wheelCancelled.push(e.defaultPrevented);
+        });
+    })()"#, &sid).await;
+    wheel(&mut ctx, 3, &sid, 50.0, 50.0, 0.0, 70.0).await;
+    assert_eq!(scroll_state(&mut ctx, 4, &sid).await["boxY"], 70.0);
+    evaluate(&mut ctx, 5, r#"document.addEventListener('wheel', e => {
+        e.preventDefault(); wheelCancelled.push(e.defaultPrevented);
+    }, {passive:false})"#, &sid).await;
+    wheel(&mut ctx, 6, &sid, 50.0, 50.0, 0.0, 70.0).await;
+    assert_eq!(scroll_state(&mut ctx, 7, &sid).await["boxY"], 70.0);
+    let result = evaluate(&mut ctx, 8, "JSON.stringify(wheelCancelled)", &sid).await;
+    let cancelled: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(cancelled, json!([false, false, true]));
+}

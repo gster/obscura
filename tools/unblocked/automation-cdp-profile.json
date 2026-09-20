@@ -128,6 +128,18 @@
       "evidence": "Rust session ownership tests; full close and disconnect matrix remains OB-028."
     },
     {
+      "method": "Target.detachFromTarget",
+      "capability": "LIMITED",
+      "implementation": "implemented",
+      "verification": "partial",
+      "params": "The observed official raw CDP session detach uses a string sessionId returned by Target.attachToTarget.",
+      "result": "Empty object after removing that session, its runtime event subscription and any screencast. The page remains available through its other session.",
+      "events": "The handler does not promise a detachedFromTarget event for this explicit detach path.",
+      "scope": "One attached page session.",
+      "errors": "Missing, unknown and malformed session identities currently return an empty result; strict negative parameter validation is not qualified.",
+      "evidence": "Official Playwright 1.60 native_wheel_smoke.py omitted-delta raw session detaches before the original page snapshot; existing Rust target attachment and detach tests verify session removal."
+    },
+    {
       "method": "Page.enable",
       "capability": "LIMITED",
       "implementation": "implemented",
@@ -288,12 +300,12 @@
       "capability": "LIMITED",
       "implementation": "implemented",
       "verification": "partial",
-      "params": "Render builds qualify the observed Playwright mouseMoved, left mousePressed and mouseReleased shapes, including force 0.5 on press. Coordinates, button, buttons, modifiers, clickCount and force are validated; omitted button on press/release is a verified no-event success.",
+      "params": "Render builds qualify the observed Playwright mouseMoved, left mousePressed/mouseReleased and mouseWheel shapes. Mouse force 0.5 on press is covered. Coordinates, button, buttons, modifiers, clickCount and force are validated. Wheel requires finite deltaX and deltaY; explicit zero deltas dispatch without scrolling. Omitted button on press/release is a verified no-event success.",
       "result": "Empty object after native phase delivery and pending-navigation processing. Mouse move is an actual dispatch, not an empty acknowledgement.",
-      "events": "The fixed fixtures qualify trusted pointermove/mousemove, pointerdown/mousedown, focus/focusin, pointerup/mouseup and click order, constructors, coordinates, button/detail/modifier and pressure fields. The triple-click fixture also qualifies its dblclick event and text selection. Canceled pointerdown, mousedown and checkbox click preserve their measured effects.",
-      "scope": "Page session and current document. Browser-owned hit testing, captured dispatch and press state survive page overrides; navigation and document.open invalidate the previous input epoch. Wheel, pen, pointer capture, hover boundary events, multi-button gestures and user activation are not qualified by this slice.",
-      "errors": "Malformed move/press/release parameters return -32602. Missing target sessions, no-render coordinate input, pen and nonzero tangential pressure/tilt/twist return errors; unsupported native capabilities use -32000. The legacy wheel branch still has separate, incomplete validation.",
-      "evidence": "Playwright 1.60 native_mouse_smoke.py: six offline fixtures compared with Chromium 148.0.7778.96 on macOS arm64, with full protocol and fixture wire captures. Rust mouse/default-action, document epoch and frame-navigation regressions cover the shared Page path."
+      "events": "The fixed fixtures qualify trusted pointermove/mousemove, pointerdown/mousedown, focus/focusin, pointerup/mouseup and click order, constructors, coordinates, button/detail/modifier and pressure fields. The triple-click fixture also qualifies its dblclick event and text selection. Canceled pointerdown, mousedown and checkbox click preserve their measured effects. Wheel fixtures qualify trusted WheelEvent metadata, nested and viewport scrolling, saturation handoff, active/passive/default-root cancellation and public API override isolation. Scroll events use the shared rendering opportunity queue and document epoch.",
+      "scope": "Page session and current document. Browser-owned hit testing, captured dispatch and press state survive page overrides; navigation and document.open invalidate previous input epochs and queued native scroll events. Pen, pointer capture, hover boundary events, multi-button gestures, user activation, wheel gesture latching/inertia, scroll snap and browser zoom are not qualified by these slices.",
+      "errors": "Malformed move/press/release/wheel parameters return -32602; missing wheel deltas fail without event delivery. Missing target sessions, no-render coordinate input, pen and nonzero tangential pressure/tilt/twist return errors; unsupported native capabilities use -32000.",
+      "evidence": "Playwright 1.60 native_mouse_smoke.py six fixtures and native_wheel_smoke.py nine fixtures compared with Chromium 148.0.7778.96 on macOS arm64, with complete protocol and fixture wire captures. Wheel uses the same 1280x720 viewport and settled offsets. Rust mouse/default-action, hidden overflow, document epoch, exact body scroll routing and frame-navigation regressions cover the shared Page path. CSSOM overflow string conformance is not implied."
     },
     {
       "method": "Network.enable",

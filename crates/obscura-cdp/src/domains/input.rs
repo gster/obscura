@@ -72,10 +72,15 @@ const BACKSPACE_JS: &str = "(function() {\
     t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
 })()";
 
-fn mouse_input(params: &Value) -> Result<obscura_browser::MouseInput, String> {
+enum CoordinateInput {
+    Mouse(obscura_browser::MouseInput),
+    Wheel(obscura_browser::WheelInput),
+}
+
+fn coordinate_input(params: &Value) -> Result<CoordinateInput, String> {
     use obscura_browser::{MouseInput, MouseInputPhase};
     let phase = match params.get("type").and_then(Value::as_str) {
-        Some("mouseMoved") => MouseInputPhase::Move,
+        Some("mouseMoved" | "mouseWheel") => MouseInputPhase::Move,
         Some("mousePressed") => MouseInputPhase::Down,
         Some("mouseReleased") => MouseInputPhase::Up,
         _ => return Err("Invalid Input.dispatchMouseEvent type".into()),
@@ -141,22 +146,23 @@ fn mouse_input(params: &Value) -> Result<obscura_browser::MouseInput, String> {
     let default_buttons = if matches!(phase, MouseInputPhase::Down) {
         match button { 0 => 1, 1 => 4, 2 => 2, 3 => 8, 4 => 16, _ => 0 }
     } else { 0 };
-    Ok(MouseInput {
+    let mouse = MouseInput {
         phase, x: coordinate("x")?, y: coordinate("y")?, button, force,
         buttons: integer("buttons", default_buttons, 31)? as u8,
         click_count: integer("clickCount", 0, i32::MAX as u64)? as u32,
         modifiers: integer("modifiers", 0, 15)? as u8,
-    })
-}
-
-fn modifier_flags(modifiers: u64) -> (bool, bool, bool, bool) {
-    // CDP Input.Modifier: Alt=1, Ctrl=2, Meta=4, Shift=8.
-    (
-        modifiers & 1 != 0,
-        modifiers & 2 != 0,
-        modifiers & 4 != 0,
-        modifiers & 8 != 0,
-    )
+    };
+    if params["type"] == "mouseWheel" {
+        if params.get("deltaX").is_none() || params.get("deltaY").is_none() {
+            return Err("Invalid mouseWheel: deltaX and deltaY are required".into());
+        }
+        Ok(CoordinateInput::Wheel(obscura_browser::WheelInput {
+            x: mouse.x, y: mouse.y, delta_x: coordinate("deltaX")?, delta_y: coordinate("deltaY")?,
+            button: mouse.button, buttons: mouse.buttons, modifiers: mouse.modifiers,
+        }))
+    } else {
+        Ok(CoordinateInput::Mouse(mouse))
+    }
 }
 
 pub async fn handle(
@@ -167,83 +173,28 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "dispatchMouseEvent" => {
-            let event_type = params.get("type").and_then(Value::as_str);
-            if event_type != Some("mouseWheel") {
-                let input = mouse_input(params)?;
-                let page = ctx.get_session_page_mut(session_id)
-                    .ok_or_else(|| "Input requires an attached page session".to_string())?;
-                page.dispatch_mouse_input(input)?;
-                let moved = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
-                let moved_frame = moved.then(|| (page.id.clone(), page.frame_id.clone(), page.url_string()));
-                if let Some((page_id, frame_id, url)) = moved_frame {
-                    let loader_id = ctx.current_loader_ids.get(&page_id).cloned()
-                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-                    ctx.pending_events.push(crate::types::CdpEvent {
-                        method: "Page.frameNavigated".into(),
-                        params: json!({
-                            "frame": crate::domains::page::frame_value(
-                                &frame_id, None, &loader_id, &url, "text/html",
-                            ),
-                            "type": "Navigation",
-                        }),
-                        session_id: session_id.clone(),
-                    });
-                }
-            } else {
-                // Wheel remains on the existing implementation until its native
-                // scrolling and cancellation path is qualified separately.
-                let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-                let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-                let modifiers = params.get("modifiers").and_then(Value::as_u64).unwrap_or(0);
-                let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
-                let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    let code = format!(
-                        "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement;\
-                            if (!target) return;\
-                            var wheel = globalThis.__obscura_markTrusted(new WheelEvent('wheel', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},deltaX:{delta_x},deltaY:{delta_y},deltaMode:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            if (!target.dispatchEvent(wheel)) return;\
-                            var dx = {delta_x}, dy = {delta_y};\
-                            var root = document.scrollingElement || document.documentElement || document.body;\
-                            var scrollTarget = null;\
-                            var el = target;\
-                            while (el && el.nodeType === 1 && el !== root && el !== document.body && el !== document.documentElement) {{\
-                                var maxX = Math.max(0, (el.scrollWidth || 0) - (el.clientWidth || 0));\
-                                var maxY = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0));\
-                                var style = null;\
-                                try {{ style = getComputedStyle(el); }} catch (_e) {{}}\
-                                var ox = style ? (style.overflowX || style.overflow || '') : '';\
-                                var oy = style ? (style.overflowY || style.overflow || '') : '';\
-                                var allowX = ox === 'auto' || ox === 'scroll' || ox === 'overlay';\
-                                var allowY = oy === 'auto' || oy === 'scroll' || oy === 'overlay';\
-                                var consumesX = allowX && ((dx > 0 && el.scrollLeft < maxX) || (dx < 0 && el.scrollLeft > 0));\
-                                var consumesY = allowY && ((dy > 0 && el.scrollTop < maxY) || (dy < 0 && el.scrollTop > 0));\
-                                if (consumesX || consumesY) {{ scrollTarget = el; break; }}\
-                                el = el.parentElement;\
-                            }}\
-                            if (!scrollTarget) scrollTarget = root;\
-                            if (scrollTarget === root && root && typeof root.scrollBy === 'function') {{\
-                                var beforeX = root.scrollLeft, beforeY = root.scrollTop;\
-                                root.scrollBy(dx, dy);\
-                                if (root.scrollLeft !== beforeX || root.scrollTop !== beforeY) setTimeout(function() {{\
-                                    try {{ document.dispatchEvent(new Event('scroll', {{bubbles:false}})); }} catch (_e) {{}}\
-                                    try {{ globalThis.dispatchEvent(new Event('scroll', {{bubbles:false}})); }} catch (_e) {{}}\
-                                }}, 0);\
-                            }} else if (scrollTarget && typeof scrollTarget.scrollBy === 'function') scrollTarget.scrollBy(dx, dy);\
-                        }})()",
-                        x = x,
-                        y = y,
-                        delta_x = delta_x,
-                        delta_y = delta_y,
-                        alt_key = alt_key,
-                        ctrl_key = ctrl_key,
-                        meta_key = meta_key,
-                        shift_key = shift_key,
-                    );
-                    page.evaluate(&code);
-                }
+            let input = coordinate_input(params)?;
+            let page = ctx.get_session_page_mut(session_id)
+                .ok_or_else(|| "Input requires an attached page session".to_string())?;
+            match input {
+                CoordinateInput::Mouse(input) => page.dispatch_mouse_input(input)?,
+                CoordinateInput::Wheel(input) => page.dispatch_wheel_input(input)?,
+            }
+            let moved = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+            let moved_frame = moved.then(|| (page.id.clone(), page.frame_id.clone(), page.url_string()));
+            if let Some((page_id, frame_id, url)) = moved_frame {
+                let loader_id = ctx.current_loader_ids.get(&page_id).cloned()
+                    .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+                ctx.pending_events.push(crate::types::CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    params: json!({
+                        "frame": crate::domains::page::frame_value(
+                            &frame_id, None, &loader_id, &url, "text/html",
+                        ),
+                        "type": "Navigation",
+                    }),
+                    session_id: session_id.clone(),
+                });
             }
 
             Ok(json!({}))

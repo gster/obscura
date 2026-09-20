@@ -240,6 +240,19 @@ pub struct MouseInput {
     pub force: f32,
 }
 
+/// Browser-owned wheel metadata. Deltas are CSS pixels (`deltaMode == 0`);
+/// modifier bits are Alt=1, Ctrl=2, Meta=4 and Shift=8.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelInput {
+    pub x: f32,
+    pub y: f32,
+    pub delta_x: f32,
+    pub delta_y: f32,
+    pub button: i16,
+    pub buttons: u8,
+    pub modifiers: u8,
+}
+
 fn mouse_button_mask(button: i16) -> Option<u8> {
     match button {
         0 => Some(1),
@@ -613,6 +626,8 @@ pub struct ObscuraJsRuntime {
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
     native_mouse: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_wheel: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    native_scroll: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_focus: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_text: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_submit: Option<deno_core::v8::Global<deno_core::v8::Function>>,
@@ -1079,6 +1094,8 @@ impl ObscuraJsRuntime {
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
             native_mouse: None,
+            native_wheel: None,
+            native_scroll: None,
             native_focus: None,
             native_text: None,
             native_submit: None,
@@ -1112,6 +1129,16 @@ impl ObscuraJsRuntime {
             instance
                 .take_native_input("__obscura_native_mouse_handoff")
                 .expect("native mouse handoff"),
+        );
+        instance.native_wheel = Some(
+            instance
+                .take_native_input("__obscura_native_wheel_handoff")
+                .expect("native wheel handoff"),
+        );
+        instance.native_scroll = Some(
+            instance
+                .take_native_input("__obscura_native_scroll_handoff")
+                .expect("native scroll handoff"),
         );
         instance.native_focus = Some(
             instance
@@ -1425,7 +1452,7 @@ impl ObscuraJsRuntime {
             }
         }
         // Child realms cannot expose native input authority either.
-        for name in ["__obscura_native_mouse_handoff", "__obscura_native_focus_handoff", "__obscura_native_text_handoff", "__obscura_native_submit_handoff", "__obscura_native_fragment_handoff", "__obscura_native_lifecycle_handoff"] {
+        for name in ["__obscura_native_mouse_handoff", "__obscura_native_wheel_handoff", "__obscura_native_scroll_handoff", "__obscura_native_focus_handoff", "__obscura_native_text_handoff", "__obscura_native_submit_handoff", "__obscura_native_fragment_handoff", "__obscura_native_lifecycle_handoff"] {
             let Some(input_key) = v8::String::new(scope, name) else {
                 return false;
             };
@@ -2794,6 +2821,147 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Dispatch one wheel gesture through browser-owned hit testing, protected
+    /// event delivery, and the retained renderer's scrolling state.
+    pub fn dispatch_wheel_input(&mut self, input: WheelInput) -> Result<(), String> {
+        if !input.x.is_finite()
+            || !input.y.is_finite()
+            || !input.delta_x.is_finite()
+            || !input.delta_y.is_finite()
+        {
+            return Err("INVALID_WHEEL_INPUT_COORDINATES".into());
+        }
+        if !(-1..=4).contains(&input.button)
+            || input.buttons & !0x1f != 0
+            || input.modifiers & !0x0f != 0
+        {
+            return Err("INVALID_WHEEL_INPUT_METADATA".into());
+        }
+        #[cfg(feature = "render")]
+        {
+            return self
+                .dispatch_wheel_input_render(input)
+                .map_err(str::to_owned);
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            let _ = input;
+            Err("INPUT_UNSUPPORTED_WITHOUT_RENDER".into())
+        }
+    }
+
+    #[cfg(feature = "render")]
+    fn dispatch_wheel_input_render(&mut self, input: WheelInput) -> Result<(), &'static str> {
+        let document_epoch = self.state.borrow().input_document_epoch.get();
+        let hit = self.hit_test(input.x, input.y)?.ok_or("INPUT_NO_TARGET")?;
+        let allowed = self.native_wheel_at_input(hit, input)?;
+        self.native_input_checkpoint_with_epoch(Some(document_epoch))?;
+        if self.state.borrow().input_document_epoch.get() != document_epoch
+            || self.has_pending_navigation()
+            || !allowed
+        {
+            return Ok(());
+        }
+        if let Some(node) = self.apply_wheel_default(hit, input)? {
+            if self.state.borrow().input_document_epoch.get() == document_epoch {
+                self.native_scroll_changed(node)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "render")]
+    fn apply_wheel_default(
+        &mut self,
+        hit: NodeId,
+        input: WheelInput,
+    ) -> Result<Option<NodeId>, &'static str> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
+            // The event path belongs to the old target. If a listener removed
+            // it, do not reinterpret the gesture as a viewport scroll.
+            if !dom.is_connected(hit) {
+                return Ok(None);
+            }
+            let ancestors = std::iter::once(hit)
+                .chain(dom.ancestors(hit))
+                .take(513)
+                .collect::<Vec<_>>();
+            if ancestors.len() > 512 {
+                return Err("INPUT_PATH_LIMIT");
+            }
+            let prepared = state
+                .prepared_render
+                .as_ref()
+                .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let (_, scroll) = state
+                .resolved_scroll
+                .as_ref()
+                .ok_or("INPUT_LAYOUT_UNAVAILABLE")?;
+            let consumes = |delta: f32, current: f32, max: f32| {
+                (delta > 0.0 && current < max) || (delta < 0.0 && current > 0.0)
+            };
+            let next_axis = |current: f32, delta: f32, max: f32| {
+                let requested = (f64::from(current) + f64::from(delta))
+                    .clamp(0.0, f64::from(max)) as f32;
+                obscura_render::quantize_scroll_value(requested, 1.0).clamp(0.0, max)
+            };
+            let candidate = ancestors.iter().find_map(|node| {
+                let axes = prepared.wheel_scroll_axes(*node)?;
+                let metrics = prepared.element_scroll_metrics(*node, scroll)?;
+                let consumes_x = axes.0 && consumes(input.delta_x, metrics.offset.0, metrics.max_offset.0);
+                let consumes_y = axes.1 && consumes(input.delta_y, metrics.offset.1, metrics.max_offset.1);
+                (consumes_x || consumes_y).then_some((*node, axes, metrics))
+            });
+            let event_node = if let Some((node, axes, metrics)) = candidate {
+                let next = (
+                    if axes.0 { next_axis(metrics.offset.0, input.delta_x, metrics.max_offset.0) } else { metrics.offset.0 },
+                    if axes.1 { next_axis(metrics.offset.1, input.delta_y, metrics.max_offset.1) } else { metrics.offset.1 },
+                );
+                if next == metrics.offset {
+                    return Ok(None);
+                }
+                if next == (0.0, 0.0) {
+                    state.element_scroll_offsets.remove(&node);
+                } else {
+                    state.element_scroll_offsets.insert(node, next);
+                }
+                node
+            } else {
+                let axes = prepared.wheel_viewport_scroll_axes(dom);
+                let requested = (
+                    if axes.0 {
+                        (f64::from(state.scroll_offset.0) + f64::from(input.delta_x))
+                            .clamp(0.0, f64::from(f32::MAX)) as f32
+                    } else {
+                        state.scroll_offset.0
+                    },
+                    if axes.1 {
+                        (f64::from(state.scroll_offset.1) + f64::from(input.delta_y))
+                            .clamp(0.0, f64::from(f32::MAX)) as f32
+                    } else {
+                        state.scroll_offset.1
+                    },
+                );
+                let next = prepared.clamp_scroll(requested);
+                if next == state.scroll_offset {
+                    return Ok(None);
+                }
+                state.scroll_offset = next;
+                dom.document()
+            };
+            state.activity_generation = state.activity_generation.wrapping_add(1);
+            state.scroll_generation = state.scroll_generation.wrapping_add(1);
+            // A user scroll, like an explicit CSSOM scroll, supersedes a
+            // delayed fragment landing for this document.
+            state.script_scroll_generation = state.script_scroll_generation.wrapping_add(1);
+            state.resolved_scroll = None;
+            Ok(Some(event_node))
+        })
+    }
+
     #[cfg(feature = "render")]
     fn dispatch_mouse_input_render(&mut self, input: MouseInput) -> Result<(), &'static str> {
         let epoch = self.state.borrow().input_document_epoch.get();
@@ -3141,6 +3309,82 @@ impl ObscuraJsRuntime {
             return Err("INPUT_DISPATCH_FAILED");
         }
         Ok(result.boolean_value(scope))
+    }
+
+    #[cfg(feature = "render")]
+    fn native_wheel_at_input(
+        &mut self,
+        hit: NodeId,
+        input: WheelInput,
+    ) -> Result<bool, &'static str> {
+        use deno_core::v8;
+        let nodes = self
+            .with_dom(|dom| {
+                let mut nodes = vec![hit];
+                nodes.extend(dom.ancestors(hit));
+                nodes
+            })
+            .ok_or("NO_DOCUMENT")?;
+        if nodes.len() > 512 {
+            return Err("INPUT_PATH_LIMIT");
+        }
+        let function = self.native_wheel.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let path = v8::Array::new(scope, nodes.len() as i32);
+        for (index, node) in nodes.iter().enumerate() {
+            let value = v8::Integer::new_from_unsigned(scope, node.index() as u32);
+            if !path
+                .set_index(scope, index as u32, value.into())
+                .unwrap_or(false)
+            {
+                return Err("INPUT_DISPATCH_FAILED");
+            }
+        }
+        let arguments = [
+            path.into(),
+            v8::Number::new(scope, input.x as f64).into(),
+            v8::Number::new(scope, input.y as f64).into(),
+            v8::Number::new(scope, input.delta_x as f64).into(),
+            v8::Number::new(scope, input.delta_y as f64).into(),
+            v8::Integer::new(scope, input.button as i32).into(),
+            v8::Integer::new_from_unsigned(scope, input.buttons as u32).into(),
+            v8::Integer::new_from_unsigned(scope, input.modifiers as u32).into(),
+        ];
+        let receiver = v8::undefined(scope).into();
+        let result = function
+            .call(scope, receiver, &arguments)
+            .ok_or("INPUT_DISPATCH_FAILED")?;
+        if !result.is_boolean() {
+            return Err("INPUT_DISPATCH_FAILED");
+        }
+        Ok(result.boolean_value(scope))
+    }
+
+    #[cfg(feature = "render")]
+    fn native_scroll_changed(&mut self, node: NodeId) -> Result<(), &'static str> {
+        use deno_core::v8;
+        let function = self.native_scroll.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let arguments = [v8::Integer::new_from_unsigned(scope, node.raw()).into()];
+        let receiver = v8::undefined(scope).into();
+        function
+            .call(scope, receiver, &arguments)
+            .ok_or("INPUT_DISPATCH_FAILED")?;
+        Ok(())
     }
 
     #[cfg(feature = "render")]
@@ -14928,6 +15172,87 @@ return {before,removed,reinsert,moved,cleared};
         assert!(values[12..]
             .iter()
             .all(|value| value == &serde_json::json!(true)));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_wheel_scroll_does_not_cross_document_open_epoch() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0"><div style="height:1000px"></div></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        rt.set_dom(dom);
+        rt.set_viewport(320.0, 200.0);
+        rt.run_page_init();
+        rt.evaluate(
+            "(() => { globalThis.__wheelScrolls = 0; document.addEventListener('scroll', () => __wheelScrolls++); })()",
+        )
+        .unwrap();
+
+        rt.dispatch_wheel_input(WheelInput {
+            x: 10.0,
+            y: 10.0,
+            delta_x: 0.0,
+            delta_y: 80.0,
+            button: -1,
+            buttons: 0,
+            modifiers: 0,
+        })
+        .unwrap();
+        rt.evaluate(
+            "(() => { document.open(); document.write('<!doctype html><body><div style=\"height:1000px\">new</div></body>'); document.close(); })()",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+
+        assert_eq!(rt.evaluate("__wheelScrolls").unwrap().as_f64(), Some(0.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_wheel_keeps_independent_body_scroll_event_target() {
+        let dom = parse_html(
+            r#"<html style="margin:0;overflow:auto"><body style="margin:0;width:120px;height:100px;overflow:auto"><div style="width:120px;height:500px"></div></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        rt.set_dom(dom);
+        rt.set_viewport(320.0, 200.0);
+        rt.run_page_init();
+        let body = rt
+            .with_dom(|dom| dom.query_selector("body").ok().flatten())
+            .flatten()
+            .expect("body");
+        rt.evaluate(
+            r#"(() => { globalThis.__bodyScrolls = 0; globalThis.__documentScrolls = 0;
+               globalThis.__bodyScrollTarget = '';
+               document.body.addEventListener('scroll', event => {
+                 __bodyScrolls++; __bodyScrollTarget = event.target.localName;
+               });
+               document.addEventListener('scroll', () => __documentScrolls++); })()"#,
+        )
+        .unwrap();
+
+        rt.dispatch_wheel_input(WheelInput {
+            x: 10.0,
+            y: 10.0,
+            delta_x: 0.0,
+            delta_y: 80.0,
+            button: -1,
+            buttons: 0,
+            modifiers: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            rt.state.borrow().element_scroll_offsets.get(&body).copied(),
+            Some((0.0, 80.0)),
+        );
+        rt.run_event_loop_bounded(40).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("[__bodyScrolls, __documentScrolls, __bodyScrollTarget]")
+                .unwrap(),
+            serde_json::json!([1, 0, "body"]),
+        );
     }
 
     #[cfg(feature = "render")]

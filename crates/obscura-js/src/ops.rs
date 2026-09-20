@@ -2692,12 +2692,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             _ => "complete",
         })
         .unwrap(),
-        "scroll_event_identity" => {
+        "scroll_event_identity" | "scroll_event_identity_exact" => {
             let result = (|| {
                 let node = NodeId::new(arg1.parse::<u32>().ok()?);
                 dom.get_node(node)?;
-                let node = if dom.is_html_element(node, "html") || dom.is_html_element(node, "body")
-                {
+                let node = if cmd == "scroll_event_identity"
+                    && (dom.is_html_element(node, "html") || dom.is_html_element(node, "body")) {
                     dom.document()
                 } else {
                     node
@@ -2706,6 +2706,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     gs.document_generation.to_string(),
                     node.raw(),
                     dom.node_generation(node)?.to_string(),
+                    gs.input_document_epoch.get().to_string(),
                 ))
             })();
             serde_json::to_string(&result).unwrap()

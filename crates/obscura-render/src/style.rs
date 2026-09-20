@@ -567,7 +567,8 @@ fn parse_overflow_axis(value: &str) -> Option<ParsedOverflowAxis> {
     let (specified, inherit) = match lower.as_str() {
         "visible" => (0, false),
         "clip" => (1, false),
-        "hidden" | "scroll" | "auto" | "overlay" => (2, false),
+        "hidden" => (2, false),
+        "scroll" | "auto" | "overlay" => (3, false),
         "inherit" => (0, true),
         "initial" | "unset" | "revert" | "revert-layer" => (0, false),
         _ => return None,
@@ -624,17 +625,19 @@ pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
     // `hidden`. A clip/visible pair remains genuinely axis-specific.
     let mut computed_x = style.overflow_specified_x;
     let mut computed_y = style.overflow_specified_y;
-    if (computed_x == 2) != (computed_y == 2) {
-        if computed_x == 2 {
-            computed_y = 2;
-        } else {
-            computed_x = 2;
-        }
+    if computed_x >= 2 && computed_y < 2 {
+        computed_y = if computed_y == 0 { 3 } else { 2 };
+    } else if computed_y >= 2 && computed_x < 2 {
+        computed_x = if computed_x == 0 { 3 } else { 2 };
     }
+    style.overflow_computed_x = computed_x;
+    style.overflow_computed_y = computed_y;
     style.overflow_clip_x = computed_x != 0;
     style.overflow_clip_y = computed_y != 0;
-    style.overflow_scroll_x = computed_x == 2;
-    style.overflow_scroll_y = computed_y == 2;
+    style.overflow_scroll_x = computed_x >= 2;
+    style.overflow_scroll_y = computed_y >= 2;
+    style.overflow_user_scroll_x = computed_x == 3;
+    style.overflow_user_scroll_y = computed_y == 3;
     style.overflow_hidden = style.overflow_clip_x || style.overflow_clip_y;
     style.overflow_scroll_container = style.overflow_scroll_x || style.overflow_scroll_y;
 }
