@@ -65,6 +65,11 @@ Wait and run JS:
 
 - `browser_wait_for`, `browser_wait_for_text`, `browser_evaluate`
 
+The two wait tools use one absolute timeout (30 seconds by default), advance
+page timers and queued navigation within that budget, and read the native DOM.
+`timeout` accepts fractional non-negative seconds; invalid or out-of-range
+values return a tool error.
+
 Diagnostics:
 
 - `browser_network_requests`, `browser_console_messages`

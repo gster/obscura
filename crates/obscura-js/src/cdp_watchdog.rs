@@ -92,6 +92,11 @@ pub struct Armed {
 /// executing `budget` later, it is terminated. O(1), no thread spawn. Safe to
 /// call concurrently from several connections: each command gets its own slot.
 pub fn arm(handle: IsolateHandle, budget: Duration) -> Armed {
+    arm_until(handle, Instant::now() + budget)
+}
+
+/// Arm against the caller's existing deadline without adding elapsed setup time.
+pub fn arm_until(handle: IsolateHandle, deadline: Instant) -> Armed {
     let s = shared();
     let mut guard = s.state.lock().unwrap();
     guard.1 += 1;
@@ -100,7 +105,7 @@ pub fn arm(handle: IsolateHandle, budget: Duration) -> Armed {
     guard.0.insert(
         gen,
         Slot {
-            deadline: Instant::now() + budget,
+            deadline,
             handle,
             fired: fired.clone(),
         },

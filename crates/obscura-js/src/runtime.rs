@@ -741,6 +741,31 @@ pub struct WatchdogToken {
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A deadline for an owned runtime phase. Cancellation disarms the watchdog
+/// and clears its termination before the isolate can be used by another task.
+pub struct ExecutionDeadlineGuard {
+    armed: Option<crate::cdp_watchdog::Armed>,
+    handle: IsolateHandle,
+}
+
+impl ExecutionDeadlineGuard {
+    fn stop(&mut self) -> bool {
+        let fired = self.armed.take().is_some_and(crate::cdp_watchdog::disarm);
+        if fired { self.handle.cancel_terminate_execution(); }
+        fired
+    }
+
+    pub fn finish(mut self) -> bool {
+        self.stop()
+    }
+}
+
+impl Drop for ExecutionDeadlineGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
 /// runtime borrow. The CDP dispatcher uses this to bound every command so a
 /// hung page cannot hold this connection's V8 lock forever. Pair with
@@ -1753,6 +1778,31 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         state.pending_frame_message_bytes = 0;
         std::mem::take(&mut state.pending_frame_messages)
+    }
+
+    /// Put undelivered messages back ahead of traffic queued by handlers that
+    /// ran during the same drain. This keeps cancellation at an automation
+    /// deadline from silently discarding the untouched tail of the queue.
+    pub fn restore_pending_frame_messages(
+        &self,
+        mut messages: Vec<crate::ops::PendingFrameMessage>,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        messages.append(&mut state.pending_frame_messages);
+        let mut bytes = messages
+            .iter()
+            .fold(0_usize, |bytes, message| bytes.saturating_add(message.data_json.len()));
+        while messages.len() > crate::ops::frame_message_queue_entry_limit()
+            || bytes > crate::ops::frame_message_queue_byte_limit()
+        {
+            let Some(dropped) = messages.pop() else { break };
+            bytes = bytes.saturating_sub(dropped.data_json.len());
+        }
+        state.pending_frame_message_bytes = bytes;
+        state.pending_frame_messages = messages;
     }
 
     /// Restore the configured V8 heap limit after the emergency headroom has
@@ -6828,6 +6878,17 @@ impl ObscuraJsRuntime {
     /// from `&self`.
     pub fn isolate_handle(&self) -> IsolateHandle {
         self.isolate_handle.clone()
+    }
+
+    pub fn execution_deadline(&self, deadline: std::time::Instant) -> ExecutionDeadlineGuard {
+        let handle = self.isolate_handle();
+        let armed = crate::cdp_watchdog::arm_until(handle.clone(), deadline);
+        ExecutionDeadlineGuard { armed: Some(armed), handle }
+    }
+
+    /// Native document identity, including synchronous document.open replacement.
+    pub fn document_epoch(&self) -> u64 {
+        self.state.borrow().input_document_epoch.get()
     }
 
     /// Clear V8's termination flag after a watchdog armed externally (via the

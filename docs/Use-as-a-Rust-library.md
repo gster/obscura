@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 - `url()` current URL
 - `evaluate(js)` run JavaScript, returns a `serde_json::Value`
 - `query_selector(css)` first match as an `Element`, or `None`
-- `wait_for_selector(css, Duration).await` poll until present
+- `wait_for_selector(css, Duration).await` exclusively borrows the page and waits on the native DOM while advancing timers and queued navigation under one deadline
 - `settle(max_ms).await` drive the event loop so async work (`fetch`, timers) completes
 - `on_request(cb)` / `on_response(cb)` passive callbacks for every request and response
 - `enable_interception()` channel to block, mock, or rewrite requests
@@ -56,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
 `Element`: `text()`, `attribute(name)`, `click()`.
 
 `CookieStore`: `set`, `get_all`, `get_for_url`, `save_to_file`, `load_from_file`.
+
+`wait_for_selector` now takes `&mut Page` instead of `&Page`. This is an intentional source-breaking API change: advancing timers, frame work, and queued navigation mutates the page while the future is pending, so the Rust type system must hold exclusive page ownership for the whole wait. Callers should bind the page as `mut`, as in the quickstart above, and must not run another operation on the same page concurrently. The change replaces a possible runtime `RefCell` borrow panic with a compile-time ownership error.
 
 ## Intercept requests
 

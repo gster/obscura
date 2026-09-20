@@ -77,6 +77,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 进展（2026-09-20，native input 切片）：CDP move/press/release 已通过 typed Page API 接入共享 native hit-test、受保护事件分发、焦点与默认动作；移除该分支的页面 JS 拼接和全局按压状态。官方 Playwright 六组离线鼠标场景已与 Chrome 对照通过；document.open/导航使原按压状态失效，no-render 坐标输入明确 unsupported。wheel 已另行接入 typed Page API，九组 Chrome 对照覆盖嵌套滚动、取消、页面覆盖和参数边界；滚动队列按文档 epoch 隔离，hidden overflow 不接受用户 wheel。keyboard/text 现通过 `Page::dispatch_keyboard_input` / `Page::insert_text` 接入受保护事件和原生编辑，七组 Playwright CDPSession 场景与 Chrome exact 对照覆盖选择区、阶段、取消、metadata、公开 API 覆盖、focus/document 重入和协议错误，真实待处理导航另由 Rust 回归覆盖；contenteditable、IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作、复杂表单默认动作和 maxlength 截断保持未资格化。等待、资源观察、限额及启动保护的后续归口仍待完成，本项保持未关闭。
 
+进展（2026-09-21，条件等待切片）：selector/text 条件等待已归口 `obscura-browser::Page` 的共享原生 DOM probe 与 `advance_automation`，CLI、MCP 和公开 Rust API 只保留参数及结果适配。单一绝对 deadline 覆盖首次 probe、timer/microtask/frame 推进、排队导航和同步脚本 watchdog；超时、非法 selector、导航失败和取消后的页面可恢复均有 Rust 回归。页面覆盖公开 selector/text getter 不影响结果；MCP 支持有限非负小数秒 timeout，并在两项等待工具中用 document identity 清理等待期间同 URL reload 和 `document.open` 后的旧引用。公开 Rust wait 有意从 `&self` 改为 `&mut self`，要求调用方持有独占页面所有权，作为已接受并记录的源代码兼容性变更。固定 `--wait`、自适应 settle、导航 lifecycle/network-idle、资源观察、容量限额和旧启动保护仍按独立契约继续处理，本项保持未关闭。
+
 ### OB-011 · P0 · Cookie 请求上下文与无损状态往返
 
 状态：未关闭。

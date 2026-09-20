@@ -55,6 +55,13 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+fn check_navigation_deadline(deadline: Option<std::time::Instant>) -> Result<(), PageError> {
+    if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+        return Err(PageError::NetworkError("navigation exceeded its task deadline".into()));
+    }
+    Ok(())
+}
+
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
 /// `&s[..max]` panics if `max` lands inside a multi-byte char; the evaluated
 /// expression logged below is caller-controlled, so slice it safely.
@@ -183,6 +190,34 @@ pub struct NetworkEvent {
 pub struct StoredResponseBody {
     pub body: String,
     pub base64_encoded: bool,
+}
+
+/// Outcome of a native automation wait. A timeout is an observed result rather
+/// than an engine error, so callers do not need to recover it from a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomationWait<T> {
+    Matched(T),
+    TimedOut,
+}
+
+/// Document identity within one Page, independent of URL and history entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentIdentity {
+    runtime_generation: u64,
+    document_epoch: Option<u64>,
+}
+
+/// Failures that prevent an automation wait from producing an outcome.
+#[derive(Debug, thiserror::Error)]
+pub enum AutomationWaitError {
+    #[error("invalid selector: {0}")]
+    InvalidSelector(String),
+
+    #[error("automation advancement failed: {0}")]
+    Advancement(String),
+
+    #[error("navigation failed while waiting: {0}")]
+    Navigation(#[source] PageError),
 }
 
 #[derive(Clone, Copy)]
@@ -1383,7 +1418,7 @@ impl Page {
     /// Reports whether anything was delivered, because a message usually causes
     /// a reply: a widget posts its result, the page answers, and the exchange
     /// only finishes if the caller settles and drains again.
-    fn deliver_frame_messages(&mut self) -> bool {
+    fn deliver_frame_messages(&mut self, deadline: Option<std::time::Instant>) -> bool {
         let pending = match self.js.as_ref() {
             Some(js) => js.take_pending_frame_messages(),
             None => return false,
@@ -1392,7 +1427,16 @@ impl Page {
             return false;
         }
 
-        for message in pending {
+        let mut pending = pending.into_iter();
+        while let Some(message) = pending.next() {
+            if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+                let mut remaining = vec![message];
+                remaining.extend(pending);
+                if let Some(js) = self.js.as_ref() {
+                    js.restore_pending_frame_messages(remaining);
+                }
+                break;
+            }
             let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
             let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
             let escaped_target_origin =
@@ -1606,6 +1650,10 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
+        self.advance_frames_until(None).await
+    }
+
+    async fn advance_frames_until(&mut self, deadline: Option<std::time::Instant>) -> bool {
         let mut queued_new = self.queue_pending_frames();
         self.release_detached_frames();
         if self.pending_frame_work.is_empty() && self.queue_pending_frames() {
@@ -1615,9 +1663,10 @@ impl Page {
         let queued = self.pending_frame_work.len();
         let mut scripts_ran = false;
         for _ in 0..queued {
+            if deadline.is_some_and(|end| std::time::Instant::now() >= end) { break; }
             scripts_ran |= self.run_next_pending_frame().await;
         }
-        let delivered = self.deliver_frame_messages();
+        let delivered = self.deliver_frame_messages(deadline);
         self.release_detached_frames();
         queued_new || scripts_ran || delivered
     }
@@ -2002,6 +2051,7 @@ impl Page {
             .collect()
     }
 
+    #[cfg(test)]
     async fn execute_scripts(&mut self) -> Result<(), PageError> {
         self.execute_scripts_with_module_budget(None).await
     }
@@ -2057,7 +2107,17 @@ impl Page {
         true
     }
 
+    #[cfg(test)]
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) -> Result<(), PageError> {
+        self.execute_scripts_with_budgets(module_budget_override, None).await
+    }
+
+    async fn execute_scripts_with_budgets(
+        &mut self,
+        module_budget_override: Option<u64>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), PageError> {
+        check_navigation_deadline(deadline)?;
         #[cfg(feature = "render")]
         let mut fragment = self.js.as_ref().and_then(ObscuraJsRuntime::begin_document_fragment);
         let scripts_started = std::time::Instant::now();
@@ -2084,6 +2144,9 @@ impl Page {
             .unwrap_or(30_000);
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
+        let script_deadline = deadline
+            .map(tokio::time::Instant::from_std)
+            .map_or(script_deadline, |end| end.min(script_deadline));
 
         // Hard backstop over the WHOLE script-execution phase. Inline scripts
         // run back-to-back with no await between them, so neither the soft
@@ -2421,6 +2484,7 @@ impl Page {
         let preload_sources = self.preload_scripts.clone();
         if let Some(js) = &mut self.js {
             for source in &preload_sources {
+                check_navigation_deadline(deadline)?;
                 if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
                     tracing::debug!("Preload script error: {}", e);
                 }
@@ -2514,6 +2578,7 @@ impl Page {
             |page: &mut Self,
              script: &ScriptInfo,
              fetched_script: ScriptResponse| {
+                if deadline.is_some_and(|end| std::time::Instant::now() >= end) { return; }
                 if script.src.is_some() {
                     if let Some((url, resp)) = fetched_script {
                         let execution_url = resp.url.to_string();
@@ -2765,6 +2830,7 @@ impl Page {
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
+        check_navigation_deadline(deadline)?;
         let lifecycle_error = self.js.as_mut().and_then(|js| js.document_lifecycle(1).err());
 
         for scheduled in post_parse {
@@ -2845,6 +2911,7 @@ impl Page {
                 // dynamic script elements do not gate it. They do remain in the
                 // document's load-event delay set, including scripts inserted by
                 // a DOMContentLoaded listener.
+                check_navigation_deadline(deadline)?;
                 js.document_lifecycle(2).map_err(|error| PageError::LifecycleError(error.into()))?;
             }
             // Parser-inserted async scripts gate load, but not DOMContentLoaded.
@@ -2863,6 +2930,7 @@ impl Page {
                 js.try_document_fragment(&mut fragment)
                     .map_err(|error| PageError::FragmentError(error.into()))?;
 
+                check_navigation_deadline(deadline)?;
                 // readyState becomes complete before the load event. A script
                 // inserted by an onload handler is therefore post-load work and
                 // remains pending until an explicit caller settle/wait.
@@ -2921,7 +2989,7 @@ impl Page {
         let history = self.requested_history.take().unwrap_or_default();
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ResourceRequest::navigation(), history),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ResourceRequest::navigation(), history, None),
         )
         .await
         {
@@ -2953,8 +3021,122 @@ impl Page {
         }
         #[cfg(feature = "render")]
         self.queue_pending_render_resources();
-        self.advance_frames().await;
+        if std::time::Instant::now() < task_deadline {
+            // Frame work is explicitly cancellation-safe: fetched work remains
+            // queued until its individual step completes. Clip it to the same
+            // absolute task deadline instead of adding another relative budget.
+            let watchdog = self.js.as_ref().map(|js| js.execution_deadline(task_deadline));
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(task_deadline),
+                self.advance_frames_until(Some(task_deadline)),
+            )
+            .await;
+            if watchdog.is_some_and(|guard| guard.finish()) {
+                return Err("automation frame task exceeded its task budget".into());
+            }
+        }
         Ok(())
+    }
+
+    pub fn document_identity(&self) -> DocumentIdentity {
+        DocumentIdentity {
+            runtime_generation: self.network_document_generation,
+            document_epoch: self.js.as_ref().map(ObscuraJsRuntime::document_epoch),
+        }
+    }
+
+    /// Wait for a selector through the native DOM. Author overrides of
+    /// `document.querySelector` cannot influence this path.
+    pub async fn wait_for_selector(
+        &mut self,
+        selector: &str,
+        deadline: std::time::Instant,
+    ) -> Result<AutomationWait<obscura_dom::NodeId>, AutomationWaitError> {
+        // Validate even when the page has no current document. A live document
+        // is validated by the immediate first probe below.
+        if self.with_dom(|_| ()).is_none() {
+            parse_html("")
+                .query_selector(selector)
+                .map_err(AutomationWaitError::InvalidSelector)?;
+        }
+        self.wait_for_automation(deadline, |page| {
+            page.with_dom(|dom| dom.query_selector(selector))
+                .unwrap_or(Ok(None))
+                .map_err(AutomationWaitError::InvalidSelector)
+        })
+        .await
+    }
+
+    /// Wait until the current document body's native text contains `needle`.
+    /// This reads `DomTree::text_content`, not JavaScript-visible text getters.
+    pub async fn wait_for_text(
+        &mut self,
+        needle: &str,
+        deadline: std::time::Instant,
+    ) -> Result<AutomationWait<()>, AutomationWaitError> {
+        self.wait_for_automation(deadline, |page| {
+            let matched = page
+                .with_dom(|dom| {
+                    dom.query_selector("body")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|body| dom.text_content(body).contains(needle))
+                })
+                .unwrap_or(false);
+            Ok(matched.then_some(()))
+        })
+        .await
+    }
+
+    async fn wait_for_automation<T>(
+        &mut self,
+        deadline: std::time::Instant,
+        mut probe: impl FnMut(&Page) -> Result<Option<T>, AutomationWaitError>,
+    ) -> Result<AutomationWait<T>, AutomationWaitError> {
+        const CADENCE: std::time::Duration = std::time::Duration::from_millis(20);
+
+        loop {
+            // Probe first so an already-satisfied wait succeeds even when its
+            // caller supplies an elapsed deadline.
+            if let Some(value) = probe(self)? {
+                return Ok(AutomationWait::Matched(value));
+            }
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(AutomationWait::TimedOut);
+            }
+            let cadence_deadline = now.checked_add(CADENCE).unwrap_or(deadline).min(deadline);
+
+            self.advance_automation(deadline)
+                .await
+                .map_err(AutomationWaitError::Advancement)?;
+
+            // A page-driven navigation owns the remaining overall wait budget.
+            // Do not wrap it in the short polling cadence: taking and cancelling
+            // the request there would lose it and invite unsafe replay.
+            if self
+                .js
+                .as_ref()
+                .and_then(|js| js.pending_navigation_url())
+                .is_some()
+            {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    continue;
+                }
+                let navigation_deadline = now.checked_add(self.navigation_timeout())
+                    .map_or(deadline, |end| end.min(deadline));
+                self.process_pending_navigation_until(navigation_deadline)
+                    .await
+                    .map_err(AutomationWaitError::Navigation)?;
+            }
+
+            let now = std::time::Instant::now();
+            if now < cadence_deadline {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(cadence_deadline)).await;
+            }
+        }
     }
 
     pub async fn settle(&mut self, max_ms: u64) {
@@ -3153,6 +3335,7 @@ impl Page {
         body: &str,
         initial_request: ResourceRequest,
         history: obscura_js::ops::HistoryNavigation,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(), PageError> {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
@@ -3161,6 +3344,7 @@ impl Page {
         let mut current_history = history;
         let chain_limit = self.navigation_chain_limit();
         for chain in 0..chain_limit {
+            check_navigation_deadline(deadline)?;
             self.navigate_single(
                 &current_url,
                 wait_until,
@@ -3168,8 +3352,10 @@ impl Page {
                 &current_body,
                 request.clone(),
                 current_history.clone(),
+                deadline,
             )
             .await?;
+            check_navigation_deadline(deadline)?;
             if let Some(navigation) = self
                 .js
                 .as_ref()
@@ -3229,6 +3415,7 @@ impl Page {
         body: &str,
         mut request: ResourceRequest,
         history_kind: obscura_js::ops::HistoryNavigation,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
@@ -3303,6 +3490,7 @@ impl Page {
             self.referrer_policy = ReferrerPolicy::default();
             self.navigate_blank();
             self.init_js();
+            let _watchdog = deadline.and_then(|end| self.js.as_ref().map(|js| js.execution_deadline(end)));
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
             // Runtime.addBinding shim) must run on about:blank too —
             // puppeteer's `browser.newPage()` lands on about:blank and
@@ -3310,6 +3498,7 @@ impl Page {
             let preload_sources = self.preload_scripts.clone();
             if let Some(js) = &mut self.js {
                 for source in &preload_sources {
+                    check_navigation_deadline(deadline)?;
                     if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
                         tracing::debug!("Preload script error on about:blank: {}", e);
                     }
@@ -3414,6 +3603,7 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        let _watchdog = deadline.and_then(|end| self.js.as_ref().map(|js| js.execution_deadline(end)));
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
@@ -3485,7 +3675,8 @@ impl Page {
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await?;
+        self.execute_scripts_with_budgets(None, deadline).await?;
+        check_navigation_deadline(deadline)?;
 
         #[cfg(feature = "render")]
         self.drain_render_resource_results();
@@ -3497,7 +3688,8 @@ impl Page {
         // send `Page.navigate` with no `waitUntil`, which lands here and returns
         // on the next line, so building frames further down left every real CDP
         // client seeing a page with no frames at all.
-        self.build_document_frames().await;
+        self.build_document_frames(deadline).await;
+        check_navigation_deadline(deadline)?;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             return Ok(());
@@ -3610,7 +3802,7 @@ impl Page {
     /// event loop rather than being ready the moment parsing ends. Pages
     /// without an iframe skip the pumping entirely and pay one native selector
     /// query.
-    async fn build_document_frames(&mut self) {
+    async fn build_document_frames(&mut self, deadline: Option<std::time::Instant>) {
         // How many rounds of "attach a frame, let it start its own" to follow.
         // A frame can add a frame, so this needs a bound rather than a loop
         // until quiet: a page that adds one on every turn would never finish.
@@ -3625,6 +3817,7 @@ impl Page {
         }
 
         for _ in 0..ROUNDS {
+            if deadline.is_some_and(|end| std::time::Instant::now() >= end) { break; }
             if let Some(js) = &mut self.js {
                 let _ = tokio::time::timeout(
                     tokio::time::Duration::from_millis(ROUND_MS),
@@ -3632,7 +3825,7 @@ impl Page {
                 )
                 .await;
             }
-            if !self.advance_frames().await {
+            if !self.advance_frames_until(deadline).await {
                 break;
             }
         }
@@ -4774,12 +4967,20 @@ impl Page {
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
+        let deadline = std::time::Instant::now().checked_add(self.navigation_timeout())
+            .ok_or_else(|| PageError::NetworkError("navigation timeout is too large".into()))?;
+        self.process_pending_navigation_until(deadline).await
+    }
+
+    async fn process_pending_navigation_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<bool, PageError> {
         if let Some(navigation) = self.js.as_ref().and_then(|js| js.take_pending_navigation_request()) {
             let obscura_js::ops::PendingNavigation { url, method, body, request, history } = navigation;
-            let nav_timeout = self.navigation_timeout();
-            let nav_timeout_ms = duration_millis_u64(nav_timeout);
-            let result = tokio::time::timeout(
-                nav_timeout,
+            let nav_timeout_ms = duration_millis_u64(deadline.saturating_duration_since(std::time::Instant::now()));
+            let result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
                 self.navigate_with_wait_post_inner(
                     &url,
                     crate::lifecycle::WaitUntil::Load,
@@ -4787,6 +4988,7 @@ impl Page {
                     &body,
                     request,
                     history,
+                    Some(deadline),
                 ),
             )
             .await
@@ -4794,7 +4996,10 @@ impl Page {
                 self.lifecycle = crate::lifecycle::LifecycleState::Failed;
                 PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
             })?;
-            result?;
+            result.map_err(|error| {
+                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                error
+            })?;
             self.sync_virtual_url();
             self.push_history(self.url_string());
             Ok(true)
@@ -6036,6 +6241,56 @@ mod tests {
         .expect("frame documents did not finish fetching")
         .unwrap();
         (page, requests, slow_seen)
+    }
+
+    async fn page_with_fetched_busy_frame(name: &str) -> super::Page {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0_u8; 2048];
+                    let _ = socket.read(&mut request).await;
+                    let body = "<html><body><script>const end=Date.now()+2500;while(Date.now()<end){}</script></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut page = import_map_test_page(
+            name,
+            &base,
+            "<html><body><iframe src=/busy.html></iframe></body></html>",
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .expect("busy frame document did not finish fetching")
+        .unwrap();
+        assert!(page.queue_pending_frames());
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn automation_deadline_terminates_queued_frame_script_and_recovers() {
+        let mut page = page_with_fetched_busy_frame("automation-deadline-frame").await;
+        let started = std::time::Instant::now();
+        let outcome = page
+            .advance_automation(started + std::time::Duration::from_millis(150))
+            .await;
+        assert!(outcome.is_err(), "busy frame unexpectedly completed: {outcome:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "frame script escaped the automation deadline",
+        );
+        assert_eq!(page.evaluate("1 + 1"), serde_json::json!(2.0));
     }
 
     async fn spawn_nested_pending_frame_server() -> (

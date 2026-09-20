@@ -825,10 +825,11 @@ async fn run_fetch(
         } else {
             1
         };
-        let hard = Duration::from_secs(
-            timeout_secs
-                .saturating_add(wait_secs.saturating_mul(settle_passes))
-                .saturating_add(10),
+        let hard = fetch_process_hard_timeout(
+            timeout_secs,
+            wait_secs,
+            settle_passes,
+            selector.is_some(),
         );
         std::thread::spawn(move || {
             std::thread::sleep(hard);
@@ -924,7 +925,7 @@ async fn run_fetch(
     }
 
     if let Some(ref sel) = selector {
-        let found = wait_for_selector(&mut page, sel, wait_secs).await;
+        let found = wait_for_selector(&mut page, sel, wait_secs).await?;
         if !found {
             eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
         }
@@ -1326,34 +1327,34 @@ async fn write_or_print_bytes(
     Ok(())
 }
 
-async fn wait_for_selector(page: &mut Page, selector: &str, timeout_secs: u64) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
-    loop {
-        let found = page
-            .with_dom(|dom| dom.query_selector(selector).ok().flatten().is_some())
-            .unwrap_or(false);
-
-        if found {
-            return true;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-
-        // The selector may be created by a timer, dynamic import, or fetch
-        // completion. Sleeping without pumping V8 makes those callbacks unable
-        // to run, so a valid selector wait always times out. Drive one bounded
-        // event-loop slice, then retain a 100ms polling cadence if it returned
-        // idle immediately.
-        let slice_started = tokio::time::Instant::now();
-        page.settle(100).await;
-        let spent = slice_started.elapsed();
-        let cadence = tokio::time::Duration::from_millis(100);
-        if spent < cadence {
-            tokio::time::sleep(cadence - spent).await;
-        }
+async fn wait_for_selector(
+    page: &mut Page,
+    selector: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<bool> {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow::anyhow!("selector wait timeout is too large"))?;
+    match page.wait_for_selector(selector, deadline).await {
+        Ok(obscura_browser::AutomationWait::Matched(_)) => Ok(true),
+        Ok(obscura_browser::AutomationWait::TimedOut) => Ok(false),
+        Err(error) => Err(anyhow::anyhow!("selector wait failed: {error}")),
     }
+}
+
+fn fetch_process_hard_timeout(
+    navigation_secs: u64,
+    wait_secs: u64,
+    settle_passes: u64,
+    has_selector_wait: bool,
+) -> Duration {
+    let wait_passes = settle_passes.saturating_add(u64::from(has_selector_wait));
+    Duration::from_secs(
+        navigation_secs
+            .saturating_add(wait_secs.saturating_mul(wait_passes))
+            .saturating_add(10),
+    )
 }
 
 fn dump_cookies(page: &Page) -> String {
@@ -1940,7 +1941,8 @@ fn dump_assets(page: &Page) -> String {
 mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
-        extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
+        extract_readable_text, fetch_original_bytes, fetch_process_hard_timeout,
+        is_quiet_command, link_kind_from_rel,
         merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
         resolve_persona, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
         DEFAULT_V8_FLAGS,
@@ -2472,6 +2474,18 @@ mod tests {
         assert_eq!(
             configured_fetch_timeout(args),
             std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn fetch_process_deadline_counts_selector_wait_separately() {
+        assert_eq!(
+            fetch_process_hard_timeout(30, 5, 2, true),
+            std::time::Duration::from_secs(55),
+        );
+        assert_eq!(
+            fetch_process_hard_timeout(30, 5, 2, false),
+            std::time::Duration::from_secs(50),
         );
     }
 

@@ -6044,14 +6044,14 @@ fn op_navigate(
     gs.same_document_navigation = false;
 }
 
-fn frame_message_queue_entry_limit() -> usize {
+pub(crate) fn frame_message_queue_entry_limit() -> usize {
     std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4096)
 }
 
-fn frame_message_queue_byte_limit() -> usize {
+pub(crate) fn frame_message_queue_byte_limit() -> usize {
     std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())

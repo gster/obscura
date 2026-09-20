@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use obscura_browser::lifecycle::WaitUntil;
-use obscura_browser::{InterceptedRequest, Page as InnerPage};
+use obscura_browser::{AutomationWaitError, InterceptedRequest, Page as InnerPage};
 use obscura_net::{RequestCallback, ResponseCallback};
 use serde_json::Value;
 
@@ -78,31 +78,41 @@ impl Page {
         nid_from_value(&val).map(|nid| Element { node_id: nid, page: self })
     }
 
-    /// Wait for CSS selector to appear (polls every 100ms).
+    /// Wait for a CSS selector while advancing native page tasks.
+    ///
+    /// The selector is evaluated against Obscura's DOM, so page scripts cannot
+    /// intercept the wait by replacing `document.querySelector`. The mutable
+    /// receiver makes the wait's exclusive page ownership explicit while it
+    /// advances timers, navigation, and frame work.
     pub async fn wait_for_selector(
-        &self,
+        &mut self,
         selector: &str,
         timeout: Duration,
     ) -> Result<Element<'_>, Error> {
-        let start = std::time::Instant::now();
-        let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
-        loop {
-            let js = format!(
-                "(function() {{ var el = document.querySelector('{}'); return el ? el._nid : null; }})()",
-                escaped
-            );
-            let val = self.evaluate(&js);
-            if let Some(nid) = nid_from_value(&val) {
-                return Ok(Element { node_id: nid, page: self });
-            }
-            if start.elapsed() > timeout {
-                return Err(Error::Timeout(format!(
-                    "wait_for_selector({}) timed out after {}ms",
-                    selector,
-                    timeout.as_millis()
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Timeout(format!(
+                "wait_for_selector({selector}) timeout is too large"
+            )))?;
+        let outcome = self
+            .inner
+            .get_mut()
+            .wait_for_selector(selector, deadline)
+            .await
+            .map_err(|error| match error {
+                AutomationWaitError::Navigation(error) => Error::Navigation(error.to_string()),
+                other => Error::Internal(anyhow::anyhow!(other)),
+            })?;
+        match outcome {
+            obscura_browser::AutomationWait::Matched(node) => Ok(Element {
+                node_id: u64::from(node.raw()),
+                page: self,
+            }),
+            obscura_browser::AutomationWait::TimedOut => Err(Error::Timeout(format!(
+                "wait_for_selector({}) timed out after {}ms",
+                selector,
+                timeout.as_millis()
+            ))),
         }
     }
 

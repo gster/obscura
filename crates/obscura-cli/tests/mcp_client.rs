@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -82,6 +82,149 @@ impl TestPageServer {
 }
 
 impl Drop for TestPageServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct SlowQueuedNavigationServer {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SlowQueuedNavigationServer {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow local fixture");
+        let addr = listener.local_addr().expect("slow fixture address");
+        listener
+            .set_nonblocking(true)
+            .expect("slow fixture nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while request.len() < 16384
+                            && !request.windows(4).any(|part| part == b"\r\n\r\n")
+                        {
+                            let Ok(read) = stream.read(&mut chunk) else { break; };
+                            if read == 0 { break; }
+                            request.extend_from_slice(&chunk[..read]);
+                        }
+                        let path = String::from_utf8_lossy(&request)
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("/")
+                            .to_string();
+                        let body = if path == "/slow" {
+                            std::thread::sleep(Duration::from_millis(80));
+                            "<!doctype html><body><div id=slow-landed>slow destination</div></body>"
+                        } else {
+                            "<!doctype html><body><script>setTimeout(() => location.href = '/slow', 10)</script></body>"
+                        };
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { addr, stop, thread: Some(thread) }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+}
+
+impl Drop for SlowQueuedNavigationServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct SameUrlReloadServer {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SameUrlReloadServer {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reload fixture");
+        let addr = listener.local_addr().expect("reload fixture address");
+        listener
+            .set_nonblocking(true)
+            .expect("reload fixture nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let responses = Arc::new(AtomicUsize::new(0));
+        let thread_responses = Arc::clone(&responses);
+        let thread = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while request.len() < 16384
+                            && !request.windows(4).any(|part| part == b"\r\n\r\n")
+                        {
+                            let Ok(read) = stream.read(&mut chunk) else { break; };
+                            if read == 0 { break; }
+                            request.extend_from_slice(&chunk[..read]);
+                        }
+                        let response_number = thread_responses.fetch_add(1, Ordering::AcqRel);
+                        let body = if response_number == 0 {
+                            "<!doctype html><body><button id=old-button>old</button><script>setTimeout(()=>location.reload(),100)</script></body>"
+                        } else {
+                            "<!doctype html><body><button id=new-button>new</button><div id=landed>landed</div></body>"
+                        };
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { addr, stop, thread: Some(thread) }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+}
+
+impl Drop for SameUrlReloadServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = TcpStream::connect(self.addr);
@@ -395,6 +538,79 @@ fn test_wait_for_selector() {
     );
     assert!(resp["result"]["isError"].is_null(), "wait_for failed: {resp}");
     assert!(content_text(&resp).contains("Found"));
+}
+
+#[test]
+fn test_wait_for_text() {
+    let mut c = McpClient::spawn();
+    c.tool("browser_navigate", serde_json::json!({"url": INLINE_TEXT_URL}));
+
+    let resp = c.tool(
+        "browser_wait_for_text",
+        serde_json::json!({"text": "Hello, world!", "timeout": 0.5}),
+    );
+    assert!(resp["result"]["isError"].is_null(), "wait_for_text failed: {resp}");
+    assert_eq!(content_text(&resp), "Found text \"Hello, world!\"");
+}
+
+#[test]
+fn test_wait_for_rejects_invalid_timeout_values() {
+    let server = TestPageServer::spawn();
+    let mut c = McpClient::spawn();
+    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+
+    for timeout in [
+        serde_json::json!("1"),
+        serde_json::Value::Null,
+        serde_json::json!(-1),
+        serde_json::json!(1e300),
+    ] {
+        let resp = c.tool(
+            "browser_wait_for",
+            serde_json::json!({"selector": "h1", "timeout": timeout}),
+        );
+        assert_eq!(resp["result"]["isError"], true, "invalid timeout accepted: {resp}");
+        assert!(content_text(&resp).contains("Invalid timeout"), "wrong error: {resp}");
+    }
+}
+
+#[test]
+fn test_wait_for_slow_queued_navigation_uses_the_overall_deadline() {
+    let server = SlowQueuedNavigationServer::spawn();
+    let mut c = McpClient::spawn();
+    let nav = c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    assert!(nav["result"]["isError"].is_null(), "navigate failed: {nav}");
+
+    let resp = c.tool(
+        "browser_wait_for",
+        serde_json::json!({"selector": "#slow-landed", "timeout": 0.5}),
+    );
+    assert!(resp["result"]["isError"].is_null(), "slow queued wait failed: {resp}");
+    assert!(content_text(&resp).contains("Found '#slow-landed'"));
+}
+
+#[test]
+fn test_wait_clears_refs_after_same_url_reload() {
+    let server = SameUrlReloadServer::spawn();
+    let mut c = McpClient::spawn();
+    let nav = c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    assert!(nav["result"]["isError"].is_null(), "navigate failed: {nav}");
+
+    let snapshot = c.tool("browser_snapshot", serde_json::json!({}));
+    assert!(content_text(&snapshot).contains("old"), "unexpected snapshot: {snapshot}");
+
+    let waited = c.tool(
+        "browser_wait_for",
+        serde_json::json!({"selector": "#landed", "timeout": 1.0}),
+    );
+    assert!(waited["result"]["isError"].is_null(), "reload wait failed: {waited}");
+
+    let click = c.tool("browser_click", serde_json::json!({"ref": "e1"}));
+    assert_eq!(click["result"]["isError"], true, "stale ref was accepted: {click}");
+    assert!(
+        content_text(&click).contains("unknown ref 'e1'"),
+        "stale ref was not invalidated: {click}",
+    );
 }
 
 #[test]

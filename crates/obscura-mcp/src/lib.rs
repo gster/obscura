@@ -11,7 +11,9 @@ use std::sync::Arc;
 use anyhow::Result;
 #[cfg(feature = "render")]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{
+    AutomationWait, AutomationWaitError, BrowserContext, DocumentIdentity, Page,
+};
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -434,7 +436,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                     "type": "object",
                     "properties": {
                         "selector": { "type": "string", "description": "CSS selector to wait for" },
-                        "timeout": { "type": "number", "description": "Timeout in seconds (default: 30)" }
+                        "timeout": { "type": "number", "minimum": 0, "description": "Timeout in seconds (default: 30; fractional values accepted)" }
                     },
                     "required": ["selector"]
                 }
@@ -542,12 +544,12 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_wait_for_text",
-                "description": "Wait until a substring appears anywhere in the rendered page text. Use when you want to wait for a result message or notification rather than a specific selector.",
+                "description": "Wait until a substring appears in the current document body's DOM text content. Use when you want to wait for a result message or notification rather than a specific selector.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "text": { "type": "string" },
-                        "timeout": { "type": "number", "description": "Seconds (default 30)" }
+                        "timeout": { "type": "number", "minimum": 0, "description": "Seconds (default 30; fractional values accepted)" }
                     },
                     "required": ["text"]
                 }
@@ -944,6 +946,44 @@ fn truncate(text: &str, max_chars: usize) -> String {
     format!("{head}\n...(truncated, {remaining} more chars)")
 }
 
+fn wait_deadline(args: &Value) -> Result<std::time::Instant, String> {
+    let seconds = match args.get("timeout") {
+        None => 30.0,
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| "Invalid timeout: expected a number".to_string())?,
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err("Invalid timeout: expected a finite non-negative number".to_string());
+    }
+    let duration = std::time::Duration::try_from_secs_f64(seconds)
+        .map_err(|_| "Invalid timeout: value is out of range".to_string())?;
+    std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| "Invalid timeout: value is out of range".to_string())
+}
+
+fn document_marker(state: &mut BrowserState) -> DocumentIdentity {
+    state.page_mut().document_identity()
+}
+
+fn wait_error(error: AutomationWaitError) -> String {
+    match error {
+        AutomationWaitError::InvalidSelector(message) => format!("Invalid selector: {message}"),
+        AutomationWaitError::Advancement(message) => message,
+        AutomationWaitError::Navigation(error) => error.to_string(),
+    }
+}
+
+fn clear_refs_after_navigation(
+    state: &mut BrowserState,
+    before: DocumentIdentity,
+) {
+    if state.page_mut().document_identity() != before {
+        state.interactive_refs.clear();
+    }
+}
+
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str)
         .ok_or("Missing url parameter")?;
@@ -1140,35 +1180,15 @@ async fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String,
 async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = args.get("selector").and_then(Value::as_str)
         .ok_or("Missing selector parameter")?;
-    let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0) as u64;
+    let deadline = wait_deadline(args)?;
+    let before = document_marker(state);
+    let result = state.page_mut().wait_for_selector(selector, deadline).await;
+    clear_refs_after_navigation(state, before);
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
-    // Exponential backoff: 5 -> 10 -> 20 -> ... -> 200 ms. The old fixed
-    // 200ms tick added up to a full poll cycle of latency every time;
-    // a selector that appears in 30ms now returns in ~35ms instead of
-    // the next 200ms tick.
-    let mut tick_ms: u64 = 5;
-    loop {
-        let found = state.page_mut().with_dom(|dom| {
-            dom.query_selector(selector).ok().flatten().is_some()
-        }).unwrap_or(false);
-
-        if found {
-            return Ok(format!("Found '{selector}'"));
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("Timeout waiting for '{selector}'"));
-        }
-
-        let tick = tokio::time::Duration::from_millis(tick_ms);
-        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => {}
-        }
-        if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
+    match result {
+        Ok(AutomationWait::Matched(_)) => Ok(format!("Found '{selector}'")),
+        Ok(AutomationWait::TimedOut) => Err(format!("Timeout waiting for '{selector}'")),
+        Err(error) => Err(wait_error(error)),
     }
 }
 
@@ -1461,31 +1481,15 @@ fn tool_clear_cookies(state: &BrowserState) -> Result<String, String> {
 async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let needle = args.get("text").and_then(Value::as_str)
         .ok_or("Missing text parameter")?;
-    let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0) as u64;
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
-    let escaped = serde_json::to_string(needle).unwrap_or_else(|_| "\"\"".to_string());
-    let js = format!(r#"(function(){{
-        var t = (document.body && (document.body.innerText || document.body.textContent)) || '';
-        return t.indexOf({needle}) >= 0;
-    }})()"#, needle = escaped);
-    // Exponential backoff like browser_wait_for (see comment there).
-    let mut tick_ms: u64 = 5;
-    loop {
-        let found = state.page_mut().evaluate(&js).as_bool().unwrap_or(false);
-        if found {
-            return Ok(format!("Found text {needle:?}"));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("Timeout waiting for text {needle:?}"));
-        }
-        let tick = tokio::time::Duration::from_millis(tick_ms);
-        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => {}
-        }
-        if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
+    let deadline = wait_deadline(args)?;
+    let before = document_marker(state);
+    let result = state.page_mut().wait_for_text(needle, deadline).await;
+    clear_refs_after_navigation(state, before);
+
+    match result {
+        Ok(AutomationWait::Matched(())) => Ok(format!("Found text {needle:?}")),
+        Ok(AutomationWait::TimedOut) => Err(format!("Timeout waiting for text {needle:?}")),
+        Err(error) => Err(wait_error(error)),
     }
 }
 
