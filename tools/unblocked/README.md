@@ -9,6 +9,11 @@ package and binary.
 - `baseline.json` records the source, lockfiles, Rust toolchains, benchmark
   revision, platform environment, exact commands, and explicit
   passed/failed/skipped/not-run results for OB-001.
+  Its lockfile digests are resolved from the exact `source.revision` Git
+  commit, so later working-tree changes do not rewrite historical evidence;
+  an unavailable revision or source lock blob is an error. Toolchain manifests,
+  CI pins, and release pins are current qualification inputs and are checked
+  from the working tree independently.
 - `client-scope.json` records the official Playwright Python version, bundled
   driver and reference Chromium revision, connection boundary, and the
   required/deferred/unsupported API inventory for OB-025.

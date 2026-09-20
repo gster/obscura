@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -96,6 +97,37 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def source_blob(repository: Path, revision: str, relative_path: str) -> bytes:
+    revision_check = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+        cwd=repository,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(
+        revision_check.returncode == 0,
+        f"source revision is unavailable: {revision}",
+    )
+    object_name = f"{revision}:{relative_path}"
+    blob = subprocess.run(
+        ["git", "show", "--format=", object_name],
+        cwd=repository,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(
+        blob.returncode == 0,
+        f"source blob is unavailable: {object_name}",
+    )
+    return blob.stdout
+
+
+def source_sha256(repository: Path, revision: str, relative_path: str) -> str:
+    return hashlib.sha256(source_blob(repository, revision, relative_path)).hexdigest()
+
+
 def locked_package_version(lock_text: str, package: str) -> str | None:
     for block in re.split(r"(?=^\[\[package\]\]$)", lock_text, flags=re.MULTILINE):
         name = re.search(r'^name\s*=\s*"([^"]+)"\s*$', block, re.MULTILINE)
@@ -123,16 +155,18 @@ def validate_baseline(path: Path) -> None:
 
     source = value.get("source")
     require(isinstance(source, dict), "baseline source must be an object")
-    require(bool(GIT_SHA.fullmatch(str(source.get("revision", "")))), "invalid source revision")
+    source_revision = str(source.get("revision", ""))
+    require(bool(GIT_SHA.fullmatch(source_revision)), "invalid source revision")
     for key in ("cargo_lock_sha256", "runtime_cargo_lock_sha256"):
         require(bool(SHA256.fullmatch(str(source.get(key, "")))), f"invalid {key}")
     require(
-        source["cargo_lock_sha256"] == sha256(repository / "Cargo.lock"),
-        "Cargo.lock digest does not match the repository",
+        source["cargo_lock_sha256"] == source_sha256(repository, source_revision, "Cargo.lock"),
+        "source Cargo.lock digest does not match the source revision",
     )
     require(
-        source["runtime_cargo_lock_sha256"] == sha256(repository / "runtime" / "Cargo.lock"),
-        "runtime/Cargo.lock digest does not match the repository",
+        source["runtime_cargo_lock_sha256"]
+        == source_sha256(repository, source_revision, "runtime/Cargo.lock"),
+        "source runtime/Cargo.lock digest does not match the source revision",
     )
 
     benchmark = value.get("benchmark")
