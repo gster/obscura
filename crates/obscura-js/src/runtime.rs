@@ -7540,10 +7540,12 @@ impl ObscuraJsRuntime {
     /// (fetch/XHR/dynamic resource). The Page moves these into its own
     /// network_events so the CDP layer emits Network events for them (#406).
     pub fn set_network_observation_context(&self, generation: u64, url: String,
-        teardown: std::sync::Arc<std::sync::Mutex<Vec<crate::ops::JsNetworkEvent>>>,
+        teardown: std::sync::Arc<std::sync::Mutex<crate::network_observation::NetworkObservationQueue>>,
         notify: std::sync::Arc<tokio::sync::Notify>,
     ) {
         let mut state = self.state.borrow_mut();
+        debug_assert!(state.js_network_events.is_empty(), "network context must be installed before requests start");
+        state.js_network_events = teardown.lock().unwrap_or_else(|error| error.into_inner()).sibling();
         state.network_document_generation = generation;
         state.network_document_url = url;
         state.network_teardown_events = teardown;
@@ -7552,19 +7554,23 @@ impl ObscuraJsRuntime {
 
     /// Dropping pending ops creates terminal abort observations. Retain the
     /// outgoing state until V8 has dropped those futures, then drain it.
-    pub fn retire_network_events(self) -> (String, Vec<crate::ops::JsNetworkEvent>) {
+    pub fn retire_network_events(self) -> (String, crate::network_observation::NetworkObservationDrain) {
         let state = self.state.clone();
         let document_url = state.borrow().network_document_url.clone();
         drop(self);
-        let events = std::mem::take(&mut state.borrow_mut().js_network_events);
+        let events = state.borrow_mut().js_network_events.drain();
         (document_url, events)
     }
 
-    pub fn take_js_network_events(&self) -> Vec<crate::ops::JsNetworkEvent> {
+    pub fn take_js_network_events(&self) -> crate::network_observation::NetworkObservationDrain {
         let mut state = self.state.borrow_mut();
-        let mut events = std::mem::take(&mut *state.network_teardown_events.lock().unwrap_or_else(|e| e.into_inner()));
-        events.append(&mut state.js_network_events);
-        events
+        let mut records = {
+            let mut teardown = state.network_teardown_events.lock()
+                .unwrap_or_else(|error| error.into_inner());
+            teardown.take_records()
+        };
+        records.extend(state.js_network_events.take_records());
+        state.js_network_events.drain_records(records)
     }
 
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {

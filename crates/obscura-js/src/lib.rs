@@ -4,6 +4,7 @@ pub mod frame;
 mod import_map;
 pub mod markdown;
 pub mod module_loader;
+pub mod network_observation;
 pub mod ops;
 pub mod runtime;
 pub mod v8_flags;

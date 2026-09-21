@@ -81,6 +81,10 @@ pub struct CdpContext {
     /// failure. One capability bit per observing session preserves that exact
     /// terminal error without retaining every later failed request ID.
     pub(crate) network_body_failure_sessions: HashSet<String>,
+    /// Page/session pairs that have received the sticky scripted-network
+    /// observation failure. The failure belongs to the Page, but delivery is
+    /// session-scoped: a later Network.enable must still receive it once.
+    pub(crate) network_observation_failure_sessions: HashSet<(String, String)>,
     /// Pages whose initial navigation event sequence has been emitted. A page
     /// is created already loaded (about:blank), but Chrome emits that load's
     /// events when the client attaches; Page.enable emits them once per page
@@ -208,6 +212,7 @@ impl CdpContext {
             network_request_sessions: HashMap::new(),
             network_body_sessions: HashMap::new(),
             network_body_failure_sessions: HashSet::new(),
+            network_observation_failure_sessions: HashSet::new(),
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: crate::pending_events::PendingEvents::default(),
@@ -396,6 +401,8 @@ impl CdpContext {
         self.document_loaders.retain(|(page_id, _), _| page_id != id);
         self.network_owners.retain(|(page_id, _), _| page_id != id);
         self.network_request_sessions.retain(|(page_id, _), _| page_id != id);
+        self.network_observation_failure_sessions
+            .retain(|(page_id, _)| page_id != id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {
@@ -576,6 +583,8 @@ impl CdpContext {
         self.network_enabled_sessions.remove(session_id);
         self.network_body_sessions.remove(session_id);
         self.network_body_failure_sessions.remove(session_id);
+        self.network_observation_failure_sessions
+            .retain(|(_, session)| session != session_id);
         for sessions in self.network_request_sessions.values_mut() {
             sessions.retain(|session| session != session_id);
         }
@@ -701,6 +710,8 @@ mod context_ownership_tests {
             ctx.network_enabled_sessions.insert(session_id.clone());
             ctx.network_body_sessions.entry(session_id.clone()).or_default().insert("request".into());
             ctx.network_body_failure_sessions.insert(session_id.clone());
+            ctx.network_observation_failure_sessions
+                .insert((page_id.clone(), session_id.clone()));
             ctx.network_request_sessions.insert((page_id.clone(), "request".into()), vec![session_id.clone()]);
             ctx.ensure_default_context(&page_id).unwrap();
             ctx.create_isolated_context(
@@ -720,6 +731,7 @@ mod context_ownership_tests {
             assert!(ctx.network_enabled_sessions.is_empty());
             assert!(ctx.network_body_sessions.is_empty());
             assert!(ctx.network_body_failure_sessions.is_empty());
+            assert!(ctx.network_observation_failure_sessions.is_empty());
             assert!(ctx.network_request_sessions.is_empty());
             assert!(ctx.sessions.is_empty());
         }

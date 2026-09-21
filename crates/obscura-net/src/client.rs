@@ -112,7 +112,7 @@ pub struct RequestInfo {
     pub resource_type: ResourceType,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, serde::Serialize)]
 pub enum ResourceType {
     Document,
     Script,

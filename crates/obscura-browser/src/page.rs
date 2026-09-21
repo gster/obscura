@@ -335,7 +335,8 @@ pub struct Page {
     network_event_counter: u32,
     pub network_document_generation: u64,
     pub network_retired_generations: Vec<u64>,
-    network_teardown_events: Arc<std::sync::Mutex<Vec<obscura_js::ops::JsNetworkEvent>>>,
+    network_teardown_events: Arc<std::sync::Mutex<obscura_js::network_observation::NetworkObservationQueue>>,
+    network_observation_failure: Option<obscura_js::network_observation::NetworkObservationFailure>,
     pub network_teardown_notify: Arc<tokio::sync::Notify>,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
@@ -1193,7 +1194,10 @@ impl Page {
             js_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             network_event_counter: 0,
             network_document_generation: 0, network_retired_generations: Vec::new(),
-            network_teardown_events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            network_teardown_events: Arc::new(std::sync::Mutex::new(
+                obscura_js::network_observation::NetworkObservationQueue::default(),
+            )),
+            network_observation_failure: None,
             network_teardown_notify: Arc::new(tokio::sync::Notify::new()),
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
@@ -4366,22 +4370,38 @@ impl Page {
     fn retire_js_network_events(&mut self) {
         if let Some(js) = self.js.take() {
             self.network_retired_generations.push(self.network_document_generation);
-            let (document_url, events) = js.retire_network_events();
-            self.append_js_network_events(events, Some(document_url));
+            let (document_url, observations) = js.retire_network_events();
+            self.append_js_network_observations(observations, Some(document_url));
             self.sync_js_network_events();
         }
     }
 
     pub fn sync_js_network_events(&mut self) {
-        let events = match self.js.as_ref() {
+        let observations = match self.js.as_ref() {
             Some(js) => js.take_js_network_events(),
-            None => std::mem::take(&mut *self.network_teardown_events.lock().unwrap_or_else(|e| e.into_inner())),
+            None => self.network_teardown_events.lock().unwrap_or_else(|e| e.into_inner()).drain(),
         };
-        self.append_js_network_events(events, None);
+        self.append_js_network_observations(observations, None);
     }
 
-    fn append_js_network_events(&mut self, events: Vec<obscura_js::ops::JsNetworkEvent>, retired_document_url: Option<String>) {
-        for ev in events {
+    /// The first shared queue failure is page-sticky even after every accepted
+    /// record has been drained. Consumers must be able to distinguish a clean,
+    /// empty queue from a terminal queue whose accepted prefix was delivered.
+    pub fn network_observation_failure(&self) -> Option<obscura_js::network_observation::NetworkObservationFailure> {
+        self.network_observation_failure.clone().or_else(|| {
+            self.network_teardown_events.lock().unwrap_or_else(|error| error.into_inner()).terminal_failure()
+        })
+    }
+
+    fn append_js_network_observations(
+        &mut self,
+        observations: obscura_js::network_observation::NetworkObservationDrain,
+        retired_document_url: Option<String>,
+    ) {
+        if self.network_observation_failure.is_none() {
+            self.network_observation_failure = observations.failure;
+        }
+        for ev in observations.events {
             self.network_events.push(NetworkEvent {
                 document_generation: ev.document_generation, document_url: ev.document_url,
                 retired_document_url: retired_document_url.clone(),
@@ -5114,6 +5134,76 @@ impl Drop for Page {
 
 #[cfg(test)]
 mod tests {
+    fn js_network_event(request_id: &str) -> obscura_js::ops::JsNetworkEvent {
+        obscura_js::ops::JsNetworkEvent {
+            document_generation: 7,
+            document_url: "https://example.test/document".to_string(),
+            initiator_request_id: None,
+            pending: false,
+            error: None,
+            request_body_size: 0,
+            request_started: true,
+            redirect: false,
+            response_body_request_id: Some(request_id.to_string()),
+            request_id: request_id.to_string(),
+            url: format!("https://example.test/{request_id}"),
+            method: "GET".to_string(),
+            resource_type: obscura_net::ResourceType::Fetch,
+            status: 200,
+            status_text: "OK".to_string(),
+            response_headers: std::collections::HashMap::from([
+                ("content-type".to_string(), "application/octet-stream".to_string()),
+            ]),
+            raw_headers: Some(obscura_net::HeaderCapture {
+                capture_stage: "transportResponse",
+                encoding: "base64",
+                fields: vec![obscura_net::RawHeader {
+                    name: b"Set-Cookie".to_vec(),
+                    value: vec![0, 0xff, b'='],
+                }],
+            }),
+            request_raw_headers: None,
+            body_size: 3,
+            timestamp: 123.5,
+        }
+    }
+
+    #[test]
+    fn page_drains_the_accepted_prefix_and_keeps_shared_failure_sticky() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "network-observation-failure".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("network-observation-failure".into(), context);
+        let mut teardown = obscura_js::network_observation::NetworkObservationQueue::with_limits(
+            1,
+            usize::MAX,
+            usize::MAX,
+        );
+        let mut runtime = teardown.sibling();
+
+        teardown.try_push(js_network_event("accepted")).unwrap();
+        let failure = runtime.try_push(js_network_event("rejected")).unwrap_err();
+        page.network_teardown_events = std::sync::Arc::new(std::sync::Mutex::new(teardown));
+        assert_eq!(page.network_observation_failure(), None,
+            "terminal must wait until the accepted prefix is drained");
+
+        page.sync_js_network_events();
+
+        assert_eq!(page.network_events.len(), 1);
+        assert_eq!(page.network_events[0].request_id, "accepted");
+        assert_eq!(page.network_events[0].raw_headers.as_ref().unwrap().fields[0].value, vec![0, 0xff, b'=']);
+        assert_eq!(page.network_observation_failure(), Some(failure.clone()));
+
+        // Draining releases the accepted record's reservation, but a shared
+        // terminal failure cannot be reset by a later producer or sync.
+        assert_eq!(runtime.try_push(js_network_event("later")).unwrap_err(), failure);
+        page.sync_js_network_events();
+        assert_eq!(page.network_events.len(), 1);
+        assert_eq!(page.network_observation_failure(), Some(failure));
+    }
+
     #[test]
     fn page_always_constructs_primp_transport() {
         let context = std::sync::Arc::new(super::BrowserContext::with_options(

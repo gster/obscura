@@ -250,8 +250,16 @@ impl ModuleLoader for ObscuraModuleLoader {
                 proxy_url.as_deref().unwrap_or("direct")
             );
 
-            let mut observation = page_state.as_ref().and_then(Weak::upgrade).map(|state|
-                crate::ops::NetworkRequest::new(state, None, &url, "GET", None, 0, obscura_net::ResourceType::Script));
+            let mut observation = if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
+                if let Some(failure) = state.borrow().js_network_events.failure() {
+                    return Err(io_err(failure.to_string()));
+                }
+                Some(crate::ops::NetworkRequest::new(
+                    state, None, &url, "GET", None, 0, obscura_net::ResourceType::Script,
+                ))
+            } else {
+                None
+            };
             let result = async {
             match page_network {
                 Ok((client, callbacks, referrer_policy)) => {
@@ -298,7 +306,9 @@ impl ModuleLoader for ObscuraModuleLoader {
             }
             }.await;
             if let Some(observation) = &mut observation {
-                observation.finish(result.as_ref().err().map(ToString::to_string));
+                if let Err(error) = observation.finish(result.as_ref().err().map(ToString::to_string)) {
+                    return Err(io_err(error.to_string()));
+                }
             }
             result
         })))

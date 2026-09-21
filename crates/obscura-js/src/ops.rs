@@ -159,7 +159,7 @@ pub(crate) fn stored_network_response_body(bytes: &[u8]) -> StoredNetworkRespons
 /// it. Static navigation subresources go through Page::record_network_event;
 /// this is the parallel channel for script-initiated requests, which run in the
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct JsNetworkEvent {
     pub document_generation: u64,
     pub document_url: String,
@@ -402,10 +402,10 @@ pub struct ObscuraState {
     // Network events for script-initiated requests (fetch/XHR/dynamic resource),
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
-    pub js_network_events: Vec<JsNetworkEvent>,
+    pub js_network_events: crate::network_observation::NetworkObservationQueue,
     pub network_document_generation: u64,
     pub network_document_url: String,
-    pub network_teardown_events: Arc<std::sync::Mutex<Vec<JsNetworkEvent>>>,
+    pub network_teardown_events: Arc<std::sync::Mutex<crate::network_observation::NetworkObservationQueue>>,
     pub network_teardown_notify: Arc<tokio::sync::Notify>,
     pub(crate) fetch_cancellations: HashMap<String, (tokio::sync::watch::Sender<Option<String>>, Option<String>)>,
     // Frame documents that have been fetched and are waiting for a realm.
@@ -618,6 +618,8 @@ impl ObscuraState {
     pub fn new(persona: obscura_net::EffectivePersona) -> Self {
         #[cfg(feature = "render")]
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
+        let js_network_events = crate::network_observation::NetworkObservationQueue::default();
+        let network_teardown_events = Arc::new(std::sync::Mutex::new(js_network_events.sibling()));
         ObscuraState {
             persona,
             dom: None,
@@ -654,9 +656,9 @@ impl ObscuraState {
             network_response_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             network_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fetched_urls: Vec::new(),
-            js_network_events: Vec::new(),
+            js_network_events,
             network_document_generation: 0, network_document_url: String::new(),
-            network_teardown_events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            network_teardown_events,
             network_teardown_notify: Arc::new(tokio::sync::Notify::new()),
             fetch_cancellations: HashMap::new(),
             pending_frames: Vec::new(),
@@ -733,6 +735,18 @@ impl ObscuraState {
             already_started_scripts: RefCell::new(HashSet::new()),
             write_stream: RefCell::new(None),
         }
+    }
+}
+
+impl Drop for ObscuraState {
+    fn drop(&mut self) {
+        let records = self.js_network_events.take_records();
+        if records.is_empty() {
+            return;
+        }
+        self.network_teardown_events.lock().unwrap_or_else(|error| error.into_inner())
+            .append_records(records);
+        self.network_teardown_notify.notify_one();
     }
 }
 
@@ -867,7 +881,8 @@ fn fetch_max_body_bytes() -> usize {
 const MAX_FETCHED_URLS: usize = 16384;
 
 /// Push `item` onto `list`, evicting the oldest entries so it never holds more
-/// than `max`. Mirrors the front-drain used for `js_network_events`.
+/// than `max`. This policy is only for the best-effort asset URL listing;
+/// network observations use lossless accepted-prefix admission instead.
 fn push_capped(list: &mut Vec<String>, item: String, max: usize) {
     list.push(item);
     if list.len() > max {
@@ -3857,19 +3872,19 @@ impl NetworkRequest {
         self.response_status_texts[index] = status_text;
     }
 
-    fn start_before_preflight(&mut self) {
+    fn start_before_preflight(&mut self) -> Result<(), crate::network_observation::NetworkObservationFailure> {
         let start = self.hop_starts.last().unwrap_or(&self.network_start).clone();
-        if start.load(std::sync::atomic::Ordering::SeqCst) == 1 { return; }
+        if start.load(std::sync::atomic::Ordering::SeqCst) == 1 { return Ok(()); }
         // Publish completed redirects and the next start in one synchronous
         // batch before a preflight can yield. finish() must not replay them.
         let redirects = self.trace.completed_since(self.emitted_exchanges);
-        for exchange in redirects {
-            let event = self.exchange_event(self.emitted_exchanges, exchange, true, None);
-            self.state.borrow_mut().js_network_events.push(event);
-            self.emitted_exchanges += 1;
+        let redirect_count = redirects.len();
+        let mut events = Vec::with_capacity(redirect_count.saturating_add(1));
+        for (offset, exchange) in redirects.into_iter().enumerate() {
+            events.push(self.exchange_event(self.emitted_exchanges + offset, exchange, true, None));
         }
-        let Some(exchange) = self.trace.last() else { return; };
-        self.state.borrow_mut().js_network_events.push(JsNetworkEvent {
+        let Some(exchange) = self.trace.last() else { return Ok(()); };
+        events.push(JsNetworkEvent {
             document_generation: self.document_generation, document_url: self.document_url.clone(),
             initiator_request_id: None,
             pending: true, error: None, request_id: self.id.clone(), url: exchange.url.clone(), method: exchange.method.clone(),
@@ -3878,16 +3893,21 @@ impl NetworkRequest {
             request_started: false, redirect: false, response_body_request_id: None, body_size: 0,
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
         });
+        self.state.borrow_mut().js_network_events.try_extend(events)?;
+        self.emitted_exchanges += redirect_count;
         start.store(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
-    pub(crate) fn finish(&mut self, error: Option<String>) {
+    pub(crate) fn finish(&mut self, error: Option<String>) -> Result<(), crate::network_observation::NetworkObservationFailure> {
         let failure = error.is_some();
-        self.finish_into(error, failure);
+        self.finish_into(error, failure)
     }
 
-    fn finish_into(&mut self, error: Option<String>, teardown: bool) {
-        if self.finished { return; }
+    fn finish_into(&mut self, error: Option<String>, teardown: bool) -> Result<(), crate::network_observation::NetworkObservationFailure> {
+        if self.finished {
+            return Ok(());
+        }
         self.finished = true;
         let exchanges = self.trace.take();
         let count = exchanges.len();
@@ -3897,17 +3917,14 @@ impl NetworkRequest {
         }
         let mut state = self.state.borrow_mut();
         if teardown {
-            let pending = std::mem::take(&mut state.js_network_events);
+            let pending = state.js_network_events.take_records();
             let mut queue = state.network_teardown_events.lock().unwrap_or_else(|e| e.into_inner());
-            queue.extend(pending);
-            queue.extend(events);
-            let excess = queue.len().saturating_sub(4096);
-            queue.drain(..excess);
+            queue.append_records(pending);
+            let result = queue.try_extend(events);
             state.network_teardown_notify.notify_one();
+            result
         } else {
-            state.js_network_events.extend(events);
-            let excess = state.js_network_events.len().saturating_sub(4096);
-            state.js_network_events.drain(..excess);
+            state.js_network_events.try_extend(events)
         }
     }
     fn exchange_event(&self, index: usize, exchange: obscura_net::observation::Exchange,
@@ -3954,7 +3971,7 @@ impl NetworkRequest {
 }
 
 impl Drop for NetworkRequest {
-    fn drop(&mut self) { self.finish_into(Some("Aborted".into()), true); }
+    fn drop(&mut self) { let _ = self.finish_into(Some("Aborted".into()), true); }
 }
 
 fn request_header_capture(headers: impl IntoIterator<Item = (String, String)>) -> obscura_net::HeaderCapture {
@@ -4010,6 +4027,9 @@ async fn op_fetch_url(
         .or_else(|| options.filter(|value| !value.starts_with('{')));
     let request_id = options_json.as_ref().and_then(|value| value["requestId"].as_str()).map(str::to_owned);
     let shared = state.borrow().borrow::<SharedState>().clone();
+    if let Some(failure) = shared.borrow().js_network_events.failure() {
+        return Err(deno_error::JsErrorBox::generic(failure.to_string()));
+    }
     let resource_type = if options_json.as_ref().and_then(|value| value["resourceType"].as_str()) == Some("XHR") {
         ResourceType::Xhr
     } else if matches!(destination.as_deref(), Some("script" | "worker")) {
@@ -4045,9 +4065,10 @@ async fn op_fetch_url(
             } else { None }
         }),
     };
-    observation.finish(error);
+    let observation_result = observation.finish(error);
     shared.borrow_mut().fetch_cancellations.remove(&observation.id);
     crate::worker::flush_observations(&state.borrow());
+    observation_result.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     result
 }
 
@@ -4199,7 +4220,8 @@ async fn fetch_url_inner(
                             observation.trace.len().saturating_sub(1), status_text,
                         );
                         observation.trace.response(&response, status != 0);
-                        observation.finish(None);
+                        observation.finish(None)
+                            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
                         let shared = state.borrow().borrow::<SharedState>().clone();
                         let _ = shared.borrow().network_response_bodies.lock()
                             .unwrap_or_else(|e| e.into_inner()).alias(&observation.id, &request_id);
@@ -4335,7 +4357,8 @@ async fn scripted_preflight(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
-        observation.start_before_preflight();
+        observation.start_before_preflight()
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
         let parsed_url = url::Url::parse(&url)
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
         let mut headers = HashMap::from([
@@ -4430,7 +4453,8 @@ async fn scripted_preflight(
         }
             Ok(())
         }.await;
-        preflight.finish(preflight_result.as_ref().err().map(ToString::to_string));
+        preflight.finish(preflight_result.as_ref().err().map(ToString::to_string))
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
         preflight_result?;
     }
 

@@ -1195,9 +1195,25 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
 fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     let page = state.page_mut();
     page.sync_js_network_events();
-    serde_json::to_string_pretty(&json!({
-        "events": page.network_events.iter().map(network_event_projection).collect::<Vec<_>>()
-    })).map_err(|error| error.to_string())
+    let events = page.network_events.iter().map(network_event_projection).collect::<Vec<_>>();
+    let terminal_failure = page.network_observation_failure().map(|failure| {
+        serde_json::to_value(failure)
+            .expect("NetworkObservationFailure serialization is infallible")
+    });
+    let payload = network_requests_payload(events, terminal_failure);
+    serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())
+}
+
+fn network_requests_payload(
+    events: Vec<Value>,
+    terminal_failure: Option<Value>,
+) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("events".to_string(), Value::Array(events));
+    if let Some(failure) = terminal_failure {
+        payload.insert("terminal_failure".to_string(), failure);
+    }
+    Value::Object(payload)
 }
 
 fn network_event_projection(event: &NetworkEvent) -> Value {
@@ -2394,6 +2410,30 @@ mod tests {
         let first = tool_network_requests(&mut state).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&first).unwrap(), json!({"events": []}));
         assert_eq!(tool_network_requests(&mut state).unwrap(), first);
+    }
+
+    #[test]
+    fn network_tool_payload_keeps_accepted_events_and_raw_terminal_failure() {
+        let accepted = json!({
+            "request_id": "accepted",
+            "headers": {"Authorization": "Bearer complete-secret"}
+        });
+        let failure = json!({
+            "kind": "bytes",
+            "message": "Network observation bytes exceeded 67108864",
+            "future_field": {"raw": [0, 255, 256]}
+        });
+        assert_eq!(
+            network_requests_payload(vec![accepted.clone()], Some(failure.clone())),
+            json!({
+                "events": [accepted],
+                "terminal_failure": failure
+            })
+        );
+        assert_eq!(
+            network_requests_payload(Vec::new(), None),
+            json!({"events": []}),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

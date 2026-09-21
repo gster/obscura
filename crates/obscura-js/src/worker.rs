@@ -101,6 +101,8 @@ pub(crate) struct WorkerEndpoint {
     events: queue::Sender<WorkerEvent>,
     closing: std::cell::Cell<bool>,
     blobs: HashMap<String, String>,
+    teardown_events: std::sync::Arc<std::sync::Mutex<crate::network_observation::NetworkObservationQueue>>,
+    teardown_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 impl WorkerEndpoint {
     fn send(&self, event: WorkerEvent) {
@@ -126,24 +128,12 @@ impl Size for WorkerEvent {
         match self {
             Self::Script(value) => value.len(),
             Self::Observations(value) => {
-                let network: usize = value.network.iter().map(|event| {
-                    std::mem::size_of_val(event) + event.request_id.len() + event.url.len() + event.method.len()
-                        + event.document_url.len()
-                        + event.initiator_request_id.as_ref().map_or(0, String::len)
-                        + event.error.as_ref().map_or(0, String::len)
-                        + event.response_body_request_id.as_ref().map_or(0, String::len)
-                        + event.response_headers.iter().map(|(k,v)| k.len() + v.len()).sum::<usize>()
-                        + event.raw_headers.iter().chain(event.request_raw_headers.iter())
-                            .map(|capture| capture.fields.iter().map(|field|
-                                std::mem::size_of_val(field) + field.name.len() + field.value.len()
-                            ).sum::<usize>()).sum::<usize>()
-                }).sum();
                 let runtime: usize = value.runtime.iter().map(|event| match event {
                     crate::ops::RuntimeEvent::Console(event) => event.kind.len() + event.args.iter().map(|arg| arg.to_string().len()).sum::<usize>(),
                     crate::ops::RuntimeEvent::Exception(event) => event.name.len() + event.description.len() + event.url.len()
                         + event.stack_trace.iter().map(|frame| frame.to_string().len()).sum::<usize>(),
                 }).sum();
-                network + runtime + value.urls.iter().chain(value.console.iter()).map(String::len).sum::<usize>()
+                runtime + value.urls.iter().chain(value.console.iter()).map(String::len).sum::<usize>()
             }
         }
     }
@@ -151,8 +141,6 @@ impl Size for WorkerEvent {
 
 #[derive(Default)]
 struct WorkerObservations {
-    // Bodies stay in the shared bounded raw store; only metadata traverses queues.
-    network: Vec<crate::ops::JsNetworkEvent>,
     urls: Vec<String>,
     console: Vec<String>,
     runtime: Vec<crate::ops::RuntimeEvent>,
@@ -161,8 +149,12 @@ struct WorkerObservations {
 pub(crate) fn flush_observations(state: &OpState) {
     let Some(endpoint) = state.try_borrow::<WorkerEndpoint>() else { return; };
     let mut worker = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow_mut();
+    move_network_observations(
+        &mut worker.js_network_events,
+        &endpoint.teardown_events,
+        &endpoint.teardown_notify,
+    );
     let mut observations = WorkerObservations::default();
-    observations.network = std::mem::take(&mut worker.js_network_events);
     observations.urls = std::mem::take(&mut worker.fetched_urls);
     observations.console = worker.pending_console_messages.drain(..).collect();
     observations.runtime = worker.pending_runtime_events.drain(..).collect();
@@ -175,22 +167,31 @@ pub(crate) fn flush_observations(state: &OpState) {
             }
         }
     }
-    if !observations.network.is_empty() || !observations.urls.is_empty() ||
-        !observations.console.is_empty() || !observations.runtime.is_empty() {
+    if !observations.urls.is_empty() || !observations.console.is_empty() || !observations.runtime.is_empty() {
         endpoint.send(WorkerEvent::Observations(observations));
     }
 }
 
+fn move_network_observations(
+    source: &mut crate::network_observation::NetworkObservationQueue,
+    teardown: &std::sync::Arc<std::sync::Mutex<crate::network_observation::NetworkObservationQueue>>,
+    notify: &std::sync::Arc<tokio::sync::Notify>,
+) {
+    let records = source.take_records();
+    if records.is_empty() {
+        return;
+    }
+    teardown.lock().unwrap_or_else(|error| error.into_inner()).append_records(records);
+    notify.notify_one();
+}
+
 impl WorkerObservations {
-    fn deliver(self, parent: &mut crate::ops::ObscuraState) {
-        parent.js_network_events.extend(self.network);
-        let excess = parent.js_network_events.len().saturating_sub(4096);
-        parent.js_network_events.drain(..excess);
-        parent.fetched_urls.extend(self.urls);
+    fn deliver(mut self, parent: &mut crate::ops::ObscuraState) {
+        parent.fetched_urls.append(&mut self.urls);
         let excess = parent.fetched_urls.len().saturating_sub(16384);
         parent.fetched_urls.drain(..excess);
-        parent.pending_console_messages.extend(self.console);
-        parent.pending_runtime_events.extend(self.runtime);
+        parent.pending_console_messages.extend(self.console.drain(..));
+        parent.pending_runtime_events.extend(self.runtime.drain(..));
         while parent.pending_console_messages.len() > 1024 { parent.pending_console_messages.pop_front(); }
         while parent.pending_runtime_events.len() > 1024 { parent.pending_runtime_events.pop_front(); }
     }
@@ -200,7 +201,7 @@ struct WorkerConfig {
     persona: obscura_net::EffectivePersona,
     document_generation: u64,
     document_url: String,
-    teardown_events: std::sync::Arc<std::sync::Mutex<Vec<crate::ops::JsNetworkEvent>>>,
+    teardown_events: std::sync::Arc<std::sync::Mutex<crate::network_observation::NetworkObservationQueue>>,
     teardown_notify: std::sync::Arc<tokio::sync::Notify>,
     policy: std::sync::Arc<std::sync::Mutex<WorkerPolicy>>,
     resources: std::sync::Arc<queue::Resources>,
@@ -963,8 +964,9 @@ async fn run_worker(id: u32, config: WorkerConfig,
         state.cookie_jar = config.cookies;
         state.network_document_generation = config.document_generation;
         state.network_document_url = config.document_url;
-        state.network_teardown_events = config.teardown_events;
-        state.network_teardown_notify = config.teardown_notify;
+        state.js_network_events = config.teardown_events.lock().unwrap().sibling();
+        state.network_teardown_events = config.teardown_events.clone();
+        state.network_teardown_notify = config.teardown_notify.clone();
         state.http_client = config.http;
         state.callbacks = config.callbacks;
         state.stealth_client = config.stealth;
@@ -988,7 +990,10 @@ async fn run_worker(id: u32, config: WorkerConfig,
         registry.resources = config.resources;
         registry.policy = config.policy;
     }
-    let endpoint = WorkerEndpoint { control: control.clone(), events, closing: std::cell::Cell::new(false), blobs: config.blobs };
+    let teardown_events = config.teardown_events.clone();
+    let teardown_notify = config.teardown_notify.clone();
+    let endpoint = WorkerEndpoint { control: control.clone(), events, closing: std::cell::Cell::new(false), blobs: config.blobs,
+        teardown_events, teardown_notify };
     rt.runtime().op_state().borrow_mut().put(endpoint);
     let setup = format!("Object.assign(globalThis, {});", serde_json::Value::Object(config.globals));
     if rt.execute_script("worker-identity", &setup).is_err() { return; }
@@ -1228,6 +1233,19 @@ pub fn op_worker_deserialize<'s>(scope: &mut v8::HandleScope<'s>, #[string] data
 mod tests {
     use super::*;
 
+    fn network_event(request_id: &str) -> crate::ops::JsNetworkEvent {
+        crate::ops::JsNetworkEvent {
+            document_generation: 0, document_url: String::new(),
+            initiator_request_id: None,
+            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
+            request_id: request_id.into(), url: "http://example.test/".into(), method: "GET".into(),
+            resource_type: obscura_net::ResourceType::Fetch, status: 200,
+            status_text: String::new(),
+            response_headers: HashMap::new(), raw_headers: None, request_raw_headers: None,
+            body_size: 256 * 1024 * 1024, timestamp: 0.0,
+        }
+    }
+
     #[test]
     fn raw_body_store_and_handle_are_thread_safe() {
         fn send_sync<T: Send + Sync>() {}
@@ -1236,36 +1254,44 @@ mod tests {
     }
 
     #[test]
-    fn worker_observation_queue_accounts_for_raw_header_fields() {
-        let mut event = crate::ops::JsNetworkEvent {
-            document_generation: 0, document_url: String::new(),
-            initiator_request_id: None,
-            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
-            request_id: "fetch-1".into(), url: "http://example.test/".into(), method: "GET".into(),
-            resource_type: obscura_net::ResourceType::Fetch, status: 200,
-            status_text: String::new(),
-            response_headers: HashMap::new(), raw_headers: None, request_raw_headers: None,
-            body_size: 256 * 1024 * 1024, timestamp: 0.0,
-        };
-        let size_without_headers = WorkerEvent::Observations(WorkerObservations {
-            network: vec![event.clone()], ..Default::default()
-        }).queued_bytes();
-        assert!(size_without_headers < 1024, "spooled bodies must not exhaust the metadata queue");
-        event.request_raw_headers = Some(obscura_net::HeaderCapture {
+    fn worker_network_observations_use_the_shared_fifo_before_terminal_failure() {
+        let teardown_events = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::network_observation::NetworkObservationQueue::with_limits(
+                2, usize::MAX, usize::MAX,
+            ),
+        ));
+        let teardown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut source = teardown_events.lock().unwrap().sibling();
+
+        let mut start = network_event("fetch-1");
+        start.pending = true;
+        start.request_raw_headers = Some(obscura_net::HeaderCapture {
             capture_stage: "transportRequest", encoding: "base64",
             fields: vec![
                 obscura_net::RawHeader { name: b"cookie".to_vec(), value: b"first=keep".to_vec() },
                 obscura_net::RawHeader { name: b"cookie".to_vec(), value: b"second=keep".to_vec() },
             ],
         });
-        event.raw_headers = Some(obscura_net::HeaderCapture {
+        source.try_push(start).unwrap();
+        move_network_observations(&mut source, &teardown_events, &teardown_notify);
+
+        let mut terminal = network_event("fetch-1");
+        terminal.error = Some("Aborted".into());
+        terminal.raw_headers = Some(obscura_net::HeaderCapture {
             capture_stage: "transportResponse", encoding: "base64",
             fields: vec![obscura_net::RawHeader { name: b"x-bytes".to_vec(), value: b"\x80\xff".to_vec() }],
         });
-        let size_with_headers = WorkerEvent::Observations(WorkerObservations {
-            network: vec![event], ..Default::default()
-        }).queued_bytes();
-        assert_eq!(size_with_headers - size_without_headers,
-            3 * std::mem::size_of::<obscura_net::RawHeader>() + 6 + 10 + 6 + 11 + 7 + 2);
+        source.try_push(terminal).unwrap();
+        move_network_observations(&mut source, &teardown_events, &teardown_notify);
+
+        let failure = source.try_push(network_event("rejected")).unwrap_err();
+        assert_eq!(teardown_events.lock().unwrap().terminal_failure(), None);
+        let drained = teardown_events.lock().unwrap().drain();
+        assert_eq!(drained.events.len(), 2);
+        assert!(drained.events[0].pending);
+        assert_eq!(drained.events[0].request_raw_headers.as_ref().unwrap().fields.len(), 2);
+        assert_eq!(drained.events[1].error.as_deref(), Some("Aborted"));
+        assert_eq!(drained.events[1].raw_headers.as_ref().unwrap().fields[0].value, b"\x80\xff");
+        assert_eq!(drained.failure, Some(failure));
     }
 }

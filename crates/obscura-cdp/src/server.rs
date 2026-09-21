@@ -15,6 +15,7 @@ use crate::access::{AccessFailure, AuthorizedRequest, CdpAccessOptions, CdpAcces
 use crate::dispatch::{self, CdpContext};
 use crate::inbound::{self, Envelope as InboundEnvelope};
 use crate::outbound::{CloseReason as OutboundCloseReason, OutboundSender};
+use crate::types::CdpEvent;
 
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
@@ -1492,7 +1493,7 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
         .map(|page| page.id.clone())
         .collect();
     for page_id in live_ids {
-        let (frame_id, page_url, network_events) = {
+        let (frame_id, page_url, network_events, observation_failure) = {
             let Some(page) = ctx.get_page_mut(&page_id) else {
                 continue;
             };
@@ -1501,19 +1502,51 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
                 page.frame_id.clone(),
                 page.url_string(),
                 page.network_events.drain(..).collect::<Vec<_>>(),
+                page.network_observation_failure(),
             )
         };
-        if network_events.is_empty() {
-            continue;
+        if !network_events.is_empty() {
+            crate::domains::page::emit_runtime_network_events(
+                ctx,
+                &None,
+                &frame_id,
+                &page_url,
+                &page_id,
+                &network_events,
+            );
         }
-        crate::domains::page::emit_runtime_network_events(
-            ctx,
-            &None,
-            &frame_id,
-            &page_url,
-            &page_id,
-            &network_events,
-        );
+        if let Some(failure) = observation_failure.as_ref() {
+            emit_network_observation_failure(ctx, &page_id, failure);
+        }
+    }
+}
+
+/// Deliver the Page-sticky terminal observation failure once to every current
+/// Network subscriber. Delivery tracking is per session, so an agent that
+/// enables Network after the failure still receives the terminal fact.
+fn emit_network_observation_failure(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    failure: &obscura_js::network_observation::NetworkObservationFailure,
+) {
+    let mut params = match serde_json::to_value(failure)
+        .expect("NetworkObservationFailure serialization is infallible")
+    {
+        serde_json::Value::Object(fields) => fields,
+        _ => unreachable!("NetworkObservationFailure serializes as an object"),
+    };
+    params.insert("pageId".to_string(), serde_json::Value::String(page_id.to_string()));
+
+    for session_id in ctx.network_sessions_for_page(page_id) {
+        if ctx.network_observation_failure_sessions
+            .insert((page_id.to_string(), session_id.clone()))
+        {
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Network.observationFailed",
+                serde_json::Value::Object(params.clone()),
+                session_id,
+            ));
+        }
     }
 }
 
@@ -2175,6 +2208,7 @@ async fn process_with_interception(
     // alongside the static navigation subresources (#406).
     page.sync_js_network_events();
     let network_events: Vec<_> = page.network_events.drain(..).collect();
+    let network_observation_failure = page.network_observation_failure();
     let page_url = page.url_string();
     let page_id_for_events = page.id.clone();
     let reached_network_idle = page.lifecycle.is_network_idle();
@@ -2221,6 +2255,9 @@ async fn process_with_interception(
         crate::domains::page::emit_runtime_network_events(ctx, &session_for_events,
             &frame_id, &page_url, &page_id_for_events, &network_events);
     }
+    if let Some(failure) = network_observation_failure.as_ref() {
+        emit_network_observation_failure(ctx, &page_id_for_events, failure);
+    }
     #[cfg(feature = "render")]
     if navigation_succeeded {
         if let Err(error) = crate::domains::page::queue_screencast_frame(
@@ -2253,6 +2290,9 @@ async fn process_cdp_message(
     service_live_page_render_resources(ctx);
     let response = dispatch::dispatch(&req, ctx).await;
     service_live_page_render_resources(ctx);
+    // A newly enabled Network session must receive an already sticky failure
+    // even when no new observation event wakes the background pump.
+    sync_live_page_network_events(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
     // (e.g. Target.targetCreated + Target.attachedToTarget from
@@ -2513,6 +2553,60 @@ pub(crate) mod tests {
         assert_eq!(reply_rx.try_recv().unwrap().as_str(), expected);
         assert!(reply_rx.try_recv().is_err());
         assert!(!reply_tx.is_closed());
+    }
+
+    #[test]
+    fn network_observation_failure_follows_accepted_events_once_per_enabled_session() {
+        let mut ctx = crate::dispatch::CdpContext::new(
+            obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        );
+        let page_id = ctx.create_page();
+        let first = "network-first".to_string();
+        ctx.sessions.insert(first.clone(), page_id.clone());
+        ctx.network_enabled_sessions.insert(first.clone());
+        ctx.pending_events.push(crate::types::CdpEvent::with_session(
+            "Network.loadingFinished",
+            json!({"requestId": "accepted"}),
+            first.clone(),
+        ));
+        let failure = obscura_js::network_observation::NetworkObservationFailure {
+            kind: obscura_js::network_observation::NetworkObservationFailureKind::Count,
+            message: "Network observation count exceeded 4096".to_string(),
+        };
+
+        super::emit_network_observation_failure(&mut ctx, &page_id, &failure);
+        assert_eq!(ctx.pending_events.len(), 2);
+        assert_eq!(ctx.pending_events[0].method, "Network.loadingFinished");
+        assert_eq!(ctx.pending_events[1].method, "Network.observationFailed");
+        assert_eq!(ctx.pending_events[1].session_id.as_deref(), Some(first.as_str()));
+        assert_eq!(ctx.pending_events[1].params, json!({
+            "pageId": page_id,
+            "kind": "count",
+            "message": "Network observation count exceeded 4096"
+        }));
+
+        super::emit_network_observation_failure(&mut ctx, &page_id, &failure);
+        assert_eq!(ctx.pending_events.len(), 2, "same session must not receive a duplicate");
+
+        let late = "network-late".to_string();
+        ctx.sessions.insert(late.clone(), page_id.clone());
+        ctx.network_enabled_sessions.insert(late.clone());
+        super::emit_network_observation_failure(&mut ctx, &page_id, &failure);
+        assert_eq!(ctx.pending_events.len(), 3);
+        assert_eq!(ctx.pending_events[2].session_id.as_deref(), Some(late.as_str()));
+
+        ctx.disable_network_session(&first);
+        assert!(!ctx.network_observation_failure_sessions
+            .contains(&(page_id.clone(), first.clone())));
+        ctx.network_enabled_sessions.insert(first.clone());
+        super::emit_network_observation_failure(&mut ctx, &page_id, &failure);
+        assert_eq!(ctx.pending_events.len(), 4);
+        assert_eq!(ctx.pending_events[3].session_id.as_deref(), Some(first.as_str()));
+
+        ctx.remove_page(&page_id);
+        assert!(ctx.network_observation_failure_sessions.is_empty());
     }
 
     #[test]
