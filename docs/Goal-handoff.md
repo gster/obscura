@@ -5,12 +5,20 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`04559e64212a7cb754437d9a2dbc9472e241317f`，`Persist Network observation history`；其实现基线为 `acd6078bb9802de607e1080cad54082ba4c28a97`。
+- 最近完成的实现提交：`fe7d23dd1a8ad2ad428120ce864148427eed0e80`，`Complete native Network lifecycle projection`；其实现基线为 `42bbedbafd552bc93359f82cb2b487da57a7d6f9`。
 - 该实现提交已推送到 `origin/main`；本交接更新提交完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
 - 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
 
 ## 最近完成的阶段
+
+Document、Stylesheet、classic Script 与 render Image/Font 已通过共享 `RequestTrace` 接入普通 native Network lifecycle：最终 prepared raw request headers/body 已知后、首次 transport send 前同步接纳 Started，并以同一 logical request ID 产生 exactly-one Redirect/Finished/Failed terminal。每个 redirect hop 保留完整响应 headers/body；无效 Location、SSRF/mode 拒绝与 redirect 上限直接形成带真实响应事实的 Failed。普通请求先写 context-owned persistent history，再进入 Page/CDP live queue；导航期间共享 Notify 实时 drain，跨 batch 保留 `redirectResponse` 并清理 retired generation 状态。Page response-body store 预算失败仍显式暴露，但 persistent history 可按自身预算保存生产者已完整取得的 raw body。
+
+render Page/runtime 关闭会先拒绝新 start、发布 cancellation、终止活动任务并同步写 `Aborted` terminal，再关闭 history writer。start observer callback、内部 `started` 提交与 shutdown cancellation 由同一 lifecycle fence 串行；精确 barrier 回归覆盖 observer 已接纳 Started、内部状态尚未提交的旧竞态，证明 close 后不会继续 transport 或留下 Started-only history。
+
+`Network.enable` 的 `maxTotalBufferSize`、`maxResourceBufferSize` 与 `maxPostDataSize` 现按有效 Page session 独立保存。`maxPostDataSize` 按 raw UTF-8 byte length 只投影标准 `requestWillBeSent.request.postData`、`postDataEntries` 及扩展 `postDataIsByteString`；canonical standard/transport body、raw headers、Fetch pause 与 `Network.getRequestPostData` 保持完整。省略、null、0、负数不限，正整数 exact threshold，浮点/字符串拒绝，未知字段接受；重复 enable 只影响未来事件，disable 清理该 session 参数与读取资格。Chrome 152 原始探针确认上述语义。
+
+Astra light 三轮复核推动修复 redirect 策略失败终态、跨批次 `redirectResponse`、render close terminal 与 start/close 窄竞态，最终为 0 blocker、0 major、0 minor。普通 native start、Page body budget 与 per-agent `maxPostDataSize` 这一相邻边界已完成；下一段是 Fetch stream 多消费者。OB-021 整体仍未关闭。以下更早阶段末尾的“未完成”列表是各阶段当时的历史快照，当前边界以上述最新结论为准。
 
 每个 `BrowserContext` 现拥有 append-only `NetworkHistory`。记录使用全局单调 sequence 与永不复用的 page-instance ID，跨导航、Page 关闭和同一 context 多 Page 保留完整 observation metadata、精确 raw request/response headers 及 immutable request、transport-request、response body 引用。默认边界为 4096 条记录和 4096 个 page instance、64 MiB metadata、16 MiB 单条、512 MiB unique body bytes、32768 个 body entry、640 MiB persistent journal。首次 count/bytes/serialization/I/O/producer/close failure 保留 accepted prefix 并成为 context-wide sticky terminal，停止现有 sibling runtime、Worker 和 native producer 的后续网络工作；不 eviction、不截断、不脱敏。
 
@@ -50,6 +58,14 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 ## 验证结果
 
+- latest race/close/redirect focused release 回归 5/5（run `7b5ddeca-936c-4950-b7c3-2e11a9259705`）。
+- latest affected net/js/browser/cdp release/render nextest 1475/1475，3 skipped（run `9c356372-cca7-429d-bfce-219385c8b605`）。
+- latest full release/render nextest 2293/2293，4 skipped（run `6c542be6-271c-44db-b730-db227fe05a83`）；另有既有 render 测试 `retained_mixed_outer_has_dependencies_match_forced_full` 被 nextest 标记为 leaky 但通过，退出码为 0。
+- latest exact render 与 no-default-features CLI build 均成功；最终 exact render SHA-256 `90d483c000b2371ba83a5e678a8c0837d7ed5f1f62b0ed10a177a6881dc95767`，120531952 bytes。
+- benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33；首次漏传必填 persona 的 0/33 配置失败完整保留。
+- 同一二进制通过官方 Playwright Python 1.60.0 automation smoke；原始协议日志通过 37-method profile 校验。
+- Astra light 第三轮终审无 blocker、major 或 minor；`git diff --check` 通过。
+
 - persistent history browser+CDP release 回归 678/678，3 skipped（run `a61a325c-82a0-48f8-aa15-654a4373f685`）。
 - full release/render nextest 最终复跑 2277/2277，4 skipped（run `90245ddb-30df-43d2-bc7a-aed6d1a67219`）。首次全量唯一失败为既有 MCP `test_evaluate` 空标题；源码未改的两项复跑 2/2（run `49ed9390-3de4-4f72-89d2-a427bc803d00`）后全量干净通过，不把该偶发复跑通过称作修复。
 - render 和 no-default-features 两种 exact CLI release build 均成功；最终 exact render SHA-256 `e92740a871748d0588e66e8a3473d00eb6cd9aeae7efc2eb8d06550ffe3dc48b`，120453184 bytes。
@@ -86,8 +102,8 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 统一普通非拦截资源 start emission 与 Page body budget/Chrome per-agent 参数契约，包括 `Network.enable.maxPostDataSize`。
-2. 补齐 Fetch stream 多消费者语义，再按实际风险推进其余 input qualification、disconnect 矩阵和 idle Worker cancellation wake。
+1. 补齐 Fetch stream 多消费者语义。
+2. 再按实际风险推进其余 input qualification、disconnect 矩阵和 idle Worker cancellation wake。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -150,6 +166,19 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/tmp/ob021-network-history-build-render.log`
 - `/tmp/ob021-network-history-obstacle.log`
 - `/tmp/ob021-network-history-playwright.1FYhiN/`
+- `/tmp/ob021-native-start-review-fixes-focused.log`
+- `/tmp/ob021-native-start-render-close-rerun.log`
+- `/tmp/ob021-native-start-affected-crates-final.log`
+- `/tmp/ob021-native-start-race-fix-focused.log`
+- `/tmp/ob021-native-start-affected-crates-race-final.log`
+- `/tmp/ob021-native-start-full-workspace-race-final.log`
+- `/tmp/ob021-native-start-build-no-render.log`
+- `/tmp/ob021-native-start-build-render.log`
+- `/tmp/ob021-native-start-obstacle.log`
+- `/tmp/ob021-native-start-obstacle-final.log`
+- `/tmp/ob021-network-enable-chrome-probe-v1.json`
+- `/tmp/ob021-network-enable-chrome-probe-v2.json`
+- `/tmp/ob021-native-start-playwright.TAcvvu/`
 - `/tmp/ob034-inbound-benchmark.cEiFsw`
 
 这些路径属于原始运行主机的临时文件，不是仓库内的持久接口。可持续引用的结论和能力边界以本页、[SUMMARY](SUMMARY.md) 及对应提交中的测试为准。处理这些日志时保留原始字段和完整内容。
