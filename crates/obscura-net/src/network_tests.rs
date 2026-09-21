@@ -1,7 +1,7 @@
 use crate::client::{
     is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-    ResourceRequest, ResourceType, SsrfGuardResolver,
+    RequestInfo, ResourceRequest, ResourceType, Response, SsrfGuardResolver,
 };
 use crate::cookies::CookieJar;
 use primp::dns::{Name, Resolve};
@@ -816,6 +816,186 @@ async fn callbacks_fire_once_across_redirects() {
         .unwrap();
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     assert_eq!(responses.load(Ordering::SeqCst), 1);
+}
+
+fn callback_request(path: &str, body: Vec<u8>) -> RequestInfo {
+    RequestInfo {
+        body,
+        url: Url::parse(&format!("https://callback.test/{path}")).unwrap(),
+        method: "POST".into(),
+        headers: HashMap::from([
+            ("Authorization".into(), "Bearer complete-secret".into()),
+            ("Cookie".into(), "session=complete-secret".into()),
+        ]),
+        raw_headers: Some(crate::HeaderCapture {
+            capture_stage: "transportRequest",
+            encoding: "base64",
+            fields: vec![
+                crate::RawHeader { name: b"X-Binary".to_vec(), value: vec![0, 0xff, b'A'] },
+                crate::RawHeader { name: b"Set-Cookie".to_vec(), value: b"first=complete".to_vec() },
+                crate::RawHeader { name: b"Set-Cookie".to_vec(), value: b"second=complete".to_vec() },
+            ],
+        }),
+        resource_type: ResourceType::Fetch,
+    }
+}
+
+#[tokio::test]
+async fn request_callback_can_register_a_callback_without_losing_observations() {
+    let callbacks = Arc::new(CallbackRegistry::new());
+    let weak = Arc::downgrade(&callbacks);
+    let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let first_observations = observations.clone();
+    let first_installed = installed.clone();
+    callbacks.add_request(Arc::new(move |request| {
+        first_observations.lock().unwrap().push((
+            "first",
+            request.url.path().to_string(),
+            request.body.clone(),
+            request.raw_headers.clone(),
+        ));
+        if !first_installed.swap(true, Ordering::SeqCst) {
+            let late_observations = first_observations.clone();
+            weak.upgrade().expect("registry still owned").add_request(Arc::new(move |request| {
+                late_observations.lock().unwrap().push((
+                    "late",
+                    request.url.path().to_string(),
+                    request.body.clone(),
+                    request.raw_headers.clone(),
+                ));
+            }));
+        }
+    }));
+
+    let first = callback_request("first", vec![0, 1, 0xff]);
+    callbacks.fire_request(&first).await;
+    let second = callback_request("second", (0_u8..=255).collect());
+    callbacks.fire_request(&second).await;
+
+    let observations = observations.lock().unwrap();
+    assert_eq!(
+        observations.iter().map(|(owner, path, _, _)| (*owner, path.as_str())).collect::<Vec<_>>(),
+        vec![("first", "/first"), ("first", "/second"), ("late", "/second")],
+        "registration during dispatch starts with the next complete observation"
+    );
+    assert_eq!(observations[0].2, vec![0, 1, 0xff]);
+    assert_eq!(observations[1].2, (0_u8..=255).collect::<Vec<_>>());
+    assert_eq!(observations[1].3, second.raw_headers);
+    assert_eq!(observations[2].3, second.raw_headers);
+}
+
+#[tokio::test]
+async fn response_callback_can_remove_itself_without_a_false_not_found_result() {
+    let callbacks = Arc::new(CallbackRegistry::new());
+    let weak = Arc::downgrade(&callbacks);
+    let callback_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let removals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let observed_removals = removals.clone();
+    let observed_responses = observations.clone();
+    let observed_id = callback_id.clone();
+    let id = callbacks.add_response(Arc::new(move |request, response| {
+        observed_responses.lock().unwrap().push((
+            request.body.clone(),
+            response.body.clone(),
+            response.raw_headers.clone(),
+        ));
+        observed_removals.lock().unwrap().push(
+            weak.upgrade().expect("registry still owned")
+                .remove_response(observed_id.load(Ordering::SeqCst)),
+        );
+    }));
+    callback_id.store(id, Ordering::SeqCst);
+
+    let request = callback_request("response", vec![0, 0xff]);
+    let response = Response {
+        url: Url::parse("https://callback.test/response").unwrap(),
+        status: 200,
+        headers: HashMap::from([("set-cookie".into(), "second=complete".into())]),
+        raw_headers: Some(crate::HeaderCapture {
+            capture_stage: "transportResponse",
+            encoding: "base64",
+            fields: vec![
+                crate::RawHeader { name: b"Set-Cookie".to_vec(), value: b"first=complete".to_vec() },
+                crate::RawHeader { name: b"Set-Cookie".to_vec(), value: b"second=complete".to_vec() },
+                crate::RawHeader { name: b"X-Binary".to_vec(), value: vec![0xff, 0] },
+            ],
+        }),
+        body: (0_u8..=255).rev().collect(),
+        redirected_from: vec![Url::parse("https://callback.test/original").unwrap()],
+        request_referrer: Some(Url::parse("https://callback.test/referrer").unwrap()),
+        request_raw_headers: request.raw_headers.clone(),
+    };
+    callbacks.fire_response(&request, &response).await;
+    callbacks.fire_response(&request, &response).await;
+
+    assert_eq!(*removals.lock().unwrap(), vec![true]);
+    let observations = observations.lock().unwrap();
+    assert_eq!(observations.len(), 1, "self-removal applies to the next observation");
+    assert_eq!(observations[0].0, request.body);
+    assert_eq!(observations[0].1, response.body);
+    assert_eq!(observations[0].2, response.raw_headers);
+}
+
+#[test]
+fn callback_capture_destructors_reenter_after_the_registry_lock_is_released() {
+    struct ReenterOnDrop {
+        callbacks: std::sync::Weak<CallbackRegistry>,
+        response: bool,
+        completed: std::sync::mpsc::SyncSender<u64>,
+    }
+
+    impl Drop for ReenterOnDrop {
+        fn drop(&mut self) {
+            let callbacks = self.callbacks.upgrade().expect("registry still owned");
+            let id = if self.response {
+                callbacks.add_response(Arc::new(|_, _| {}))
+            } else {
+                callbacks.add_request(Arc::new(|_| {}))
+            };
+            self.completed.send(id).unwrap();
+        }
+    }
+
+    let callbacks = Arc::new(CallbackRegistry::new());
+    for response in [false, true] {
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let reentry = ReenterOnDrop {
+            callbacks: Arc::downgrade(&callbacks),
+            response,
+            completed: completed_tx,
+        };
+        let id = if response {
+            callbacks.add_response(Arc::new(move |_, _| {
+                std::hint::black_box(&reentry);
+            }))
+        } else {
+            callbacks.add_request(Arc::new(move |_| {
+                std::hint::black_box(&reentry);
+            }))
+        };
+        let owned_callbacks = callbacks.clone();
+        let (removed_tx, removed_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let removed = if response {
+                owned_callbacks.remove_response(id)
+            } else {
+                owned_callbacks.remove_request(id)
+            };
+            removed_tx.send(removed).unwrap();
+        });
+
+        assert_eq!(
+            completed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            id + 1,
+            "captured destructor could not reenter the registry"
+        );
+        assert!(removed_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+    }
 }
 
 async fn cacheable_resource_fixture(

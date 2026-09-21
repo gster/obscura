@@ -527,16 +527,19 @@ pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 /// callback-free; page-driven fetches pass the page's registry in. Ids keep
 /// the `u64` shape #416 established on `Page::on_request`/`on_response`.
 pub struct CallbackRegistry {
-    on_request: RwLock<Vec<(u64, RequestCallback)>>,
-    on_response: RwLock<Vec<(u64, ResponseCallback)>>,
+    // Dispatch owns an immutable Arc snapshot and releases this mutex before
+    // invoking user code. A callback may therefore add or remove observers
+    // without deadlocking or turning lock contention into silent data loss.
+    on_request: std::sync::Mutex<Arc<Vec<(u64, RequestCallback)>>>,
+    on_response: std::sync::Mutex<Arc<Vec<(u64, ResponseCallback)>>>,
     id_counter: std::sync::atomic::AtomicU64,
 }
 
 impl CallbackRegistry {
     pub fn new() -> Self {
         CallbackRegistry {
-            on_request: RwLock::new(Vec::new()),
-            on_response: RwLock::new(Vec::new()),
+            on_request: std::sync::Mutex::new(Arc::new(Vec::new())),
+            on_response: std::sync::Mutex::new(Arc::new(Vec::new())),
             id_counter: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -547,70 +550,100 @@ impl CallbackRegistry {
     }
 
     /// Register a request callback; the returned id detaches it via
-    /// `remove_request`. Sync like the pre-registry push path: registration
-    /// happens from `Page` setup where no reader holds the lock, so
-    /// `try_write` cannot fail there.
+    /// `remove_request`. A dispatch already in progress keeps its immutable
+    /// snapshot; this callback starts with the next observation.
     pub fn add_request(&self, cb: RequestCallback) -> u64 {
         let id = self.next_id();
-        if let Ok(mut v) = self.on_request.try_write() {
-            v.push((id, cb));
-        }
+        let mut callbacks = self
+            .on_request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Arc::make_mut(&mut callbacks).push((id, cb));
         id
     }
 
     /// Register a response callback; see `add_request`.
     pub fn add_response(&self, cb: ResponseCallback) -> u64 {
         let id = self.next_id();
-        if let Ok(mut v) = self.on_response.try_write() {
-            v.push((id, cb));
-        }
+        let mut callbacks = self
+            .on_response
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Arc::make_mut(&mut callbacks).push((id, cb));
         id
     }
 
     /// Detach a request callback. Returns true when the id was found and
-    /// removed, so a double detach is a visible no-op.
+    /// removed, so a double detach is a visible no-op. A dispatch that already
+    /// cloned its snapshot still completes delivery of the current fact.
     pub fn remove_request(&self, id: u64) -> bool {
-        match self.on_request.try_write() {
-            Ok(mut v) => {
-                let before = v.len();
-                v.retain(|(cid, _)| *cid != id);
-                v.len() != before
-            }
-            Err(_) => false,
-        }
+        let removed = {
+            let mut callbacks = self
+                .on_request
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let callbacks = Arc::make_mut(&mut callbacks);
+            callbacks
+                .iter()
+                .position(|(callback_id, _)| *callback_id == id)
+                .map(|index| callbacks.remove(index))
+        };
+        removed.is_some()
     }
 
     /// Detach a response callback; see `remove_request`.
     pub fn remove_response(&self, id: u64) -> bool {
-        match self.on_response.try_write() {
-            Ok(mut v) => {
-                let before = v.len();
-                v.retain(|(cid, _)| *cid != id);
-                v.len() != before
-            }
-            Err(_) => false,
-        }
+        let removed = {
+            let mut callbacks = self
+                .on_response
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let callbacks = Arc::make_mut(&mut callbacks);
+            callbacks
+                .iter()
+                .position(|(callback_id, _)| *callback_id == id)
+                .map(|index| callbacks.remove(index))
+        };
+        removed.is_some()
     }
 
     /// True when at least one request callback is registered. Lets fire sites
     /// skip building a `RequestInfo` when nobody listens.
     pub async fn has_request_callbacks(&self) -> bool {
-        !self.on_request.read().await.is_empty()
+        !self
+            .on_request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
     }
 
     /// True when at least one response callback is registered.
     pub async fn has_response_callbacks(&self) -> bool {
-        !self.on_response.read().await.is_empty()
+        !self
+            .on_response
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
     }
 
     pub async fn fire_request(&self, info: &RequestInfo) {
-        for (_, cb) in self.on_request.read().await.iter() {
+        let callbacks = self
+            .on_request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        for (_, cb) in callbacks.iter() {
             cb(info);
         }
     }
 
     pub async fn fire_response(&self, info: &RequestInfo, resp: &Response) {
-        for (_, cb) in self.on_response.read().await.iter() {
+        let callbacks = self
+            .on_response
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        for (_, cb) in callbacks.iter() {
             cb(info, resp);
         }
     }
