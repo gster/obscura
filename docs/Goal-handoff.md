@@ -5,8 +5,8 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 当前实现基于 `cddec40372f3fc7a93965f3a5fbdf434f63701d4`；本轮 request-body retention 将与本交接一起提交，提交标题为 `Retain exact request bodies`。
-- 写入本交接时，本轮提交尚待推送到 `origin/main`；完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
+- 最近完成的实现提交：`1b9de24276cbcf484f3e1988516c11fc728a9b03`，`Retain exact request bodies`；其实现基线为 `cddec40372f3fc7a93965f3a5fbdf434f63701d4`。
+- 该实现提交已推送到 `origin/main`；本交接更新提交完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
 - 相关实现入口：[`request_body.rs`](../crates/obscura-net/src/request_body.rs) 的 Page-owned raw store、[`page.rs`](../crates/obscura-browser/src/page.rs) 的原生导航/redirect 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker 接入，以及 [`network.rs`](../crates/obscura-cdp/src/domains/network.rs)、[`server.rs`](../crates/obscura-cdp/src/server.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的读取与投影。
 
