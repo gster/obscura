@@ -10157,8 +10157,9 @@ return {before,removed,reinsert,moved,cleared};
         let mut rt = setup_runtime("<html><body></body></html>");
         let cancellation = crate::execution_cancellation::ExecutionCancellation::default();
         rt.set_execution_cancellation(Some(cancellation.clone()));
-        let resources = rt.runtime().op_state().borrow()
-            .borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>().borrow().resources.clone();
+        let worker_registry = rt.runtime().op_state().borrow()
+            .borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>().clone();
+        let resources = worker_registry.borrow().resources.clone();
         rt.execute_script("worker-connection-cancellation", r#"
             globalThis.__workerCancellationReady = false;
             const source = "for(let first=true;;){if(first){first=false;postMessage('ready')}}";
@@ -10180,6 +10181,77 @@ return {before,removed,reinsert,moved,cleared};
         // Keep the owner and Worker object alive through the assertion. The
         // resource reaching zero therefore cannot be explained by Page or
         // WorkerRegistry teardown.
+        assert_eq!(resources.active_workers(), 0);
+        drop(rt);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_cancellation_wakes_idle_worker_while_owner_remains_alive() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let cancellation = crate::execution_cancellation::ExecutionCancellation::default();
+        rt.set_execution_cancellation(Some(cancellation.clone()));
+        let worker_registry = rt.runtime().op_state().borrow()
+            .borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>().clone();
+        let resources = worker_registry.borrow().resources.clone();
+        rt.execute_script("idle-worker-connection-cancellation", r#"
+            globalThis.__idleWorkerCancellationReady = false;
+            const url = URL.createObjectURL(new Blob(["postMessage('ready');"], {type:'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = event => { __idleWorkerCancellationReady = event.data === 'ready'; };
+        "#).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        assert_eq!(rt.evaluate("__idleWorkerCancellationReady").unwrap(), serde_json::json!(true));
+        assert_eq!(resources.active_workers(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while worker_registry.borrow().idle_worker_count() != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("Worker must reach its commands.recv() wait before cancellation");
+
+        cancellation.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while resources.active_workers() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("connection cancellation must wake an idle Worker command wait");
+
+        // The owner and Worker object remain alive. The lease can only reach
+        // zero because the shared cancellation woke the idle worker thread.
+        assert_eq!(resources.active_workers(), 0);
+        drop(rt);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_cancellation_wakes_parked_autonomous_worker() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let cancellation = crate::execution_cancellation::ExecutionCancellation::default();
+        rt.set_execution_cancellation(Some(cancellation.clone()));
+        let worker_registry = rt.runtime().op_state().borrow()
+            .borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>().clone();
+        let resources = worker_registry.borrow().resources.clone();
+        rt.execute_script("parked-worker-connection-cancellation", r#"
+            globalThis.__parkedWorkerCancellationReady = false;
+            const source = "setTimeout(() => postMessage('late'), 60000); postMessage('ready');";
+            const url = URL.createObjectURL(new Blob([source], {type:'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = event => { __parkedWorkerCancellationReady = event.data === 'ready'; };
+        "#).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        assert_eq!(rt.evaluate("__parkedWorkerCancellationReady").unwrap(), serde_json::json!(true));
+        assert_eq!(resources.active_workers(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while worker_registry.borrow().autonomous_worker_count() != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("Worker must park in its autonomous event-loop wait before cancellation");
+
+        cancellation.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while resources.active_workers() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("connection cancellation must wake a parked autonomous Worker");
+
         assert_eq!(resources.active_workers(), 0);
         drop(rt);
     }

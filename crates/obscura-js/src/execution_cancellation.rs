@@ -19,6 +19,7 @@ struct ExecutionSlot {
 struct Registry {
     closed: AtomicBool,
     slots: Mutex<Vec<Weak<ExecutionSlot>>>,
+    signal: tokio::sync::watch::Sender<bool>,
 }
 
 /// Cancellation source shared by every V8 runtime owned by one connection.
@@ -27,12 +28,18 @@ pub struct ExecutionCancellation {
     registry: Arc<Registry>,
 }
 
+pub(crate) struct ExecutionCancellationWaiter {
+    signal: tokio::sync::watch::Receiver<bool>,
+}
+
 impl Default for ExecutionCancellation {
     fn default() -> Self {
+        let (signal, _) = tokio::sync::watch::channel(false);
         Self {
             registry: Arc::new(Registry {
                 closed: AtomicBool::new(false),
                 slots: Mutex::new(Vec::new()),
+                signal,
             }),
         }
     }
@@ -43,6 +50,7 @@ impl ExecutionCancellation {
     /// executing page or worker JavaScript.
     pub fn cancel(&self) {
         self.registry.closed.store(true, Ordering::SeqCst);
+        self.registry.signal.send_replace(true);
         let mut slots = self
             .registry
             .slots
@@ -61,6 +69,20 @@ impl ExecutionCancellation {
 
     pub fn is_cancelled(&self) -> bool {
         self.registry.closed.load(Ordering::SeqCst)
+    }
+
+    /// Wait until this connection is cancelled. The signal is sticky, so a
+    /// waiter created after cancellation returns immediately without relying
+    /// on a runtime entering V8 again.
+    pub(crate) fn waiter(&self) -> ExecutionCancellationWaiter {
+        ExecutionCancellationWaiter {
+            signal: self.registry.signal.subscribe(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cancelled(&self) {
+        self.waiter().cancelled().await;
     }
 
     pub(crate) fn attach(&self, handle: IsolateHandle) -> ExecutionTracker {
@@ -89,6 +111,19 @@ impl ExecutionCancellation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+}
+
+impl ExecutionCancellationWaiter {
+    pub(crate) async fn cancelled(&mut self) {
+        if *self.signal.borrow_and_update() {
+            return;
+        }
+        while self.signal.changed().await.is_ok() {
+            if *self.signal.borrow_and_update() {
+                return;
+            }
+        }
     }
 }
 
@@ -183,5 +218,32 @@ mod tests {
             1,
             "only the final dead slot may remain until the next attach or cancel"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_wakes_current_and_future_waiters() {
+        let cancellation = ExecutionCancellation::default();
+        let first = cancellation.clone();
+        let second = cancellation.clone();
+        let first_waiter = tokio::spawn(async move { first.cancelled().await });
+        let second_waiter = tokio::spawn(async move { second.cancelled().await });
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_waiter)
+            .await
+            .expect("first waiter must observe cancellation")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_waiter)
+            .await
+            .expect("second waiter must observe cancellation")
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            cancellation.cancelled(),
+        )
+        .await
+        .expect("a waiter created after cancellation must return immediately");
     }
 }

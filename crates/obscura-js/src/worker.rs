@@ -98,6 +98,22 @@ impl WorkerShutdownFailure {
 }
 
 impl WorkerRegistry {
+    #[cfg(test)]
+    pub(crate) fn idle_worker_count(&self) -> usize {
+        self.workers
+            .values()
+            .filter(|worker| worker.control.waiting_for_commands.load(std::sync::atomic::Ordering::SeqCst))
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn autonomous_worker_count(&self) -> usize {
+        self.workers
+            .values()
+            .filter(|worker| worker.control.waiting_for_autonomous.load(std::sync::atomic::Ordering::SeqCst))
+            .count()
+    }
+
     fn record_completion(
         failures: &mut Vec<WorkerShutdownFailure>,
         worker_id: u32,
@@ -228,6 +244,10 @@ pub struct WorkerInstance {
 #[derive(Default)]
 struct WorkerControl {
     terminated: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    waiting_for_commands: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    waiting_for_autonomous: std::sync::atomic::AtomicBool,
     isolate: std::sync::Mutex<Option<v8::IsolateHandle>>,
 }
 impl WorkerControl {
@@ -1201,6 +1221,9 @@ async fn run_worker(id: u32, config: WorkerConfig,
         return Ok(());
     }
     let mut idle = true;
+    let mut execution_cancellation_waiter = execution_cancellation
+        .as_ref()
+        .map(crate::execution_cancellation::ExecutionCancellation::waiter);
     loop {
         flush_observations(&rt.runtime().op_state().borrow());
         if control.stopped()
@@ -1209,8 +1232,28 @@ async fn run_worker(id: u32, config: WorkerConfig,
             )
             || rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().closing.get()
         { break; }
-        let command = if idle { commands.recv().await.map(queue::Queued::into_inner) } else {
+        #[cfg(test)]
+        {
+            control.waiting_for_commands.store(idle, std::sync::atomic::Ordering::SeqCst);
+            control.waiting_for_autonomous.store(!idle, std::sync::atomic::Ordering::SeqCst);
+        }
+        let command = if idle {
             tokio::select! {
+                biased;
+                _ = wait_for_execution_cancellation(execution_cancellation_waiter.as_mut()) => {
+                    #[cfg(test)]
+                    control.waiting_for_commands.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                },
+                command = commands.recv() => command.map(queue::Queued::into_inner),
+            }
+        } else {
+            tokio::select! {
+                _ = wait_for_execution_cancellation(execution_cancellation_waiter.as_mut()) => {
+                    #[cfg(test)]
+                    control.waiting_for_autonomous.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                },
                 command = commands.recv() => command.map(queue::Queued::into_inner),
                 result = rt.run_autonomous_event_loop_turn() => {
                     match result {
@@ -1227,7 +1270,16 @@ async fn run_worker(id: u32, config: WorkerConfig,
                 }
             }
         };
-        if control.stopped() { break; }
+        #[cfg(test)]
+        {
+            control.waiting_for_commands.store(false, std::sync::atomic::Ordering::SeqCst);
+            control.waiting_for_autonomous.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        if control.stopped()
+            || execution_cancellation.as_ref().is_some_and(
+                crate::execution_cancellation::ExecutionCancellation::is_cancelled,
+            )
+        { break; }
         let result = match command {
             Some(WorkerCommand::Run(source)) => rt.execute_worker_script(&source),
             Some(WorkerCommand::Message(json)) => rt.execute_worker_script(&format!("(globalThis[Symbol.for('__obscura_worker_receive')] || globalThis.__obscura_worker_receive)({});", serde_json::to_string(&json).unwrap())),
@@ -1243,6 +1295,15 @@ async fn run_worker(id: u32, config: WorkerConfig,
     }
     rt.shutdown_workers(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())
+}
+
+async fn wait_for_execution_cancellation(
+    cancellation: Option<&mut crate::execution_cancellation::ExecutionCancellationWaiter>,
+) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[op2]

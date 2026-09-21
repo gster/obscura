@@ -65,7 +65,7 @@ async fn wait_for_log(capture: &CompleteLogCapture, marker: &str) {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "missing synchronous iframe marker {marker}; complete logs:\n{}",
+            "missing synchronous execution marker {marker}; complete logs:\n{}",
             String::from_utf8_lossy(&bytes)
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -169,6 +169,209 @@ async fn start_single_connection_server(port: u16) {
         ),
     )
     .await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DisconnectInput {
+    WebSocketClose,
+    Fin,
+    Rst,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExecutionRealm {
+    Main,
+    Iframe,
+    Worker,
+}
+
+async fn qualify_synchronous_execution(
+    ws: &mut Ws,
+    session: &str,
+    realm: ExecutionRealm,
+    case_id: usize,
+    log_capture: &CompleteLogCapture,
+) {
+    match realm {
+        ExecutionRealm::Main => {
+            let marker = format!("obscura-disconnect-matrix-main-{case_id}");
+            ws.send(Message::Text(
+                json!({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session,
+                    "params": {
+                        "expression": format!("for(let first=true;;){{if(first){{first=false;console.info('{marker}')}}}}"),
+                        "returnByValue": true
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            wait_for_log(log_capture, &marker).await;
+        }
+        ExecutionRealm::Iframe => {
+            let marker = format!("obscura-disconnect-matrix-iframe-{case_id}");
+            let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fixture_port = fixture.local_addr().unwrap().port();
+            let requested = std::sync::Arc::new(Notify::new());
+            let fixture_requested = requested.clone();
+            let fixture_marker = marker.clone();
+            tokio::task::spawn_local(async move {
+                let (mut socket, _) = fixture.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let body = format!(
+                    "<!doctype html><script>for(let first=true;;){{if(first){{first=false;console.info('{fixture_marker}')}}}}</script>"
+                );
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                fixture_requested.notify_one();
+            });
+            ws.send(Message::Text(
+                json!({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session,
+                    "params": {
+                        "expression": format!("(function(){{const frame=document.createElement('iframe');frame.src='http://127.0.0.1:{fixture_port}/child';document.body.appendChild(frame);return 'created'}})()"),
+                        "returnByValue": true
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), requested.notified())
+                .await
+                .expect("matrix iframe document was not requested");
+            wait_for_log(log_capture, &marker).await;
+        }
+        ExecutionRealm::Worker => {
+            let response = command(
+                ws,
+                2,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "new Promise(resolve=>{const source=\"for(let first=true;;){if(first){first=false;postMessage('started')}}\";const worker=new Worker(URL.createObjectURL(new Blob([source],{type:'application/javascript'})));globalThis.__disconnectMatrixWorker=worker;worker.onmessage=event=>resolve(event.data)})",
+                    "awaitPromise": true,
+                    "returnByValue": true
+                }),
+                Some(session),
+            )
+            .await;
+            assert_eq!(
+                response["result"]["result"]["value"],
+                "started",
+                "matrix Worker must enter its synchronous script: {response}"
+            );
+        }
+    }
+}
+
+async fn disconnect_and_reconnect(first: Ws, input: DisconnectInput, url: &str) -> Ws {
+    match input {
+        DisconnectInput::WebSocketClose => {
+            let mut first = first;
+            first.send(Message::Close(None)).await.expect("send WebSocket Close frame");
+            let drain = async {
+                let mut messages = Vec::new();
+                while let Some(message) = first.next().await {
+                    let done = message.is_err() || matches!(&message, Ok(Message::Close(_)));
+                    messages.push(message);
+                    if done { break; }
+                }
+                messages
+            };
+            let (second, drained) = tokio::join!(
+                reconnect(url),
+                tokio::time::timeout(Duration::from_secs(5), drain),
+            );
+            let _complete_old_connection_messages = drained
+                .expect("server did not close the socket after matrix WebSocket Close");
+            second
+        }
+        DisconnectInput::Fin => {
+            let mut fin_socket = raw_fin(first).await;
+            let drain = async {
+                let mut messages = Vec::new();
+                while let Some(message) = fin_socket.next().await {
+                    let done = message.is_err() || matches!(&message, Ok(Message::Close(_)));
+                    messages.push(message);
+                    if done { break; }
+                }
+                messages
+            };
+            let (second, drained) = tokio::join!(
+                reconnect(url),
+                tokio::time::timeout(Duration::from_secs(5), drain),
+            );
+            let _complete_old_connection_messages = drained
+                .expect("server did not close the read half after matrix client FIN");
+            second
+        }
+        DisconnectInput::Rst => {
+            raw_rst(first);
+            reconnect(url).await
+        }
+    }
+}
+
+#[test]
+fn close_fin_rst_interrupt_main_iframe_and_worker_matrix() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let log_capture = install_complete_log_capture();
+        let mut case_id = 0;
+        for input in [DisconnectInput::WebSocketClose, DisconnectInput::Fin, DisconnectInput::Rst] {
+            for realm in [ExecutionRealm::Main, ExecutionRealm::Iframe, ExecutionRealm::Worker] {
+                case_id += 1;
+                let port = pick_port().await;
+                tokio::task::spawn_local(async move {
+                    start_single_connection_server(port).await;
+                });
+                let url = format!("ws://127.0.0.1:{port}/devtools/browser");
+                let mut first = reconnect(&url).await;
+                let session = create_page(&mut first, 1).await;
+                qualify_synchronous_execution(
+                    &mut first,
+                    &session,
+                    realm,
+                    case_id,
+                    &log_capture,
+                )
+                .await;
+
+                let mut second = disconnect_and_reconnect(first, input, &url).await;
+                let second_session = create_page(&mut second, 10).await;
+                let response = command(
+                    &mut second,
+                    11,
+                    "Runtime.evaluate",
+                    json!({"expression": "6 * 7", "returnByValue": true}),
+                    Some(&second_session),
+                )
+                .await;
+                assert_eq!(
+                    response["result"]["result"]["value"].as_f64(),
+                    Some(42.0),
+                    "fresh connection failed after {input:?} interrupted {realm:?}: {response}"
+                );
+            }
+        }
+    });
 }
 
 #[test]
