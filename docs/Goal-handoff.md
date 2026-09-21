@@ -5,16 +5,22 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`35f884de038afbc0b4fc437cd19582dcf5ce03ea`，`Bound multi-worker CDP relays`。
+- 最近完成的实现提交：`9d5ceab111ecc8c654cfc6c7281b16c92a2a0997`，`Supervise multi-worker CDP children`。
 - 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
+- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的受控 readiness/shutdown、[`main.rs`](../crates/obscura-cli/src/main.rs) 的 multi-worker supervisor/relay lifecycle，以及 [`cdp_multi_worker_lifecycle.py`](../tools/unblocked/cdp_multi_worker_lifecycle.py) 的真实进程资格工具。
 
 ## 最近完成的阶段
 
+OB-034 multi-worker child lifecycle 切片已完成受控 child readiness、startup failure cleanup、child crash fail-fast、parent-only shutdown、parent SIGKILL 后 stdin EOF 退出，以及 serve 参数与 access behavior 的完整投影。父进程先绑定公开 listener；child 只在 listener/access/Mio accept/V8 初始化完成后写出单条精确 JSON readiness；任一 child 意外退出都会停止、drain 并 join relay，再通知和回收 siblings。multi-worker 共享 `--storage-dir` 因 ownership 未定义而在 spawn 前明确拒绝。
+
+`tools/unblocked/cdp_multi_worker_lifecycle.py` 保留全部原始 argv/env override、stdout/stderr、PID/process table、signal、HTTP request/response、traceback 与 hash，对 public/worker port conflict、ready child crash、parent-only SIGTERM + 参数/access 投影、parent SIGKILL + stdin EOF 五个场景实测 **5/5**。最终 committed evidence 位于 `/private/tmp/ob034-lifecycle-committed.cBlBR7/evidence/`，manifest SHA-256 `45d0dbd62e15dd5e9cc95d8ce8b33c6a6c573b9ffe948ec30dc3d3384d209f91`，73 个 artifact 全部通过 hash 校验；所有进程组消失、server streams 稳定，无 forced cleanup。Astra light 独立复核代码和 committed evidence 均为 0 blocker、0 major、0 minor。
+
+最终资格二进制来自提交 `9d5ceab111ecc8c654cfc6c7281b16c92a2a0997`，版本 `0.1.0-dev+9d5ceab`，SHA-256 `8a3a7f27e5010ec05ec4f10d1a453223d7397e7f1a5242f27c04c42745e39143`，120705920 bytes。工具 unittest 8/8、完整 unblocked unittest 80/80、no-render CLI 88/88（run `1cc31c25-ce22-4dbc-8c2d-b3237fbc7560`）、release/render 全工作区 2318/2318 且 4 skipped（run `56c3ad40-95ae-43bc-b8b1-0e1b5bb305d2`）、两种 exact build、obstacle 33/33、Playwright Python 1.60.0 smoke 与 37-method profile 均通过。Playwright 原始证据目录为 `/private/tmp/ob034-lifecycle-playwright.0IBf1Z/`。结论只限 Darwin 24.6.0 arm64 与该 binary，不外推 Linux、Windows、container、自动 restart/session migration、共享存储 ownership 或总资源上限；OB-034 仍开放。
+
 OB-034 multi-worker parent relay 已移除无 timeout `peek()`、request-line 解析和 `/json` 特判，父进程对 HTTP 与升级后的 WebSocket 都执行 byte-transparent relay。aggregate relay 上限是经溢出检查的 `workers * max-connections`，permit 覆盖 worker connect、完整 relay 与 502；到达上限时先在 100ms 总预算内发送并 flush 完整 503，再 shutdown write 和有界 drain。固定 16 条拒绝任务及 relay task 全部由持续 reap 的 `JoinSet` 管理。聚焦 render 回归 **5/5** 两轮通过，Astra light 代码终审为 0 blocker、0 major、0 minor。
 
-`tools/unblocked/cdp_multi_worker.py` 用 host socket table barrier 证明真实零字节首 client 已由父进程接纳并连到 worker，再要求后续 discovery 完整 200；容量阶段用完成 101 的 WS 占满 aggregate relay，要求大于 4 KiB 且不 half-close 的请求取得完整 503。主动 Close 一条后，另一条必须仍映射且完成 raw `Browser.getVersion id=2`，HTTP 与全新 WS id=1 也必须恢复。全部 request/response/frame/payload、socket probes、host command/server streams、traceback 与 hashes 原样保留。完整工具 unittest **72/72**，Astra light 工具与既有原始证据终审为 0 blocker、0 major、0 minor。worker readiness/crash/reap、parent-only shutdown、参数完整传递及 Linux/Windows/container 仍未资格化。
+`tools/unblocked/cdp_multi_worker.py` 用 host socket table barrier 证明真实零字节首 client 已由父进程接纳并连到 worker，再要求后续 discovery 完整 200；容量阶段用完成 101 的 WS 占满 aggregate relay，要求大于 4 KiB 且不 half-close 的请求取得完整 503。主动 Close 一条后，另一条必须仍映射且完成 raw `Browser.getVersion id=2`，HTTP 与全新 WS id=1 也必须恢复。全部 request/response/frame/payload、socket probes、host command/server streams、traceback 与 hashes 原样保留。完整工具 unittest **72/72**，Astra light 工具与既有原始证据终审为 0 blocker、0 major、0 minor。该 parent relay 切片当时未覆盖的 Darwin worker readiness/crash/reap、parent-only shutdown 和参数传递已由上方新切片补齐；Linux/Windows/container 仍未资格化。
 
 最终资格二进制来自提交 `a82aab13cca8f0227b6ccb28dc46f628f5fdca55`，版本 `0.1.0-dev+a82aab1`，render SHA-256 `e180178c997dbd51b824e0cd8784638dba81ba0f0aa5d53ca173f7d6cf994a67`，120504448 bytes。no-render 聚焦 **5/5**、CLI **86/86**（2 leaky），release/render 全工作区 **2316/2316**、4 skipped；两种 exact build、固定 benchmark obstacle **33/33**、官方 Playwright 1.60.0 smoke 与 **37-method** 原始 protocol profile 均通过。最终 Darwin 2 workers x 1 connection 运行通过所有 barrier，完整 raw evidence 位于 `/private/tmp/ob034-multiworker-final.adE5nF/evidence/`，manifest SHA-256 `d4c9430fe9d3a6ed39b61b78cf9918909a57cdcc80c1a4036b35f1dae1ce6d59`，139 个登记 artifact；TERM 后 process group 完全消失，无 forced kill。
 
@@ -161,7 +167,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
 1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
-2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py` 和 `tools/unblocked/cdp_multi_worker.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。继续资格化 multi-worker worker readiness/crash/reap、parent-only shutdown 与 serve 参数完整传递，再推进 container network namespace、silent-pending、WS handoff、live slot 与剩余 input qualification。不要把本机 kernel queue、Mio 控制流、逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
+2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace、silent-pending、WS handoff、live slot 与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -193,6 +199,9 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/private/tmp/ob034-multiworker-build-render-final.log`
 - `/private/tmp/ob034-multiworker-obstacle.log`
 - `/private/tmp/ob034-multiworker-tools-unittest.log`
+- `/private/tmp/ob034-lifecycle-final.aFv2t0/evidence/`（review fixes 后、implementation commit 前的完整原始成功证据）
+- `/private/tmp/ob034-lifecycle-committed.cBlBR7/evidence/`（最终 committed binary 证据）
+- `/private/tmp/ob034-lifecycle-playwright.0IBf1Z/`
 - `/tmp/ob021-fetch-stream-net-focused.log`
 - `/tmp/ob021-fetch-stream-cdp-focused.log`
 - `/tmp/ob021-fetch-stream-cdp-focused-rerun.log`

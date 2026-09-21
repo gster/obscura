@@ -162,6 +162,12 @@ outer I/O task cancellation 与 sticky server shutdown 的完整 connection 回�
 
 该切片没有资格化 worker readiness、child crash/reap、parent-only shutdown、所有 serve 参数向 worker 的传递、Linux/Windows/container、kernel listen backlog 或总 FD/task/RSS/V8/socket-buffer 上限；这些边界继续保留，OB-034 仍未关闭。
 
+进展（2026-09-22，multi-worker child lifecycle 与参数投影资格切片，实施 `9d5ceab`）：父进程先绑定公开 listener，再以受控 stdio 协议启动 child；child 只在 listener、access policy、Mio waker、accept thread、context 与 V8 初始化全部成功后写出单条有界且字段精确的 JSON readiness record。父进程持续检测意外 child exit，首个失败即停止 accept、drain/abort/join 所有 relay task，然后通知并有界回收全部 children；只向 parent 发送 SIGTERM 也会走同一清理路径，parent 被 SIGKILL 时 children 通过 control pipe EOF 退出。共享 `--storage-dir` 的 multi-worker 启动在 spawn 前明确拒绝；token/proxy 只通过环境传递，V8 flags、quiet/verbose、file/private access、Host/Origin allowlist、advertised WebSocket URL 与 font directories 都投影到 child argv。
+
+新增 `tools/unblocked/cdp_multi_worker_lifecycle.py`，对 public-port conflict、worker-port conflict、ready child SIGKILL、parent-PID-only SIGTERM + 参数/access 投影、parent SIGKILL + stdin EOF 五个真实进程场景做资格。命令、argv/env override、stdout/stderr、PID 与进程表、signal、HTTP request/response、异常/traceback 及 SHA-256 全部以原始数据保留，不脱敏、不截断、不删字段。最终 Darwin 24.6.0 arm64 运行 **5/5** 通过，每个场景 `groupGone=true`、`serverStreamsStable=true`，无 forced cleanup；完整目录为 `/private/tmp/ob034-lifecycle-committed.cBlBR7/evidence/`，manifest SHA-256 `45d0dbd62e15dd5e9cc95d8ce8b33c6a6c573b9ffe948ec30dc3d3384d209f91`，**73** 个登记 artifact 的 SHA-256 全部校验通过。Astra light 对代码、失败收尾和最终 committed evidence 复审均为 0 blocker、0 major、0 minor。
+
+最终资格二进制来自提交 `9d5ceab111ecc8c654cfc6c7281b16c92a2a0997`，版本 `0.1.0-dev+9d5ceab`，render SHA-256 `8a3a7f27e5010ec05ec4f10d1a453223d7397e7f1a5242f27c04c42745e39143`，120705920 bytes。工具定向 unittest **8/8**、完整 `tools/unblocked` unittest **80/80**；no-render CLI release nextest **88/88**（run `1cc31c25-ce22-4dbc-8c2d-b3237fbc7560`）；release/render 全工作区 **2318/2318**、4 skipped（run `56c3ad40-95ae-43bc-b8b1-0e1b5bb305d2`）；两种 exact CLI build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 的 obstacle **33/33**、官方 Playwright Python 1.60.0 smoke 与完整 **37-method** protocol profile 全部通过。Playwright 原始目录为 `/private/tmp/ob034-lifecycle-playwright.0IBf1Z/`。该结论只资格化记录的 Darwin 环境和该 binary；不外推 Linux、Windows、container、自动 restart/session migration、共享存储 ownership 或总 process/FD/RSS/V8/socket-buffer 上限，OB-034 仍未关闭。
+
 ### OB-037 · P0 · 定性并恢复 obstacle 门禁
 
 状态：已关闭。实施：benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`，CI pin `741f40a`。
