@@ -9805,6 +9805,38 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn connection_cancellation_stops_infinite_worker_while_owner_remains_alive() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let cancellation = crate::execution_cancellation::ExecutionCancellation::default();
+        rt.set_execution_cancellation(Some(cancellation.clone()));
+        let resources = rt.runtime().op_state().borrow()
+            .borrow::<Rc<RefCell<crate::worker::WorkerRegistry>>>().borrow().resources.clone();
+        rt.execute_script("worker-connection-cancellation", r#"
+            globalThis.__workerCancellationReady = false;
+            const source = "for(let first=true;;){if(first){first=false;postMessage('ready')}}";
+            const url = URL.createObjectURL(new Blob([source], {type:'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = event => { __workerCancellationReady = event.data === 'ready'; };
+        "#).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        assert_eq!(rt.evaluate("__workerCancellationReady").unwrap(), serde_json::json!(true));
+        assert_eq!(resources.active_workers(), 1);
+
+        cancellation.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while resources.active_workers() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("connection cancellation must stop active Worker V8 before owner drop");
+
+        // Keep the owner and Worker object alive through the assertion. The
+        // resource reaching zero therefore cannot be explained by Page or
+        // WorkerRegistry teardown.
+        assert_eq!(resources.active_workers(), 0);
+        drop(rt);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_network_keeps_interception_callbacks_and_response_bodies() {
         use std::io::{Read, Write};
         use std::sync::{Arc, Mutex};

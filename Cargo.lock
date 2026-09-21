@@ -1908,11 +1908,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]

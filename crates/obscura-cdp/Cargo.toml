@@ -42,3 +42,5 @@ libc = "0.2"
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
+socket2 = "0.6"
+tracing-subscriber = { workspace = true }

@@ -944,12 +944,13 @@ async fn run_worker(id: u32, config: WorkerConfig,
     mut commands: queue::Receiver<WorkerCommand>,
     events: queue::Sender<WorkerEvent>, control: std::sync::Arc<WorkerControl>) {
     if control.stopped() { return; }
+    let execution_cancellation = config.execution_cancellation.clone();
     let mut rt = crate::runtime::ObscuraJsRuntime::with_base_url_and_proxy(
         &config.url,
         None,
         config.persona.clone(),
     );
-    rt.set_execution_cancellation(config.execution_cancellation.clone());
+    rt.set_execution_cancellation(execution_cancellation.clone());
     {
         let mut handle = control.isolate.lock().unwrap();
         *handle = Some(rt.isolate_handle());
@@ -999,7 +1000,12 @@ async fn run_worker(id: u32, config: WorkerConfig,
     let mut idle = true;
     loop {
         flush_observations(&rt.runtime().op_state().borrow());
-        if control.stopped() || rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().closing.get() { break; }
+        if control.stopped()
+            || execution_cancellation.as_ref().is_some_and(
+                crate::execution_cancellation::ExecutionCancellation::is_cancelled,
+            )
+            || rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().closing.get()
+        { break; }
         let command = if idle { commands.recv().await.map(queue::Queued::into_inner) } else {
             tokio::select! {
                 command = commands.recv() => command.map(queue::Queued::into_inner),
@@ -1007,8 +1013,10 @@ async fn run_worker(id: u32, config: WorkerConfig,
                     match result {
                         Ok(done) => idle = done,
                         Err(error) => {
+                            if control.stopped() || execution_cancellation.as_ref().is_some_and(
+                                crate::execution_cancellation::ExecutionCancellation::is_cancelled,
+                            ) { break; }
                             rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().emit("error", &error);
-                            if control.stopped() { break; }
                             idle = false;
                         }
                     }
@@ -1023,6 +1031,9 @@ async fn run_worker(id: u32, config: WorkerConfig,
             Some(WorkerCommand::Stop) | None => break,
         };
         if let Err(error) = result {
+            if execution_cancellation.as_ref().is_some_and(
+                crate::execution_cancellation::ExecutionCancellation::is_cancelled,
+            ) { break; }
             rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().emit("error", &error);
         }
         idle = false;
