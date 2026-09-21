@@ -5,12 +5,20 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`9d5ceab111ecc8c654cfc6c7281b16c92a2a0997`，`Supervise multi-worker CDP children`。
+- 最近完成的实现提交：`ada9a69ba33aa28cb98e6cccd8a85bdd9e27194f`，`Bound queued CDP WebSocket admission`。
 - 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的受控 readiness/shutdown、[`main.rs`](../crates/obscura-cli/src/main.rs) 的 multi-worker supervisor/relay lifecycle，以及 [`cdp_multi_worker_lifecycle.py`](../tools/unblocked/cdp_multi_worker_lifecycle.py) 的真实进程资格工具。
+- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的 queued+active WebSocket admission、[`main.rs`](../crates/obscura-cli/src/main.rs) 的 `--max-connections` 投影，以及 [`cdp_ws_capacity.py`](../tools/unblocked/cdp_ws_capacity.py) 的单 worker 真实进程资格工具。
 
 ## 最近完成的阶段
+
+OB-034 单 worker WebSocket admission 切片把 `--max-connections` 从 active processor 计数提升为 authorized upgrade handoff 与 active processor 共用的 RAII permit。permit 在完整且授权的 upgrade request 进入有界 handoff 前取得，覆盖 queued handoff、Page/V8/persistence 初始化和连接处理，直到 processor 清理后才释放；达到共享上限返回完整 503/`X-Obscura-Reason: max-connections`。handoff channel 满或关闭时返回完整 503/`ws-handoff-saturated` 并释放 permit；shutdown 先关闭 receiver、丢弃并释放 queued envelope，再等待 active drain。active 计数继续只服务 shutdown drain 与 idle trim，不再冒充 admission authority。
+
+确定性 Rust gate 覆盖 queued permit、handoff full/closed、queued client reset、shutdown queue drain 和 active cleanup。真实 Darwin 工具用一 worker、`max-connections=1` 运行两轮 active/reject/recover：每轮 held WS 完成 101 与 `Browser.getVersion`，超额 WS 收到完整 503，原 held WS 在拒绝后仍可用，主动 Close 后 FD/thread/listen queue 精确恢复；最后在 active WS 存在时 SIGTERM，client clean EOF、进程 returncode 0、无 forced kill。最终 committed evidence 为 `/private/tmp/ob034-ws-capacity-final.XXvMow/evidence/`，manifest SHA-256 `00679f9def1549ce74f9167ac515a790995df904e55bfda24cb12e2b82d7ea48`，142 个登记 artifact 全部通过 bytes 与 SHA-256 校验；两次 recovery 均为 16 FD、12 threads、listen queue 0/128。
+
+最终资格二进制来自提交 `ada9a69ba33aa28cb98e6cccd8a85bdd9e27194f`，版本 `0.1.0-dev+ada9a69`，SHA-256 `be2fbf71ea4e4da5d1c1d480ca49589fafda33512f3c71f4e406cd9d375f40cf`，120763696 bytes。工具定向 unittest 12/12、完整 unblocked unittest 92/92；聚焦 render/no-render 各 7/7（runs `31a36263-d05e-40bf-ac70-5027e6b7b14d`、`290927a0-a2d9-4366-8f89-fba028ec3e7e`）；render CDP 377/377、3 skipped（run `cd4c545c-f65b-4c38-9cc6-726bbc58f006`），no-render 排除既有 render-only binary 后 314/314、3 skipped（run `a6713caf-f5ba-40fb-9740-8a5d9175d353`）；release/render 全工作区 2324/2324、4 skipped（run `731021cc-0b61-4c26-8a3a-265a04438e8e`）。两种 exact CLI build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 的 obstacle 33/33、官方 Playwright Python 1.60.0 smoke 与完整 37-method profile 均通过；Playwright 原始目录为 `/private/tmp/ob034-ws-admission-playwright.nPxkn2/`。
+
+Astra light 首审指出工具在 read exception 时可能丢弃 partial wire，以及 post-rejection command 可能把 matching-id error 当成功；修复后终审为 0 blocker、0 major、0 minor。两次 FileExistsError 失败证据保留在 `/private/tmp/ob034-ws-capacity.C4oTQY/evidence/` 与 `/private/tmp/ob034-ws-capacity.QXRnYK/evidence/`；提交后首次证据 `/private/tmp/ob034-ws-capacity-committed.r438or/evidence/` 因 Cargo 复用旧版本 `9f33502` 而被保留但不作为最终资格。该切片只资格化 Darwin 24.6.0 arm64、IPv4 loopback、单 worker 的 active/shared admission；handoff saturation 由真实 loopback Rust gate 确定性覆盖，发布工具未稳定制造该内部状态。silent-pending 仍有独立数量/TTL 边界，Linux、Windows、container、multi-worker 与总 process/FD/RSS/V8/socket-buffer 上限均不继承，OB-034 保持开放。
 
 OB-034 multi-worker child lifecycle 切片已完成受控 child readiness、startup failure cleanup、child crash fail-fast、parent-only shutdown、parent SIGKILL 后 stdin EOF 退出，以及 serve 参数与 access behavior 的完整投影。父进程先绑定公开 listener；child 只在 listener/access/Mio accept/V8 初始化完成后写出单条精确 JSON readiness；任一 child 意外退出都会停止、drain 并 join relay，再通知和回收 siblings。multi-worker 共享 `--storage-dir` 因 ownership 未定义而在 spawn 前明确拒绝。
 
@@ -167,7 +175,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
 1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
-2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace、silent-pending、WS handoff、live slot 与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
+2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_ws_capacity.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace、silent-pending、发布工具可重复制造的 handoff saturation 证据与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
