@@ -152,6 +152,12 @@ outer I/O task cancellation 与 sticky server shutdown 的完整 connection 回�
 
 本机 Darwin 24.6.0 arm64、`kern.ipc.somaxconn=128`、最终 render binary SHA-256 `ea23d498afe9988536ed1860012a5c4e550e9c89e0fd6fad1a73a0947dcecee7` 的 240-connect 最终运行通过：baseline/queued/recovered queue 为 `0/128 -> 128/128 -> 0/128`，服务数字 FD 为 `16 -> 16 -> 16`，128 条已发送请求全部完整 200，112 条为 connect timeout pressure，其他 client failure 为 0；恢复 HTTP 完整、WebSocket 101 与 CDP response id=1 成功，server stderr 0 bytes，SIGTERM returncode 0。RSS 采样为 19232/19232/20624 KiB，只是三时点事实，不是内存上限。该结果只资格化本机、IPv4 loopback、单 worker 和该 binary；Linux release 平台、Windows、容器 network namespace/published-port、kernel TCP memory、总 RSS、silent-pending、WS handoff、live slot 与 `--workers > 1` 均不能继承。multi-worker 父 listener 仍有无 timeout `peek()` 和每连接无界 relay task，需要独立修复与资格，因此 OB-034 保持未关闭。
 
+进展（2026-09-22，multi-worker parent relay 切片，实施 `35f884d`）：`--workers > 1` 父进程不再先 `peek()` 和解析请求路径，所有 HTTP 与升级后 WebSocket 字节都直接 `copy_bidirectional`。父层 aggregate relay permit 固定为 `workers * max-connections`，乘法、端口和 semaphore 上限都先校验；permit 覆盖 worker connect、完整 relay 与错误响应。达到上限时在 100ms 预算内先发送并 flush 完整 `503 Content-Length: 0` 和 `X-Obscura-Reason: max-relays`，再 shutdown write 并在同一预算内有界 drain；worker 一秒内不可达则同样返回完整 502。固定 16 条拒绝任务与所有 relay task 都由持续 reap 的 `JoinSet` 管理，消除 per-connection detached task 无界增长。`--workers 0` 现明确拒绝，`--max-connections` 的 CLI 契约明确为每 worker，上层并发 relay 是二者乘积。
+
+新增 `tools/unblocked/cdp_multi_worker.py`：先用 host socket table 证明零字节首连接已经由父进程接纳并连到 worker，再要求后续 discovery 完整 200；随后用完成 101 的真实 WebSocket 占满 aggregate relay，要求一个超过 4 KiB 且未 half-close 的请求得到完整 503。主动 masked Close 一条后，barrier 必须同时证明另一条 WS 仍映射且安静，再要求 HTTP 恢复、剩余 WS 的 raw `Browser.getVersion id=2` 成功，最后用新 WS 完成 id=1 往返。每个 request/response/frame/payload/socket probe、host command stdout/stderr、server byte stream、异常 traceback 和 hash 都原样保留，不脱敏、不截断、不删字段；进程组清理不依赖 parent 仍存活。Rust 聚焦 render 回归 **5/5** 两轮通过；完整工具 unittest **72/72**。Astra light 针对代码与最终工具证据分别复核，均为 0 blocker、0 major、0 minor。
+
+该切片没有资格化 worker readiness、child crash/reap、parent-only shutdown、所有 serve 参数向 worker 的传递、Linux/Windows/container、kernel listen backlog 或总 FD/task/RSS/V8/socket-buffer 上限；这些边界继续保留，OB-034 仍未关闭。
+
 ### OB-037 · P0 · 定性并恢复 obstacle 门禁
 
 状态：已关闭。实施：benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`，CI pin `741f40a`。

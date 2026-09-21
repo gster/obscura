@@ -220,6 +220,46 @@ live connection slots, or any other operating system/kernel. A Linux run must
 be performed on Linux; a Darwin result cannot be copied into the release
 matrix. Windows lacks this SIGSTOP method and remains unqualified by this tool.
 
+## Multi-worker relay qualification
+
+`cdp_multi_worker.py` qualifies the bounded byte-transparent parent relay used
+by `obscura serve --workers 2` on Darwin or Linux. It first holds a true
+zero-byte TCP client and uses the host socket table to prove that the parent has
+accepted it and opened a worker relay. A later discovery request must still
+complete. It then holds `workers * max-connections` fully upgraded WebSockets,
+proves each parent-to-worker mapping, and sends an oversized request without a
+client write shutdown. The saturated parent must return a complete HTTP 503
+with `X-Obscura-Reason: max-relays`. After a masked Close releases one relay,
+the tool proves another held WebSocket is still mapped and live, requires HTTP
+admission to recover, executes `Browser.getVersion` on the remaining socket,
+and finally opens a fresh WebSocket for another raw CDP round trip.
+
+Use a release binary and a new output path outside the repository:
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+python3 tools/unblocked/cdp_multi_worker.py \
+  --binary target/release/obscura \
+  --output "$RUN_ROOT/cdp-multi-worker" \
+  --workers 2 \
+  --max-connections 1
+```
+
+The runner retains every request, response, WebSocket payload/frame, socket
+probe, host-command stdout/stderr stream, server stdout/stderr byte stream,
+exception traceback, and artifact hash without redaction, truncation, or field
+removal. The automatically selected contiguous ports are only probed as free;
+they are not reserved across process spawn, so a competing bind is an explicit
+failed run rather than proof of worker readiness. Cleanup targets the recorded
+process group even if the parent exits first and records whether SIGTERM or a
+forced SIGKILL was required.
+
+This result qualifies only the named host, binary, worker count, and per-worker
+limit. It does not qualify worker startup readiness, crash detection, child
+reaping, parent-only shutdown, kernel listen backlog, total FD/task/RSS/V8 or
+socket-buffer limits, container networking, or any other operating system.
+Those boundaries require separate evidence.
+
 ## Trace comparison
 
 Each successful mode writes one trace and `result.json` reports the first exact

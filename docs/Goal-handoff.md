@@ -5,12 +5,16 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`9f559eac0d8eda453ab813305cc1df39b5901a75`，`Add CDP backlog qualification`；其实现基线为 `610adb2244881a89a5114f74017cdb1c8353054c`。
+- 最近完成的实现提交：`35f884de038afbc0b4fc437cd19582dcf5ce03ea`，`Bound multi-worker CDP relays`。
 - 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
 - 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
 
 ## 最近完成的阶段
+
+OB-034 multi-worker parent relay 已移除无 timeout `peek()`、request-line 解析和 `/json` 特判，父进程对 HTTP 与升级后的 WebSocket 都执行 byte-transparent relay。aggregate relay 上限是经溢出检查的 `workers * max-connections`，permit 覆盖 worker connect、完整 relay 与 502；到达上限时先在 100ms 总预算内发送并 flush 完整 503，再 shutdown write 和有界 drain。固定 16 条拒绝任务及 relay task 全部由持续 reap 的 `JoinSet` 管理。聚焦 render 回归 **5/5** 两轮通过，Astra light 代码终审为 0 blocker、0 major、0 minor。
+
+`tools/unblocked/cdp_multi_worker.py` 用 host socket table barrier 证明真实零字节首 client 已由父进程接纳并连到 worker，再要求后续 discovery 完整 200；容量阶段用完成 101 的 WS 占满 aggregate relay，要求大于 4 KiB 且不 half-close 的请求取得完整 503。主动 Close 一条后，另一条必须仍映射且完成 raw `Browser.getVersion id=2`，HTTP 与全新 WS id=1 也必须恢复。全部 request/response/frame/payload、socket probes、host command/server streams、traceback 与 hashes 原样保留。完整工具 unittest **72/72**，Astra light 工具与既有原始证据终审为 0 blocker、0 major、0 minor。worker readiness/crash/reap、parent-only shutdown、参数完整传递及 Linux/Windows/container 仍未资格化。
 
 OB-034 现有单 worker 实际 OS listen backlog 资格工具。它在 readiness 与基线 snapshot 后向整个服务进程组发送 `SIGSTOP`，由内核确认 stopped 后再同时释放完整 discovery 请求；成功连接因此只能留在 kernel listen queue，不会先进入 256 条 accepted silent-pending。通过条件同时包括目标 queue 达其报告 maximum、服务数字 FD 不增长、压力项只能是 connect timeout、恢复后所有已发送请求取得完整 200、queue/FD 回到基线，以及新 WebSocket 完成 101 和 raw `Browser.getVersion` 往返。所有 request/response、frames、host command stdout/stderr、server byte streams、snapshot、failure traceback 和 hashes 完整保留。
 
@@ -155,7 +159,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
 1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
-2. 在 Linux release 平台运行 `tools/unblocked/cdp_capacity.py`，保留完整原始目录；当前只有 Darwin 单 worker 资格，不能复制结论。随后修复并独立资格化 `--workers > 1` 父 listener 的无 timeout `peek()` 和无界 per-connection relay task，再推进 container network namespace、silent-pending、WS handoff、live slot 与剩余 input qualification。不要把本机 kernel queue、Mio 控制流、四层逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
+2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py` 和 `tools/unblocked/cdp_multi_worker.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。继续资格化 multi-worker worker readiness/crash/reap、parent-only shutdown 与 serve 参数完整传递，再推进 container network namespace、silent-pending、WS handoff、live slot 与剩余 input qualification。不要把本机 kernel queue、Mio 控制流、逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
