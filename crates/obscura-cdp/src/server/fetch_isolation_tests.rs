@@ -321,6 +321,13 @@ async fn response_stage_pause_exposes_complete_body_and_enforces_stage_lifecycle
         assert_eq!(final_pause["params"]["redirectedRequestId"], redirect["params"]["requestId"]);
         assert_eq!(final_pause["params"]["responseStatusCode"], 200);
         let stream = client.ok(Some(&session), "Fetch.takeResponseBodyAsStream", json!({"requestId":final_pause["params"]["requestId"]})).await["stream"].clone();
+        for method in ["Fetch.getResponseBody", "Fetch.takeResponseBodyAsStream"] {
+            assert!(client.command(Some(&session), method, json!({"requestId":final_pause["params"]["requestId"]})).await
+                ["error"]["message"].as_str().unwrap().contains("response_body_access_conflict"));
+        }
+        let same_target_session = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(client.ok(Some(&same_target_session), "IO.read", json!({"handle":stream,"size":0})).await["data"], "",
+            "Fetch IO handles belong to the target, not only the issuing session");
         let other_target = client.ok(None, "Target.createTarget", json!({"url":"about:blank"})).await["targetId"].as_str().unwrap().to_string();
         let other_session = client.ok(None, "Target.attachToTarget", json!({"targetId":other_target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
         assert!(client.command(Some(&other_session), "IO.read", json!({"handle":stream})).await.get("error").is_some());
@@ -333,8 +340,9 @@ async fn response_stage_pause_exposes_complete_body_and_enforces_stage_lifecycle
                 .as_str().unwrap().contains("only failRequest or fulfillRequest"));
         }
         client.ok(Some(&session), "Fetch.fulfillRequest", json!({"requestId":final_pause["params"]["requestId"],
-            "responseCode":200,"responsePhrase":"Stream Replacement"})).await;
-        assert_eq!(client.result(&session).await, "/final", "omitted fulfill body preserves the captured body");
+            "responseCode":200,"responsePhrase":"Stream Replacement",
+            "body":base64::engine::general_purpose::STANDARD.encode(b"replacement")})).await;
+        assert_eq!(client.result(&session).await, "replacement");
         while !client.events.iter().any(|event| event["method"] == "Network.loadingFinished"
             && event["params"]["requestId"] == final_pause["params"]["networkId"]) {
             let event = client.recv().await; client.events.push(event);
@@ -342,7 +350,7 @@ async fn response_stage_pause_exposes_complete_body_and_enforces_stage_lifecycle
         let stream_response = client.events.iter().find(|event| event["method"] == "Network.responseReceived"
             && event["params"]["requestId"] == final_pause["params"]["networkId"]).unwrap();
         assert_eq!(stream_response["params"]["response"]["statusText"], "Stream Replacement");
-        assert_eq!(client.ok(Some(&session), "Network.getResponseBody", json!({"requestId":final_pause["params"]["networkId"]})).await["body"], "/final",
+        assert_eq!(client.ok(Some(&session), "Network.getResponseBody", json!({"requestId":final_pause["params"]["networkId"]})).await["body"], "replacement",
             "fulfilled request aliases must point at the replacement Page body");
         let old = client.ok(Some(&session), "IO.read", json!({"handle":stream})).await;
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(old["data"].as_str().unwrap()).unwrap(), b"/final");
@@ -618,6 +626,8 @@ async fn single_page_sessionless_pause_resolution_and_navigation_disconnect() {
         }
         client.ok(None, "Fetch.disable", json!({})).await;
         assert_eq!(client.result(&session).await, "failed", "disable must abort a sessionless pause after stream transfer");
+        assert_eq!(client.ok(None, "IO.read", json!({"handle":stream,"size":0})).await["data"], "",
+            "Fetch.disable must not close an already-issued IO handle");
         client.ok(None, "IO.close", json!({"handle":stream})).await;
         let histories = client.ok(None, "Obscura.getNetworkHistories", json!({})).await;
         let history_id = histories["histories"].as_array().unwrap().iter()

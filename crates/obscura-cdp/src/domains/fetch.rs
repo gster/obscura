@@ -279,7 +279,8 @@ pub async fn handle(
             Ok(json!({ "body": encoded.0, "base64Encoded": encoded.1 }))
         },
         "takeResponseBodyAsStream" => {
-            // Move raw storage into IO; file-backed bodies are read in chunks.
+            // Clone immutable raw storage into IO; file-backed bodies are read
+            // in chunks and remain independent from the Page store lifetime.
             let request_id = params
                 .get("requestId")
                 .and_then(|v| v.as_str())
@@ -289,18 +290,39 @@ pub async fn handle(
                 return Err(response_body_not_ready(request_id));
             }
             let (page_id, store) = super::network::response_body_owner(ctx, session_id, request_id)?;
-            let size = store.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
-                .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))?
-                .map_err(|error| error.to_string())?.0.len();
-            let reservation = ctx.io_streams.reserve_fetch(size, session_id.clone(), page_id)?;
-            let bytes = store.lock().unwrap_or_else(|e| e.into_inner()).take(request_id)
-                .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))?
-                .map_err(|error| error.to_string())?;
-            let handle = reservation.commit(bytes);
+            // Keep the Page body store locked from sizing through the Fetch
+            // access transition. A worker may replace a completed capture, so
+            // releasing this guard between those operations would let the IO
+            // reservation describe a different body generation.
+            let mut bodies = store.lock().unwrap_or_else(|e| e.into_inner());
+            let handle = commit_response_body_stream(
+                &mut bodies,
+                &mut ctx.io_streams,
+                request_id,
+                session_id.clone(),
+                page_id,
+            )?;
             Ok(json!({ "stream": handle }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
     }
+}
+
+fn commit_response_body_stream(
+    bodies: &mut obscura_net::response_body::ResponseBodyStore,
+    streams: &mut super::io::IoStreamStore,
+    request_id: &str,
+    session_id: Option<String>,
+    page_id: String,
+) -> Result<String, String> {
+    let size = bodies.get(request_id)
+        .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))?
+        .map_err(|error| error.to_string())?.0.len();
+    let reservation = streams.reserve_fetch(size, session_id, page_id)?;
+    let bytes = bodies.take_for_fetch(request_id)
+        .ok_or_else(|| format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}"))?
+        .map_err(|error| error.to_string())?;
+    reservation.commit(bytes)
 }
 
 fn validate_resource_type(resource_type: &str) -> Result<&str, &'static str> {
@@ -319,9 +341,54 @@ pub(crate) fn response_body_not_ready(request_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use crate::dispatch::CdpContext;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn response_replacement_cannot_change_reserved_fetch_generation() {
+        use obscura_net::response_body::{ResponseBodyLimits, ResponseBodyStore};
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let bodies = Arc::new(Mutex::new(ResponseBodyStore::new(ResponseBodyLimits {
+            memory_threshold: usize::MAX,
+            total_bytes: 64,
+            entries: 1,
+        })));
+        bodies.lock().unwrap().insert("request".into(), b"old!", true).unwrap();
+        let mut guard = bodies.lock().unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let worker_bodies = Arc::clone(&bodies);
+        let worker_start = Arc::clone(&start);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            worker_bodies.lock().unwrap()
+                .insert("request".into(), b"replacement", true)
+                .unwrap();
+        });
+
+        // The worker is now racing to replace this completed capture, but the
+        // same Page-store guard covers sizing, reservation, and access change.
+        start.wait();
+        let mut streams = super::super::io::IoStreamStore::with_limits(1, 4);
+        let handle = commit_response_body_stream(
+            &mut guard,
+            &mut streams,
+            "request",
+            None,
+            "page".into(),
+        ).unwrap();
+        drop(guard);
+        worker.join().unwrap();
+
+        let streamed = streams.read(&handle, None, usize::MAX).unwrap();
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(streamed.0).unwrap(), b"old!");
+        let replacement = bodies.lock().unwrap().get("request").unwrap().unwrap().0;
+        assert_eq!(replacement.with_bytes(|bytes| bytes.to_vec()).unwrap(), b"replacement");
+        streams.remove(&handle);
+        assert!(streams.insert(b"next".to_vec()).is_ok(), "old generation length must be released exactly");
+    }
 
     fn pause(ctx: &mut CdpContext, id: &str) -> tokio::sync::oneshot::Receiver<FetchResolution> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -463,9 +530,12 @@ mod tests {
         let stream = handle("takeResponseBodyAsStream", &json!({"requestId": pause_ids[0]}), &mut ctx, &session).await.unwrap();
         for id in [&pause_ids[0], &events[0].request_id] {
             let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
-            assert!(error.contains("response_body_already_consumed"), "{error}");
-            let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
-            assert!(error.contains("response_body_already_consumed"), "{error}");
+            assert!(error.contains("response_body_access_conflict"), "{error}");
+            let body = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap();
+            let actual = if body["base64Encoded"] == true {
+                base64::engine::general_purpose::STANDARD.decode(body["body"].as_str().unwrap()).unwrap()
+            } else { body["body"].as_str().unwrap().as_bytes().to_vec() };
+            assert_eq!(actual, bodies[0]);
         }
         super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx, &session).await.unwrap();
         let other_id = ctx.create_page();
@@ -486,7 +556,7 @@ mod tests {
         grant_network_body_access(&mut ctx, &other_session, &[&other_pause_id]);
         let body = handle("getResponseBody", &json!({"requestId": other_pause_id}), &mut ctx, &other_session).await.unwrap();
         assert_eq!(body["body"], "other-page");
-        assert!(handle("getResponseBody", &json!({"requestId": other_pause_id}), &mut ctx, &session).await.unwrap_err().contains("response_body_already_consumed"));
+        assert!(handle("getResponseBody", &json!({"requestId": other_pause_id}), &mut ctx, &session).await.unwrap_err().contains("response_body_access_conflict"));
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/html,<html>rebuilt</html>").await.unwrap();
         page.network_events.clear();
@@ -502,7 +572,7 @@ mod tests {
         grant_network_body_access(&mut ctx, &session, &[&rebuilt_pause_id]);
         let body = handle("getResponseBody", &json!({"requestId": rebuilt_pause_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(body["body"], "after-navigation");
-        assert!(handle("getResponseBody", &json!({"requestId": pause_ids[0]}), &mut ctx, &session).await.unwrap_err().contains("response_body_already_consumed"));
+        assert!(handle("getResponseBody", &json!({"requestId": pause_ids[0]}), &mut ctx, &session).await.unwrap_err().contains("response_body_access_conflict"));
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.set_response_body_limits(obscura_net::response_body::ResponseBodyLimits {
             memory_threshold: 0, total_bytes: 4, entries: 1,
@@ -606,10 +676,10 @@ mod tests {
         grant_network_body_access(&mut ctx, &session, &[request_id, "js-alias"]);
         let result = handle("takeResponseBodyAsStream", &json!({"requestId": "js-alias"}), &mut ctx, &session).await.unwrap();
         let stream = result["stream"].as_str().unwrap();
-        let error = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
-        assert!(error.contains("response_body_already_consumed"), "{error}");
+        let network = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(network["body"].as_str().unwrap()).unwrap(), binary);
         let error = handle("getResponseBody", &json!({"requestId": "js-alias"}), &mut ctx, &session).await.unwrap_err();
-        assert!(error.contains("response_body_already_consumed"), "{error}");
+        assert!(error.contains("response_body_access_conflict"), "{error}");
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.set_response_body_limits(obscura_net::response_body::ResponseBodyLimits { memory_threshold: 0, total_bytes: 4, entries: 1 });
         let result = page.evaluate_for_cdp("fetch('/budget').then(r => r.text())", true, true).await;
@@ -624,7 +694,6 @@ mod tests {
         let error = handle("takeResponseBodyAsStream", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("response_body_budget_exhausted"), "{error}");
         ctx.get_page_mut(&page_id).unwrap().clear_response_bodies();
-        ctx.remove_page(&page_id);
         let mut received = Vec::new();
         loop {
             let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx, &session).await.unwrap();
@@ -633,11 +702,12 @@ mod tests {
         }
         assert_eq!(received, binary);
         super::super::io::handle("close", &json!({"handle": stream}), &mut ctx, &session).await.unwrap();
+        ctx.remove_page(&page_id);
         server.join().unwrap();
     }
 
     #[tokio::test]
-    async fn response_body_stream_spool_is_once_and_survives_page_drop() {
+    async fn response_body_stream_spool_survives_store_clear_and_target_close_reclaims_it() {
         use base64::Engine as _;
         let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
@@ -659,14 +729,13 @@ mod tests {
         let stream = result["stream"].as_str().unwrap();
         for id in [&request_id, "loader"] {
             let error = handle("takeResponseBodyAsStream", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
-            assert!(error.contains("response_body_already_consumed"), "{error}");
+            assert!(error.contains("response_body_access_conflict"), "{error}");
             let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
-            assert!(error.contains("response_body_already_consumed"), "{error}");
-            let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
-            assert!(error.contains("response_body_already_consumed"), "{error}");
+            assert!(error.contains("response_body_access_conflict"), "{error}");
+            let body = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap();
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(body["body"].as_str().unwrap()).unwrap(), bytes);
         }
         ctx.get_page_mut(&page_id).unwrap().clear_response_bodies();
-        ctx.remove_page(&page_id);
         let mut received = Vec::new();
         loop {
             let result = super::super::io::handle("read", &json!({"handle": stream, "size": 131071}), &mut ctx, &session).await.unwrap();
@@ -674,7 +743,7 @@ mod tests {
             if result["eof"] == true { break; }
         }
         assert_eq!(received, bytes);
-        super::super::io::handle("close", &json!({"handle": stream}), &mut ctx, &session).await.unwrap();
+        ctx.remove_page(&page_id);
         assert!(super::super::io::handle("read", &json!({"handle": stream}), &mut ctx, &session).await.is_err());
     }
 
@@ -768,9 +837,11 @@ mod tests {
         }
         let stream = handle("takeResponseBodyAsStream", &json!({"requestId": "shared-id"}), &mut ctx, &sessions[0]).await.unwrap();
         super::super::io::handle("close", &json!({"handle": stream["stream"]}), &mut ctx, &sessions[0]).await.unwrap();
+        let body = super::super::network::handle("getResponseBody", &json!({"requestId": "shared-id"}), &mut ctx, &sessions[0]).await.unwrap();
+        assert_eq!(body["body"], "first");
         for method in ["getResponseBody", "takeResponseBodyAsStream"] {
             let error = handle(method, &json!({"requestId": "shared-id"}), &mut ctx, &sessions[0]).await.unwrap_err();
-            assert!(error.contains("response_body_already_consumed") || error.contains("response_body_access_conflict"), "{error}");
+            assert!(error.contains("response_body_access_conflict"), "{error}");
             let error = handle(method, &json!({"requestId": ids[1]}), &mut ctx, &sessions[0]).await.unwrap_err();
             assert!(error.contains("No response body found"), "{error}");
             let error = handle(method, &json!({"requestId": "shared-id"}), &mut ctx, &Some("unknown-session".into())).await.unwrap_err();

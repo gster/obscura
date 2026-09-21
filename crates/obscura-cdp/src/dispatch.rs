@@ -203,11 +203,12 @@ pub struct CdpContext {
     page_isolated_worlds: HashMap<String, Vec<String>>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<RoutedInterceptedRequest>>,
-    // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
-    // body taken out of the page cache so a large download is streamed
-    // chunk-by-chunk via IO.read and freed on IO.close (issue #360). The store
-    // caps open bodies and their total bytes by rejecting new streams, keeping
-    // active handles readable until IO.close or this context is dropped.
+    // Open IO streams for Fetch.takeResponseBodyAsStream. Each pins an immutable
+    // response-body backing also retained by the Page, so a large download is
+    // streamed chunk-by-chunk via IO.read without consuming Network readers
+    // (issue #360). The store caps open bodies and their total bytes by rejecting
+    // new streams, keeping active handles readable until IO.close,
+    // target/last-session teardown, or this connection context is dropped.
     pub io_streams: crate::domains::io::IoStreamStore,
     /// Serializes V8 work within THIS connection. With the thread-per-connection
     /// server (#430) each connection runs on its own OS thread, so isolates never
@@ -559,6 +560,9 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        // Fetch IO handles belong to the DevTools target. Dropping the Page
+        // store is not enough because each stream pins an immutable body clone.
+        self.io_streams.remove_fetch_for_page(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()

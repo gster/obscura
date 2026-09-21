@@ -28,7 +28,11 @@ fn io_stream_max_bytes() -> usize {
 
 /// Context-owned raw response streams. Active handles are never evicted: new
 /// streams fail explicitly when the context entry/byte budget is exhausted.
-/// File-backed bodies stay on disk and are released on close/context drop.
+/// File-backed bodies stay on disk and are released on close, target/last-
+/// session teardown, or connection-context drop.
+/// Fetch byte accounting is also unique-backing accounting: one canonical
+/// response slot (including all aliases) can issue exactly one Fetch handle.
+/// Non-Fetch streams retain their existing per-handle accounting contract.
 pub struct IoStreamStore {
     streams: HashMap<String, IoStream>,
     total_bytes: usize,
@@ -45,40 +49,70 @@ struct IoStream {
 }
 
 #[derive(Clone)]
-struct IoStreamOwner {
-    session_id: Option<String>,
-    #[allow(dead_code)]
-    page_id: String,
+enum IoStreamOwner {
+    /// Non-Fetch streams retain their existing issuer-session authorization.
+    ExactSession { session_id: Option<String>, #[allow(dead_code)] page_id: String },
+    /// Chrome's Fetch stream handle belongs to the target IO context, not the
+    /// session that happened to call takeResponseBodyAsStream. An explicitly
+    /// sessionless owner remains sessionless-only for compatibility.
+    FetchPage { page_id: String, sessionless: bool },
+}
+
+impl IoStreamOwner {
+    #[cfg(test)]
+    fn page_id(&self) -> &str {
+        match self {
+            Self::ExactSession { page_id, .. } | Self::FetchPage { page_id, .. } => page_id,
+        }
+    }
+
+    fn is_fetch_for_page(&self, page_id: &str) -> bool {
+        matches!(self, Self::FetchPage { page_id: owner, .. } if owner == page_id)
+    }
 }
 
 impl IoStream {
-    fn belongs_to_session(&self, session_id: &Option<String>) -> bool {
+    fn belongs_to_caller(&self, session_id: &Option<String>, session_page_id: Option<&str>) -> bool {
         match &self.owner {
-            Some(owner) => &owner.session_id == session_id,
+            Some(IoStreamOwner::ExactSession { session_id: owner, .. }) => owner == session_id,
+            Some(IoStreamOwner::FetchPage { sessionless: true, .. }) => {
+                session_id.is_none() && session_page_id.is_none()
+            }
+            Some(IoStreamOwner::FetchPage { page_id, sessionless: false }) => {
+                session_id.is_some() && session_page_id == Some(page_id.as_str())
+            }
             None => session_id.is_none(),
         }
     }
 }
 
-/// Holds exclusive access until the body is taken from its Page. Dropping a
-/// reservation without committing changes neither capacity nor handle state.
+/// Reserves capacity before Fetch changes its access mode. Dropping a
+/// reservation without committing changes affects neither capacity nor handle
+/// state.
 pub(crate) struct IoStreamReservation<'a> {
     store: &'a mut IoStreamStore,
     handle: String,
     next_counter: u64,
-    total_bytes: usize,
+    reserved_len: usize,
     owner: Option<IoStreamOwner>,
     sequential_only: bool,
 }
 
 impl IoStreamReservation<'_> {
-    pub(crate) fn commit(self, body: ResponseBody) -> String {
+    pub(crate) fn commit(self, body: ResponseBody) -> Result<String, String> {
+        if body.len() != self.reserved_len {
+            return Err(format!(
+                "IO stream reservation length mismatch: reserved {}, got {}",
+                self.reserved_len,
+                body.len(),
+            ));
+        }
         self.store.counter = self.next_counter;
-        self.store.total_bytes = self.total_bytes;
+        self.store.total_bytes += self.reserved_len;
         self.store.streams.insert(self.handle.clone(), IoStream {
             body, cursor: 0, owner: self.owner, sequential_only: self.sequential_only,
         });
-        self.handle
+        Ok(self.handle)
     }
 }
 
@@ -122,7 +156,12 @@ impl IoStreamStore {
     pub(crate) fn reserve_fetch(
         &mut self, len: usize, session_id: Option<String>, page_id: String,
     ) -> Result<IoStreamReservation<'_>, String> {
-        self.reserve_with_owner(len, Some(IoStreamOwner { session_id, page_id }), true)
+        let sessionless = session_id.is_none();
+        self.reserve_with_owner(
+            len,
+            Some(IoStreamOwner::FetchPage { page_id, sessionless }),
+            true,
+        )
     }
 
     pub(crate) fn insert_pdf(
@@ -132,13 +171,12 @@ impl IoStreamStore {
         page_id: String,
     ) -> Result<String, String> {
         let bytes = bytes.into();
-        Ok(self
-            .reserve_with_owner(
+        self.reserve_with_owner(
                 bytes.len(),
-                Some(IoStreamOwner { session_id, page_id }),
+                Some(IoStreamOwner::ExactSession { session_id, page_id }),
                 false,
             )?
-            .commit(bytes))
+            .commit(bytes)
     }
 
     fn reserve_with_owner(
@@ -148,7 +186,7 @@ impl IoStreamStore {
         Ok(IoStreamReservation {
             handle: format!("stream-{}", self.counter),
             next_counter: self.counter + 1,
-            total_bytes: self.total_bytes + len,
+            reserved_len: len,
             owner,
             sequential_only,
             store: self,
@@ -157,7 +195,7 @@ impl IoStreamStore {
 
     pub fn insert(&mut self, bytes: impl Into<ResponseBody>) -> Result<String, String> {
         let bytes = bytes.into();
-        Ok(self.reserve(bytes.len())?.commit(bytes))
+        self.reserve(bytes.len())?.commit(bytes)
     }
 
     #[cfg(test)]
@@ -174,7 +212,7 @@ impl IoStreamStore {
         offset: Option<usize>,
         size: usize,
     ) -> Option<(String, bool)> {
-        self.read_result(handle, &None, offset, size)?.ok()
+        self.read_result(handle, &None, None, offset, size)?.ok()
     }
 
     /// CDP retains I/O failures so a failed spool read is not an unknown handle.
@@ -182,12 +220,13 @@ impl IoStreamStore {
         &mut self,
         handle: &str,
         session_id: &Option<String>,
+        session_page_id: Option<&str>,
         offset: Option<usize>,
         size: usize,
     ) -> Option<Result<(String, bool), String>> {
         let stream = self.streams.get_mut(handle)?;
-        if !stream.belongs_to_session(session_id) {
-            return Some(Err("IO stream handle does not belong to this session".into()));
+        if !stream.belongs_to_caller(session_id, session_page_id) {
+            return Some(Err("IO stream handle does not belong to this target/session".into()));
         }
         if stream.sequential_only && offset.is_some() {
             return Some(Err("Fetch response streams do not support IO.read offset".into()));
@@ -210,18 +249,35 @@ impl IoStreamStore {
 
     /// Free a stream's buffer (IO.close). A no-op for an unknown handle.
     pub fn remove(&mut self, handle: &str) {
-        let _ = self.remove_owned(handle, &None);
+        let _ = self.remove_owned(handle, &None, None);
     }
 
-    pub fn remove_owned(&mut self, handle: &str, session_id: &Option<String>) -> Result<(), String> {
+    pub fn remove_owned(
+        &mut self,
+        handle: &str,
+        session_id: &Option<String>,
+        session_page_id: Option<&str>,
+    ) -> Result<(), String> {
         let stream = self.streams.get(handle).ok_or_else(|| format!("IO.close: unknown handle {handle}"))?;
-        if !stream.belongs_to_session(session_id) {
-            return Err("IO stream handle does not belong to this session".into());
+        if !stream.belongs_to_caller(session_id, session_page_id) {
+            return Err("IO stream handle does not belong to this target/session".into());
         }
         if let Some(stream) = self.streams.remove(handle) {
-            self.total_bytes -= stream.body.len();
+            self.total_bytes = self.total_bytes.saturating_sub(stream.body.len());
         }
         Ok(())
+    }
+
+    /// Target teardown is a Fetch-stream lifetime boundary. Page-store clear
+    /// is not: an open stream still pins its immutable ResponseBody clone.
+    pub(crate) fn remove_fetch_for_page(&mut self, page_id: &str) {
+        let mut released = 0usize;
+        self.streams.retain(|_, stream| {
+            let remove = stream.owner.as_ref().is_some_and(|owner| owner.is_fetch_for_page(page_id));
+            if remove { released = released.saturating_add(stream.body.len()); }
+            !remove
+        });
+        self.total_bytes = self.total_bytes.saturating_sub(released);
     }
 }
 
@@ -259,9 +315,11 @@ pub async fn handle(
                 })
                 .transpose()?;
 
+            let session_page_id = session_id.as_ref()
+                .and_then(|session| ctx.sessions.get(session)).cloned();
             let (data, eof) = ctx
                 .io_streams
-                .read_result(handle, session_id, offset, size)
+                .read_result(handle, session_id, session_page_id.as_deref(), offset, size)
                 .ok_or_else(|| format!("IO.read: unknown handle {handle}"))??;
 
             Ok(json!({ "data": data, "eof": eof, "base64Encoded": true }))
@@ -271,7 +329,9 @@ pub async fn handle(
                 .get("handle")
                 .and_then(|v| v.as_str())
                 .ok_or("IO.close requires handle")?;
-            ctx.io_streams.remove_owned(handle, session_id)?;
+            let session_page_id = session_id.as_ref()
+                .and_then(|session| ctx.sessions.get(session)).cloned();
+            ctx.io_streams.remove_owned(handle, session_id, session_page_id.as_deref())?;
             Ok(json!({}))
         }
         _ => Err(format!("Unknown IO method: {}", method)),
@@ -290,6 +350,14 @@ mod tests {
     fn response_body_unused_reservation_does_not_change_capacity_or_handle() {
         let mut store = IoStreamStore::with_limits(1, 4);
         drop(store.reserve(4).unwrap());
+        assert_eq!(store.total_bytes, 0);
+        assert_eq!(store.insert(vec![1; 4]).unwrap(), "stream-0");
+    }
+
+    #[test]
+    fn reservation_rejects_length_change_without_consuming_capacity_or_handle() {
+        let mut store = IoStreamStore::with_limits(1, 4);
+        assert!(store.reserve(1).unwrap().commit(b"too long".to_vec().into()).is_err());
         assert_eq!(store.total_bytes, 0);
         assert_eq!(store.insert(vec![1; 4]).unwrap(), "stream-0");
     }
@@ -364,10 +432,10 @@ mod tests {
     fn requested_read_size_is_capped() {
         let mut store = IoStreamStore::with_limits(2, MAX_READ_CHUNK * 2);
         let handle = store.insert(vec![7u8; MAX_READ_CHUNK + 17]).unwrap();
-        let (first, eof) = store.read_result(&handle, &None, None, usize::MAX).unwrap().unwrap();
+        let (first, eof) = store.read_result(&handle, &None, None, None, usize::MAX).unwrap().unwrap();
         assert_eq!(decode(&first).len(), MAX_READ_CHUNK);
         assert!(!eof);
-        let (second, eof) = store.read_result(&handle, &None, None, usize::MAX).unwrap().unwrap();
+        let (second, eof) = store.read_result(&handle, &None, None, None, usize::MAX).unwrap().unwrap();
         assert_eq!(decode(&second).len(), 17);
         assert!(eof);
     }
@@ -386,32 +454,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.streams[&sessionless].owner.as_ref().unwrap().page_id,
+            store.streams[&sessionless].owner.as_ref().unwrap().page_id(),
             "sessionless-page"
         );
-        assert!(store.read_result(&sessionless, &None, None, 4).unwrap().is_ok());
-        assert!(store.read_result(&sessionless, &owner, None, 4).unwrap().is_err());
-        assert!(store.remove_owned(&sessionless, &owner).is_err());
+        assert!(store.read_result(&sessionless, &None, None, None, 4).unwrap().is_ok());
+        assert!(store.read_result(&sessionless, &owner, Some("sessionless-page"), None, 4).unwrap().is_err());
+        assert!(store.remove_owned(&sessionless, &owner, Some("sessionless-page")).is_err());
 
         let pdf = store
             .insert_pdf(b"abcdef".to_vec(), owner.clone(), "pdf-page".to_string())
             .unwrap();
-        assert_eq!(store.streams[&pdf].owner.as_ref().unwrap().page_id, "pdf-page");
-        assert!(store.read_result(&pdf, &None, None, 2).unwrap().is_err());
-        assert!(store.read_result(&pdf, &other, None, 2).unwrap().is_err());
-        let (chunk, _) = store.read_result(&pdf, &owner, Some(2), 2).unwrap().unwrap();
+        assert_eq!(store.streams[&pdf].owner.as_ref().unwrap().page_id(), "pdf-page");
+        assert!(store.read_result(&pdf, &None, None, None, 2).unwrap().is_err());
+        assert!(store.read_result(&pdf, &other, Some("pdf-page"), None, 2).unwrap().is_err());
+        let (chunk, _) = store.read_result(&pdf, &owner, Some("pdf-page"), Some(2), 2).unwrap().unwrap();
         assert_eq!(decode(&chunk), b"cd");
 
         let fetch = store
             .reserve_fetch(6, owner.clone(), "fetch-page".to_string())
             .unwrap()
-            .commit(b"abcdef".to_vec().into());
-        assert!(store.read_result(&fetch, &owner, Some(1), 2).unwrap().is_err());
-        let (chunk, _) = store.read_result(&fetch, &owner, None, 2).unwrap().unwrap();
+            .commit(b"abcdef".to_vec().into())
+            .unwrap();
+        assert!(store.read_result(&fetch, &owner, Some("fetch-page"), Some(1), 2).unwrap().is_err());
+        let (chunk, _) = store.read_result(&fetch, &owner, Some("fetch-page"), None, 2).unwrap().unwrap();
         assert_eq!(decode(&chunk), b"ab");
 
-        assert!(store.remove_owned(&pdf, &other).is_err());
-        assert!(store.remove_owned(&pdf, &owner).is_ok());
-        assert!(store.remove_owned(&sessionless, &None).is_ok());
+        assert!(store.remove_owned(&pdf, &other, Some("pdf-page")).is_err());
+        assert!(store.remove_owned(&pdf, &owner, Some("pdf-page")).is_ok());
+        assert!(store.remove_owned(&sessionless, &None, None).is_ok());
+    }
+
+    #[test]
+    fn fetch_stream_is_target_scoped_and_target_teardown_releases_capacity() {
+        let mut store = IoStreamStore::with_limits(2, 16);
+        let issuer = Some("issuer".to_string());
+        let sibling = Some("sibling".to_string());
+        let other = Some("other".to_string());
+        let handle = store
+            .reserve_fetch(6, issuer.clone(), "page-a".to_string())
+            .unwrap()
+            .commit(b"abcdef".to_vec().into())
+            .unwrap();
+
+        assert!(store.read_result(&handle, &sibling, Some("page-a"), None, 2).unwrap().is_ok());
+        assert!(store.read_result(&handle, &issuer, None, None, 2).unwrap().is_err(),
+            "a detached issuer is not a live target session");
+        assert!(store.read_result(&handle, &other, Some("page-b"), None, 2).unwrap().is_err());
+        assert!(store.read_result(&handle, &None, None, None, 2).unwrap().is_err());
+
+        store.remove_fetch_for_page("page-a");
+        assert!(store.read_result(&handle, &sibling, Some("page-a"), None, 2).is_none());
+        assert_eq!(store.total_bytes, 0);
     }
 }

@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 pub struct ResponseBodyLimits {
     /// Bodies larger than this are spooled rather than copied into memory.
     pub memory_threshold: usize,
-    /// Total retained raw bytes, including bodies transferred to streams.
+    /// Total raw bytes retained by canonical Page body slots.
     pub total_bytes: usize,
-    /// Captured responses, including consumed-body markers; aliases are free.
+    /// Captured canonical response slots; aliases are free.
     pub entries: usize,
 }
 
@@ -49,7 +49,7 @@ enum Storage {
 type SharedStorage = Mutex<Storage>;
 
 /// A raw response body. Clones share storage; no text/base64 copy is retained.
-/// A stream takes ownership, keeping a spool alive until the stream closes.
+/// An IO stream clone keeps a spool alive independently of the Page store.
 #[derive(Clone)]
 pub struct ResponseBody {
     storage: Arc<SharedStorage>,
@@ -114,12 +114,15 @@ impl From<Vec<u8>> for ResponseBody {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FetchAccess { None, Get }
+/// Fetch-specific access mode for one canonical body slot. This does not affect
+/// ordinary readers such as Network.getResponseBody: those always retain the
+/// immutable canonical body. Aliases share this state so they cannot be used to
+/// obtain a second Fetch stream for the same captured response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchAccess { None, Get, Streamed }
 
 enum Entry {
     Ready { body: ResponseBody, binary: bool, fetch_access: FetchAccess },
-    Taken { len: usize },
 }
 
 /// Page-owned bounded capture. A failed admission stops further capture until
@@ -166,7 +169,6 @@ impl ResponseBodyStore {
         let previous_len = existing.as_ref().map(|entry| {
             match &*entry.lock().unwrap_or_else(|e| e.into_inner()) {
                 Entry::Ready { body, .. } => body.len(),
-                Entry::Taken { len } => *len,
             }
         }).unwrap_or(0);
         let total = (self.total_bytes - previous_len).checked_add(bytes.len());
@@ -189,7 +191,7 @@ impl ResponseBodyStore {
         Ok(())
     }
 
-    /// Includes consumed entries and aliases, but not a store-wide failure.
+    /// Includes canonical entries and aliases, but not a store-wide failure.
     pub fn contains(&self, request_id: &str) -> bool {
         self.entries.contains_key(request_id)
     }
@@ -200,7 +202,6 @@ impl ResponseBodyStore {
         };
         Some(match &*entry.lock().unwrap_or_else(|e| e.into_inner()) {
             Entry::Ready { body, binary, .. } => Ok((body.clone(), *binary)),
-            Entry::Taken { .. } => Err(ResponseBodyError::Consumed),
         })
     }
 
@@ -213,27 +214,56 @@ impl ResponseBodyStore {
         let mut entry = entry.lock().unwrap_or_else(|e| e.into_inner());
         Some(match &mut *entry {
             Entry::Ready { body, binary, fetch_access } => {
-                *fetch_access = FetchAccess::Get;
-                Ok((body.clone(), *binary))
+                match *fetch_access {
+                    FetchAccess::None | FetchAccess::Get => {
+                        *fetch_access = FetchAccess::Get;
+                        Ok((body.clone(), *binary))
+                    }
+                    FetchAccess::Streamed => Err(ResponseBodyError::AccessConflict),
+                }
             }
-            Entry::Taken { .. } => Err(ResponseBodyError::AccessConflict),
         })
     }
 
-    /// All aliases transition together. The stream becomes the storage owner;
-    /// Page clear/drop only removes the consumed marker.
-    pub fn take(&mut self, request_id: &str) -> Option<Result<ResponseBody, ResponseBodyError>> {
+    /// Mark this canonical slot as streamed and return an immutable storage
+    /// clone. Ordinary reads remain available; only Fetch whole-body/stream
+    /// access is mutually exclusive. Page clear/drop removes its references but
+    /// an open IO stream keeps the shared backing alive.
+    pub fn take_for_fetch(&mut self, request_id: &str) -> Option<Result<ResponseBody, ResponseBodyError>> {
         let Some(entry) = self.entries.get(request_id) else {
             return self.failure.clone().map(Err);
         };
         let mut entry = entry.lock().unwrap_or_else(|e| e.into_inner());
-        let result = match &*entry {
-            Entry::Ready { body, fetch_access: FetchAccess::None, .. } => Ok(body.clone()),
-            Entry::Ready { fetch_access: FetchAccess::Get, .. } => Err(ResponseBodyError::AccessConflict),
-            Entry::Taken { .. } => Err(ResponseBodyError::Consumed),
+        Some(match &mut *entry {
+            Entry::Ready { body, fetch_access, .. } => match *fetch_access {
+                FetchAccess::None => {
+                    *fetch_access = FetchAccess::Streamed;
+                    Ok(body.clone())
+                }
+                FetchAccess::Get | FetchAccess::Streamed => Err(ResponseBodyError::AccessConflict),
+            },
+        })
+    }
+
+    /// Compatibility name for embedders that already use the backing-transfer
+    /// API. The operation no longer consumes ordinary canonical readers.
+    pub fn take(&mut self, request_id: &str) -> Option<Result<ResponseBody, ResponseBodyError>> {
+        self.take_for_fetch(request_id)
+    }
+
+    pub fn fetch_access(&self, request_id: &str) -> Option<Result<FetchAccess, ResponseBodyError>> {
+        let Some(entry) = self.entries.get(request_id) else {
+            return self.failure.clone().map(Err);
         };
-        if let Ok(body) = &result { *entry = Entry::Taken { len: body.len() }; }
-        Some(result)
+        Some(match &*entry.lock().unwrap_or_else(|e| e.into_inner()) {
+            Entry::Ready { fetch_access, .. } => Ok(*fetch_access),
+        })
+    }
+
+    pub fn is_fetch_streamed(&self, request_id: &str) -> Option<Result<bool, ResponseBodyError>> {
+        self.fetch_access(request_id).map(|access| {
+            access.map(|access| access == FetchAccess::Streamed)
+        })
     }
 
     pub fn alias(&mut self, from: &str, to: &str) -> Result<(), ResponseBodyError> {
@@ -312,16 +342,20 @@ mod tests {
     }
 
     #[test]
-    fn response_body_take_alias_is_once_and_stream_owns_spool() {
+    fn response_body_fetch_stream_alias_is_once_but_canonical_reads_remain() {
         let mut store = ResponseBodyStore::new(ResponseBodyLimits { memory_threshold: 0, entries: 1, ..limits() });
         store.insert("request".into(), b"stream", false).unwrap();
         store.alias("request", "loader").unwrap();
         assert_eq!(store.total_bytes, 6);
         assert_eq!(store.entry_count, 1);
-        let body = store.take("loader").unwrap().unwrap();
+        let body = store.take_for_fetch("loader").unwrap().unwrap();
         let path = spool_path(&body);
-        assert!(matches!(store.take("request"), Some(Err(ResponseBodyError::Consumed))));
-        assert!(matches!(store.get("loader"), Some(Err(ResponseBodyError::Consumed))));
+        assert_eq!(store.fetch_access("request").unwrap().unwrap(), FetchAccess::Streamed);
+        assert!(store.is_fetch_streamed("loader").unwrap().unwrap());
+        assert!(matches!(store.take_for_fetch("request"), Some(Err(ResponseBodyError::AccessConflict))));
+        assert!(matches!(store.get_for_fetch("loader"), Some(Err(ResponseBodyError::AccessConflict))));
+        assert_eq!(store.get("request").unwrap().unwrap().0.read(0, 99).unwrap(), b"stream");
+        assert_eq!(store.get("loader").unwrap().unwrap().0.read(0, 99).unwrap(), b"stream");
         store.clear();
         drop(store);
         assert!(path.exists());
@@ -342,8 +376,9 @@ mod tests {
         store.insert("loader".into(), b"new", false).unwrap();
         assert_eq!(store.entry_count, 1);
         assert_eq!(store.total_bytes, 3);
-        assert_eq!(store.take("request").unwrap().unwrap().read(0, 99).unwrap(), b"new");
-        assert!(matches!(store.get("loader"), Some(Err(ResponseBodyError::Consumed))));
+        assert_eq!(store.take_for_fetch("request").unwrap().unwrap().read(0, 99).unwrap(), b"new");
+        assert_eq!(store.get("loader").unwrap().unwrap().0.read(0, 99).unwrap(), b"new");
+        assert!(matches!(store.take_for_fetch("loader"), Some(Err(ResponseBodyError::AccessConflict))));
     }
 
     #[test]
@@ -355,7 +390,7 @@ mod tests {
             let error = store.insert("rejected".into(), b"x", false).unwrap_err();
             assert!(error.to_string().contains("response_body_budget_exhausted"));
             assert!(matches!(store.get("rejected"), Some(Err(ResponseBodyError::BudgetExceeded { .. }))));
-            assert!(matches!(store.take("rejected"), Some(Err(ResponseBodyError::BudgetExceeded { .. }))));
+            assert!(matches!(store.take_for_fetch("rejected"), Some(Err(ResponseBodyError::BudgetExceeded { .. }))));
             assert_eq!(store.get("first").unwrap().unwrap().0.read(0, 10).unwrap(), b"1234");
             for index in 0..1000 { assert!(store.insert(index.to_string(), b"", false).is_err()); }
             assert_eq!(store.entries.len(), 1, "failure metadata must not grow with requests");

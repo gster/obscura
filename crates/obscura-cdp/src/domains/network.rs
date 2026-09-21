@@ -334,6 +334,25 @@ pub(crate) fn response_body_owner(
     Err(error.unwrap_or_else(missing))
 }
 
+/// Fetch stream state is independent from ordinary Network body visibility.
+/// Keep this typed so lifecycle handling never mistakes a body-store budget or
+/// I/O error for a stream transfer.
+pub(crate) fn fetch_response_body_access(
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+    request_id: &str,
+) -> Result<obscura_net::response_body::FetchAccess, String> {
+    let (_, store) = response_body_owner(ctx, session_id, request_id)?;
+    let access = {
+        let store = store.lock().unwrap_or_else(|error| error.into_inner());
+        store
+            .fetch_access(request_id)
+            .ok_or_else(|| format!("No response body found for requestId {request_id}"))?
+            .map_err(|error| error.to_string())?
+    };
+    Ok(access)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

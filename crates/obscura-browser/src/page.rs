@@ -5465,16 +5465,16 @@ impl Page {
         self.take_response_body_result(request_id)?.ok()?.with_bytes(|bytes| bytes.to_vec()).ok()
     }
 
-    /// CDP transfers the backing storage instead of materializing its contents.
+    /// CDP opens an immutable backing view instead of materializing its contents.
     pub fn take_response_body_result(&mut self, request_id: &str) -> Option<Result<obscura_net::response_body::ResponseBody, String>> {
-        self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).take(request_id).map(|body| body.map_err(|error| error.to_string()))
+        self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).take_for_fetch(request_id).map(|body| body.map_err(|error| error.to_string()))
     }
 
     pub fn response_body_store(&self) -> Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>> {
         self.response_bodies.clone()
     }
 
-    /// Navigation's loaderId and internal request ID share storage and take state.
+    /// Navigation's loaderId and internal request ID share storage and Fetch access state.
     pub fn alias_response_body(&mut self, from_id: &str, to_id: &str) {
         let _ = self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).alias(from_id, to_id);
     }

@@ -323,6 +323,12 @@ pub async fn handle(
                 ctx.disable_network_session(session_id);
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
+                    if !ctx.sessions.values().any(|owner| owner == &page_id) {
+                        // Chromium keeps target IO streams while sibling
+                        // sessions remain, then discards them with the last
+                        // target session.
+                        ctx.io_streams.remove_fetch_for_page(&page_id);
+                    }
                 }
                 #[cfg(feature = "render")]
                 ctx.screencasts.remove(session_id);
@@ -628,8 +634,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detaching_explicit_session_removes_its_page_and_network_routes_only() {
+    async fn detach_preserves_target_stream_for_sibling_and_last_detach_reclaims_it() {
         let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        ctx.io_streams = crate::domains::io::IoStreamStore::with_limits(1, 6);
         let page_id = ctx.create_page();
         let parent_session = Some("browser-session".to_string());
         let attached = handle(
@@ -660,6 +667,11 @@ mod tests {
             (page_id.clone(), "request-id".into()),
             vec![session_id.clone(), sibling.clone()],
         );
+        let stream = ctx.io_streams
+            .reserve_fetch(6, Some(session_id.clone()), page_id.clone())
+            .unwrap()
+            .commit(b"stream".to_vec().into())
+            .unwrap();
 
         handle(
             "detachFromTarget",
@@ -680,6 +692,12 @@ mod tests {
         assert!(ctx.network_enabled_sessions.contains(&sibling));
         assert!(ctx.network_agent_limits.contains_key(&sibling));
         assert!(ctx.network_body_sessions[&sibling].contains("body-id"));
+        crate::domains::io::handle(
+            "read",
+            &json!({"handle": stream, "size": 0}),
+            &mut ctx,
+            &Some(sibling.clone()),
+        ).await.expect("a sibling session on the same target owns the IO context");
 
         let replacement = handle(
             "attachToTarget",
@@ -690,11 +708,40 @@ mod tests {
         assert!(!ctx.network_enabled_sessions.contains(&replacement));
         assert!(!ctx.network_agent_limits.contains_key(&replacement));
         assert!(!ctx.network_body_sessions.contains_key(&replacement));
+
+        handle(
+            "detachFromTarget",
+            &json!({"sessionId": sibling}),
+            &mut ctx,
+            &parent_session,
+        ).await.unwrap();
+        assert!(crate::domains::io::handle(
+            "read",
+            &json!({"handle": stream, "size": 0}),
+            &mut ctx,
+            &Some(replacement.clone()),
+        ).await.is_ok(), "the stream remains while one target session is live");
+        handle(
+            "detachFromTarget",
+            &json!({"sessionId": replacement.clone()}),
+            &mut ctx,
+            &parent_session,
+        ).await.unwrap();
+        assert!(crate::domains::io::handle(
+            "read",
+            &json!({"handle": stream}),
+            &mut ctx,
+            &Some(replacement),
+        ).await.is_err(), "the last target detach releases its IO streams");
+        assert!(ctx.io_streams
+            .reserve_fetch(6, None, page_id)
+            .is_ok(), "last detach must release entry and byte capacity, not only revoke the session");
     }
 
     #[tokio::test]
     async fn closing_target_detaches_every_actual_page_session() {
         let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        ctx.io_streams = crate::domains::io::IoStreamStore::with_limits(1, 4);
         let page_id = ctx.create_page();
         let parent_session = Some("browser-session".to_string());
         let first = handle(
@@ -710,6 +757,11 @@ mod tests {
             &parent_session,
         ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
         ctx.pending_events.clear();
+        let stream = ctx.io_streams
+            .reserve_fetch(4, Some(first.clone()), page_id.clone())
+            .unwrap()
+            .commit(b"body".to_vec().into())
+            .unwrap();
 
         handle(
             "closeTarget",
@@ -725,6 +777,15 @@ mod tests {
         assert_eq!(detached, vec![first.as_str(), second.as_str()]);
         let fabricated = format!("{page_id}-session");
         assert!(!detached.contains(&fabricated.as_str()));
+        assert!(crate::domains::io::handle(
+            "read",
+            &json!({"handle": stream}),
+            &mut ctx,
+            &Some(first),
+        ).await.is_err(), "closing the target releases its IO streams");
+        assert!(ctx.io_streams
+            .reserve_fetch(4, None, "replacement-page".to_string())
+            .is_ok(), "target close must release entry and byte capacity, not only revoke sessions");
     }
 
     #[tokio::test]

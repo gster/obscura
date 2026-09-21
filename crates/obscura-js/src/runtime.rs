@@ -2542,7 +2542,7 @@ impl ObscuraJsRuntime {
     }
 
     pub fn take_network_response_body_result(&self, request_id: &str) -> Option<Result<obscura_net::response_body::ResponseBody, obscura_net::response_body::ResponseBodyError>> {
-        self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).take(request_id)
+        self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).take_for_fetch(request_id)
     }
 
     /// Install the owner store and Page-lifetime capture/interception ID
@@ -8475,8 +8475,8 @@ mod tests {
         let binary_id = &events[1].request_id;
         rt.state.borrow().network_response_bodies.lock().unwrap().alias(binary_id, "stream-alias").unwrap();
         let stream = rt.take_network_response_body_result("stream-alias").unwrap().unwrap();
-        assert!(matches!(rt.get_network_response_body_result(binary_id),
-            Some(Err(obscura_net::response_body::ResponseBodyError::Consumed))));
+        let (canonical, _) = rt.get_network_response_body_result(binary_id).unwrap().unwrap();
+        assert_eq!(canonical.read(0, usize::MAX).unwrap(), binary);
         rt.clear_network_response_bodies();
         assert!(rt.get_network_response_body_result(binary_id).is_none());
         drop(rt);
@@ -8552,8 +8552,8 @@ mod tests {
         let (alias, _) = rt.get_network_response_body_result(&pause_id).unwrap().unwrap();
         assert_eq!(alias.with_bytes(|body| body.to_vec()).unwrap(), bytes);
         rt.take_network_response_body_result(&pause_id).unwrap().unwrap();
-        assert!(matches!(rt.get_network_response_body_result(&event.request_id),
-            Some(Err(obscura_net::response_body::ResponseBodyError::Consumed))));
+        let (canonical, _) = rt.get_network_response_body_result(&event.request_id).unwrap().unwrap();
+        assert_eq!(canonical.with_bytes(|body| body.to_vec()).unwrap(), bytes);
     }
 
     #[tokio::test(flavor = "current_thread")]

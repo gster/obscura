@@ -1969,10 +1969,12 @@ fn handle_fetch_resolution(
                     .filter(|(sid, _)| owner.as_ref() == Some(sid)).cloned().collect();
                 for key in keys {
                     if let Some(pause) = intercepted_paused.remove(&key) {
-                        let body_taken = crate::domains::network::response_body_owner(ctx, &key.0, &key.1)
-                            .err().is_some_and(|error| error.contains("response_body_already_consumed")
-                                || error.contains("response_body_access_conflict"));
-                        let resolution = if body_taken {
+                        let body_streamed = crate::domains::network::fetch_response_body_access(
+                            ctx, &key.0, &key.1,
+                        ).is_ok_and(|access| {
+                            access == obscura_net::response_body::FetchAccess::Streamed
+                        });
+                        let resolution = if body_streamed {
                             obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() }
                         } else if pause.stage == obscura_js::ops::InterceptionStage::Response {
                             obscura_js::ops::InterceptResolution::ContinueResponse { status: None, status_text: None, headers: None, raw_headers: None }
@@ -2058,9 +2060,11 @@ fn handle_fetch_resolution(
         if matches!(method, "Fetch.continueRequest" | "Fetch.continueResponse")
             && intercepted_paused.get(&key).is_some_and(|pause| pause.stage == obscura_js::ops::InterceptionStage::Response)
         {
-            if crate::domains::network::response_body_owner(ctx, &req.session_id, request_id)
-                .err().is_some_and(|error| error.contains("response_body_already_consumed")
-                    || error.contains("response_body_access_conflict"))
+            if crate::domains::network::fetch_response_body_access(
+                ctx, &req.session_id, request_id,
+            ).is_ok_and(|access| {
+                access == obscura_net::response_body::FetchAccess::Streamed
+            })
             {
                 let response = CdpResponse::error(req.id, -32000,
                     "response body was taken as a stream; only failRequest or fulfillRequest may resolve this pause".into(), req.session_id);
