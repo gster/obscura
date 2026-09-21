@@ -5,38 +5,36 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`b2dc8b7a1d400b0093f806b3be201ac99e460665`，`Secure CDP control-plane admission`。
+- 最近完成的实现提交：`30f19d394be554934d35cddcc4685eaa46028aa1`，`Cancel V8 work on CDP disconnect`。
 - 写入本交接前，该提交已在 `origin/main` 和本地主仓库 `main` 上对齐，相关工作树保持干净。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 相关实现入口：[`access.rs`](../crates/obscura-cdp/src/access.rs)、[`server.rs`](../crates/obscura-cdp/src/server.rs)、[`main.rs`](../crates/obscura-cli/src/main.rs)、[`cdp_access_smoke.py`](../tools/unblocked/cdp_access_smoke.py) 和 [Native execution](Native-execution.md)。
+- 相关实现入口：[`execution_cancellation.rs`](../crates/obscura-js/src/execution_cancellation.rs)、[`runtime.rs`](../crates/obscura-js/src/runtime.rs)、[`worker.rs`](../crates/obscura-js/src/worker.rs)、[`page.rs`](../crates/obscura-browser/src/page.rs)、[`server.rs`](../crates/obscura-cdp/src/server.rs) 和 [`disconnect_cancels_v8.rs`](../crates/obscura-cdp/tests/disconnect_cancels_v8.rs)。
 
 ## 最近完成的阶段
 
-CDP discovery 与 WebSocket upgrade 现在在 handoff、live connection slot 和 V8 前经过同一套 byte-level admission。HTTP 路由、Host authority、可选 Origin 与 Bearer 都按精确值处理；query 和 substring lookalike 不再落入其他处理路径，显式无效端口不会退化成无端口 Host。官方 Playwright 1.60 所需的 `/json/version/` 作为单独精确兼容路由保留。
+CDP WebSocket I/O 已与 connection-local processor/V8 分离：I/O 留在 server runtime，V8 继续固定在专用 OS thread 的 current-thread runtime/LocalSet。同步脚本占满 V8 线程时，socket reader 仍能独立观测 Close、EOF/FIN、RST、writer failure 与 server shutdown，并通过 thread-safe isolate handle 终止当前执行。
 
-loopback 默认只允许实际监听端口的本机 authority，并兼容无 Origin、无 token 的 native client。配置 `OBSCURA_CDP_TOKEN` 或 `--auth-token-file` 后，默认无子命令、单 worker、多 worker balancer 与 direct worker 都要求同一 Bearer。non-loopback 默认还要求显式 Host allowlist；只有 `--allow-unauthenticated-remote` 才把鉴权责任明确交给外层边界。discovery 对外 ws/wss URL 与请求 Host 校验分开配置。
+每个连接拥有 sticky `ExecutionCancellation`。Page 当前 runtime、导航后新 runtime、共享 parent runtime 的 iframe 和 Dedicated Worker runtime 都附着同一 cancellation source；runtime 每次进入或 poll V8 时登记 active slot，退出后解除，termination clear 后若连接已经关闭则立即重新终止。弱引用登记会回收已销毁 runtime，避免长连接反复导航导致注册表无界增长。watchdog 的 armed guard 在 drop 时移除自己的 generation，避免取消调用后留下延迟误杀。
 
-访问策略只控制 CDP 入口，不改写或脱敏授权连接中的 page/CDP 原始数据，也不参与出站 SSRF。采集 smoke 为每次 readiness 尝试保留独立 request、已收到的 response bytes 和完整错误；异常或重试不覆盖前一份证据。inbound、pending events 与 outbound 的既有三个逻辑 payload 预算继续有效，但它们和本次 admission 都不是总连接内存或 RSS 上限；同步 V8 中立即断连等边界仍未完成。
+断连后 processor 最多获得 1 秒清理 Fetch pause/page，随后 abort 异步 navigation/network wait；I/O handler 自身被取消时也会中止 processor 和 detached writer。断连不是事务回滚：终止前已经发生的 DOM、Cookie 或网络副作用可以保留；关闭连接的 queued/deferred 命令不重放。客户端仅取消本地 asyncio wait 而不关闭 wire 时不是服务端断连；FIN/RST 尚未到达 reader 前也不宣称已经终止。直接 iframe/Worker wire-level 组合尚未分别取得端到端资格。
 
 ## 验证结果
 
-- focused release/render nextest：15/15，run `0888f887-84be-458f-91d9-3104047534d1`。
-- full release/render nextest：2214/2214，4 skipped，run `ed34dab5-c3a5-42a8-b53e-07706d8cc777`。
-- no-render access 定向：15/15，run `f399723d-7903-4037-9471-078edd93e070`。
-- render build：SHA-256 `6872b9d8e2e550ae03805695fdfa8df11814f1dc6eee470821a6aceb57d73afc`，119418656 bytes。
-- no-render build：SHA-256 `11aad4b682be83d7a68fef1d50aceac5bb94c263fbdbe92107e270fa4aeff457`，77529584 bytes；随后恢复 exact render build，并核对到相同的冻结 hash。
+- CDP focused release/render nextest：9/9；覆盖 infinite evaluate、inline infinite navigation、stalled transport navigation、slot recovery、writer cancellation 和既有 admission/并发回归。
+- obscura-js focused release/render nextest：3/3；覆盖 sticky termination、dead runtime slot 回收和 watchdog guard drop。
+- full release/render nextest 首轮为 2220/2221，唯一失败 `obscura-cli::mcp_client test_wait_for_selector`；未改源码单项复跑 1/1，通过后完整复跑为 2221/2221，4 skipped。现有证据不足以把首轮失败归因于本次改动，不宣称已修复其根因。
+- render 和 no-default-features 两种 exact CLI release build 均成功；最终恢复 exact render build，SHA-256 `7a788c29747423e9c67a58db25abd8d9bb0b9714cedb059ed01afad114c4fb9c`，119546448 bytes。
 - benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`：在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33，包括 `observer-intersection`。
-- 官方 Playwright Python 1.60.0 的默认入口、鉴权单 worker、多 worker/direct worker smoke，以及默认 loopback automation smoke 全部通过。
-- manifests 有效，Python 工具测试 52/52。
-- Standards 与 Spec 复核无遗留 finding；Astra light 首审的三项 blocker 全部修复，最终复审为 0 blocker。
+- `cargo check -p obscura-cdp --features render` 和 `git diff --check` 通过。
+- Astra light 首审指出 processor teardown、connection handler 取消时 writer 泄漏、runtime registry churn 三项 major；修复后复审确认全部关闭，无新增 blocker、major 或 minor finding。
 
 ## 后续执行顺序
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 继续补齐任意同步 V8 执行的 disconnect/cancellation matrix；现有 V8 watchdog 仍是最终保护。
+1. 为 iframe 与 Dedicated Worker 的同步 V8 断连补直接 wire-level 回归，并根据实际客户端行为补原始 FIN/RST 资格；不要从共享实现静态外推完整矩阵。
 2. 继续处理 [TODO](TODO.md) 中 OB-021 剩余的 input qualification 和 observation ownership 项目。
-3. 继续区分 admission、已授权命令 ownership 和 TCP/kernel/container 总资源边界，不把本切片扩大成完整授权或 RSS 证明。
+3. 继续区分 admission、已授权命令 ownership 和 TCP/kernel/container 总资源边界，不把本切片扩大成完整授权、事务回滚或 RSS 证明。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
