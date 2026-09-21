@@ -129,8 +129,92 @@ async fn client() -> (Client, tokio::task::JoinHandle<()>) {
 async fn page(client: &mut Client, base: &str) -> (String, String) {
     let target = client.ok(None, "Target.createTarget", json!({"url":format!("{base}/")})).await["targetId"].as_str().unwrap().to_string();
     let session = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+    client.ok(Some(&session), "Network.enable", json!({})).await;
     client.ok(Some(&session), "Fetch.enable", json!({})).await;
     (target, session)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_subscriptions_fan_out_independently_from_fetch_ownership() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (base, fixture_task, _) = fixture_with_requests().await;
+        let (mut client, processor) = client().await;
+        let target = client.ok(None, "Target.createTarget", json!({"url":format!("{base}/")})).await["targetId"].as_str().unwrap().to_string();
+        let fetch_owner = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        let observer = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        client.ok(Some(&fetch_owner), "Fetch.enable", json!({})).await;
+        client.ok(Some(&observer), "Network.enable", json!({})).await;
+
+        client.start_fetch(&fetch_owner, &format!("{base}/observer-only"), false).await;
+        let first_pause = client.pause(&fetch_owner).await;
+        let first_network = first_pause["params"]["networkId"].as_str().unwrap().to_string();
+        let starts = client.events.iter().filter(|event|
+            event["method"] == "Network.requestWillBeSent"
+                && event["params"]["requestId"] == first_network
+        ).collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1, "Fetch ownership must not imply Network subscription: {starts:?}");
+        assert_eq!(starts[0]["sessionId"], observer);
+        assert_eq!(starts[0]["params"]["request"]["headers"]["Authorization"], "Bearer complete-secret");
+        client.ok(Some(&fetch_owner), "Fetch.continueRequest", json!({"requestId":first_pause["params"]["requestId"]})).await;
+        assert_eq!(client.result(&fetch_owner).await, "/observer-only");
+        while !client.events.iter().any(|event|
+            event["method"] == "Network.loadingFinished"
+                && event["params"]["requestId"] == first_network
+        ) {
+            let event = client.recv().await;
+            client.events.push(event);
+        }
+        let response = client.events.iter().find(|event|
+            event["method"] == "Network.responseReceived"
+                && event["params"]["requestId"] == first_network
+        ).unwrap();
+        assert_eq!(response["sessionId"], observer);
+        assert_eq!(response["params"]["response"]["rawHeaders"]["encoding"], "base64");
+        assert_eq!(client.ok(Some(&observer), "Network.getResponseBody", json!({"requestId":first_network})).await["body"], "/observer-only");
+        assert!(client.command(Some(&fetch_owner), "Network.getResponseBody", json!({"requestId":first_network})).await.get("error").is_some());
+
+        client.ok(Some(&fetch_owner), "Network.enable", json!({})).await;
+        client.start_fetch(&fetch_owner, &format!("{base}/both"), false).await;
+        let both_pause = client.pause(&fetch_owner).await;
+        let both_network = both_pause["params"]["networkId"].as_str().unwrap().to_string();
+        let mut both_sessions = client.events.iter().filter(|event|
+            event["method"] == "Network.requestWillBeSent"
+                && event["params"]["requestId"] == both_network
+        ).map(|event| event["sessionId"].as_str().unwrap()).collect::<Vec<_>>();
+        both_sessions.sort_unstable();
+        let mut expected = vec![fetch_owner.as_str(), observer.as_str()];
+        expected.sort_unstable();
+        assert_eq!(both_sessions, expected);
+        client.ok(Some(&fetch_owner), "Fetch.continueRequest", json!({"requestId":both_pause["params"]["requestId"]})).await;
+        assert_eq!(client.result(&fetch_owner).await, "/both");
+        while client.events.iter().filter(|event|
+            event["method"] == "Network.loadingFinished"
+                && event["params"]["requestId"] == both_network
+        ).count() < 2 {
+            let event = client.recv().await;
+            client.events.push(event);
+        }
+        assert_eq!(client.ok(Some(&fetch_owner), "Network.getResponseBody", json!({"requestId":both_network})).await["body"], "/both");
+        assert_eq!(client.ok(Some(&observer), "Network.getResponseBody", json!({"requestId":both_network})).await["body"], "/both");
+
+        client.ok(Some(&fetch_owner), "Network.disable", json!({})).await;
+        assert!(client.command(Some(&fetch_owner), "Network.getResponseBody", json!({"requestId":both_network})).await.get("error").is_some());
+        assert_eq!(client.ok(Some(&observer), "Network.getResponseBody", json!({"requestId":both_network})).await["body"], "/both");
+        client.start_fetch(&fetch_owner, &format!("{base}/fetch-survives-network-disable"), false).await;
+        let final_pause = client.pause(&fetch_owner).await;
+        let final_network = final_pause["params"]["networkId"].as_str().unwrap().to_string();
+        let final_starts = client.events.iter().filter(|event|
+            event["method"] == "Network.requestWillBeSent"
+                && event["params"]["requestId"] == final_network
+        ).collect::<Vec<_>>();
+        assert_eq!(final_starts.len(), 1);
+        assert_eq!(final_starts[0]["sessionId"], observer);
+        client.ok(Some(&fetch_owner), "Fetch.failRequest", json!({"requestId":final_pause["params"]["requestId"],"errorReason":"BlockedByClient"})).await;
+
+        drop(client);
+        processor.await.unwrap();
+        fixture_task.abort();
+    }).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -140,6 +224,7 @@ async fn response_stage_pause_exposes_complete_body_and_enforces_stage_lifecycle
         let (mut client, processor) = client().await;
         let target = client.ok(None, "Target.createTarget", json!({"url":format!("{base}/")})).await["targetId"].as_str().unwrap().to_string();
         let session = client.ok(None, "Target.attachToTarget", json!({"targetId":target,"flatten":true})).await["sessionId"].as_str().unwrap().to_string();
+        client.ok(Some(&session), "Network.enable", json!({})).await;
         assert!(client.command(Some(&session), "Fetch.enable", json!({"handleAuthRequests":true})).await["error"]["message"]
             .as_str().unwrap().contains("not supported"));
         assert!(client.command(Some(&session), "Fetch.enable", json!({"handleAuthRequests":"false"})).await["error"]["message"]
@@ -397,10 +482,10 @@ async fn active_multi_page_fetch_pauses_keep_session_ownership_and_body_aliases(
                 assert!(client.command(None, "Network.getResponseBody", json!({"requestId":id})).await.get("error").is_some());
                 client.ok(Some(&right), "Fetch.fulfillRequest", json!({"requestId":id,"responseCode":200,"body":"cmlnaHQtc2VjcmV0"})).await;
                 assert_eq!(client.result(&right).await, "right-secret");
-                for method in ["Network.getResponseBody", "Fetch.getResponseBody"] {
-                    assert_eq!(client.ok(Some(&right), method, json!({"requestId":id})).await["body"], "right-secret");
-                    assert!(client.command(None, method, json!({"requestId":id})).await.get("error").is_some());
-                }
+                assert!(client.command(Some(&right), "Network.getResponseBody", json!({"requestId":id})).await.get("error").is_some(),
+                    "Fetch interception IDs are not Network request IDs");
+                assert_eq!(client.ok(Some(&right), "Fetch.getResponseBody", json!({"requestId":id})).await["body"], "right-secret");
+                assert!(client.command(None, "Fetch.getResponseBody", json!({"requestId":id})).await.get("error").is_some());
                 assert!(client.command(Some(&left), "Fetch.takeResponseBodyAsStream", json!({"requestId":id})).await["error"]["message"]
                     .as_str().unwrap().contains("response_body_access_conflict"));
                 assert_eq!(client.ok(Some(&right), "Fetch.getResponseBody", json!({"requestId":id})).await["body"], "right-secret");
@@ -678,13 +763,13 @@ fn closed_reply_channel_aborts_instead_of_registering_a_pause() {
         response_headers: None, response_raw_headers: None, response_body_request_id: None, resolver,
     };
     let mut paused = InterceptedPauses::new();
-    emit_intercepted_request(request, "frame", "loader", "https://example.test/", Some("session".into()), &reply_tx, &mut paused);
+    emit_intercepted_request(request, "frame", "loader", "https://example.test/", Some("session".into()), &[], &reply_tx, &mut paused);
     assert!(paused.is_empty());
     assert!(matches!(resolved.try_recv(), Ok(obscura_js::ops::InterceptResolution::Fail { reason }) if reason == "Aborted"));
 }
 
 #[test]
-fn closed_routed_pause_does_not_restore_a_retired_network_owner() {
+fn closed_routed_pause_does_not_create_a_network_start_observer() {
     let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
     let page_id = ctx.create_page();
     let session = Some("closed-route-session".to_string());
@@ -710,7 +795,7 @@ fn closed_routed_pause_does_not_restore_a_retired_network_owner() {
     let mut paused = InterceptedPauses::new();
     emit_routed_intercepted_request(routed, &mut ctx, &reply_tx, &mut paused);
     assert!(paused.is_empty());
-    assert!(ctx.network_owners.is_empty());
+    assert!(ctx.network_request_sessions.is_empty());
     assert!(replies.try_recv().is_err());
 }
 

@@ -339,6 +339,20 @@ mod tests {
         rx
     }
 
+    fn grant_network_body_access(ctx: &mut CdpContext, session: &Option<String>, ids: &[&str]) {
+        let session = session.as_ref().expect("test Network access needs a session");
+        ctx.network_enabled_sessions.insert(session.clone());
+        ctx.network_body_sessions.entry(session.clone()).or_default()
+            .extend(ids.iter().map(|id| (*id).to_string()));
+    }
+
+    fn grant_network_body_failure(ctx: &mut CdpContext, session: &Option<String>) {
+        let session = session.as_ref().expect("test Network access needs a session");
+        ctx.network_enabled_sessions.insert(session.clone());
+        ctx.network_body_sessions.entry(session.clone()).or_default();
+        ctx.network_body_failure_sessions.insert(session.clone());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fulfilled_js_bodies_reach_network_and_fetch_without_transport_capture() {
         use base64::Engine as _;
@@ -406,6 +420,9 @@ mod tests {
         assert_eq!(failure.status, 0);
         assert_eq!(failure.error.as_deref(), Some("Failed"));
         assert!(ctx.get_page(&page_id).unwrap().get_response_body_result(&failure.request_id).is_none());
+        let mut visible_ids = events.iter().map(|event| event.request_id.as_str()).collect::<Vec<_>>();
+        visible_ids.extend(pause_ids.iter().map(String::as_str));
+        grant_network_body_access(&mut ctx, &session, &visible_ids);
         for (index, (event, bytes)) in events.iter().zip(&bodies).enumerate() {
             assert_eq!(event.status, if index == 4 { 302 } else { 201 });
             assert_eq!(event.method, if index == 0 { "POST" } else { "GET" });
@@ -466,6 +483,7 @@ mod tests {
         let (other_result, other_pause_id) = tokio::join!(other.evaluate_for_cdp("fetch('https://synthetic.test/other').then(r=>r.text())", true, true), respond);
         assert_eq!(other_result.value, Some(json!("other-page")));
         assert_eq!(other_pause_id, pause_ids[0], "fixture exercises identical IDs in separate Page stores");
+        grant_network_body_access(&mut ctx, &other_session, &[&other_pause_id]);
         let body = handle("getResponseBody", &json!({"requestId": other_pause_id}), &mut ctx, &other_session).await.unwrap();
         assert_eq!(body["body"], "other-page");
         assert!(handle("getResponseBody", &json!({"requestId": other_pause_id}), &mut ctx, &session).await.unwrap_err().contains("response_body_already_consumed"));
@@ -481,6 +499,7 @@ mod tests {
         let (result, rebuilt_pause_id) = tokio::join!(page.evaluate_for_cdp("fetch('https://synthetic.test/rebuilt').then(r=>r.text())", true, true), respond);
         assert_eq!(result.value, Some(json!("after-navigation")));
         assert_ne!(rebuilt_pause_id, pause_ids[0], "pause IDs must not collide with retained aliases after navigation");
+        grant_network_body_access(&mut ctx, &session, &[&rebuilt_pause_id]);
         let body = handle("getResponseBody", &json!({"requestId": rebuilt_pause_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(body["body"], "after-navigation");
         assert!(handle("getResponseBody", &json!({"requestId": pause_ids[0]}), &mut ctx, &session).await.unwrap_err().contains("response_body_already_consumed"));
@@ -501,6 +520,7 @@ mod tests {
         assert_eq!(result.value, Some(json!("uncaptured")));
         page.sync_js_network_events();
         let id = page.network_events.pop().unwrap().request_id;
+        grant_network_body_failure(&mut ctx, &session);
         let error = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("response_body_budget_exhausted"), "{error}");
         let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
@@ -567,6 +587,11 @@ mod tests {
         page.sync_js_network_events();
         let events: Vec<_> = page.network_events.drain(..).collect();
         assert_eq!(events.len(), 3);
+        grant_network_body_access(
+            &mut ctx,
+            &session,
+            &events.iter().map(|event| event.request_id.as_str()).collect::<Vec<_>>(),
+        );
         for (event, bytes) in events.iter().zip([&text, &binary, &module]) {
             assert_eq!(event.body_size, bytes.len());
             let value = super::super::network::handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
@@ -578,6 +603,7 @@ mod tests {
         assert_eq!(events[2].resource_type, "Script");
         let request_id = &events[1].request_id;
         ctx.get_page_mut(&page_id).unwrap().alias_response_body(request_id, "js-alias");
+        grant_network_body_access(&mut ctx, &session, &[request_id, "js-alias"]);
         let result = handle("takeResponseBodyAsStream", &json!({"requestId": "js-alias"}), &mut ctx, &session).await.unwrap();
         let stream = result["stream"].as_str().unwrap();
         let error = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
@@ -590,6 +616,7 @@ mod tests {
         assert_eq!(result.value, Some(json!("denied")));
         page.sync_js_network_events();
         let rejected = page.network_events.last().unwrap().request_id.clone();
+        grant_network_body_failure(&mut ctx, &session);
         let error = super::super::network::handle("getResponseBody", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("response_body_budget_exhausted"), "{error}");
         let error = handle("getResponseBody", &json!({"requestId": rejected}), &mut ctx, &session).await.unwrap_err();
@@ -622,6 +649,7 @@ mod tests {
         page.navigate(&url).await.unwrap();
         let request_id = page.network_events.last().unwrap().request_id.clone();
         page.alias_response_body(&request_id, "loader");
+        grant_network_body_access(&mut ctx, &session, &[&request_id, "loader"]);
         for id in [&request_id, "loader"] {
             let body = super::super::network::handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap();
             assert_eq!(body["base64Encoded"], true);
@@ -659,6 +687,7 @@ mod tests {
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/plain,retained").await.unwrap();
         let request_id = page.network_events.last().unwrap().request_id.clone();
+        grant_network_body_access(&mut ctx, &session, &[&request_id]);
         ctx.io_streams.set_handle_counter(u64::MAX);
         let error = handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("handle space exhausted"), "{error}");
@@ -679,6 +708,7 @@ mod tests {
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/plain,hello").await.unwrap();
         let request_id = page.network_events.last().unwrap().request_id.clone();
+        grant_network_body_access(&mut ctx, &session, &[&request_id]);
         let error = handle("takeResponseBodyAsStream", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap_err();
         assert!(error.contains("io_stream_budget_exhausted"));
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
@@ -728,6 +758,7 @@ mod tests {
             page.navigate(&format!("data:text/plain,{text}")).await.unwrap();
             let request_id = page.network_events.last().unwrap().request_id.clone();
             page.alias_response_body(&request_id, "shared-id");
+            grant_network_body_access(&mut ctx, &session, &[&request_id, "shared-id"]);
             sessions.push(session);
             ids.push(request_id);
         }

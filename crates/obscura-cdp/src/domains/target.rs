@@ -320,6 +320,7 @@ pub async fn handle(
                 let page_id = ctx.sessions.get(session_id).cloned();
                 ctx.sessions.remove(session_id);
                 ctx.runtime_enabled_sessions.remove(session_id);
+                ctx.disable_network_session(session_id);
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
                 }
@@ -627,7 +628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detaching_explicit_session_removes_its_page_route() {
+    async fn detaching_explicit_session_removes_its_page_and_network_routes_only() {
         let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let parent_session = Some("browser-session".to_string());
@@ -640,6 +641,25 @@ mod tests {
         .await
         .unwrap();
         let session_id = attached["sessionId"].as_str().unwrap().to_string();
+        let sibling = handle(
+            "attachToTarget",
+            &json!({"targetId": page_id, "flatten": true}),
+            &mut ctx,
+            &parent_session,
+        ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        for session in [&session_id, &sibling] {
+            crate::domains::network::handle(
+                "enable",
+                &json!({}),
+                &mut ctx,
+                &Some(session.clone()),
+            ).await.unwrap();
+            ctx.network_body_sessions.get_mut(session).unwrap().insert("body-id".into());
+        }
+        ctx.network_request_sessions.insert(
+            (page_id.clone(), "request-id".into()),
+            vec![session_id.clone(), sibling.clone()],
+        );
 
         handle(
             "detachFromTarget",
@@ -650,6 +670,23 @@ mod tests {
         .await
         .expect("detach should succeed");
         assert!(!ctx.sessions.contains_key(&session_id));
+        assert!(!ctx.network_enabled_sessions.contains(&session_id));
+        assert!(!ctx.network_body_sessions.contains_key(&session_id));
+        assert_eq!(
+            ctx.network_request_sessions[&(page_id.clone(), "request-id".into())],
+            vec![sibling.clone()]
+        );
+        assert!(ctx.network_enabled_sessions.contains(&sibling));
+        assert!(ctx.network_body_sessions[&sibling].contains("body-id"));
+
+        let replacement = handle(
+            "attachToTarget",
+            &json!({"targetId": page_id, "flatten": true}),
+            &mut ctx,
+            &parent_session,
+        ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        assert!(!ctx.network_enabled_sessions.contains(&replacement));
+        assert!(!ctx.network_body_sessions.contains_key(&replacement));
     }
 
     #[tokio::test]

@@ -64,7 +64,23 @@ pub struct CdpContext {
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
     pub document_loaders: HashMap<(String, u64), String>,
+    /// Legacy source-compatibility field. Network routing no longer reads or
+    /// writes this single-owner map; subscriptions are session-scoped below.
+    #[doc(hidden)]
     pub network_owners: HashMap<(String, String), Option<String>>,
+    /// Sessions that called Network.enable. Network observations are a
+    /// session-scoped subscription, independent of Fetch interception owner.
+    pub network_enabled_sessions: HashSet<String>,
+    /// Subscribers that saw a live request start. Later Network events fan out
+    /// to current subscribers, but only start observers gain body access.
+    pub(crate) network_request_sessions: HashMap<(String, String), Vec<String>>,
+    /// Response bodies visible to each Network agent. Chrome invalidates this
+    /// view on Network.disable without deleting a sibling session's cache.
+    pub(crate) network_body_sessions: HashMap<String, HashSet<String>>,
+    /// A page body store stops accepting entries after its first budget or I/O
+    /// failure. One capability bit per observing session preserves that exact
+    /// terminal error without retaining every later failed request ID.
+    pub(crate) network_body_failure_sessions: HashSet<String>,
     /// Pages whose initial navigation event sequence has been emitted. A page
     /// is created already loaded (about:blank), but Chrome emits that load's
     /// events when the client attaches; Page.enable emits them once per page
@@ -188,6 +204,10 @@ impl CdpContext {
             current_loader_ids: HashMap::new(),
             document_loaders: HashMap::new(),
             network_owners: HashMap::new(),
+            network_enabled_sessions: HashSet::new(),
+            network_request_sessions: HashMap::new(),
+            network_body_sessions: HashMap::new(),
+            network_body_failure_sessions: HashSet::new(),
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: crate::pending_events::PendingEvents::default(),
@@ -375,6 +395,7 @@ impl CdpContext {
         self.current_loader_ids.remove(id);
         self.document_loaders.retain(|(page_id, _), _| page_id != id);
         self.network_owners.retain(|(page_id, _), _| page_id != id);
+        self.network_request_sessions.retain(|(page_id, _), _| page_id != id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {
@@ -384,6 +405,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.disable_network_session(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -541,6 +563,84 @@ impl CdpContext {
         sessions
     }
 
+    pub(crate) fn network_sessions_for_page(&self, page_id: &str) -> Vec<String> {
+        let mut sessions = self.network_enabled_sessions.iter()
+            .filter(|session| self.sessions.get(*session).is_some_and(|owner| owner == page_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions
+    }
+
+    pub(crate) fn disable_network_session(&mut self, session_id: &str) {
+        self.network_enabled_sessions.remove(session_id);
+        self.network_body_sessions.remove(session_id);
+        self.network_body_failure_sessions.remove(session_id);
+        for sessions in self.network_request_sessions.values_mut() {
+            sessions.retain(|session| session != session_id);
+        }
+    }
+
+    pub(crate) fn remember_network_body(
+        &mut self,
+        page_id: &str,
+        sessions: &[String],
+        request_id: &str,
+    ) {
+        let store = self.get_page(page_id).map(|page| page.response_body_store())
+            .or_else(|| self.navigating_response_bodies.as_ref()
+                .filter(|(owner, _)| owner == page_id)
+                .map(|(_, store)| store.clone()));
+        let Some(store) = store else { return; };
+        let (retained, failed) = {
+            let store = store.lock().unwrap_or_else(|error| error.into_inner());
+            let retained = store.contains(request_id);
+            (retained, !retained && store.get(request_id).is_some())
+        };
+        if retained {
+            self.grant_network_body(page_id, sessions, request_id);
+        } else if failed {
+            for session in sessions {
+                if self.network_enabled_sessions.contains(session)
+                    && self.sessions.get(session).is_some_and(|owner| owner == page_id)
+                {
+                    self.network_body_failure_sessions.insert(session.clone());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn grant_network_body(
+        &mut self,
+        page_id: &str,
+        sessions: &[String],
+        request_id: &str,
+    ) {
+        for session in sessions {
+            if self.network_enabled_sessions.contains(session)
+                && self.sessions.get(session).is_some_and(|owner| owner == page_id)
+            {
+                self.network_body_sessions.entry(session.clone()).or_default()
+                    .insert(request_id.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn network_body_is_visible(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        retained: bool,
+    ) -> bool {
+        self.network_enabled_sessions.contains(session_id)
+            && if retained {
+                self.network_body_sessions.get(session_id)
+                    .is_some_and(|request_ids| request_ids.contains(request_id))
+            } else {
+                self.network_body_failure_sessions.contains(session_id)
+            }
+    }
+
     #[cfg(feature = "render")]
     pub(crate) fn next_screencast_session(&mut self) -> i64 {
         // Never wrap a delayed acknowledgement onto a replacement stream.
@@ -598,6 +698,10 @@ mod context_ownership_tests {
             let page_id = ctx.create_page();
             let session_id = format!("session-{cycle}");
             ctx.sessions.insert(session_id.clone(), page_id.clone());
+            ctx.network_enabled_sessions.insert(session_id.clone());
+            ctx.network_body_sessions.entry(session_id.clone()).or_default().insert("request".into());
+            ctx.network_body_failure_sessions.insert(session_id.clone());
+            ctx.network_request_sessions.insert((page_id.clone(), "request".into()), vec![session_id.clone()]);
             ctx.ensure_default_context(&page_id).unwrap();
             ctx.create_isolated_context(
                 &page_id,
@@ -613,8 +717,51 @@ mod context_ownership_tests {
             assert!(ctx.page_isolated_worlds.is_empty());
             assert!(ctx.valid_context_ids.is_empty());
             assert!(ctx.runtime_enabled_sessions.is_empty());
+            assert!(ctx.network_enabled_sessions.is_empty());
+            assert!(ctx.network_body_sessions.is_empty());
+            assert!(ctx.network_body_failure_sessions.is_empty());
+            assert!(ctx.network_request_sessions.is_empty());
             assert!(ctx.sessions.is_empty());
         }
+    }
+
+    #[test]
+    fn failed_body_store_uses_one_session_capability_instead_of_unbounded_ids() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let first = "network-first".to_string();
+        let late = "network-late".to_string();
+        for session in [&first, &late] {
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            ctx.network_enabled_sessions.insert(session.clone());
+            ctx.network_body_sessions.insert(session.clone(), Default::default());
+        }
+        ctx.get_page_mut(&page_id).unwrap().set_response_body_limits(
+            obscura_net::response_body::ResponseBodyLimits {
+                memory_threshold: 4,
+                total_bytes: 4,
+                entries: 1,
+            },
+        );
+        let store = ctx.get_page(&page_id).unwrap().response_body_store();
+        assert!(store.lock().unwrap().insert("old-body".into(), b"old", false).is_ok());
+        ctx.grant_network_body(&page_id, std::slice::from_ref(&first), "old-body");
+        assert!(store.lock().unwrap().insert("first-failed".into(), b"too-large", false).is_err());
+
+        for index in 0..4096 {
+            ctx.remember_network_body(&page_id, std::slice::from_ref(&late), &format!("failed-{index}"));
+        }
+        assert!(ctx.network_body_sessions[&late].is_empty());
+        assert_eq!(ctx.network_body_failure_sessions.len(), 1);
+        assert!(ctx.network_body_is_visible(&late, "any-failed-request", false));
+        assert!(!ctx.network_body_is_visible(&late, "old-body", true));
+        assert!(ctx.network_body_is_visible(&first, "old-body", true));
+
+        ctx.disable_network_session(&late);
+        assert!(ctx.network_body_failure_sessions.is_empty());
+        assert!(!ctx.network_body_is_visible(&late, "any-failed-request", false));
     }
 
     #[test]

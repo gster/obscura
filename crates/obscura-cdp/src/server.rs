@@ -1297,12 +1297,30 @@ fn emit_routed_intercepted_request(
         } else { loader_id };
         let loader_id = ctx.document_loaders.entry((routed.page_id.clone(), routed.request.document_generation)).or_insert(loader_id).clone();
         let document_url = routed.request.document_url.clone();
-        let owner_key = (routed.page_id, routed.request.network_id.clone());
-        let owner_session = routed.session_id.clone();
-        if emit_intercepted_request(routed.request, &routed.frame_id, &loader_id, &document_url,
-            routed.session_id, reply_tx, paused)
-        {
-            ctx.network_owners.insert(owner_key, owner_session);
+        let page_id = routed.page_id.clone();
+        let request_id = routed.request.network_id.clone();
+        let redirect_body_id = routed.request.redirect_response.as_ref()
+            .and_then(|exchange| exchange.body_request_id.clone());
+        let network_sessions = ctx.network_sessions_for_page(&page_id);
+        let previous_network_sessions = ctx.network_request_sessions
+            .get(&(page_id.clone(), request_id.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let (_, network_started) = emit_intercepted_request(
+            routed.request,
+            &routed.frame_id,
+            &loader_id,
+            &document_url,
+            routed.session_id,
+            &network_sessions,
+            reply_tx,
+            paused,
+        );
+        if network_started {
+            if let Some(body_id) = redirect_body_id {
+                ctx.remember_network_body(&page_id, &previous_network_sessions, &body_id);
+            }
+            ctx.network_request_sessions.insert((page_id, request_id), network_sessions);
         }
     } else {
         let _ = routed.request.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
@@ -1322,14 +1340,15 @@ fn emit_intercepted_request(
     loader_id: &str,
     document_url: &str,
     session_id: Option<String>,
+    network_sessions: &[String],
     reply_tx: &OutboundSender,
     intercepted_paused: &mut InterceptedPauses,
-) -> bool {
-    if intercepted.resolver.is_closed() { return false; }
+) -> (bool, bool) {
+    if intercepted.resolver.is_closed() { return (false, false); }
     let emit_request_start = match intercepted.stage {
         obscura_js::ops::InterceptionStage::Request => {
             if intercepted.network_start.compare_exchange(0, 1,
-                std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() { return false; }
+                std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() { return (false, false); }
             true
         }
         obscura_js::ops::InterceptionStage::Response => intercepted.network_start.compare_exchange(0, 1,
@@ -1355,8 +1374,6 @@ fn emit_intercepted_request(
         "referrerPolicy": "strict-origin-when-cross-origin",
     });
     let request_will_be_sent = json!({
-        "method": "Network.requestWillBeSent",
-        "params": {
             "requestId": intercepted.network_id,
             "loaderId": loader_id,
             "documentURL": document_url,
@@ -1372,12 +1389,19 @@ fn emit_intercepted_request(
             "initiator": {"type": "script"},
             "type": intercepted.resource_type,
             "frameId": frame_id,
-        },
-        "sessionId": session_id,
     });
-    if emit_request_start && reply_tx.send(request_will_be_sent.to_string()).is_err() {
-        let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
-        return false;
+    if emit_request_start {
+        for network_session in network_sessions {
+            let event = json!({
+                "method": "Network.requestWillBeSent",
+                "params": request_will_be_sent,
+                "sessionId": network_session,
+            });
+            if reply_tx.send(event.to_string()).is_err() {
+                let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
+                return (false, false);
+            }
+        }
     }
 
     let response_headers = intercepted.response_raw_headers.as_ref().map(|capture| capture.fields.iter()
@@ -1409,14 +1433,14 @@ fn emit_intercepted_request(
     });
     if reply_tx.send(request_paused.to_string()).is_err() {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
-        return false;
+        return (false, emit_request_start);
     }
     intercepted_paused.insert((session_id, intercepted.request_id), InterceptedPause {
         stage: intercepted.stage,
         redirect_response,
         resolver: intercepted.resolver,
     });
-    true
+    (true, emit_request_start)
 }
 
 async fn wait_network_teardown(notifiers: Vec<Arc<Notify>>) {
@@ -1459,22 +1483,15 @@ fn service_live_page_render_resources(ctx: &mut CdpContext) {
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    // Emit script-initiated network events for every live page, each attributed
-    // to its own session/frame — not just the first live page (#872).
+    // Drain script-initiated network events for every live page. The page
+    // emitter fans each fact out to every Network-enabled session rather than
+    // assigning it to one arbitrary HashMap entry.
     let live_ids: Vec<String> = ctx
         .pages
         .iter()
         .map(|page| page.id.clone())
         .collect();
     for page_id in live_ids {
-        let Some(session_id) = ctx
-            .sessions
-            .iter()
-            .find(|(_, pid)| *pid == &page_id)
-            .map(|(session_id, _)| Some(session_id.clone()))
-        else {
-            continue;
-        };
         let (frame_id, page_url, network_events) = {
             let Some(page) = ctx.get_page_mut(&page_id) else {
                 continue;
@@ -1491,7 +1508,7 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
         }
         crate::domains::page::emit_runtime_network_events(
             ctx,
-            &session_id,
+            &None,
             &frame_id,
             &page_url,
             &page_id,
@@ -1901,7 +1918,8 @@ fn handle_fetch_resolution(
         } else { None };
         if let Some(pause) = intercepted_paused.remove(&key) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
-            let resp = if pause.resolver.send(parsed_resolution.expect("validated fetch resolution")).is_ok() {
+            let resolved = pause.resolver.send(parsed_resolution.expect("validated fetch resolution")).is_ok();
+            let resp = if resolved {
                 crate::types::CdpResponse::success(req.id, json!({}), req.session_id)
             } else {
                 crate::types::CdpResponse::error(req.id, -32000, "requestId is no longer paused".into(), req.session_id)

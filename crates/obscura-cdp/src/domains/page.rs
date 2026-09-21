@@ -868,6 +868,45 @@ pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
 /// per-isolated-world fixes don't have to be duplicated.
+fn queue_network_event(
+    ctx: &mut CdpContext,
+    sessions: &[String],
+    method: &str,
+    params: Value,
+) {
+    ctx.pending_events.extend(sessions.iter().map(|session| {
+        CdpEvent::with_session(method, params.clone(), session.clone())
+    }));
+}
+
+fn begin_network_request(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    request_id: &str,
+    params: Value,
+) {
+    let sessions = ctx.network_sessions_for_page(page_id);
+    let redirect_body_id = params.get("redirectResponse")
+        .and_then(|response| response.get("bodyRequestId"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(body_id) = redirect_body_id {
+        // The redirect response belongs to the preceding hop. A Network agent
+        // enabled between hops sees the new request start, but Chrome does not
+        // let it read the previous hop's body.
+        let previous_sessions = ctx.network_request_sessions
+            .get(&(page_id.to_string(), request_id.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        ctx.remember_network_body(page_id, &previous_sessions, &body_id);
+    }
+    ctx.network_request_sessions.insert(
+        (page_id.to_string(), request_id.to_string()),
+        sessions.clone(),
+    );
+    queue_network_event(ctx, &sessions, "Network.requestWillBeSent", params);
+}
+
 pub fn emit_navigation_events(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
@@ -940,14 +979,15 @@ pub fn emit_navigation_events(
 
     // Playwright needs `Network.requestWillBeSent` for the main document to
     // arrive BEFORE `Page.frameNavigated` (issue #190).
-    if let Some(idx) = nav_idx {
+    if let Some(idx) = nav_idx.filter(|idx| !network_events[*idx].request_started) {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
+        begin_network_request(
+            ctx,
+            page_id,
+            rid,
+            json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+        );
     }
 
     let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
@@ -1005,19 +1045,31 @@ pub fn emit_navigation_events(
     let mut redirect_responses = std::collections::HashMap::new();
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
-        let owner_key = (page_id.to_string(), net_event.request_id.clone());
-        let owner_session = ctx.network_owners.get(&owner_key).cloned().unwrap_or_else(|| es.clone());
+        if net_event.request_started && rid != &net_event.request_id {
+            if let Some(sessions) = ctx.network_request_sessions
+                .get(&(page_id.to_string(), net_event.request_id.clone()))
+                .cloned()
+            {
+                ctx.network_request_sessions.insert(
+                    (page_id.to_string(), rid.clone()),
+                    sessions,
+                );
+            }
+        }
         let redirect_key = (net_event.document_generation, rid.clone());
         if Some(i) != nav_idx && !net_event.request_started {
-            ctx.pending_events.push(CdpEvent {
-                method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-                session_id: owner_session.clone(),
-            });
+            begin_network_request(
+                ctx,
+                page_id,
+                rid,
+                json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            );
         }
         if net_event.redirect { redirect_responses.insert(redirect_key, network_response_value(net_event)); }
-        emit_network_result(ctx, &owner_session, loader_id, frame_id, net_event, rid);
-        if !net_event.pending && !net_event.redirect { ctx.network_owners.remove(&owner_key); }
+        emit_network_result(ctx, page_id, loader_id, frame_id, net_event, rid);
+        if !net_event.pending && !net_event.redirect && rid != &net_event.request_id {
+            ctx.network_request_sessions.remove(&(page_id.to_string(), net_event.request_id.clone()));
+        }
     }
 
     let mut phase3 = vec![
@@ -1083,7 +1135,7 @@ pub fn emit_navigation_events(
 /// must not replay frame navigation or load lifecycle events.
 pub(crate) fn emit_runtime_network_events(
     ctx: &mut CdpContext,
-    session_id: &Option<String>,
+    _session_id: &Option<String>,
     frame_id: &str,
     page_url: &str,
     page_id: &str,
@@ -1111,14 +1163,9 @@ pub(crate) fn emit_runtime_network_events(
                 .or_insert_with(|| loader_id.clone()).clone()
         };
         let request_id = &network_event.request_id;
-        let owner_key = (page_id.to_string(), request_id.clone());
-        let owner_session = ctx.network_owners.get(&owner_key).or_else(|| ctx.fetch_intercept.owners.get(page_id)).cloned().unwrap_or_else(|| session_id.clone());
-        let session_id = &owner_session;
         let redirect_key = (network_event.document_generation, request_id.clone());
         if !network_event.request_started {
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({
+        begin_network_request(ctx, page_id, request_id, json!({
                 "requestId": request_id,
                 "redirectResponse": redirect_responses.remove(&redirect_key),
                 "redirectHasExtraInfo": false,
@@ -1139,13 +1186,10 @@ pub(crate) fn emit_runtime_network_events(
                 } else { json!({"type": "script"}) },
                 "type": network_event.resource_type,
                 "frameId": frame_id,
-            }),
-            session_id: session_id.clone(),
-        });
+            }));
         }
         if network_event.redirect { redirect_responses.insert(redirect_key, network_response_value(network_event)); }
-        emit_network_result(ctx, session_id, &loader_id, frame_id, network_event, request_id);
-        if !network_event.pending && !network_event.redirect { ctx.network_owners.remove(&owner_key); }
+        emit_network_result(ctx, page_id, &loader_id, frame_id, network_event, request_id);
     }
 }
 
@@ -1157,50 +1201,48 @@ fn network_response_value(event: &obscura_browser::NetworkEvent) -> Value {
 }
 
 fn emit_network_result(
-    ctx: &mut CdpContext, session_id: &Option<String>, loader_id: &str, frame_id: &str,
+    ctx: &mut CdpContext, page_id: &str, loader_id: &str, frame_id: &str,
     event: &obscura_browser::NetworkEvent, request_id: &str,
 ) {
     if event.pending { return; }
+    let sessions = ctx.network_sessions_for_page(page_id);
     if let Some(raw) = &event.request_raw_headers {
         if raw.capture_stage == "transportRequest" {
-            ctx.pending_events.push(CdpEvent {
-                method: "Network.requestWillBeSentExtraInfo".into(),
-                params: json!({"requestId": request_id, "headers": raw.text_headers(), "rawHeaders": raw,
+            queue_network_event(ctx, &sessions, "Network.requestWillBeSentExtraInfo",
+                json!({"requestId": request_id, "headers": raw.text_headers(), "rawHeaders": raw,
                     "associatedCookies": [], "connectTiming": {"requestTime": event.timestamp},
-                    "bodySize": event.request_body_size}),
-                session_id: session_id.clone(),
-            });
+                    "bodySize": event.request_body_size}));
         }
+    }
+    let start_sessions = ctx.network_request_sessions
+        .get(&(page_id.to_string(), request_id.to_string()))
+        .cloned()
+        .unwrap_or_default();
+    ctx.remember_network_body(page_id, &start_sessions, request_id);
+    if let Some(body_request_id) = event.response_body_request_id.as_deref() {
+        ctx.remember_network_body(page_id, &start_sessions, body_request_id);
     }
     if event.redirect { return; }
     if event.status != 0 {
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.responseReceived".into(),
-            params: json!({"requestId": request_id, "loaderId": loader_id,
+        queue_network_event(ctx, &sessions, "Network.responseReceived",
+            json!({"requestId": request_id, "loaderId": loader_id,
                 "timestamp": event.timestamp, "type": event.resource_type, "frameId": frame_id, "hasExtraInfo": false,
                 "response": {"url": event.url, "status": event.status, "statusText": event.status_text,
                     "headers": &*event.response_headers, "rawHeaders": event.raw_headers,
                     "bodyRequestId": event.response_body_request_id,
-                    "mimeType": event.response_headers.get("content-type").cloned().unwrap_or_default()}}),
-            session_id: session_id.clone(),
-        });
+                    "mimeType": event.response_headers.get("content-type").cloned().unwrap_or_default()}}));
     }
     if let Some(error) = &event.error {
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFailed".into(),
-            params: json!({"requestId": request_id, "timestamp": event.timestamp,
+        queue_network_event(ctx, &sessions, "Network.loadingFailed",
+            json!({"requestId": request_id, "timestamp": event.timestamp,
                 "type": event.resource_type, "errorText": error,
-                "canceled": error.starts_with("Aborted")}),
-            session_id: session_id.clone(),
-        });
+                "canceled": error.starts_with("Aborted")}));
     } else {
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({"requestId": request_id, "timestamp": event.timestamp,
-                "encodedDataLength": event.body_size}),
-            session_id: session_id.clone(),
-        });
+        queue_network_event(ctx, &sessions, "Network.loadingFinished",
+            json!({"requestId": request_id, "timestamp": event.timestamp,
+                "encodedDataLength": event.body_size}));
     }
+    ctx.network_request_sessions.remove(&(page_id.to_string(), request_id.to_string()));
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -1864,6 +1906,12 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
+    fn enable_network(ctx: &mut CdpContext, session: &Option<String>) {
+        let session = session.as_ref().expect("test Network subscription needs a session");
+        ctx.network_enabled_sessions.insert(session.clone());
+        ctx.network_body_sessions.insert(session.clone(), Default::default());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn raw_headers_survive_proxy_redirect_callbacks_page_and_cdp_events() {
         use base64::Engine;
@@ -1900,6 +1948,7 @@ mod tests {
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let responses = Arc::new(Mutex::new(Vec::new()));
         let request_sink = requests.clone();
@@ -2047,6 +2096,7 @@ mod tests {
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let responses = Arc::new(Mutex::new(Vec::new()));
         let request_sink = requests.clone();
@@ -2272,6 +2322,7 @@ mod tests {
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session);
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/html,<html>original</html>").await.unwrap();
         let old_url=page.url_string();
@@ -2329,6 +2380,7 @@ mod tests {
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session);
         ctx.current_loader_ids.insert(page_id.clone(), "loader-old".into());
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.resume_js();
@@ -2368,6 +2420,7 @@ mod tests {
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session);
         ctx.current_loader_ids.insert(page_id.clone(), "loader-old".into());
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/html,<html>old</html>").await.unwrap();
@@ -2401,6 +2454,7 @@ mod tests {
         let session_id = Some(format!("{page_id}-session"));
         ctx.sessions
             .insert(session_id.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session_id);
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
@@ -2446,6 +2500,211 @@ mod tests {
                 "Page.frameNavigated" | "Page.lifecycleEvent"
             )
         }));
+    }
+
+    #[test]
+    fn network_sessions_fan_out_each_phase_but_body_access_belongs_to_start_observers() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let page_id = ctx.create_page();
+        let first = "network-first".to_string();
+        let second = "network-second".to_string();
+        ctx.sessions.insert(first.clone(), page_id.clone());
+        ctx.sessions.insert(second.clone(), page_id.clone());
+        ctx.network_enabled_sessions.insert(first.clone());
+        ctx.network_body_sessions.insert(first.clone(), Default::default());
+        ctx.current_loader_ids.insert(page_id.clone(), "loader-current".into());
+
+        let raw_request = obscura_net::HeaderCapture {
+            capture_stage: "transportRequest",
+            encoding: "base64",
+            fields: vec![
+                obscura_net::RawHeader { name: b"Authorization".to_vec(), value: b"Bearer complete-secret".to_vec() },
+                obscura_net::RawHeader { name: b"X-Binary".to_vec(), value: vec![0, 0xff] },
+            ],
+        };
+        let raw_response = obscura_net::HeaderCapture {
+            capture_stage: "transportResponse",
+            encoding: "base64",
+            fields: vec![
+                obscura_net::RawHeader { name: b"Set-Cookie".to_vec(), value: b"first=complete".to_vec() },
+                obscura_net::RawHeader { name: b"Set-Cookie".to_vec(), value: b"second=complete".to_vec() },
+            ],
+        };
+        let make_event = |request_id: &str| obscura_browser::NetworkEvent {
+            document_generation: 0,
+            document_url: "https://example.test/".into(),
+            initiator_request_id: None,
+            retired_document_url: None,
+            pending: false,
+            error: None,
+            request_body_size: 3,
+            request_started: true,
+            redirect: false,
+            response_body_request_id: Some(request_id.to_string()),
+            raw_headers: Some(raw_response.clone()),
+            request_raw_headers: Some(raw_request.clone()),
+            request_id: request_id.into(),
+            url: format!("https://example.test/{request_id}"),
+            method: "POST".into(),
+            resource_type: "Fetch".into(),
+            status: 200,
+            status_text: "OK".into(),
+            headers: std::collections::HashMap::from([
+                ("Authorization".into(), "Bearer complete-secret".into()),
+                ("Cookie".into(), "session=complete-secret".into()),
+            ]),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([
+                ("set-cookie".into(), "second=complete".into()),
+            ])),
+            body_size: 256,
+            timestamp: 42.0,
+        };
+
+        begin_network_request(
+            &mut ctx,
+            &page_id,
+            "late",
+            json!({"requestId":"late","request":{"url":"https://example.test/late","headers":{"Authorization":"Bearer complete-secret","Cookie":"session=complete-secret"},"rawHeaders":raw_request}}),
+        );
+        ctx.network_enabled_sessions.insert(second.clone());
+        ctx.network_body_sessions.insert(second.clone(), Default::default());
+        ctx.get_page(&page_id).unwrap().response_body_store()
+            .lock().unwrap().insert("late".into(), &(0_u8..=255).collect::<Vec<_>>(), true).unwrap();
+        emit_network_result(
+            &mut ctx,
+            &page_id,
+            "loader-current",
+            "frame-current",
+            &make_event("late"),
+            "late",
+        );
+
+        let late = ctx.pending_events.iter()
+            .filter(|event| event.params["requestId"] == "late")
+            .collect::<Vec<_>>();
+        assert_eq!(late.iter().filter(|event| event.method == "Network.requestWillBeSent").count(), 1);
+        assert_eq!(late.iter().filter(|event| event.method == "Network.responseReceived").count(), 2);
+        assert_eq!(late.iter().filter(|event| event.method == "Network.loadingFinished").count(), 2);
+        assert_eq!(late.iter().find(|event| event.method == "Network.requestWillBeSent").unwrap().session_id.as_deref(), Some(first.as_str()));
+        assert!(late.iter().filter(|event| event.method == "Network.responseReceived")
+            .any(|event| event.session_id.as_deref() == Some(second.as_str())));
+        assert_eq!(late.iter().find(|event| event.method == "Network.responseReceived").unwrap().params["response"]["rawHeaders"], json!(raw_response));
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(first.clone()), "late").is_ok());
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(second.clone()), "late").is_err());
+
+        ctx.disable_network_session(&first);
+        ctx.network_enabled_sessions.insert(first.clone());
+        ctx.network_body_sessions.insert(first.clone(), Default::default());
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(first.clone()), "late").is_err());
+
+        ctx.pending_events.clear();
+        begin_network_request(
+            &mut ctx,
+            &page_id,
+            "shared",
+            json!({"requestId":"shared","request":{"url":"https://example.test/shared"}}),
+        );
+        ctx.get_page(&page_id).unwrap().response_body_store()
+            .lock().unwrap().insert("shared".into(), b"complete shared body", false).unwrap();
+        emit_network_result(
+            &mut ctx,
+            &page_id,
+            "loader-current",
+            "frame-current",
+            &make_event("shared"),
+            "shared",
+        );
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(first.clone()), "shared").is_ok());
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(second.clone()), "shared").is_ok());
+        ctx.disable_network_session(&first);
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(first), "shared").is_err());
+        assert_eq!(crate::domains::network::get_response_body(&ctx, &Some(second), "shared").unwrap()["body"], "complete shared body");
+    }
+
+    #[test]
+    fn redirect_and_navigation_body_aliases_stay_with_their_start_observers() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let page_id = ctx.create_page();
+        let first = "network-first".to_string();
+        let late = "network-late".to_string();
+        ctx.sessions.insert(first.clone(), page_id.clone());
+        ctx.sessions.insert(late.clone(), page_id.clone());
+        ctx.network_enabled_sessions.insert(first.clone());
+        ctx.network_body_sessions.insert(first.clone(), Default::default());
+
+        begin_network_request(
+            &mut ctx,
+            &page_id,
+            "redirect-chain",
+            json!({"requestId":"redirect-chain","request":{"url":"https://example.test/one"}}),
+        );
+        ctx.get_page(&page_id).unwrap().response_body_store().lock().unwrap()
+            .insert("redirect-body".into(), b"redirect-complete", false).unwrap();
+        ctx.network_enabled_sessions.insert(late.clone());
+        ctx.network_body_sessions.insert(late.clone(), Default::default());
+        begin_network_request(
+            &mut ctx,
+            &page_id,
+            "redirect-chain",
+            json!({
+                "requestId":"redirect-chain",
+                "redirectResponse":{"bodyRequestId":"redirect-body"},
+                "request":{"url":"https://example.test/two"}
+            }),
+        );
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(first.clone()), "redirect-body").is_ok());
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(late.clone()), "redirect-body").is_err());
+
+        let internal_id = "navigation-internal";
+        ctx.get_page(&page_id).unwrap().response_body_store().lock().unwrap()
+            .insert(internal_id.into(), b"navigation-complete", false).unwrap();
+        ctx.network_request_sessions.insert(
+            (page_id.clone(), internal_id.into()),
+            vec![first.clone()],
+        );
+        let document_generation = ctx.get_page(&page_id).unwrap().network_document_generation;
+        let event = obscura_browser::NetworkEvent {
+            document_generation,
+            document_url: "https://example.test/document".into(),
+            initiator_request_id: None,
+            retired_document_url: None,
+            pending: false,
+            error: None,
+            request_body_size: 0,
+            request_started: true,
+            redirect: false,
+            response_body_request_id: Some(internal_id.into()),
+            raw_headers: None,
+            request_raw_headers: None,
+            request_id: internal_id.into(),
+            url: "https://example.test/document".into(),
+            method: "GET".into(),
+            resource_type: "Document".into(),
+            status: 200,
+            status_text: "OK".into(),
+            headers: Default::default(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([
+                ("content-type".into(), "text/html".into()),
+            ])),
+            body_size: 19,
+            timestamp: 42.0,
+        };
+        emit_navigation_events(
+            &mut ctx,
+            &Some(first.clone()),
+            "frame-current",
+            "loader-visible",
+            "https://example.test/document",
+            &page_id,
+            &[event],
+            WaitUntil::Load,
+            false,
+        );
+        assert_eq!(
+            crate::domains::network::get_response_body(&ctx, &Some(first), "loader-visible").unwrap()["body"],
+            "navigation-complete"
+        );
+        assert!(crate::domains::network::get_response_body(&ctx, &Some(late), "loader-visible").is_err());
     }
 
     #[tokio::test]

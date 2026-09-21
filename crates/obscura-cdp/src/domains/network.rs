@@ -38,15 +38,22 @@ pub async fn handle(
             {
                 return Err("Network.enable supports only empty params".to_string());
             }
+            if let Some(session) = session_id {
+                if !ctx.sessions.get(session).is_some_and(|page_id| ctx.has_page(page_id)) {
+                    return Err(format!("No page found for sessionId {session}"));
+                }
+                if ctx.network_enabled_sessions.insert(session.clone()) {
+                    // A fresh Network agent cannot read bodies from requests
+                    // observed before it enabled. Repeated enable is idempotent.
+                    ctx.network_body_sessions.insert(session.clone(), Default::default());
+                    ctx.network_body_failure_sessions.remove(session);
+                }
+            }
             Ok(json!({}))
         }
         "disable" => {
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.clear_response_bodies();
-            } else {
-                for page in &mut ctx.pages {
-                    page.clear_response_bodies();
-                }
+            if let Some(session) = session_id {
+                ctx.disable_network_session(session);
             }
             Ok(json!({}))
         }
@@ -158,6 +165,20 @@ pub(super) fn get_response_body(
     session_id: &Option<String>,
     request_id: &str,
 ) -> Result<Value, String> {
+    if let Some(session) = session_id {
+        let page_id = ctx.sessions.get(session)
+            .ok_or_else(|| format!("No page found for sessionId {session}"))?;
+        let store = ctx.get_page(page_id).map(|page| page.response_body_store())
+            .or_else(|| ctx.navigating_response_bodies.as_ref()
+                .filter(|(owner, _)| owner == page_id)
+                .map(|(_, store)| store.clone()))
+            .ok_or_else(|| format!("No page found for sessionId {session}"))?;
+        let retained = store.lock().unwrap_or_else(|error| error.into_inner())
+            .contains(request_id);
+        if !ctx.network_body_is_visible(session, request_id, retained) {
+            return Err(format!("No response body found for requestId {request_id}"));
+        }
+    }
     let (_, store) = response_body_owner(ctx, session_id, request_id)?;
     let body = store.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
         .ok_or_else(|| format!("No response body found for requestId {request_id}"))?
@@ -221,6 +242,20 @@ pub(crate) fn response_body_owner(
 mod tests {
     use super::*;
     use obscura_net::CookieInfo;
+
+    fn grant_network_body_access(ctx: &mut CdpContext, session: &Option<String>, ids: &[&str]) {
+        let session = session.as_ref().expect("test Network access needs a session");
+        ctx.network_enabled_sessions.insert(session.clone());
+        ctx.network_body_sessions.entry(session.clone()).or_default()
+            .extend(ids.iter().map(|id| (*id).to_string()));
+    }
+
+    fn grant_network_body_failure(ctx: &mut CdpContext, session: &Option<String>) {
+        let session = session.as_ref().expect("test Network access needs a session");
+        ctx.network_enabled_sessions.insert(session.clone());
+        ctx.network_body_sessions.entry(session.clone()).or_default();
+        ctx.network_body_failure_sessions.insert(session.clone());
+    }
 
     fn sample_cookie(name: &str) -> CookieInfo {
         CookieInfo {
@@ -421,6 +456,7 @@ mod tests {
             .await
             .unwrap();
         let request_id = page.network_events[0].request_id.clone();
+        grant_network_body_access(&mut ctx, &session_id, &[&request_id]);
 
         let result = handle(
             "getResponseBody",
@@ -452,6 +488,7 @@ mod tests {
             let page = ctx.get_page_mut(&page_id).unwrap();
             page.navigate(&url).await.unwrap();
             let request_id = page.network_events.last().unwrap().request_id.clone();
+            grant_network_body_access(&mut ctx, &session, &[&request_id]);
             let result = handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &session).await.unwrap();
             assert_eq!(result["base64Encoded"], binary);
             let returned = result["body"].as_str().unwrap();
@@ -510,6 +547,8 @@ mod tests {
         page.navigate(&format!("{origin}/")).await.unwrap();
         page.prepare_screenshot_resources(3000).await;
         let events = page.network_events.clone();
+        let request_ids = events.iter().map(|event| event.request_id.as_str()).collect::<Vec<_>>();
+        grant_network_body_access(&mut ctx, &session, &request_ids);
         for (path, (_, expected, resource_type)) in resources.iter() {
             let event = events.iter().find(|event| event.url == format!("{origin}{path}"))
                 .unwrap_or_else(|| panic!("missing {resource_type} event"));
@@ -570,6 +609,7 @@ mod tests {
         page.navigate("data:text/plain,hello").await.unwrap();
         let request_id = page.network_events.last().unwrap().request_id.clone();
         page.alias_response_body(&request_id, "loader");
+        grant_network_body_failure(&mut ctx, &session);
         for id in [&request_id, "loader"] {
             let error = handle("getResponseBody", &json!({"requestId": id}), &mut ctx, &session).await.unwrap_err();
             assert!(error.contains("response_body_budget_exhausted"), "{error}");
@@ -594,17 +634,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_disable_clears_stored_response_bodies() {
+    async fn network_disable_invalidates_only_that_agents_body_view() {
         let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
         let page_id = ctx.create_page();
         let session_id = Some("session-1".to_string());
+        let sibling = Some("session-2".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.sessions.insert(sibling.clone().unwrap(), page_id.clone());
 
         let page = ctx.get_page_mut(&page_id).unwrap();
         page.navigate("data:text/html,<html><body>temporary body</body></html>")
             .await
             .unwrap();
         let request_id = page.network_events[0].request_id.clone();
+        grant_network_body_access(&mut ctx, &session_id, &[&request_id]);
+        grant_network_body_access(&mut ctx, &sibling, &[&request_id]);
 
         handle("disable", &json!({}), &mut ctx, &session_id)
             .await
@@ -619,6 +663,12 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("No response body found"));
+        assert_eq!(
+            handle("getResponseBody", &json!({"requestId": request_id}), &mut ctx, &sibling)
+                .await.unwrap()["body"],
+            "<html><body>temporary body</body></html>"
+        );
+        assert!(ctx.get_page(&page_id).unwrap().has_response_body(&request_id));
     }
 
     #[tokio::test]
@@ -633,6 +683,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn enable_rejects_a_non_page_session() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        ctx.sessions.insert("browser-session".into(), "browser".into());
+        let error = handle(
+            "enable",
+            &json!({}),
+            &mut ctx,
+            &Some("browser-session".into()),
+        ).await.unwrap_err();
+        assert!(error.contains("No page found for sessionId browser-session"), "{error}");
+        assert!(ctx.network_enabled_sessions.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
