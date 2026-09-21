@@ -5,12 +5,16 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`90b075becae164b35ae3defb7e9cc44e692c9bd2`，`Complete Fetch response stream sharing`；其实现基线为 `c9277bd252b792e0f2a0c756626bce9fa88e3ad0`。
+- 最近完成的实现提交：`b3c1d3d1e57e29e94374178142080338c358d6c6`，`Wake parked workers on disconnect`；其实现基线为 `f3fe629b2f6e805b673e112ab8fb1ac8b881003e`。
 - 该实现提交已推送到 `origin/main`；本交接更新提交完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
 - 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
 
 ## 最近完成的阶段
+
+OB-034 的直接客户端断连矩阵现在覆盖 WebSocket Close、原始 FIN、linger-zero RST x main、iframe、active Dedicated Worker 的 3 x 3 组合。main/iframe 以第一轮同步循环 console marker、Worker 以第一轮 `postMessage("started")` 证明执行已进入对应 realm；Close 保留并排空旧 socket，FIN 保留读半边，避免测试输入被客户端 drop 改写。每项都在 `max_connections=1` 下要求旧 slot 释放并由新连接执行 `42`。
+
+connection cancellation 同时通过 sticky watch 主动唤醒仅等待 `commands.recv()` 的 idle Worker，以及停在远期 timer/I/O autonomous future 的 Worker。owner 与 Worker object 保持存活的精确测试先观察真实 wait-state，再要求 lease 在一秒内归零。Astra light 首审发现非 idle biased select 会饥饿 autonomous progress，以及 Close 用例可能退化成其他断连输入；两项修复后终审为 0 blocker、0 major、0 minor。真实 writer failure/timeout、server shutdown 和 I/O task cancellation 与 active execution 的组合仍未完全资格化，OB-034 保持开放。
 
 Fetch response stream 已完成 shared-consumption 边界。Page 的 canonical response body 不再因 `takeResponseBodyAsStream` 被替换为 consumed tombstone；Network/Page、persistent history 和 stream 共享 immutable raw backing。Fetch 自身仍按 Chrome 契约维护 canonical access 状态：重复 `Fetch.getResponseBody` 可用，但 get 与一次 take 互斥，alias 不能绕过；普通 `Network.getResponseBody` 在 stream 打开后仍返回完整正文。Fulfill replacement 产生新 generation，Network 读新 body，旧 stream 继续读旧 body。
 
@@ -64,6 +68,13 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 ## 验证结果
 
+- 最新断连专项 release nextest 在 render/no-render 下均为 8/8；Worker 广义定向两种 feature 均为 43/43。no-render 的 `offscreen_webgl_owns_its_context_in_window_and_worker` 被 nextest 标记为 1 leaky，测试仍通过，本轮不宣称已解释或修复该退出期资源观察。
+- 最新根 release/render nextest 最终 2300/2300，4 skipped（run `65a44505-67d5-4234-b7ab-acff500cfee7`）。此前两个全量各出现一个不同的既有 MCP loopback fixture 偶发失败；源码未改的对应单项重放各 1/1，最终全量通过，不把重放通过称作修复。
+- exact no-default-features 与 render CLI build 均成功；清理后重新执行 exact render build 也成功，最终 SHA-256 `232fbe49471737929de027304a63a1e0e778832e8cd62e06d761c977bc7c64a0`，120528528 bytes。
+- benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33。
+- 同一二进制通过官方 Playwright Python 1.60.0 automation smoke；完整原始协议日志通过 37-method profile 校验。
+- Astra light 终审无 blocker、major 或 minor；`git diff --check` 通过。
+
 - Fetch/IO/PDF/target review-fix 定向回归 6/6（run `011162eb-00aa-4309-9e4a-ba3147de8740`）。
 - `obscura-cdp` release/render 全量 359/359，3 skipped（run `ecebb351-1585-422a-b31b-ea8eb9bc4134`）。
 - 根 release/render nextest 2296/2296，4 skipped（run `4ee20af2-0968-4fe3-a859-6af72abed67a`）。
@@ -116,8 +127,8 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 按实际风险推进其余 input qualification 与 disconnect 组合矩阵。
-2. 补齐仅等待 `commands.recv()` 的 idle Worker cancellation wake。
+1. 资格化真实 writer failure/timeout、server shutdown 与 I/O task cancellation x active main/iframe/Worker 的 server-side disconnect 组合，继续证明 slot、queued command 与 Worker 清理边界。
+2. 推进 admission 前 TCP/kernel/container capacity 与剩余 input qualification；不要把三层逻辑 payload 预算外推为总 RSS 上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -212,6 +223,22 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/tmp/ob021-network-enable-chrome-probe-v2.json`
 - `/tmp/ob021-native-start-playwright.TAcvvu/`
 - `/tmp/ob034-inbound-benchmark.cEiFsw`
+- `/tmp/ob034-disconnect-matrix-focused.log`
+- `/tmp/ob034-disconnect-matrix-focused-latest.log`
+- `/tmp/ob034-disconnect-matrix-focused-no-render.log`
+- `/tmp/ob034-disconnect-review-fixes-render.log`
+- `/tmp/ob034-worker-broad-render.log`
+- `/tmp/ob034-worker-broad-no-render.log`
+- `/tmp/ob034-disconnect-full-workspace.log`
+- `/tmp/ob034-disconnect-full-workspace-rerun.log`
+- `/tmp/ob034-disconnect-full-workspace-final.log`
+- `/tmp/ob034-mcp-wait-for-selector-replay.log`
+- `/tmp/ob034-mcp-wait-clears-refs-replay.log`
+- `/tmp/ob034-disconnect-build-no-render.log`
+- `/tmp/ob034-disconnect-build-render.log`
+- `/tmp/ob034-disconnect-render-rebuild-after-clean.log`
+- `/tmp/ob034-disconnect-obstacle.log`
+- `/tmp/ob034-disconnect-playwright.6n2Ie6/`
 
 这些路径属于原始运行主机的临时文件，不是仓库内的持久接口。可持续引用的结论和能力边界以本页、[SUMMARY](SUMMARY.md) 及对应提交中的测试为准。处理这些日志时保留原始字段和完整内容。
 
