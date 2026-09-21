@@ -470,7 +470,9 @@ impl StealthHttpClient {
     pub async fn fetch_resource_traced(
         &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>, trace: &RequestTrace,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, request, callbacks, Some(trace)).await
+        let result = self.fetch_with_profile(url, request, callbacks, Some(trace)).await;
+        if let Err(error) = &result { trace.fail(&error.to_string()); }
+        result
     }
 
     async fn fetch_with_profile(
@@ -505,16 +507,29 @@ impl StealthHttpClient {
 
         match acquisition {
             Acquisition::Cached(response) => {
-                if let Some(trace) = trace { trace.response(&response, true); }
+                if let Some(trace) = trace {
+                    trace.start()?;
+                    let mut observed = response.clone();
+                    // This logical requester did not prepare or send the
+                    // cached request. Preserve the response capture but never
+                    // attribute the transport leader's request headers to it.
+                    observed.request_raw_headers = None;
+                    trace.response(&observed, true);
+                }
                 self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
                 Ok(response)
             }
             Acquisition::Follower(mut receiver) => loop {
+                if let Some(trace) = trace { trace.start()?; }
                 let outcome = { receiver.borrow().clone() };
                 if let Some(outcome) = outcome {
                     break match outcome {
                         SharedFetchOutcome::Cacheable(response) => {
-                            if let Some(trace) = trace { trace.response(&response, true); }
+                            if let Some(trace) = trace {
+                                let mut observed = response.clone();
+                                observed.request_raw_headers = None;
+                                trace.response(&observed, true);
+                            }
                 self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
                             Ok(response)
                         }
@@ -631,9 +646,11 @@ impl StealthHttpClient {
         &self, url: &Url, body: &str, request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>, trace: &RequestTrace,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_method_with_profile(
+        let result = self.fetch_method_with_profile(
             url, request, callbacks, http::Method::POST, body.as_bytes(), Some(trace),
-        ).await
+        ).await;
+        if let Err(error) = &result { trace.fail(&error.to_string()); }
+        result
     }
 
     async fn fetch_method_with_profile(
@@ -650,7 +667,10 @@ impl StealthHttpClient {
                 response.request_referrer = None;
                 return Ok(response);
             }
-            return fetch_file_url(url, request.max_response_bytes).await;
+            if let Some(trace) = trace { trace.start()?; }
+            let response = fetch_file_url(url, request.max_response_bytes).await?;
+            if let Some(trace) = trace { trace.response(&response, true); }
+            return Ok(response);
         }
 
         let mut current_url = url.clone();
@@ -659,9 +679,10 @@ impl StealthHttpClient {
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
-        // Follow up to 20 redirects (Fetch spec): 0..=20 makes
-        // 21 requests, so the 20th hop is followed and only the 21st fails.
-        for _ in 0..=20 {
+        // Follow up to 20 redirects (Fetch spec). `hop == 20` is the 21st
+        // response and must fail the current, already-started hop rather than
+        // first publishing it as a successful redirect.
+        for hop in 0..=20 {
             if !redirects.is_empty() {
                 if let Some(trace) = trace {
                     trace.begin(current_url.as_str(), method.as_str(), None,
@@ -743,7 +764,7 @@ impl StealthHttpClient {
             request_info.raw_headers = Some(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
             if let Some(trace) = trace {
                 trace.prepared(request_info.raw_headers.clone().unwrap(), &request_body)
-                    .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+                    ?;
             }
             request_info.headers = request_info.raw_headers.as_ref().unwrap().text_headers();
             if !request_callback_fired {
@@ -775,7 +796,7 @@ impl StealthHttpClient {
             let request_raw_headers = resp.request_headers.clone();
             let response_headers = raw_headers.text_headers();
 
-            let mut captured_body = None;
+            let mut traced_response = None;
             let mut resp = Some(resp);
             if let Some(trace) = trace {
                 let mut response = Response { url: current_url.clone(), status: status.as_u16(),
@@ -784,24 +805,49 @@ impl StealthHttpClient {
                     request_referrer: request.referrer.clone() };
                 trace.response(&response, false);
                 response.body = read_stealth_body_limited(resp.take().unwrap(), &current_url, request.max_response_bytes).await?;
-                trace.response(&response, true);
-                captured_body = Some(response.body);
+                traced_response = Some(response);
             }
-            cors_result?;
+
+            if let Err(error) = cors_result {
+                if let (Some(trace), Some(response)) = (trace, traced_response.as_ref()) {
+                    let message = error.to_string();
+                    trace.response_with_error(response, true, Some(&message));
+                }
+                return Err(error);
+            }
 
             if status.is_redirection() {
                 if let Some(location) = raw_headers.fields.iter().find(|field| field.name.eq_ignore_ascii_case(b"location")) {
-                    let location_str = std::str::from_utf8(&location.value).map_err(|_| {
-                        ObscuraNetError::Network("Invalid redirect Location".into())
-                    })?;
-                    let mut next_url = current_url.join(location_str).map_err(|e| {
-                        ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
-                    })?;
-                    if next_url.fragment().is_none() {
-                        next_url.set_fragment(current_url.fragment());
+                    let redirect_result = (|| {
+                        let location_str = std::str::from_utf8(&location.value).map_err(|_| {
+                            ObscuraNetError::Network("Invalid redirect Location".into())
+                        })?;
+                        let mut next_url = current_url.join(location_str).map_err(|e| {
+                            ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
+                        })?;
+                        if next_url.fragment().is_none() {
+                            next_url.set_fragment(current_url.fragment());
+                        }
+                        validate_url(&next_url, self.allow_private_network)?;
+                        validate_request_mode(&request, &next_url)?;
+                        if hop == 20 {
+                            return Err(ObscuraNetError::TooManyRedirects(url.to_string()));
+                        }
+                        Ok(next_url)
+                    })();
+                    let next_url = match redirect_result {
+                        Ok(next_url) => next_url,
+                        Err(error) => {
+                            if let (Some(trace), Some(response)) = (trace, traced_response.as_ref()) {
+                                let message = error.to_string();
+                                trace.response_with_error(response, true, Some(&message));
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if let (Some(trace), Some(response)) = (trace, traced_response.as_ref()) {
+                        trace.response(response, true);
                     }
-                    validate_url(&next_url, self.allow_private_network)?;
-                    validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     redirects.push(current_url.clone());
@@ -819,8 +865,11 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = match captured_body {
-                Some(body) => body,
+            if let (Some(trace), Some(response)) = (trace, traced_response.as_ref()) {
+                trace.response(response, true);
+            }
+            let body = match traced_response {
+                Some(response) => response.body,
                 None => read_stealth_body_limited(resp.unwrap(), &current_url, request.max_response_bytes).await?,
             };
 
@@ -950,7 +999,7 @@ impl StealthHttpClient {
         let (transport, prepared) = self.client.request(req_method, url, headers, body, timeout)?;
         if let Some(trace) = trace {
             trace.prepared(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()), body)
-                .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+                ?;
         }
         if let Some((callbacks, resource_type)) = observation {
             if callbacks.has_request_callbacks().await {
@@ -1011,6 +1060,263 @@ impl StealthHttpClient {
 
 #[cfg(test)]
 mod tests {
+    struct LifecycleBoundaryObserver {
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        terminals: std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+    }
+
+    impl crate::observation::RequestLifecycleObserver for LifecycleBoundaryObserver {
+        fn started(
+            &self,
+            request_id: &str,
+            _: crate::ResourceType,
+            _: usize,
+            exchange: &crate::observation::Exchange,
+        ) -> Result<(), crate::ObscuraNetError> {
+            assert!(exchange.request_headers.is_some(), "prepared raw headers precede admission");
+            assert_eq!(request_id, "ordinary-boundary");
+            self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn terminal(
+            &self,
+            request_id: &str,
+            _: crate::ResourceType,
+            _: usize,
+            _: &crate::observation::Exchange,
+            _: Option<&[u8]>,
+            error: Option<&str>,
+        ) {
+            self.terminals.lock().unwrap().push((
+                request_id.to_string(), error.map(str::to_string),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn traced_ordinary_start_is_accepted_before_transport_send() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_at_wire = started.clone();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).unwrap();
+            assert!(observed_at_wire.load(std::sync::atomic::Ordering::SeqCst),
+                "request bytes reached the peer before Started admission");
+            socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ).unwrap();
+        });
+        let terminals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = std::sync::Arc::new(LifecycleBoundaryObserver {
+            started: started.clone(),
+            terminals: terminals.clone(),
+        });
+        let policy = std::sync::Arc::new(crate::client::ObscuraHttpClient::new());
+        let client = super::StealthHttpClient::with_policy(
+            std::sync::Arc::new(crate::cookies::CookieJar::new()),
+            Some(&proxy),
+            policy,
+            &default_persona(),
+        );
+        let url = url::Url::parse("http://lifecycle.test/style.css").unwrap();
+        let trace = crate::observation::RequestTrace::new(
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            "ordinary-boundary".into(),
+        ).observe(observer, crate::ResourceType::Stylesheet);
+        trace.begin(url.as_str(), "GET", None, None).unwrap();
+        client.fetch_resource_traced(
+            &url,
+            crate::ResourceRequest::subresource(crate::ResourceType::Stylesheet, &url),
+            None,
+            &trace,
+        ).await.unwrap();
+        server.join().unwrap();
+
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(terminals.lock().unwrap().as_slice(), [
+            ("ordinary-boundary".to_string(), None),
+        ]);
+    }
+
+    #[derive(Debug)]
+    struct RedirectTerminal {
+        hop: usize,
+        status: u16,
+        raw_body: Vec<u8>,
+        error: Option<String>,
+    }
+
+    struct RedirectLifecycleObserver {
+        starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        terminals: std::sync::Arc<std::sync::Mutex<Vec<RedirectTerminal>>>,
+    }
+
+    impl crate::observation::RequestLifecycleObserver for RedirectLifecycleObserver {
+        fn started(
+            &self,
+            _: &str,
+            _: crate::ResourceType,
+            _: usize,
+            _: &crate::observation::Exchange,
+        ) -> Result<(), crate::ObscuraNetError> {
+            self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn terminal(
+            &self,
+            _: &str,
+            _: crate::ResourceType,
+            hop: usize,
+            exchange: &crate::observation::Exchange,
+            body: Option<&[u8]>,
+            error: Option<&str>,
+        ) {
+            self.terminals.lock().unwrap().push(RedirectTerminal {
+                hop,
+                status: exchange.response.as_ref().map_or(0, |response| response.status),
+                raw_body: body.unwrap_or_default().to_vec(),
+                error: error.map(str::to_string),
+            });
+        }
+    }
+
+    async fn traced_redirect_failure(location: &str) -> (
+        crate::ObscuraNetError,
+        usize,
+        Vec<RedirectTerminal>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let location = location.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = std::sync::Arc::new(RedirectLifecycleObserver {
+            starts: starts.clone(),
+            terminals: terminals.clone(),
+        });
+        let policy = std::sync::Arc::new(crate::client::ObscuraHttpClient::new());
+        let client = super::StealthHttpClient::with_policy(
+            std::sync::Arc::new(crate::cookies::CookieJar::new()),
+            Some(&proxy),
+            policy,
+            &default_persona(),
+        );
+        let url = url::Url::parse("http://redirect.test/style.css").unwrap();
+        let trace = crate::observation::RequestTrace::new(
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            "redirect-boundary".into(),
+        ).observe(observer, crate::ResourceType::Stylesheet);
+        trace.begin(url.as_str(), "GET", None, None).unwrap();
+        let error = client.fetch_resource_traced(
+            &url,
+            crate::ResourceRequest::subresource(crate::ResourceType::Stylesheet, &url),
+            None,
+            &trace,
+        ).await.unwrap_err();
+        server.join().unwrap();
+        let count = starts.load(std::sync::atomic::Ordering::SeqCst);
+        let captured = std::mem::take(&mut *terminals.lock().unwrap());
+        (error, count, captured)
+    }
+
+    #[tokio::test]
+    async fn invalid_redirect_is_one_failed_terminal_with_complete_response() {
+        let (error, starts, terminals) = traced_redirect_failure("http://[::1").await;
+        assert!(error.to_string().contains("Invalid redirect URL"));
+        assert_eq!(starts, 1);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].hop, 0);
+        assert_eq!(terminals[0].status, 302);
+        assert_eq!(terminals[0].raw_body, b"body");
+        assert!(terminals[0].error.as_deref()
+            .is_some_and(|error| error.contains("Invalid redirect URL")));
+    }
+
+    #[tokio::test]
+    async fn blocked_redirect_is_one_failed_terminal_with_complete_response() {
+        let (error, starts, terminals) =
+            traced_redirect_failure("http://127.0.0.1/private").await;
+        assert!(error.to_string().contains("private/internal IP"));
+        assert_eq!(starts, 1);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].status, 302);
+        assert_eq!(terminals[0].raw_body, b"body");
+        assert!(terminals[0].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn redirect_limit_fails_only_the_last_started_hop() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for hop in 0..=20 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("hop-{hop}");
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = std::sync::Arc::new(RedirectLifecycleObserver {
+            starts: starts.clone(),
+            terminals: terminals.clone(),
+        });
+        let client = super::StealthHttpClient::with_policy(
+            std::sync::Arc::new(crate::cookies::CookieJar::new()),
+            Some(&proxy),
+            std::sync::Arc::new(crate::client::ObscuraHttpClient::new()),
+            &default_persona(),
+        );
+        let url = url::Url::parse("http://redirect.test/loop").unwrap();
+        let trace = crate::observation::RequestTrace::new(
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            "redirect-limit".into(),
+        ).observe(observer, crate::ResourceType::Stylesheet);
+        trace.begin(url.as_str(), "GET", None, None).unwrap();
+        let error = client.fetch_resource_traced(
+            &url,
+            crate::ResourceRequest::subresource(crate::ResourceType::Stylesheet, &url),
+            None,
+            &trace,
+        ).await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, crate::ObscuraNetError::TooManyRedirects(_)));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 21);
+        let terminals = terminals.lock().unwrap();
+        assert_eq!(terminals.len(), 21);
+        assert!(terminals[..20].iter().all(|terminal| terminal.error.is_none()));
+        assert!(terminals[20].error.as_deref()
+            .is_some_and(|error| error.contains("Too many redirects")));
+        assert_eq!(terminals[20].raw_body, b"hop-20");
+    }
+
     fn default_persona() -> crate::EffectivePersona {
         crate::EffectivePersona::builtin(super::StealthProfile::WindowsChrome145)
     }

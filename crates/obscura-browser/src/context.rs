@@ -403,7 +403,7 @@ mod tests {
         );
         let context = Arc::new(context);
         let mut first = crate::Page::new("first".to_string(), context.clone());
-        first.navigate("data:text/html,first").await.unwrap();
+        first.navigate("about:blank").await.unwrap();
 
         let second = crate::Page::new("second".to_string(), context.clone());
 

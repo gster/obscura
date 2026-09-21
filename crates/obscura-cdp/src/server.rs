@@ -1308,6 +1308,12 @@ fn emit_routed_intercepted_request(
         let standard_request_body_id = routed.request.request_body_request_id.clone();
         let transport_request_body_id = routed.request.transport_request_body_request_id.clone();
         let network_sessions = ctx.network_sessions_for_page(&page_id);
+        let network_agents = network_sessions.iter().map(|session| {
+            (
+                session.clone(),
+                ctx.network_agent_limits.get(session).copied().unwrap_or_default(),
+            )
+        }).collect::<Vec<_>>();
         let request_bodies = ctx.get_page(&page_id).map(|page| page.request_body_store())
             .or_else(|| ctx.navigating_request_bodies.as_ref()
                 .filter(|(owner, _)| owner == &page_id)
@@ -1322,7 +1328,7 @@ fn emit_routed_intercepted_request(
             &loader_id,
             &document_url,
             routed.session_id,
-            &network_sessions,
+            &network_agents,
             request_bodies.as_ref(),
             reply_tx,
             paused,
@@ -1387,7 +1393,7 @@ fn emit_intercepted_request(
     loader_id: &str,
     document_url: &str,
     session_id: Option<String>,
-    network_sessions: &[String],
+    network_agents: &[(String, crate::dispatch::NetworkAgentLimits)],
     request_bodies: Option<&Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>>,
     reply_tx: &OutboundSender,
     intercepted_paused: &mut InterceptedPauses,
@@ -1462,10 +1468,12 @@ fn emit_intercepted_request(
             "frameId": frame_id,
     });
     if emit_request_start {
-        for network_session in network_sessions {
+        for (network_session, limits) in network_agents {
+            let mut projected = request_will_be_sent.clone();
+            limits.project_request_will_be_sent(&mut projected);
             let event = json!({
                 "method": "Network.requestWillBeSent",
-                "params": request_will_be_sent,
+                "params": projected,
                 "sessionId": network_session,
             });
             if reply_tx.send(event.to_string()).is_err() {
@@ -1668,6 +1676,81 @@ fn forward_pending_events(
     }
 }
 
+/// Drain browser-owned starts and terminals while the Page itself is moved
+/// into the navigation task. The observer commits durable history before
+/// enqueueing these records. Draining here makes the start-time Network
+/// session snapshot real instead of selecting subscribers only after the
+/// whole navigation has completed.
+fn forward_navigating_native_network_events(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    frame_id: &str,
+    loader_id: &str,
+    page_url: &str,
+    session_id: &Option<String>,
+    events: &Arc<std::sync::Mutex<Vec<obscura_browser::NetworkEvent>>>,
+    reply_tx: &OutboundSender,
+) -> Vec<obscura_browser::NetworkEvent> {
+    let mut events = std::mem::take(
+        &mut *events.lock().unwrap_or_else(|error| error.into_inner()),
+    );
+    if events.is_empty() { return Vec::new(); }
+
+    // Chrome exposes the main Document under its loader id. Browser history
+    // retains its own immutable logical id; only the live CDP projection and
+    // Page-store aliases use loaderId.
+    for event in &mut events {
+        if event.resource_type != "Document" { continue; }
+        if event.pending {
+            if let Some((owner, store)) = ctx.navigating_request_bodies.as_ref()
+                .filter(|(owner, _)| owner == page_id)
+            {
+                let _ = owner;
+                let mut store = store.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(body_id) = event.request_body_request_id.as_deref() {
+                    let _ = store.alias(body_id, loader_id);
+                } else {
+                    store.clear_alias(loader_id);
+                }
+            }
+        } else if !event.redirect && event.error.is_none() {
+            if let Some((owner, store)) = ctx.navigating_response_bodies.as_ref()
+                .filter(|(owner, _)| owner == page_id)
+            {
+                let _ = owner;
+                if let Some(body_id) = event.response_body_request_id.as_deref() {
+                    let _ = store.lock().unwrap_or_else(|error| error.into_inner())
+                        .alias(body_id, loader_id);
+                }
+            }
+        }
+        event.request_id = loader_id.to_string();
+    }
+
+    let previous_loader = ctx.current_loader_ids.insert(page_id.to_string(), loader_id.to_string());
+    crate::domains::page::emit_runtime_network_events(
+        ctx, session_id, frame_id, page_url, page_id, &events,
+    );
+    match previous_loader {
+        Some(previous) => {
+            ctx.current_loader_ids.insert(page_id.to_string(), previous);
+        }
+        None => {
+            ctx.current_loader_ids.remove(page_id);
+        }
+    }
+    forward_pending_events(ctx, Some(reply_tx));
+
+    // Keep response metadata for frame MIME/body alias selection after the
+    // Page returns, but mark these copies as already projected so the shared
+    // navigation emitter cannot send any Network phase twice.
+    for event in &mut events {
+        event.pending = true;
+        event.request_started = true;
+    }
+    events
+}
+
 fn has_active_screencast(ctx: &CdpContext) -> bool {
     #[cfg(feature = "render")]
     {
@@ -1707,7 +1790,8 @@ fn is_navigate_method(text: &str) -> bool {
 fn is_navigation_safe_body_command(text: &str) -> bool {
     serde_json::from_str::<CdpRequest>(text).is_ok_and(|request| matches!(request.method.as_str(),
         "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody"
-            | "Network.getRequestPostData" | "IO.read" | "IO.close"))
+            | "Network.getRequestPostData" | "Network.enable" | "Network.disable"
+            | "IO.read" | "IO.close"))
 }
 
 // Keep CDP field order, spelling and full values until the HTTP boundary.
@@ -2107,6 +2191,9 @@ async fn process_with_interception(
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let live_native_network_events = page.native_network_event_queue();
+    let live_native_network_notify = page.network_teardown_notify.clone();
+    let live_document_url = url.to_string();
     // The new runtime can pause before the navigating Page returns to ctx.
     // Retain the old generation mapping and pre-register the expected new one.
     ctx.navigating_document_loader = Some((page.network_document_generation, loader_id.clone()));
@@ -2139,6 +2226,7 @@ async fn process_with_interception(
 
     let navigate_result: Result<(), String>;
     let page_back: Option<obscura_browser::Page>;
+    let mut live_native_metadata = Vec::new();
 
     // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
     // While the spawned nav task is executing V8 (potentially parked on
@@ -2175,6 +2263,21 @@ async fn process_with_interception(
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
+            biased;
+            _ = live_native_network_notify.notified() => {
+                if connection_open {
+                    live_native_metadata.extend(forward_navigating_native_network_events(
+                        ctx,
+                        &page_id,
+                        &frame_id,
+                        &loader_id,
+                        &live_document_url,
+                        &session_for_events,
+                        &live_native_network_events,
+                        reply_tx,
+                    ));
+                }
+            }
             Some((returned_page, result)) = nav_done_rx.recv() => {
                 page_back = Some(returned_page);
                 navigate_result = result;
@@ -2279,7 +2382,8 @@ async fn process_with_interception(
     // resource) so they emit as Network.requestWillBeSent / responseReceived
     // alongside the static navigation subresources (#406).
     page.sync_js_network_events();
-    let network_events: Vec<_> = page.network_events.drain(..).collect();
+    live_native_metadata.extend(page.network_events.drain(..));
+    let network_events = live_native_metadata;
     let network_observation_failure = page.network_observation_failure();
     let page_url = page.url_string();
     let page_id_for_events = page.id.clone();
@@ -2581,8 +2685,9 @@ pub(crate) mod tests {
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn request_pause(resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>) -> InterceptedPause {
         InterceptedPause { stage: obscura_js::ops::InterceptionStage::Request, redirect_response: false, resolver }
@@ -2595,6 +2700,61 @@ pub(crate) mod tests {
             projected.chars().map(u32::from).collect::<Vec<_>>(),
             vec![255, 254, 65]
         );
+    }
+
+    #[test]
+    fn intercepted_request_projects_post_data_per_network_agent_but_fetch_keeps_full_body() {
+        let body_id = "intercept-body";
+        let body = "ééé".as_bytes();
+        let mut store = obscura_net::request_body::RequestBodyStore::default();
+        store.insert(body_id.into(), body).unwrap();
+        let store = Arc::new(std::sync::Mutex::new(store));
+        let (resolver, mut resolved) = tokio::sync::oneshot::channel();
+        let request = obscura_js::ops::InterceptedRequest {
+            stage: obscura_js::ops::InterceptionStage::Request,
+            document_generation: 0,
+            document_url: "https://example.test/".into(),
+            redirect_response: None,
+            redirected_request_id: None,
+            network_id: "network-post".into(),
+            network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            request_raw_headers: Some(obscura_net::HeaderCapture {
+                capture_stage: "transportRequest", encoding: "base64",
+                fields: vec![obscura_net::RawHeader { name: b"X-Raw".to_vec(), value: vec![0, 255] }],
+            }),
+            request_body_present: true, request_body_request_id: Some(body_id.into()), request_body_size: body.len(),
+            transport_request_body_present: true, transport_request_body_request_id: Some(body_id.into()), transport_request_body_size: body.len(),
+            request_id: "intercept-post".into(), url: "https://example.test/post".into(), method: "POST".into(),
+            headers: HashMap::new(), resource_type: "Fetch".into(), response_status_code: None,
+            response_headers: None, response_raw_headers: None, response_body_request_id: None, resolver,
+        };
+        let (reply_tx, mut replies, _) = crate::outbound::channel();
+        let agents = vec![
+            ("network-tight".into(), crate::dispatch::NetworkAgentLimits { max_post_data_size: Some(5), ..Default::default() }),
+            ("network-exact".into(), crate::dispatch::NetworkAgentLimits { max_post_data_size: Some(6), ..Default::default() }),
+        ];
+        let mut paused = HashMap::new();
+        let (queued, started) = super::emit_intercepted_request(
+            request, "frame", "loader", "https://example.test/", Some("fetch-owner".into()),
+            &agents, Some(&store), &reply_tx, &mut paused,
+        );
+        assert!(queued && started);
+        let mut events = Vec::new();
+        while let Ok(raw) = replies.try_recv() { events.push(serde_json::from_str::<Value>(&raw).unwrap()); }
+        let tight = events.iter().find(|event| event["method"] == "Network.requestWillBeSent" && event["sessionId"] == "network-tight").unwrap();
+        let exact = events.iter().find(|event| event["method"] == "Network.requestWillBeSent" && event["sessionId"] == "network-exact").unwrap();
+        assert!(tight["params"]["request"].get("postData").is_none());
+        assert!(tight["params"]["request"].get("postDataEntries").is_none());
+        assert_eq!(tight["params"]["request"]["requestBodyRequestId"], body_id);
+        assert_eq!(tight["params"]["request"]["transportRequestBodyRequestId"], body_id);
+        assert_eq!(exact["params"]["request"]["postData"], "ééé");
+        assert_eq!(tight["params"]["request"]["transportPostData"], "ééé");
+        assert_eq!(exact["params"]["request"]["requestBodyRequestId"], body_id);
+        assert_eq!(tight["params"]["request"]["rawHeaders"]["fields"][0]["valueBase64"], "AP8=");
+        assert_eq!(exact["params"]["request"]["rawHeaders"]["fields"][0]["valueBase64"], "AP8=");
+        let paused_event = events.iter().find(|event| event["method"] == "Fetch.requestPaused").unwrap();
+        assert_eq!(paused_event["params"]["request"]["postData"], "ééé");
+        assert!(resolved.try_recv().is_err());
     }
 
     #[test]

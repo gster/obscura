@@ -219,3 +219,98 @@ async fn navigation_without_script_fetch_is_unaffected() {
         "no spurious script-fetch events for a page that makes none; saw {urls:?}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_post_data_projection_is_per_session_and_body_access_is_session_owned() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let (content_type, body) = if request.starts_with("POST /submit") {
+                    ("text/plain", "ok")
+                } else if request.starts_with("GET /reset") {
+                    ("text/html", r#"<script>
+fetch('/submit-reset', {method:'POST', body:'ééé'})
+  .then(() => document.body.dataset.reset = 'yes');
+</script><body></body>"#)
+                } else {
+                    ("text/html", r#"<script>
+fetch('/submit', {method:'POST', body:'ééé'})
+  .then(() => document.body.dataset.done = 'yes');
+</script><body></body>"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.as_bytes().len(),
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+    let page_id = ctx.create_page();
+    let tight = "network-tight";
+    let exact = "network-exact";
+    ctx.sessions.insert(tight.to_string(), page_id.clone());
+    ctx.sessions.insert(exact.to_string(), page_id.clone());
+    cdp(&mut ctx, 0, "Network.enable", json!({"maxPostDataSize": 5}), tight).await;
+    cdp(&mut ctx, 1, "Network.enable", json!({"maxPostDataSize": 6}), exact).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url": format!("http://{addr}/"), "waitUntil": "networkidle0"}), tight).await;
+
+    let post_url = format!("http://{addr}/submit");
+    let starts = ctx.pending_events.iter().filter(|event| {
+        event.method == "Network.requestWillBeSent"
+            && event.params["request"]["url"] == post_url
+    }).collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    let tight_start = starts.iter().find(|event| event.session_id.as_deref() == Some(tight)).unwrap();
+    let exact_start = starts.iter().find(|event| event.session_id.as_deref() == Some(exact)).unwrap();
+    let request_id = tight_start.params["requestId"].as_str().unwrap().to_string();
+    assert_eq!(exact_start.params["requestId"], request_id);
+    assert!(tight_start.params["request"].get("postData").is_none());
+    assert!(tight_start.params["request"].get("postDataEntries").is_none());
+    assert_eq!(exact_start.params["request"]["postData"], "ééé");
+    assert_eq!(exact_start.params["request"]["postDataEntries"][0]["bytes"], "w6nDqcOp");
+
+    for session in [tight, exact] {
+        let body = cdp(&mut ctx, 3, "Network.getRequestPostData", json!({"requestId": request_id}), session).await;
+        assert_eq!(body, json!({"postData": "ééé", "base64Encoded": false}));
+    }
+
+    // Re-enable tight with defaults: only future projections change, and the
+    // retained canonical body remains readable. Disable/re-enable exact must
+    // not restore its old body capability.
+    cdp(&mut ctx, 4, "Network.enable", json!({}), tight).await;
+    cdp(&mut ctx, 5, "Network.disable", json!({}), exact).await;
+    cdp(&mut ctx, 6, "Network.enable", json!({"maxPostDataSize": 6}), exact).await;
+    let old_exact = dispatch(&CdpRequest { id: 7, method: "Network.getRequestPostData".into(), params: json!({"requestId": request_id}), session_id: Some(exact.into()) }, &mut ctx).await;
+    assert!(old_exact.error.is_some());
+
+    ctx.pending_events.clear();
+    cdp(&mut ctx, 8, "Page.navigate", json!({
+        "url": format!("http://{addr}/reset"), "waitUntil": "networkidle0"
+    }), tight).await;
+    let reset_url = format!("http://{addr}/submit-reset");
+    let reset_starts = ctx.pending_events.iter().filter(|event| {
+        event.method == "Network.requestWillBeSent"
+            && event.params["request"]["url"] == reset_url
+    }).collect::<Vec<_>>();
+    assert_eq!(reset_starts.len(), 2);
+    let reset_id = reset_starts[0].params["requestId"].as_str().unwrap().to_string();
+    for event in &reset_starts {
+        assert_eq!(event.params["requestId"], reset_id);
+        assert_eq!(event.params["request"]["postData"], "ééé");
+        assert_eq!(event.params["request"]["postDataEntries"][0]["bytes"], "w6nDqcOp");
+    }
+    for session in [tight, exact] {
+        let body = cdp(&mut ctx, 9, "Network.getRequestPostData", json!({"requestId": reset_id}), session).await;
+        assert_eq!(body, json!({"postData": "ééé", "base64Encoded": false}));
+    }
+}

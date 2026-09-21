@@ -671,12 +671,14 @@ mod tests {
         .expect("detach should succeed");
         assert!(!ctx.sessions.contains_key(&session_id));
         assert!(!ctx.network_enabled_sessions.contains(&session_id));
+        assert!(!ctx.network_agent_limits.contains_key(&session_id));
         assert!(!ctx.network_body_sessions.contains_key(&session_id));
         assert_eq!(
             ctx.network_request_sessions[&(page_id.clone(), "request-id".into())],
             vec![sibling.clone()]
         );
         assert!(ctx.network_enabled_sessions.contains(&sibling));
+        assert!(ctx.network_agent_limits.contains_key(&sibling));
         assert!(ctx.network_body_sessions[&sibling].contains("body-id"));
 
         let replacement = handle(
@@ -686,6 +688,7 @@ mod tests {
             &parent_session,
         ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
         assert!(!ctx.network_enabled_sessions.contains(&replacement));
+        assert!(!ctx.network_agent_limits.contains_key(&replacement));
         assert!(!ctx.network_body_sessions.contains_key(&replacement));
     }
 

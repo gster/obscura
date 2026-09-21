@@ -626,6 +626,153 @@ fn scroll_node_into_view(
     })
 }
 
+#[cfg(feature = "render")]
+struct RenderTraceEpochState {
+    starts_closed: bool,
+    terminals_closed: bool,
+    next_token: u64,
+    active: HashMap<u64, obscura_net::observation::RequestTrace>,
+}
+
+#[cfg(feature = "render")]
+struct RenderTraceEpoch {
+    observer: Option<std::sync::Arc<dyn obscura_net::observation::RequestLifecycleObserver>>,
+    state: std::sync::Mutex<RenderTraceEpochState>,
+    #[cfg(test)]
+    after_started_hook: std::sync::Mutex<Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>>,
+}
+
+#[cfg(feature = "render")]
+impl RenderTraceEpoch {
+    fn new(
+        observer: Option<std::sync::Arc<dyn obscura_net::observation::RequestLifecycleObserver>>,
+    ) -> Self {
+        Self {
+            observer,
+            state: std::sync::Mutex::new(RenderTraceEpochState {
+                starts_closed: false,
+                terminals_closed: false,
+                next_token: 0,
+                active: HashMap::new(),
+            }),
+            #[cfg(test)]
+            after_started_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn register(
+        self: &std::sync::Arc<Self>,
+        trace: &obscura_net::observation::RequestTrace,
+    ) -> Option<RenderTraceRegistration> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.starts_closed {
+            return None;
+        }
+        state.next_token = state.next_token.wrapping_add(1);
+        let token = state.next_token;
+        state.active.insert(token, trace.clone());
+        Some(RenderTraceRegistration { epoch: self.clone(), token })
+    }
+
+    fn begin_shutdown(&self) -> Vec<obscura_net::observation::RequestTrace> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.starts_closed = true;
+        let active: Vec<_> = state.active.values().cloned().collect();
+        // This is deliberately non-blocking while the epoch mutex is held.
+        // A start callback may hold RequestTrace's lifecycle mutex while it
+        // waits to leave this epoch. The flag becomes its final admission
+        // check; terminalization happens after this mutex is released.
+        for trace in &active {
+            trace.request_cancel("Aborted");
+        }
+        active
+    }
+
+    fn finish_shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Acquiring this mutex waits for any already-entered terminal append.
+        // Later task completions see the fence and cannot append after the Page
+        // writer has been closed.
+        state.terminals_closed = true;
+        state.active.clear();
+    }
+}
+
+#[cfg(feature = "render")]
+impl obscura_net::observation::RequestLifecycleObserver for RenderTraceEpoch {
+    fn started(
+        &self,
+        request_id: &str,
+        resource_type: obscura_net::ResourceType,
+        hop_index: usize,
+        exchange: &obscura_net::observation::Exchange,
+    ) -> Result<(), obscura_net::ObscuraNetError> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.starts_closed {
+            return Err(obscura_net::ObscuraNetError::Blocked(
+                "render resource lifecycle is closing".to_string(),
+            ));
+        }
+        let result = match self.observer.as_ref() {
+            Some(observer) => observer.started(
+                request_id, resource_type, hop_index, exchange,
+            ),
+            None => Ok(()),
+        };
+        drop(state);
+        #[cfg(test)]
+        if let Some((entered, release)) = self.after_started_hook
+            .lock().unwrap_or_else(|failure| failure.into_inner()).clone()
+        {
+            entered.wait();
+            release.wait();
+        }
+        result
+    }
+
+    fn terminal(
+        &self,
+        request_id: &str,
+        resource_type: obscura_net::ResourceType,
+        hop_index: usize,
+        exchange: &obscura_net::observation::Exchange,
+        response_body: Option<&[u8]>,
+        error: Option<&str>,
+    ) {
+        let state = self.state.lock().unwrap_or_else(|failure| failure.into_inner());
+        if state.terminals_closed {
+            return;
+        }
+        if let Some(observer) = self.observer.as_ref() {
+            observer.terminal(
+                request_id,
+                resource_type,
+                hop_index,
+                exchange,
+                response_body,
+                error,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "render")]
+struct RenderTraceRegistration {
+    epoch: std::sync::Arc<RenderTraceEpoch>,
+    token: u64,
+}
+
+#[cfg(feature = "render")]
+impl Drop for RenderTraceRegistration {
+    fn drop(&mut self) {
+        self.epoch.state.lock().unwrap_or_else(|error| error.into_inner())
+            .active.remove(&self.token);
+    }
+}
+
 pub struct ObscuraJsRuntime {
     pub(crate) state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
@@ -689,6 +836,11 @@ pub struct ObscuraJsRuntime {
     input_document_epoch: u64,
     #[cfg(feature = "render")]
     input_mouse_chorded: bool,
+    /// Per-document fence and accepted-trace registry for background Image /
+    /// Font loads. Retiring the epoch terminalizes its accepted prefix before
+    /// the Page history writer may close.
+    #[cfg(feature = "render")]
+    render_trace_epoch: RefCell<std::sync::Arc<RenderTraceEpoch>>,
     // Keep the runtime last: custom `Drop` enters its isolate, then every
     // V8-backed field above is released before `OwnedIsolate` performs the
     // matching exit and disposes the isolate.
@@ -990,8 +1142,16 @@ impl Drop for ObscuraJsRuntime {
         // a dropped JoinHandle would only detach them (the page also calls
         // `abandon_render_resources`, a directly embedded runtime may not).
         #[cfg(feature = "render")]
-        for task in self.state.borrow_mut().render_resource_tasks.drain(..) {
-            task.abort();
+        {
+            let epoch = self.render_trace_epoch.borrow().clone();
+            let accepted = epoch.begin_shutdown();
+            for task in self.state.borrow_mut().render_resource_tasks.drain(..) {
+                task.abort();
+            }
+            for trace in accepted {
+                trace.fail("Aborted");
+            }
+            epoch.finish_shutdown();
         }
         // Teardown needs the isolate current as much as any other V8 work:
         // deno_core's context cleanup clears the context's embedder slots, and
@@ -1200,6 +1360,10 @@ impl ObscuraJsRuntime {
             input_document_epoch: 0,
             #[cfg(feature = "render")]
             input_mouse_chorded: false,
+            #[cfg(feature = "render")]
+            render_trace_epoch: RefCell::new(std::sync::Arc::new(
+                RenderTraceEpoch::new(None),
+            )),
             js_runtime: runtime,
         };
         // Take the op table before any page script can run, and drop the global
@@ -1969,6 +2133,19 @@ impl ObscuraJsRuntime {
         Ok(())
     }
 
+    pub fn set_network_trace_observer(
+        &self,
+        observer: Option<std::sync::Arc<dyn obscura_net::observation::RequestLifecycleObserver>>,
+    ) {
+        #[cfg(feature = "render")]
+        {
+            *self.render_trace_epoch.borrow_mut() =
+                std::sync::Arc::new(RenderTraceEpoch::new(observer));
+        }
+        #[cfg(not(feature = "render"))]
+        let _ = observer;
+    }
+
     /// Advance readiness and dispatch each document lifecycle event once.
     pub fn document_lifecycle(&mut self, phase: u8) -> Result<(), &'static str> {
         if !(1..=4).contains(&phase) {
@@ -2018,6 +2195,8 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_dom(&self, dom: DomTree) {
+        #[cfg(feature = "render")]
+        self.abandon_render_resources();
         let mut gs = self.state.borrow_mut();
         dom.set_document_url(&gs.url);
         gs.dom = Some(dom);
@@ -2041,18 +2220,6 @@ impl ObscuraJsRuntime {
             let render_resources = crate::ops::fresh_render_resources(&gs);
             gs.render_resources = render_resources;
             gs.render_image_in_flight.clear();
-            for task in gs.render_resource_tasks.drain(..) {
-                task.abort();
-            }
-            gs.render_resource_in_flight.clear();
-            gs.render_resource_backlog.clear();
-            gs.render_resource_events.clear();
-            // A fresh channel: a load of the old document that is still
-            // finishing (abort is not a join) delivers into a dropped
-            // receiver, never into this document's results.
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            gs.render_resource_tx = tx;
-            gs.render_resource_rx = rx;
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
@@ -5593,6 +5760,8 @@ impl ObscuraJsRuntime {
     /// dropped channel.
     #[cfg(feature = "render")]
     pub fn abandon_render_resources(&self) {
+        let retired_epoch = self.render_trace_epoch.borrow().clone();
+        let accepted = retired_epoch.begin_shutdown();
         let mut state = self.state.borrow_mut();
         for task in state.render_resource_tasks.drain(..) {
             task.abort();
@@ -5606,6 +5775,14 @@ impl ObscuraJsRuntime {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         state.render_resource_tx = tx;
         state.render_resource_rx = rx;
+        drop(state);
+        for trace in accepted {
+            trace.fail("Aborted");
+        }
+        retired_epoch.finish_shutdown();
+        *self.render_trace_epoch.borrow_mut() = std::sync::Arc::new(
+            RenderTraceEpoch::new(retired_epoch.observer.clone()),
+        );
     }
 
     /// Whether a standalone or Page-owned asynchronous transport is installed.
@@ -5656,6 +5833,10 @@ impl ObscuraJsRuntime {
         let initiator = initiator.expect("checked above");
         let referrer_policy = state.referrer_policy;
         let callbacks = state.callbacks.clone();
+        let trace_epoch = self.render_trace_epoch.borrow().clone();
+        let response_bodies = state.network_response_bodies.clone();
+        let request_bodies = state.network_request_bodies.clone();
+        let request_counter = state.network_response_body_counter.clone();
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
@@ -5666,6 +5847,10 @@ impl ObscuraJsRuntime {
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(|(raw, profile, is_font)| {
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
+                let trace_epoch = trace_epoch.clone();
+                let response_bodies = response_bodies.clone();
+                let request_bodies = request_bodies.clone();
+                let request_counter = request_counter.clone();
                 let initiator = initiator.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
@@ -5703,10 +5888,27 @@ impl ObscuraJsRuntime {
                         }
                         _ => {}
                     }
-                    let response = stealth_client
-                        .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
-                        .await
-                        .ok();
+                    let response = if trace_epoch.observer.is_some() {
+                        let ordinal = request_counter.fetch_add(
+                            1, std::sync::atomic::Ordering::Relaxed,
+                        ) + 1;
+                        let request_id = format!("render-{generation}-{ordinal}");
+                        let trace = obscura_net::observation::RequestTrace::new(
+                            response_bodies, request_bodies, request_id,
+                        ).observe(trace_epoch.clone(), kind);
+                        let registration = trace_epoch.register(&trace);
+                        match (registration, trace.begin(parsed.as_str(), "GET", None, None)) {
+                            (Some(_registration), Ok(())) => stealth_client.fetch_resource_traced(
+                                &parsed, request, callbacks.as_deref(), &trace,
+                            ).await.ok(),
+                            _ => None,
+                        }
+                    } else {
+                        stealth_client
+                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                            .await
+                            .ok()
+                    };
                     crate::ops::RenderResourceLoad {
                         generation,
                         url: raw,
@@ -7504,6 +7706,8 @@ impl ObscuraJsRuntime {
         }
     }
     pub fn take_dom(&self) -> Option<DomTree> {
+        #[cfg(feature = "render")]
+        self.abandon_render_resources();
         let mut state = self.state.borrow_mut();
         #[cfg(feature = "render")]
         {
@@ -7511,15 +7715,6 @@ impl ObscuraJsRuntime {
             state.pending_style_mutations.clear();
             let render_resources = crate::ops::fresh_render_resources(&state);
             state.render_resources = render_resources;
-            for task in state.render_resource_tasks.drain(..) {
-                task.abort();
-            }
-            state.render_resource_in_flight.clear();
-            state.render_resource_backlog.clear();
-            state.render_resource_events.clear();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            state.render_resource_tx = tx;
-            state.render_resource_rx = rx;
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
@@ -7991,6 +8186,85 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_shutdown_between_started_callback_and_trace_commit_cancels_send() {
+        struct Observer {
+            starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            terminals: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        }
+
+        impl obscura_net::observation::RequestLifecycleObserver for Observer {
+            fn started(
+                &self,
+                _: &str,
+                _: obscura_net::ResourceType,
+                _: usize,
+                _: &obscura_net::observation::Exchange,
+            ) -> Result<(), obscura_net::ObscuraNetError> {
+                self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn terminal(
+                &self,
+                _: &str,
+                _: obscura_net::ResourceType,
+                _: usize,
+                _: &obscura_net::observation::Exchange,
+                _: Option<&[u8]>,
+                error: Option<&str>,
+            ) {
+                self.terminals.lock().unwrap().push(error.map(str::to_string));
+            }
+        }
+
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let epoch = std::sync::Arc::new(RenderTraceEpoch::new(Some(std::sync::Arc::new(
+            Observer { starts: starts.clone(), terminals: terminals.clone() },
+        ))));
+        let callback_returned = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let allow_commit = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *epoch.after_started_hook.lock().unwrap() = Some((
+            callback_returned.clone(),
+            allow_commit.clone(),
+        ));
+        let trace = obscura_net::observation::RequestTrace::new(
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+            "render-race".to_string(),
+        ).observe(epoch.clone(), obscura_net::ResourceType::Image);
+        trace.begin("https://example.test/pending.png", "GET", None, None).unwrap();
+        let _registration = epoch.register(&trace).unwrap();
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_by_start = sent.clone();
+        let start_trace = trace.clone();
+        let start = std::thread::spawn(move || {
+            let result = start_trace.start();
+            if result.is_ok() {
+                sent_by_start.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            result
+        });
+
+        // Pause after the observer has durably accepted Started but before
+        // RequestTrace can commit exchange.started. Shutdown deterministically
+        // owns this exact former race window, without timing sleeps.
+        callback_returned.wait();
+        let accepted = epoch.begin_shutdown();
+        allow_commit.wait();
+        assert!(start.join().unwrap().is_err());
+        for trace in accepted {
+            trace.fail("Aborted");
+        }
+        epoch.finish_shutdown();
+
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(terminals.lock().unwrap().as_slice(), [Some("Aborted".to_string())]);
     }
 
     #[cfg(feature = "render")]

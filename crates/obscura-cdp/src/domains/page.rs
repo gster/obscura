@@ -915,7 +915,17 @@ fn begin_network_request(
         page_id, &sessions, request_id,
         standard_body_id.as_deref(), transport_body_id.as_deref(),
     );
-    queue_network_event(ctx, &sessions, "Network.requestWillBeSent", params);
+    let events = sessions.iter().map(|session| {
+        let mut projected = params.clone();
+        ctx.network_agent_limits.get(session).copied().unwrap_or_default()
+            .project_request_will_be_sent(&mut projected);
+        CdpEvent::with_session(
+            "Network.requestWillBeSent",
+            projected,
+            session.clone(),
+        )
+    }).collect::<Vec<_>>();
+    ctx.pending_events.extend(events);
 }
 
 fn add_exact_request_body(
@@ -1003,12 +1013,19 @@ pub fn emit_navigation_events(
             .map(|(_, store)| store.clone()));
     let previous_loader = ctx.current_loader_ids.get(page_id).cloned().unwrap_or_else(|| format!("loader-blank-{page_id}"));
     let retired = ctx.get_page_mut(page_id).map(|page| std::mem::take(&mut page.network_retired_generations)).unwrap_or_default();
-    for retired in retired { ctx.document_loaders.entry((page_id.to_string(), retired)).or_insert_with(|| previous_loader.clone()); }
+    for retired_generation in &retired {
+        ctx.document_loaders
+            .entry((page_id.to_string(), *retired_generation))
+            .or_insert_with(|| previous_loader.clone());
+    }
     let retired_events: Vec<_> = network_events.iter().filter(|event| event.retired_document_url.is_some() || event.document_generation < generation).cloned().collect();
     for event in &retired_events {
         ctx.document_loaders.entry((page_id.to_string(), event.document_generation)).or_insert_with(|| previous_loader.clone());
     }
     emit_runtime_network_events(ctx, session_id, frame_id, page_url, page_id, &retired_events);
+    ctx.network_redirect_responses.retain(|(owner, generation, _), _| {
+        owner != page_id || !retired.contains(generation)
+    });
     let current_events: Vec<_> = network_events.iter().filter(|event| event.retired_document_url.is_none() && event.document_generation >= generation).cloned().collect();
     let network_events = current_events.as_slice();
     ctx.document_loaders.insert((page_id.to_string(), generation), loader_id.to_string());
@@ -1259,9 +1276,6 @@ pub(crate) fn emit_runtime_network_events(
     page_id: &str,
     network_events: &[obscura_browser::NetworkEvent],
 ) {
-    if network_events.is_empty() {
-        return;
-    }
     let request_bodies = ctx.get_page(page_id).map(|page| page.request_body_store())
         .or_else(|| ctx.navigating_request_bodies.as_ref()
             .filter(|(owner, _)| owner == page_id)
@@ -1271,13 +1285,18 @@ pub(crate) fn emit_runtime_network_events(
         .get(page_id)
         .cloned()
         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-    let retired = ctx.get_page_mut(page_id).map(|page| {
-        let mut generations = std::mem::take(&mut page.network_retired_generations);
-        generations.push(page.network_document_generation);
-        generations
+    let (retired, current_generation) = ctx.get_page_mut(page_id).map(|page| {
+        (
+            std::mem::take(&mut page.network_retired_generations),
+            Some(page.network_document_generation),
+        )
     }).unwrap_or_default();
-    for generation in retired { ctx.document_loaders.entry((page_id.to_string(), generation)).or_insert_with(|| loader_id.clone()); }
-    let mut redirect_responses = std::collections::HashMap::new();
+    let mut generations = retired.clone();
+    if let Some(generation) = current_generation { generations.push(generation); }
+    for generation in generations {
+        ctx.document_loaders.entry((page_id.to_string(), generation))
+            .or_insert_with(|| loader_id.clone());
+    }
     for network_event in network_events {
         let page_url = if network_event.document_url.is_empty() { page_url } else { &network_event.document_url };
         let loader_id = if network_event.document_generation == u64::MAX { loader_id.clone() } else {
@@ -1285,8 +1304,13 @@ pub(crate) fn emit_runtime_network_events(
                 .or_insert_with(|| loader_id.clone()).clone()
         };
         let request_id = &network_event.request_id;
-        let redirect_key = (network_event.document_generation, request_id.clone());
+        let redirect_key = (
+            page_id.to_string(),
+            network_event.document_generation,
+            request_id.clone(),
+        );
         if !network_event.request_started {
+        let redirect_response = ctx.network_redirect_responses.remove(&redirect_key);
         let request = request_bodies.as_ref().map(|store| {
             let store = store.lock().unwrap_or_else(|error| error.into_inner());
             network_request_value(network_event, &store)
@@ -1301,7 +1325,7 @@ pub(crate) fn emit_runtime_network_events(
         }));
         begin_network_request(ctx, page_id, request_id, json!({
                 "requestId": request_id,
-                "redirectResponse": redirect_responses.remove(&redirect_key),
+                "redirectResponse": redirect_response,
                 "redirectHasExtraInfo": false,
                 "loaderId": loader_id,
                 "documentURL": page_url,
@@ -1315,9 +1339,19 @@ pub(crate) fn emit_runtime_network_events(
                 "frameId": frame_id,
             }));
         }
-        if network_event.redirect { redirect_responses.insert(redirect_key, network_response_value(network_event)); }
+        if network_event.redirect {
+            ctx.network_redirect_responses
+                .insert(redirect_key, network_response_value(network_event));
+        } else if !network_event.pending {
+            // A terminal failure before a next hop must not leave stale state
+            // that could be attached to an unrelated future request.
+            ctx.network_redirect_responses.remove(&redirect_key);
+        }
         emit_network_result(ctx, page_id, &loader_id, frame_id, network_event, request_id);
     }
+    ctx.network_redirect_responses.retain(|(owner, generation, _), _| {
+        owner != page_id || !retired.contains(generation)
+    });
 }
 
 fn network_response_value(event: &obscura_browser::NetworkEvent) -> Value {
@@ -2099,11 +2133,17 @@ mod tests {
         assert_eq!(result.value, Some(json!("ok")));
         page.sync_js_network_events();
         let scripted: Vec<_> = page.network_events.drain(..).collect();
-        assert_eq!(navigation.len(), 1);
+        assert_eq!(navigation.len(), 2);
+        assert!(navigation[0].pending);
+        assert!(!navigation[1].pending);
+        assert_eq!(navigation[0].request_id, navigation[1].request_id);
         assert_eq!(scripted.len(), 2);
         assert!(scripted[0].redirect);
         assert_eq!(scripted[0].request_id, scripted[1].request_id);
-        for (event, (request, response)) in navigation.iter().chain(scripted.iter().filter(|event| !event.redirect)).zip(responses.lock().unwrap().iter()) {
+        for (event, (request, response)) in navigation.iter().filter(|event| !event.pending)
+            .chain(scripted.iter().filter(|event| !event.redirect))
+            .zip(responses.lock().unwrap().iter())
+        {
             assert_eq!(event.raw_headers, response.raw_headers);
             assert_eq!(event.request_raw_headers, request.raw_headers);
             assert_eq!(event.request_raw_headers, response.request_raw_headers);
@@ -2641,6 +2681,248 @@ mod tests {
                 "Page.frameNavigated" | "Page.lifecycleEvent"
             )
         }));
+    }
+
+    #[test]
+    fn runtime_redirect_response_survives_separate_live_drain_batches() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session);
+        ctx.current_loader_ids.insert(page_id.clone(), "loader-current".into());
+
+        let event = |pending, request_started, redirect, status, url: &str| {
+            obscura_browser::NetworkEvent {
+                document_generation: 7,
+                document_url: "https://example.test/".into(),
+                initiator_request_id: None,
+                retired_document_url: None,
+                pending,
+                error: None,
+                request_body_present: false,
+                request_body_request_id: None,
+                request_body_size: 0,
+                transport_request_body_present: false,
+                transport_request_body_request_id: None,
+                transport_request_body_size: 0,
+                request_started,
+                redirect,
+                response_body_request_id: None,
+                response_body_capture_error: None,
+                request_id: "native-redirect".into(),
+                url: url.into(),
+                method: "GET".into(),
+                resource_type: "Image".into(),
+                status,
+                status_text: String::new(),
+                headers: Default::default(),
+                response_headers: std::sync::Arc::new(
+                    (status != 0)
+                        .then(|| std::collections::HashMap::from([
+                            ("location".into(), "/two.png".into()),
+                            ("set-cookie".into(), "complete=raw+/=".into()),
+                        ]))
+                        .unwrap_or_default(),
+                ),
+                raw_headers: None,
+                request_raw_headers: None,
+                body_size: 0,
+                timestamp: 42.0,
+            }
+        };
+
+        emit_runtime_network_events(
+            &mut ctx,
+            &session,
+            "frame-1",
+            "https://example.test/",
+            &page_id,
+            &[event(true, false, false, 0, "https://example.test/one.png")],
+        );
+        emit_runtime_network_events(
+            &mut ctx,
+            &session,
+            "frame-1",
+            "https://example.test/",
+            &page_id,
+            &[event(false, true, true, 302, "https://example.test/one.png")],
+        );
+        assert_eq!(ctx.network_redirect_responses.len(), 1);
+
+        emit_runtime_network_events(
+            &mut ctx,
+            &session,
+            "frame-1",
+            "https://example.test/",
+            &page_id,
+            &[event(true, false, false, 0, "https://example.test/two.png")],
+        );
+
+        let starts = ctx.pending_events.iter().filter(|queued| {
+            queued.method == "Network.requestWillBeSent"
+                && queued.params["requestId"] == "native-redirect"
+        }).collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2);
+        assert!(starts[0].params["redirectResponse"].is_null());
+        assert_eq!(starts[1].params["redirectResponse"]["status"], 302);
+        assert_eq!(
+            starts[1].params["redirectResponse"]["headers"]["set-cookie"],
+            "complete=raw+/=",
+        );
+        assert!(ctx.network_redirect_responses.is_empty());
+
+        ctx.network_redirect_responses.insert(
+            (page_id.clone(), 8, "aborted-before-next-start".into()),
+            json!({"status": 307, "headers": {"location": "/never-started"}}),
+        );
+        ctx.get_page_mut(&page_id).unwrap().network_retired_generations.push(8);
+        emit_runtime_network_events(
+            &mut ctx,
+            &session,
+            "frame-1",
+            "https://example.test/",
+            &page_id,
+            &[],
+        );
+        assert!(ctx.network_redirect_responses.is_empty());
+    }
+
+    #[test]
+    fn max_post_data_size_is_a_session_local_event_projection_only() {
+        use base64::Engine as _;
+
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let page_id = ctx.create_page();
+        let tight = "network-tight".to_string();
+        let exact = "network-exact".to_string();
+        let default = "network-default".to_string();
+        for session in [&tight, &exact, &default] {
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            ctx.network_enabled_sessions.insert(session.clone());
+            ctx.network_body_sessions.insert(session.clone(), Default::default());
+            ctx.network_request_body_sessions.insert(session.clone(), Default::default());
+        }
+        ctx.network_agent_limits.insert(
+            tight.clone(),
+            crate::dispatch::NetworkAgentLimits {
+                max_post_data_size: Some(5),
+                ..Default::default()
+            },
+        );
+        ctx.network_agent_limits.insert(
+            exact.clone(),
+            crate::dispatch::NetworkAgentLimits {
+                max_post_data_size: Some(6),
+                ..Default::default()
+            },
+        );
+        ctx.network_agent_limits.insert(
+            default.clone(),
+            crate::dispatch::NetworkAgentLimits::default(),
+        );
+
+        let body_id = "fetch-raw-request-hop-0-standard";
+        let body = "ééé".as_bytes();
+        let request_store = ctx.get_page(&page_id).unwrap().request_body_store();
+        request_store.lock().unwrap_or_else(|error| error.into_inner())
+            .insert(body_id.into(), body).unwrap();
+        let raw_headers = obscura_net::HeaderCapture {
+            capture_stage: "transportRequest",
+            encoding: "base64",
+            fields: vec![obscura_net::RawHeader {
+                name: b"Authorization".to_vec(),
+                value: b"Bearer complete-secret".to_vec(),
+            }],
+        };
+        let event = obscura_browser::NetworkEvent {
+            document_generation: 0,
+            document_url: "https://example.test/".into(),
+            initiator_request_id: None,
+            retired_document_url: None,
+            pending: true,
+            error: None,
+            request_body_present: true,
+            request_body_request_id: Some(body_id.into()),
+            request_body_size: body.len(),
+            transport_request_body_present: true,
+            transport_request_body_request_id: Some(body_id.into()),
+            transport_request_body_size: body.len(),
+            request_started: false,
+            redirect: false,
+            response_body_request_id: None,
+            response_body_capture_error: None,
+            request_id: "fetch-raw".into(),
+            url: "https://example.test/raw".into(),
+            method: "POST".into(),
+            resource_type: "Fetch".into(),
+            status: 0,
+            status_text: String::new(),
+            headers: std::collections::HashMap::from([
+                ("Authorization".into(), "Bearer complete-secret".into()),
+            ]),
+            response_headers: std::sync::Arc::new(Default::default()),
+            raw_headers: None,
+            request_raw_headers: Some(raw_headers.clone()),
+            body_size: 0,
+            timestamp: 42.0,
+        };
+        let request = {
+            let store = request_store.lock().unwrap_or_else(|error| error.into_inner());
+            network_request_value(&event, &store)
+        };
+        begin_network_request(
+            &mut ctx,
+            &page_id,
+            &event.request_id,
+            json!({
+                "requestId": event.request_id,
+                "request": request,
+                "loaderId": "loader-current",
+                "documentURL": event.document_url,
+                "timestamp": event.timestamp,
+                "wallTime": event.timestamp,
+                "initiator": {"type": "script"},
+                "type": event.resource_type,
+                "frameId": "frame-current",
+            }),
+        );
+
+        let start = |session: &str| ctx.pending_events.iter().find(|event| {
+            event.method == "Network.requestWillBeSent"
+                && event.session_id.as_deref() == Some(session)
+        }).unwrap();
+        let tight_event = start(&tight);
+        assert_eq!(tight_event.params["request"]["hasPostData"], true);
+        assert_eq!(tight_event.params["request"]["bodySize"], 6);
+        assert_eq!(tight_event.params["request"]["requestBodyRequestId"], body_id);
+        assert_eq!(tight_event.params["request"]["rawHeaders"], json!(raw_headers));
+        assert!(tight_event.params["request"].get("postData").is_none());
+        assert!(tight_event.params["request"].get("postDataEntries").is_none());
+        assert!(tight_event.params["request"].get("postDataIsByteString").is_none());
+        assert_eq!(tight_event.params["request"]["transportPostData"], "ééé");
+        assert_eq!(tight_event.params["request"]["transportBodySize"], 6);
+
+        for session in [&exact, &default] {
+            let request = &start(session).params["request"];
+            assert_eq!(request["postData"], "ééé");
+            assert_eq!(request["postDataIsByteString"], false);
+            let encoded = request["postDataEntries"][0]["bytes"].as_str().unwrap();
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(), body);
+        }
+
+        // Event omission is not data loss: every start observer can still
+        // retrieve the full canonical bytes by logical request id.
+        for session in [tight, exact, default] {
+            let result = crate::domains::network::get_request_post_data(
+                &ctx,
+                &Some(session),
+                "fetch-raw",
+            ).unwrap();
+            assert_eq!(result, json!({"postData":"ééé", "base64Encoded":false}));
+        }
     }
 
     #[test]

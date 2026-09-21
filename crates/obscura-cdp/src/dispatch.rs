@@ -55,6 +55,40 @@ pub(crate) struct CdpNetworkHistory {
     pub live: bool,
 }
 
+/// Per-CDP-agent Network event projection limits. These belong to the
+/// attached session, not to the Page-owned canonical body stores. In
+/// particular, `maxPostDataSize` may omit request body fields from one
+/// agent's `requestWillBeSent` event without truncating or deleting the exact
+/// bytes retained for `Network.getRequestPostData`, history, or another
+/// session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NetworkAgentLimits {
+    /// Chrome response-cache hints. Obscura retains them per agent but does
+    /// not apply an eviction policy until Chrome's ordering semantics are
+    /// qualified; they must never shrink the Page/context raw-data authority.
+    pub max_total_buffer_size: Option<i64>,
+    pub max_resource_buffer_size: Option<i64>,
+    pub max_post_data_size: Option<usize>,
+}
+
+impl NetworkAgentLimits {
+    /// Apply only per-agent inline event policy. Canonical request bytes,
+    /// body ids, raw headers, and Obscura's transport-body extension remain
+    /// untouched and therefore available to authorized body/history readers.
+    pub(crate) fn project_request_will_be_sent(&self, params: &mut serde_json::Value) {
+        let Some(max) = self.max_post_data_size else { return; };
+        let Some(request) = params.get_mut("request").and_then(serde_json::Value::as_object_mut)
+        else { return; };
+        let body_size = request.get("bodySize").and_then(serde_json::Value::as_u64)
+            .and_then(|size| usize::try_from(size).ok());
+        if body_size.is_some_and(|size| size > max) {
+            request.remove("postData");
+            request.remove("postDataEntries");
+            request.remove("postDataIsByteString");
+        }
+    }
+}
+
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub(crate) navigating_page_id: Option<String>,
@@ -81,9 +115,17 @@ pub struct CdpContext {
     /// Sessions that called Network.enable. Network observations are a
     /// session-scoped subscription, independent of Fetch interception owner.
     pub network_enabled_sessions: HashSet<String>,
+    /// Event projection limits from the most recent Network.enable call for
+    /// each session. Omitted, null, zero, and negative maxPostDataSize values
+    /// use Chrome's unbounded/default projection.
+    pub(crate) network_agent_limits: HashMap<String, NetworkAgentLimits>,
     /// Subscribers that saw a live request start. Later Network events fan out
     /// to current subscribers, but only start observers gain body access.
     pub(crate) network_request_sessions: HashMap<(String, String), Vec<String>>,
+    /// Completed redirect responses waiting for the next hop's live
+    /// requestWillBeSent. Ordinary native events can be drained in separate
+    /// batches while a Page is navigating, so this cannot be function-local.
+    pub(crate) network_redirect_responses: HashMap<(String, u64, String), Value>,
     /// Response bodies visible to each Network agent. Chrome invalidates this
     /// view on Network.disable without deleting a sibling session's cache.
     pub(crate) network_body_sessions: HashMap<String, HashSet<String>>,
@@ -292,7 +334,9 @@ impl CdpContext {
             document_loaders: HashMap::new(),
             network_owners: HashMap::new(),
             network_enabled_sessions: HashSet::new(),
+            network_agent_limits: HashMap::new(),
             network_request_sessions: HashMap::new(),
+            network_redirect_responses: HashMap::new(),
             network_body_sessions: HashMap::new(),
             network_request_body_sessions: HashMap::new(),
             network_body_failure_sessions: HashSet::new(),
@@ -531,6 +575,8 @@ impl CdpContext {
         self.document_loaders.retain(|(page_id, _), _| page_id != id);
         self.network_owners.retain(|(page_id, _), _| page_id != id);
         self.network_request_sessions.retain(|(page_id, _), _| page_id != id);
+        self.network_redirect_responses
+            .retain(|(page_id, _, _), _| page_id != id);
         self.network_observation_failure_sessions
             .retain(|(page_id, _)| page_id != id);
         self.announced_frames.remove(id);
@@ -711,6 +757,7 @@ impl CdpContext {
 
     pub(crate) fn disable_network_session(&mut self, session_id: &str) {
         self.network_enabled_sessions.remove(session_id);
+        self.network_agent_limits.remove(session_id);
         self.network_body_sessions.remove(session_id);
         self.network_request_body_sessions.remove(session_id);
         self.network_body_failure_sessions.remove(session_id);
@@ -874,6 +921,10 @@ mod context_ownership_tests {
             let session_id = format!("session-{cycle}");
             ctx.sessions.insert(session_id.clone(), page_id.clone());
             ctx.network_enabled_sessions.insert(session_id.clone());
+            ctx.network_agent_limits.insert(
+                session_id.clone(),
+                NetworkAgentLimits { max_post_data_size: Some(cycle + 1), ..Default::default() },
+            );
             ctx.network_body_sessions.entry(session_id.clone()).or_default().insert("request".into());
             ctx.network_request_body_sessions.entry(session_id.clone()).or_default()
                 .insert("request".into(), "request".into());
@@ -881,6 +932,10 @@ mod context_ownership_tests {
             ctx.network_observation_failure_sessions
                 .insert((page_id.clone(), session_id.clone()));
             ctx.network_request_sessions.insert((page_id.clone(), "request".into()), vec![session_id.clone()]);
+            ctx.network_redirect_responses.insert(
+                (page_id.clone(), 0, "request".into()),
+                serde_json::json!({"status": 302, "headers": {"location": "/next"}}),
+            );
             ctx.ensure_default_context(&page_id).unwrap();
             ctx.create_isolated_context(
                 &page_id,
@@ -897,11 +952,13 @@ mod context_ownership_tests {
             assert!(ctx.valid_context_ids.is_empty());
             assert!(ctx.runtime_enabled_sessions.is_empty());
             assert!(ctx.network_enabled_sessions.is_empty());
+            assert!(ctx.network_agent_limits.is_empty());
             assert!(ctx.network_body_sessions.is_empty());
             assert!(ctx.network_request_body_sessions.is_empty());
             assert!(ctx.network_body_failure_sessions.is_empty());
             assert!(ctx.network_observation_failure_sessions.is_empty());
             assert!(ctx.network_request_sessions.is_empty());
+            assert!(ctx.network_redirect_responses.is_empty());
             assert!(ctx.sessions.is_empty());
         }
     }

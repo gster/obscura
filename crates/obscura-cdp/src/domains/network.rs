@@ -15,6 +15,28 @@ const SOURCE_SCHEME_SECURE: &str = "Secure";
 const SOURCE_SCHEME_NONSECURE: &str = "NonSecure";
 const DEFAULT_SAME_SITE: &str = "Lax";
 
+fn network_enable_integer(params: &Value, name: &str) -> Result<Option<i64>, String> {
+    let Some(value) = params.get(name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_i64().map(Some).ok_or_else(|| {
+        format!("Network.enable {name} must be an integer or null")
+    })
+}
+
+fn network_enable_post_data_size(params: &Value) -> Result<Option<usize>, String> {
+    let Some(integer) = network_enable_integer(params, "maxPostDataSize")? else {
+        return Ok(None);
+    };
+    if integer <= 0 { return Ok(None); }
+    usize::try_from(integer).map(Some).map_err(|_| {
+        "Network.enable maxPostDataSize is too large for this platform".to_string()
+    })
+}
+
 // Resolve the cookie jar for a Network request: prefer the session's page jar,
 // fall back to the default browser context. Puppeteer and Playwright both call
 // Network.setCookie/getCookies/deleteCookies BEFORE attaching to a target —
@@ -33,15 +55,31 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
-            if !(params.is_null()
-                || params.as_object().is_some_and(serde_json::Map::is_empty))
-            {
-                return Err("Network.enable supports only empty params".to_string());
+            if !(params.is_null() || params.is_object()) {
+                return Err("Network.enable params must be an object or null".to_string());
             }
+            // Chrome validates the three integer buffer arguments. Only
+            // maxPostDataSize has a qualified projection contract here. Keep
+            // the two response-cache hints in agent state for future Chrome
+            // eviction parity; neither may truncate Page/history raw data.
+            let max_total_buffer_size = network_enable_integer(params, "maxTotalBufferSize")?;
+            let max_resource_buffer_size = network_enable_integer(params, "maxResourceBufferSize")?;
+            let max_post_data_size = network_enable_post_data_size(params)?;
             if let Some(session) = session_id {
-                if !ctx.sessions.get(session).is_some_and(|page_id| ctx.has_page(page_id)) {
+                if !ctx.sessions.get(session).is_some_and(|page_id| {
+                    ctx.has_page(page_id)
+                        || ctx.navigating_page_id.as_deref() == Some(page_id.as_str())
+                }) {
                     return Err(format!("No page found for sessionId {session}"));
                 }
+                ctx.network_agent_limits.insert(
+                    session.clone(),
+                    crate::dispatch::NetworkAgentLimits {
+                        max_total_buffer_size,
+                        max_resource_buffer_size,
+                        max_post_data_size,
+                    },
+                );
                 if ctx.network_enabled_sessions.insert(session.clone()) {
                     // A fresh Network agent cannot read bodies from requests
                     // observed before it enabled. Repeated enable is idempotent.
@@ -666,7 +704,9 @@ mod tests {
         let request_ids = events.iter().map(|event| event.request_id.as_str()).collect::<Vec<_>>();
         grant_network_body_access(&mut ctx, &session, &request_ids);
         for (path, (_, expected, resource_type)) in resources.iter() {
-            let event = events.iter().find(|event| event.url == format!("{origin}{path}"))
+            let event = events.iter().find(|event| {
+                !event.pending && event.url == format!("{origin}{path}")
+            })
                 .unwrap_or_else(|| panic!("missing {resource_type} event"));
             assert_eq!(&event.resource_type, resource_type);
             assert_eq!(event.body_size, expected.len());
@@ -788,17 +828,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enable_accepts_only_empty_params() {
-        for params in [Value::Null, json!({})] {
-            handle("enable", &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
-                .await
-                .expect("omitted and empty params are equivalent");
-        }
-        assert!(
-            handle("enable", &json!({"maxTotalBufferSize": 1}), &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
-                .await
-                .is_err()
+    async fn enable_accepts_chrome_buffer_params_and_resets_session_projection() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let page_id = ctx.create_page();
+        let session = Some("network-limits".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        handle(
+            "enable",
+            &json!({
+                "maxTotalBufferSize": 1024,
+                "maxResourceBufferSize": null,
+                "maxPostDataSize": 6,
+                "unknownFutureField": "accepted-by-Chrome"
+            }),
+            &mut ctx,
+            &session,
+        ).await.unwrap();
+        assert_eq!(
+            ctx.network_agent_limits[session.as_ref().unwrap()].max_post_data_size,
+            Some(6),
         );
+        assert_eq!(
+            ctx.network_agent_limits[session.as_ref().unwrap()].max_total_buffer_size,
+            Some(1024),
+        );
+        assert_eq!(
+            ctx.network_agent_limits[session.as_ref().unwrap()].max_resource_buffer_size,
+            None,
+        );
+        ctx.network_request_body_sessions.get_mut(session.as_ref().unwrap()).unwrap()
+            .insert("already-observed".into(), "already-observed-body".into());
+
+        // Repeated enable updates only event projection policy. Omitted, null,
+        // zero, and negative values all restore Chrome's default/unbounded
+        // request event projection.
+        for params in [Value::Null, json!({}), json!({"maxPostDataSize": null}),
+            json!({"maxPostDataSize": 0}), json!({"maxPostDataSize": -1})]
+        {
+            handle("enable", &params, &mut ctx, &session).await.unwrap();
+            assert_eq!(
+                ctx.network_agent_limits[session.as_ref().unwrap()].max_post_data_size,
+                None,
+            );
+            assert_eq!(
+                ctx.network_request_body_sessions[session.as_ref().unwrap()]["already-observed"],
+                "already-observed-body",
+            );
+        }
+
+        for params in [json!({"maxPostDataSize": 1.5}), json!({"maxPostDataSize": "6"}),
+            json!({"maxTotalBufferSize": false}), json!([])]
+        {
+            assert!(handle("enable", &params, &mut ctx, &session).await.is_err(),
+                "invalid Network.enable params unexpectedly accepted: {params}");
+        }
+
+        handle("enable", &json!({"maxPostDataSize": 4}), &mut ctx, &session).await.unwrap();
+        handle("disable", &json!({}), &mut ctx, &session).await.unwrap();
+        assert!(!ctx.network_agent_limits.contains_key(session.as_ref().unwrap()));
     }
 
     #[tokio::test]
@@ -813,6 +901,31 @@ mod tests {
         ).await.unwrap_err();
         assert!(error.contains("No page found for sessionId browser-session"), "{error}");
         assert!(ctx.network_enabled_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enable_accepts_a_page_temporarily_owned_by_navigation() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let page_id = ctx.create_page();
+        let session = Some("navigating-network-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let _navigating_page = ctx.pages.remove(
+            ctx.pages.iter().position(|page| page.id == page_id).unwrap(),
+        );
+        ctx.navigating_page_id = Some(page_id);
+
+        handle(
+            "enable",
+            &json!({"maxPostDataSize": 7}),
+            &mut ctx,
+            &session,
+        ).await.unwrap();
+
+        assert!(ctx.network_enabled_sessions.contains(session.as_ref().unwrap()));
+        assert_eq!(
+            ctx.network_agent_limits[session.as_ref().unwrap()].max_post_data_size,
+            Some(7),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
