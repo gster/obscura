@@ -122,7 +122,12 @@ pub struct InterceptedRequest {
     pub network_id: String,
     pub network_start: Arc<std::sync::atomic::AtomicU8>,
     pub request_raw_headers: Option<obscura_net::HeaderCapture>,
+    pub request_body_present: bool,
+    pub request_body_request_id: Option<String>,
     pub request_body_size: usize,
+    pub transport_request_body_present: bool,
+    pub transport_request_body_request_id: Option<String>,
+    pub transport_request_body_size: usize,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -167,7 +172,12 @@ pub struct JsNetworkEvent {
     /// A terminal failure never produces loadingFinished, even with a real response.
     pub pending: bool,
     pub error: Option<String>,
+    pub request_body_present: bool,
+    pub request_body_request_id: Option<String>,
     pub request_body_size: usize,
+    pub transport_request_body_present: bool,
+    pub transport_request_body_request_id: Option<String>,
+    pub transport_request_body_size: usize,
     pub request_started: bool,
     pub redirect: bool,
     pub response_body_request_id: Option<String>,
@@ -394,6 +404,7 @@ pub struct ObscuraState {
     pub console_messages_enabled: bool,
     pub runtime_exception_counter: u64,
     pub network_response_bodies: Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
+    pub network_request_bodies: Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>,
     pub network_response_body_counter: Arc<std::sync::atomic::AtomicU64>,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
@@ -654,6 +665,7 @@ impl ObscuraState {
             console_messages_enabled: false,
             runtime_exception_counter: 0,
             network_response_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
+            network_request_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             network_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fetched_urls: Vec::new(),
             js_network_events,
@@ -3850,18 +3862,20 @@ pub(crate) struct NetworkRequest {
 
 impl NetworkRequest {
     pub(crate) fn new(state: SharedState, id: Option<String>, url: &str, method: &str,
-        headers: Option<obscura_net::HeaderCapture>, body_size: usize, resource_type: ResourceType,
-    ) -> Self {
+        headers: Option<obscura_net::HeaderCapture>, body: Option<&[u8]>, resource_type: ResourceType,
+    ) -> Result<Self, obscura_net::request_body::RequestBodyError> {
         let id = id.unwrap_or_else(|| {
             let state = state.borrow();
             let id = state.network_response_body_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             format!("fetch-{id}")
         });
-        let trace = obscura_net::observation::RequestTrace::new(state.borrow().network_response_bodies.clone(), id.clone());
-        trace.begin(url, method, headers, body_size);
+        let trace = obscura_net::observation::RequestTrace::new(
+            state.borrow().network_response_bodies.clone(), state.borrow().network_request_bodies.clone(), id.clone(),
+        );
+        trace.begin(url, method, headers, body)?;
         let document_generation = state.borrow().network_document_generation;
         let document_url = state.borrow().network_document_url.clone();
-        Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, response_interception_id: None, response_status_texts: Vec::new(), initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 }
+        Ok(Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, response_interception_id: None, response_status_texts: Vec::new(), initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 })
     }
 
     fn set_response_status_text(&mut self, index: usize, status_text: Option<String>) {
@@ -3890,6 +3904,11 @@ impl NetworkRequest {
             pending: true, error: None, request_id: self.id.clone(), url: exchange.url.clone(), method: exchange.method.clone(),
             resource_type: self.resource_type, status: 0, status_text: String::new(), response_headers: HashMap::new(), raw_headers: None,
             request_raw_headers: exchange.request_headers.clone(), request_body_size: exchange.request_body_size,
+            request_body_present: exchange.request_body_present,
+            request_body_request_id: exchange.request_body_request_id.clone(),
+            transport_request_body_present: exchange.transport_request_body_present,
+            transport_request_body_request_id: exchange.transport_request_body_request_id.clone(),
+            transport_request_body_size: exchange.transport_request_body_size,
             request_started: false, redirect: false, response_body_request_id: None, body_size: 0,
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
         });
@@ -3960,7 +3979,12 @@ impl NetworkRequest {
             body_size: exchange.body_size,
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
             error: if redirect { None } else { error },
+            request_body_present: exchange.request_body_present,
+            request_body_request_id: exchange.request_body_request_id,
             request_body_size: exchange.request_body_size,
+            transport_request_body_present: exchange.transport_request_body_present,
+            transport_request_body_request_id: exchange.transport_request_body_request_id,
+            transport_request_body_size: exchange.transport_request_body_size,
             request_started: if index == 0 { self.network_start.swap(2, std::sync::atomic::Ordering::SeqCst) == 1 } else {
                 self.hop_starts.get(index - 1).is_some_and(|start| start.swap(2, std::sync::atomic::Ordering::SeqCst) == 1)
             }, redirect,
@@ -4026,6 +4050,7 @@ async fn op_fetch_url(
     let destination = options_json.as_ref().and_then(|value| value["destination"].as_str()).map(str::to_owned)
         .or_else(|| options.filter(|value| !value.starts_with('{')));
     let request_id = options_json.as_ref().and_then(|value| value["requestId"].as_str()).map(str::to_owned);
+    let body_present = options_json.as_ref().and_then(|value| value["bodyPresent"].as_bool()).unwrap_or(false);
     let shared = state.borrow().borrow::<SharedState>().clone();
     if let Some(failure) = shared.borrow().js_network_events.failure() {
         return Err(deno_error::JsErrorBox::generic(failure.to_string()));
@@ -4036,12 +4061,14 @@ async fn op_fetch_url(
         ResourceType::Script
     } else { ResourceType::Fetch };
     let fields = serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default();
+    let body = body.to_vec();
     let mut observation = NetworkRequest::new(shared.clone(), request_id, &url, &method,
-        Some(request_header_capture(fields)), body.len(), resource_type);
+        Some(request_header_capture(fields)), body_present.then_some(body.as_slice()), resource_type)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     observation.interception_id = shared.borrow().fetch_cancellations.get(&observation.id).and_then(|(_, id)| id.clone());
     let mut cancel = shared.borrow().fetch_cancellations.get(&observation.id).map(|(sender, _)| sender.subscribe());
     let result = {
-        let operation = fetch_url_inner(state.clone(), url, method, headers_json, body.to_vec(), origin,
+        let operation = fetch_url_inner(state.clone(), url, method, headers_json, body, body_present, origin,
             mode, credentials, destination, resource_type, &mut observation);
         tokio::pin!(operation);
         if let Some(cancel) = cancel.as_mut() {
@@ -4073,7 +4100,7 @@ async fn op_fetch_url(
 }
 
 async fn fetch_url_inner(
-    state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String, body: Vec<u8>,
+    state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String, body: Vec<u8>, body_present: bool,
     origin: String, mode: String, credentials: String, destination: Option<String>, resource_type: ResourceType,
     observation: &mut NetworkRequest,
 ) -> Result<String, deno_error::JsErrorBox> {
@@ -4162,6 +4189,7 @@ async fn fetch_url_inner(
     if let Some((tx, request_id)) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
+        let exchange = observation.trace.last().expect("request trace exists before request-stage pause");
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             stage: InterceptionStage::Request,
@@ -4170,7 +4198,12 @@ async fn fetch_url_inner(
             network_id: observation.id.clone(),
             network_start: observation.network_start.clone(),
             request_raw_headers: Some(request_header_capture(custom_headers.clone())),
-            request_body_size: body.len(),
+            request_body_present: exchange.request_body_present,
+            request_body_request_id: exchange.request_body_request_id,
+            request_body_size: exchange.request_body_size,
+            transport_request_body_present: false,
+            transport_request_body_request_id: None,
+            transport_request_body_size: 0,
             request_id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),
@@ -4279,11 +4312,14 @@ async fn fetch_url_inner(
     // gate as the original request (checked above) and as redirects (checked
     // below). Without this re-validation a rewrite to an internal address would
     // bypass validate_fetch_url entirely.
-    observation.trace.take();
-    observation.trace.begin(override_url.as_deref().unwrap_or(&url), override_method.as_deref().unwrap_or(&method),
-        Some(request_header_capture(override_headers.clone().unwrap_or_else(||
-            serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default().into_iter().collect()))),
-        override_body.as_ref().unwrap_or(&body).len());
+    let final_headers = override_headers.clone().unwrap_or_else(||
+        serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default().into_iter().collect());
+    let transport_body_present = override_body.is_some() || body_present;
+    let transport_body = override_body.as_deref().or_else(|| body_present.then_some(body.as_slice()));
+    observation.trace.update_request(
+        override_url.as_deref().unwrap_or(&url), override_method.as_deref().unwrap_or(&method),
+        request_header_capture(final_headers), transport_body,
+    ).map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     let url = if let Some(new_url) = override_url {
         if let Ok(parsed) = url::Url::parse(&new_url) {
             if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
@@ -4327,7 +4363,7 @@ async fn fetch_url_inner(
     drop(page_in_flight_guard.take());
     stealth_fetch_all(
         state.clone(), stealth_client, url, req_method.as_str().to_string(),
-        custom_headers, body, page_origin, mode, credentials, destination,
+        custom_headers, body, transport_body_present, page_origin, mode, credentials, destination,
         resource_type, callbacks, allow_private_network, referrer, referrer_policy, observation,
     ).await
 }
@@ -4376,7 +4412,8 @@ async fn scripted_preflight(
         let fields: Vec<_> = headers.into_iter().collect();
         let shared = state.borrow().borrow::<SharedState>().clone();
         let mut preflight = NetworkRequest::new(shared, None, &url, "OPTIONS",
-            Some(request_header_capture(fields.clone())), 0, ResourceType::Other);
+            Some(request_header_capture(fields.clone())), None, ResourceType::Other)
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
         preflight.initiator_request_id = Some(observation.id.clone());
         let preflight_result: Result<(), deno_error::JsErrorBox> = async {
         let mut response = tokio::time::timeout(fetch_timeout(), stealth_client.send_single_traced_fields(
@@ -4537,7 +4574,12 @@ async fn pause_response_hop(
         redirected_request_id,
         network_id: observation.id.clone(), network_start: start,
         request_raw_headers: exchange.request_headers.clone(),
+        request_body_present: exchange.request_body_present,
+        request_body_request_id: exchange.request_body_request_id.clone(),
         request_body_size: exchange.request_body_size,
+        transport_request_body_present: exchange.transport_request_body_present,
+        transport_request_body_request_id: exchange.transport_request_body_request_id.clone(),
+        transport_request_body_size: exchange.transport_request_body_size,
         request_id, url: exchange.url, method: exchange.method,
         headers: exchange.request_headers.as_ref().map(|headers| headers.text_headers()).unwrap_or_default(),
         resource_type: if observation.initiator_request_id.is_some() { "Preflight".into() } else { cdp_resource_type(observation.resource_type).into() },
@@ -4588,6 +4630,7 @@ async fn pause_redirect_hop(
     state: &Rc<RefCell<OpState>>, observation: &mut NetworkRequest,
     previous: obscura_net::observation::Exchange,
     url: &mut String, method: &mut String, headers: &mut Vec<(String, String)>, body: &mut Vec<u8>,
+    body_present: &mut bool,
     allow_private_network: bool,
 ) -> Result<Option<obscura_net::Response>, deno_error::JsErrorBox> {
     let start = Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -4611,13 +4654,20 @@ async fn pause_redirect_hop(
     let id = shared.borrow().intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let request_id = format!("intercept-{id}");
     *observation.hop_interceptions.last_mut().unwrap() = Some(request_id.clone());
+    let exchange = observation.trace.last().expect("redirect trace exists before request-stage pause");
     let (resolver, resolution) = tokio::sync::oneshot::channel();
     tx.send(InterceptedRequest {
         stage: InterceptionStage::Request,
         document_generation: observation.document_generation, document_url: observation.document_url.clone(),
         redirect_response: Some(previous), redirected_request_id,
         network_id: observation.id.clone(), network_start: start,
-        request_raw_headers: Some(request_header_capture(headers.clone())), request_body_size: body.len(),
+        request_raw_headers: Some(request_header_capture(headers.clone())),
+        request_body_present: exchange.request_body_present,
+        request_body_request_id: exchange.request_body_request_id,
+        request_body_size: exchange.request_body_size,
+        transport_request_body_present: false,
+        transport_request_body_request_id: None,
+        transport_request_body_size: 0,
         request_id, url: url.clone(), method: method.clone(), headers: headers.iter().cloned().collect(),
         resource_type: cdp_resource_type(observation.resource_type).into(),
         response_status_code: None, response_headers: None, response_raw_headers: None,
@@ -4630,8 +4680,10 @@ async fn pause_redirect_hop(
             if let Some(u) = u { *url = u; }
             if let Some(m) = m { *method = m; }
             if let Some(h) = h { *headers = h.into_iter().collect(); }
-            if let Some(b) = b { *body = b; }
-            observation.trace.update_request(url, method, request_header_capture(headers.clone()), body.len());
+            if let Some(b) = b { *body = b; *body_present = true; }
+            observation.trace.update_request(url, method, request_header_capture(headers.clone()),
+                (*body_present).then_some(body.as_slice()))
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
             let parsed = url::Url::parse(url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
             validate_fetch_url(&parsed, allow_private_network).map_err(deno_error::JsErrorBox::generic)?;
             Ok(None)
@@ -4640,8 +4692,10 @@ async fn pause_redirect_hop(
             if let Some(u) = u { *url = u; }
             if let Some(m) = m { *method = m; }
             *headers = h;
-            if let Some(b) = b { *body = b; }
-            observation.trace.update_request(url, method, request_header_capture(headers.clone()), body.len());
+            if let Some(b) = b { *body = b; *body_present = true; }
+            observation.trace.update_request(url, method, request_header_capture(headers.clone()),
+                (*body_present).then_some(body.as_slice()))
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
             let parsed = url::Url::parse(url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
             validate_fetch_url(&parsed, allow_private_network).map_err(deno_error::JsErrorBox::generic)?;
             Ok(None)
@@ -4686,6 +4740,7 @@ async fn stealth_fetch_all(
     method: String,
     mut custom_headers: Vec<(String, String)>,
     body: Vec<u8>,
+    body_present: bool,
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
@@ -4700,6 +4755,7 @@ async fn stealth_fetch_all(
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
+    let mut current_body_present = body_present;
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = request_origin(&current_url)
@@ -4798,6 +4854,7 @@ async fn stealth_fetch_all(
         if r.status == 301 || r.status == 302 || r.status == 303 {
             current_method = "GET".to_string();
             current_body.clear();
+            current_body_present = false;
         }
         redirected_from.push(parsed_current);
         if let Some(policy) = r.header("referrer-policy").and_then(ReferrerPolicy::from_header) {
@@ -4805,9 +4862,12 @@ async fn stealth_fetch_all(
         }
         current_url = next_url.to_string();
         let previous = observation.trace.last().expect("redirect response trace");
-        observation.trace.begin(&current_url, &current_method, Some(request_header_capture(custom_headers.clone())), current_body.len());
+        observation.trace.begin(&current_url, &current_method, Some(request_header_capture(custom_headers.clone())),
+            current_body_present.then_some(current_body.as_slice()))
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
         if let Some(response) = pause_redirect_hop(&state, observation, previous, &mut current_url,
-            &mut current_method, &mut custom_headers, &mut current_body, allow_private_network).await? {
+            &mut current_method, &mut custom_headers, &mut current_body, &mut current_body_present,
+            allow_private_network).await? {
             observation.trace.response(&response, response.status != 0);
             break response;
         }

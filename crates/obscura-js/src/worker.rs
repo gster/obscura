@@ -222,6 +222,7 @@ struct WorkerConfig {
     intercept_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     response_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     response_bodies: std::sync::Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
+    request_bodies: std::sync::Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     console_enabled: bool,
     runtime_events_enabled: bool,
@@ -917,6 +918,7 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         intercept_response_patterns: parent.intercept_response_patterns.clone(),
         intercept_counter: parent.intercept_counter.clone(), response_counter: parent.network_response_body_counter.clone(),
         response_bodies: parent.network_response_bodies.clone(),
+        request_bodies: parent.network_request_bodies.clone(),
         in_flight: parent.page_in_flight.clone(), console_enabled: parent.console_messages_enabled,
         runtime_events_enabled: parent.runtime_events_enabled,
         execution_cancellation: registry.borrow().execution_cancellation.clone(),
@@ -979,6 +981,7 @@ async fn run_worker(id: u32, config: WorkerConfig,
         state.intercept_counter = config.intercept_counter;
         state.network_response_body_counter = config.response_counter;
         state.network_response_bodies = config.response_bodies;
+        state.network_request_bodies = config.request_bodies;
         state.page_in_flight = config.in_flight;
         state.console_messages_enabled = config.console_enabled;
         state.runtime_events_enabled = config.runtime_events_enabled;
@@ -1237,7 +1240,11 @@ mod tests {
         crate::ops::JsNetworkEvent {
             document_generation: 0, document_url: String::new(),
             initiator_request_id: None,
-            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
+            pending: false, error: None,
+            request_body_present: false, request_body_request_id: None, request_body_size: 0,
+            transport_request_body_present: false, transport_request_body_request_id: None,
+            transport_request_body_size: 0,
+            request_started: false, redirect: false, response_body_request_id: None,
             request_id: request_id.into(), url: "http://example.test/".into(), method: "GET".into(),
             resource_type: obscura_net::ResourceType::Fetch, status: 200,
             status_text: String::new(),
@@ -1251,6 +1258,7 @@ mod tests {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<obscura_net::response_body::ResponseBody>();
         send_sync::<obscura_net::response_body::ResponseBodyStore>();
+        send_sync::<obscura_net::request_body::RequestBodyStore>();
     }
 
     #[test]

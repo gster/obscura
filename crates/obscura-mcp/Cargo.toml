@@ -9,7 +9,7 @@ repository.workspace = true
 default = []
 # Compatibility alias. MCP pages always use the primp transport.
 stealth = []
-render = ["obscura-browser/render", "dep:base64"]
+render = ["obscura-browser/render"]
 
 [dependencies]
 obscura-browser = { workspace = true }
@@ -21,4 +21,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-base64 = { workspace = true, optional = true }
+base64.workspace = true

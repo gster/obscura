@@ -5,12 +5,18 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`87b577e361e3cba343a4face5f499c769ea28ee4`，`Bound scripted Network observations`；其前置实现为 `f98a577d36e2dde5982ed8b8bdecc26e82e84f6a`，`Route Network events per session`。
-- 写入本交接前，最近实现提交尚待与本交接一起推送到 `origin/main`；完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
+- 当前实现基于 `cddec40372f3fc7a93965f3a5fbdf434f63701d4`；本轮 request-body retention 将与本交接一起提交，提交标题为 `Retain exact request bodies`。
+- 写入本交接时，本轮提交尚待推送到 `origin/main`；完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 相关实现入口：[`network_observation.rs`](../crates/obscura-js/src/network_observation.rs) 的 Page-wide admission/reservation、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的生产和 teardown、[`page.rs`](../crates/obscura-browser/src/page.rs) 的 accepted-prefix drain，以及 [`server.rs`](../crates/obscura-cdp/src/server.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的 terminal 投影。
+- 相关实现入口：[`request_body.rs`](../crates/obscura-net/src/request_body.rs) 的 Page-owned raw store、[`page.rs`](../crates/obscura-browser/src/page.rs) 的原生导航/redirect 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker 接入，以及 [`network.rs`](../crates/obscura-cdp/src/domains/network.rs)、[`server.rs`](../crates/obscura-cdp/src/server.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的读取与投影。
 
 ## 最近完成的阶段
+
+Page 现有独立 request-body store：默认 2 MiB 后 spool、256 MiB unique raw bytes、16384 canonical entries，支持三项 `OBSCURA_NETWORK_REQUEST_BODY_*` 环境配置。预算失败和 I/O 失败 sticky，保留 accepted prefix，并在发送前拒绝后续需要新增正文 capture 的请求；无正文请求不受该正文预算影响。不 eviction、不截断、不脱敏。显式空 body 与缺省 body 严格区分；相同 standard/transport 或 307/308 redirect body 共享 raw bytes 但各占 canonical entry，bodyless logical alias 不积累 tombstone。
+
+JS fetch/XHR、Request、module、Dedicated Worker、原生表单导航和 native redirect 统一产生稳定 per-hop standard/transport IDs。302/303 清 body，307/308 保留；Fetch pause 看到 override 前 standard body，Continue override 另存 transport body。CDP 事件保留精确 body presence/size/ID、UTF-8 `postData` 或完整 base64 entries；`Network.getRequestPostData` 支持 logical current hop 与 canonical ID，服从 start-time Network session ownership。原生 redirect 链按 hop 顺序复用同一 loader requestId。MCP 按 ID 物化完整 standard/transport body；observation queue 只携带 metadata/ID。
+
+Astra light 复核发现并推动修复 native POST redirect 误保留原 body、bodyless tombstone 无界增长、CDP native redirect 链拆分/重排和 loader alias 未解析 canonical entry；最终复审无 blocker、major 或 minor。`Network.enable.maxPostDataSize` 的 per-agent 语义、持久 observation history、普通非拦截资源 start emission/Page budget 统一和 Fetch stream 多消费者仍未完成，OB-021 保持未关闭。
 
 JS fetch/XHR、module loader 与全部 Dedicated Worker 已不再使用 4096 条 oldest-drop network observation queue。owning Page 共享 4096 条、64 MiB 完整序列化 metadata、16 MiB 单条的原子 admission budget；batch 全有或全无。已接纳记录携带 reservation，在 active、teardown 和 Page drain 间移动不重新计数。Worker 网络记录不再经过通用 Worker event channel，而是按 Worker 生命周期顺序直接写 Page teardown FIFO；`ObscuraState::drop` 覆盖初始化失败、取消和 runtime 退出，保证残余 accepted records 最终回灌。
 
@@ -38,6 +44,13 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 ## 验证结果
 
+- request-body 聚焦批次 18/18、14/14、review fixes 6/6、CDP redirect fixes 4/4。
+- full release/render nextest 2255/2255，4 skipped（run `4a6d3e2f-b260-4acb-8f30-0f84dcf0d814`）。
+- render 和 no-default-features 两种 exact CLI release build 均成功；最终 exact render SHA-256 `20b8ef6e6cead3235f0a0c96bc3d31b235c5821de7a790a07a78ca20375cde8e`，119759824 bytes。
+- benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33。
+- 官方 Playwright Python 1.60.0 request-body E2E 与 required automation smoke 通过；完整 smoke 协议满足 37-method profile。
+- Astra light 终审无 blocker、major 或 minor；最终 `git diff --check` 在提交前再次执行。
+
 - 本轮最终 render 聚焦回归 9/9（run `94afe313-7601-45a6-8c2f-3a23a1179694`）；no-render 聚焦回归 12/12（run `04e0e6e3-8e1d-42a9-9c8c-8c0e18a0d14e`）。
 - full release/render nextest 2241/2241，4 skipped（run `4fc14590-dbe5-4b89-866d-61f1c75d0077`）。
 - render 和 no-default-features 两种 exact CLI release build 均成功；最终 exact render SHA-256 `ca94b2e0f75b6ae55678a1dad6cca85ace0c51d984606396f7e2a8ce1d442bc7`，119519872 bytes。
@@ -60,10 +73,9 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 继续请求正文保留，并明确 binary、重复字段、重定向与失败路径的精确归属和预算语义。
-2. 建立导航/多页面持久 observation history；当前 active Page 内存历史不能作为 append-only 或崩溃恢复证据。
-3. 统一普通非拦截资源 start emission 与 Page body budget/Chrome per-agent 参数契约。
-4. 补齐 Fetch stream 多消费者语义，再按实际风险推进其余 input qualification、disconnect 矩阵和 idle Worker cancellation wake。
+1. 建立导航/多页面持久 observation history；当前 active Page 内存历史不能作为 append-only 或崩溃恢复证据。
+2. 统一普通非拦截资源 start emission 与 Page body budget/Chrome per-agent 参数契约，包括 `Network.enable.maxPostDataSize`。
+3. 补齐 Fetch stream 多消费者语义，再按实际风险推进其余 input qualification、disconnect 矩阵和 idle Worker cancellation wake。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -80,6 +92,19 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 
 生成本交接的主机上曾保留以下完整临时证据：
 
+- `/tmp/ob021-request-body-focused.log`
+- `/tmp/ob021-request-body-focused-expanded.log`
+- `/tmp/ob021-request-body-astra-fixes.log`
+- `/tmp/ob021-request-body-astra-cdp-fixes.log`
+- `/tmp/ob021-request-body-full-nextest.log`
+- `/tmp/ob021-request-body-build-no-render.log`
+- `/tmp/ob021-request-body-build-render.log`
+- `/tmp/ob021-request-body-obstacle.log`
+- `/tmp/ob021-request-body-chrome-complete.json`
+- `/tmp/ob021-request-body-chrome-protocol.log`
+- `/tmp/ob021-request-body-obscura-final.json`
+- `/tmp/ob021-request-body-obscura-final-protocol.log`
+- `/tmp/ob021-request-body-playwright.cpLudh/`
 - `/tmp/ob021-network-subscription-chrome-complete.json`
 - `/tmp/ob021-network-subscription-chrome-body-scope.json`
 - `/tmp/ob021-network-subscription-chrome-late-enable.json`

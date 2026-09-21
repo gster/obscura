@@ -2365,6 +2365,10 @@ impl ObscuraJsRuntime {
         self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
     }
 
+    pub fn get_network_request_body_result(&self, request_id: &str) -> Option<Result<obscura_net::response_body::ResponseBody, obscura_net::request_body::RequestBodyError>> {
+        self.state.borrow().network_request_bodies.lock().unwrap_or_else(|e| e.into_inner()).get(request_id)
+    }
+
     pub fn take_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
         self.take_network_response_body_result(request_id)?.ok()?
             .with_bytes(crate::ops::stored_network_response_body).ok()
@@ -2388,8 +2392,20 @@ impl ObscuraJsRuntime {
         state.network_response_body_counter = counter;
     }
 
+    /// Install the Page-owned, navigation-stable request body store. Workers
+    /// spawned by this runtime inherit the same Arc.
+    pub fn set_network_request_body_store(&self,
+        store: std::sync::Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>,
+    ) {
+        self.state.borrow_mut().network_request_bodies = store;
+    }
+
     pub fn clear_network_response_bodies(&self) {
         self.state.borrow().network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    pub fn clear_network_request_bodies(&self) {
+        self.state.borrow().network_request_bodies.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Wire up the interception channel without enabling interception.
@@ -24007,6 +24023,48 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fetch_op_distinguishes_absent_from_explicit_empty_body() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const calls = [];
+                try {
+                    Deno.core.ops.op_fetch_url =
+                        (url, method, headers, body, origin, mode, credentials, options) => {
+                            calls.push({
+                                path: new URL(url).pathname,
+                                bodyPresent: JSON.parse(options).bodyPresent,
+                                size: body.byteLength,
+                            });
+                            return JSON.stringify({ status: 200, headers: {}, body: "ok", url });
+                        };
+                    await fetch("/absent");
+                    await fetch("/empty", { method: "POST", body: "" });
+                    await fetch(new Request("/request-empty", { method: "POST", body: "" }));
+                    await new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open("POST", "/xhr-empty");
+                        xhr.onload = resolve;
+                        xhr.onerror = reject;
+                        xhr.send("");
+                    });
+                    return calls;
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+            None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([
+            { "path": "/absent", "bodyPresent": false, "size": 0 },
+            { "path": "/empty", "bodyPresent": true, "size": 0 },
+            { "path": "/request-empty", "bodyPresent": true, "size": 0 },
+            { "path": "/xhr-empty", "bodyPresent": true, "size": 0 },
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fetch_form_urlencoded_and_xhr_bodies_reach_the_op_as_bytes() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
@@ -24449,8 +24507,23 @@ return {before,removed,reinsert,moved,cleared};
         assert_eq!(events.len(), 2);
         assert!(events[0].redirect);
         assert_eq!(events[0].request_id, events[1].request_id);
+        assert!(events[0].request_body_present);
+        assert_eq!(events[0].request_body_size, 7);
+        assert!(events[0].transport_request_body_present);
+        assert_eq!(events[0].transport_request_body_size, 7);
         assert_eq!(events[1].method, expected_method);
         assert!(events[1].url.ends_with("/final"));
+        if expected_method == "GET" {
+            assert!(!events[1].request_body_present);
+            assert!(events[1].request_body_request_id.is_none());
+            assert!(rt.get_network_request_body_result(&events[1].request_id).is_none());
+        } else {
+            assert!(events[1].request_body_present);
+            assert_eq!(events[1].request_body_size, 7);
+            let body = rt.get_network_request_body_result(&events[1].request_id)
+                .expect("logical request body alias").expect("retained request body");
+            assert_eq!(body.read(0, 99).unwrap(), b"payload");
+        }
         let wire_requests = wire_requests.lock().unwrap();
         assert!(wire_requests[0].starts_with("POST /start "));
         assert!(wire_requests[1].starts_with(&format!("{expected_method} /final ")));
@@ -24464,6 +24537,31 @@ return {before,removed,reinsert,moved,cleared};
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_307_response_preserves_the_post_method() {
         assert_post_redirect_method(307, "POST").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_body_budget_failure_rejects_before_transport() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_network_request_body_store(std::sync::Arc::new(std::sync::Mutex::new(
+            obscura_net::request_body::RequestBodyStore::new(
+                obscura_net::request_body::RequestBodyLimits {
+                    memory_threshold: 0, total_bytes: 0, entries: 1,
+                },
+            ),
+        )));
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                try {
+                    await fetch("https://example.test/never-sent", { method: "POST", body: "x" });
+                    return "unexpected success";
+                } catch (error) {
+                    return String(error && error.message || error);
+                }
+            }"#,
+            None, &[], true, true,
+        ).await.unwrap();
+        assert!(result.value.unwrap().as_str().unwrap_or_default()
+            .contains("request_body_budget_exhausted"));
     }
 
     #[tokio::test(flavor = "current_thread")]

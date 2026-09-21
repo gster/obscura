@@ -1,6 +1,5 @@
 use super::*;
 use crate::outbound::{OutboundReceiver, OutboundSender};
-use base64::Engine as _;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -757,13 +756,16 @@ fn closed_reply_channel_aborts_instead_of_registering_a_pause() {
                 redirected_request_id: None,
                 network_id: "fixture-network-id".into(),
                 network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-                request_raw_headers: None, request_body_size: 0,
+                request_raw_headers: None,
+                request_body_present: false, request_body_request_id: None, request_body_size: 0,
+                transport_request_body_present: false, transport_request_body_request_id: None,
+                transport_request_body_size: 0,
         request_id: "intercept-1".into(), url: "https://example.test/".into(), method: "GET".into(),
         headers: HashMap::new(), resource_type: "Fetch".into(), response_status_code: None,
         response_headers: None, response_raw_headers: None, response_body_request_id: None, resolver,
     };
     let mut paused = InterceptedPauses::new();
-    emit_intercepted_request(request, "frame", "loader", "https://example.test/", Some("session".into()), &[], &reply_tx, &mut paused);
+    emit_intercepted_request(request, "frame", "loader", "https://example.test/", Some("session".into()), &[], None, &reply_tx, &mut paused);
     assert!(paused.is_empty());
     assert!(matches!(resolved.try_recv(), Ok(obscura_js::ops::InterceptResolution::Fail { reason }) if reason == "Aborted"));
 }
@@ -783,7 +785,10 @@ fn closed_routed_pause_does_not_create_a_network_start_observer() {
         redirected_request_id: None,
         network_id: "retired-network-id".into(),
         network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        request_raw_headers: None, request_body_size: 0,
+        request_raw_headers: None,
+        request_body_present: false, request_body_request_id: None, request_body_size: 0,
+        transport_request_body_present: false, transport_request_body_request_id: None,
+        transport_request_body_size: 0,
         request_id: "intercept-retired".into(), url: "https://example.test/".into(), method: "GET".into(),
         headers: HashMap::new(), resource_type: "Fetch".into(), response_status_code: None,
         response_headers: None, response_raw_headers: None, response_body_request_id: None, resolver,

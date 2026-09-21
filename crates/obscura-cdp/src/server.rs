@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use base64::Engine as _;
+use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
@@ -1302,7 +1303,13 @@ fn emit_routed_intercepted_request(
         let request_id = routed.request.network_id.clone();
         let redirect_body_id = routed.request.redirect_response.as_ref()
             .and_then(|exchange| exchange.body_request_id.clone());
+        let standard_request_body_id = routed.request.request_body_request_id.clone();
+        let transport_request_body_id = routed.request.transport_request_body_request_id.clone();
         let network_sessions = ctx.network_sessions_for_page(&page_id);
+        let request_bodies = ctx.get_page(&page_id).map(|page| page.request_body_store())
+            .or_else(|| ctx.navigating_request_bodies.as_ref()
+                .filter(|(owner, _)| owner == &page_id)
+                .map(|(_, store)| store.clone()));
         let previous_network_sessions = ctx.network_request_sessions
             .get(&(page_id.clone(), request_id.clone()))
             .cloned()
@@ -1314,6 +1321,7 @@ fn emit_routed_intercepted_request(
             &document_url,
             routed.session_id,
             &network_sessions,
+            request_bodies.as_ref(),
             reply_tx,
             paused,
         );
@@ -1321,6 +1329,10 @@ fn emit_routed_intercepted_request(
             if let Some(body_id) = redirect_body_id {
                 ctx.remember_network_body(&page_id, &previous_network_sessions, &body_id);
             }
+            ctx.remember_network_request_bodies(
+                &page_id, &network_sessions, &request_id,
+                standard_request_body_id.as_deref(), transport_request_body_id.as_deref(),
+            );
             ctx.network_request_sessions.insert((page_id, request_id), network_sessions);
         }
     } else {
@@ -1335,6 +1347,38 @@ fn raw_header_bytes_to_cdp_string(bytes: &[u8]) -> String {
     }
 }
 
+fn add_exact_intercepted_request_body(
+    request: &mut serde_json::Map<String, Value>,
+    store: &obscura_net::request_body::RequestBodyStore,
+    body_id: &str,
+    post_data_key: &str,
+    entries_key: &str,
+    byte_string_key: &str,
+    error_key: &str,
+) {
+    let result = store.get(body_id)
+        .ok_or_else(|| format!("request body capture missing for {body_id}"))
+        .and_then(|body| body.map_err(|error| error.to_string()))
+        .and_then(|body| body.with_bytes(|bytes| {
+            let (post_data, byte_string) = match std::str::from_utf8(bytes) {
+                Ok(text) => (text.to_owned(), false),
+                Err(_) => (bytes.iter().map(|byte| char::from(*byte)).collect(), true),
+            };
+            (post_data, byte_string,
+                base64::engine::general_purpose::STANDARD.encode(bytes))
+        }).map_err(|error| error.to_string()));
+    match result {
+        Ok((post_data, byte_string, bytes)) => {
+            request.insert(post_data_key.to_string(), Value::String(post_data));
+            request.insert(entries_key.to_string(), json!([{"bytes": bytes}]));
+            request.insert(byte_string_key.to_string(), Value::Bool(byte_string));
+        }
+        Err(error) => {
+            request.insert(error_key.to_string(), Value::String(error));
+        }
+    }
+}
+
 fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     frame_id: &str,
@@ -1342,6 +1386,7 @@ fn emit_intercepted_request(
     document_url: &str,
     session_id: Option<String>,
     network_sessions: &[String],
+    request_bodies: Option<&Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>>,
     reply_tx: &OutboundSender,
     intercepted_paused: &mut InterceptedPauses,
 ) -> (bool, bool) {
@@ -1364,16 +1409,39 @@ fn emit_intercepted_request(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    let request = json!({
-        "url": intercepted.url,
-        "method": intercepted.method,
-        "headers": intercepted.headers,
-        "rawHeaders": intercepted.request_raw_headers,
-        "hasPostData": intercepted.request_body_size > 0,
-        "bodySize": intercepted.request_body_size,
-        "initialPriority": "High",
-        "referrerPolicy": "strict-origin-when-cross-origin",
-    });
+    let mut request = serde_json::Map::from_iter([
+        ("url".into(), Value::String(intercepted.url.clone())),
+        ("method".into(), Value::String(intercepted.method.clone())),
+        ("headers".into(), json!(intercepted.headers)),
+        ("rawHeaders".into(), json!(intercepted.request_raw_headers)),
+        ("hasPostData".into(), Value::Bool(intercepted.request_body_present)),
+        ("bodySize".into(), json!(intercepted.request_body_size)),
+        ("requestBodyRequestId".into(), json!(intercepted.request_body_request_id)),
+        ("transportHasPostData".into(), Value::Bool(intercepted.transport_request_body_present)),
+        ("transportBodySize".into(), json!(intercepted.transport_request_body_size)),
+        ("transportRequestBodyRequestId".into(), json!(intercepted.transport_request_body_request_id)),
+        ("initialPriority".into(), Value::String("High".into())),
+        ("referrerPolicy".into(), Value::String("strict-origin-when-cross-origin".into())),
+    ]);
+    if let Some(store) = request_bodies {
+        let store = store.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(body_id) = intercepted.request_body_request_id.as_deref()
+            .filter(|_| intercepted.request_body_present)
+        {
+            add_exact_intercepted_request_body(&mut request, &store, body_id,
+                "postData", "postDataEntries", "postDataIsByteString", "requestBodyError");
+        }
+        if let Some(body_id) = intercepted.transport_request_body_request_id.as_deref()
+            .filter(|_| intercepted.transport_request_body_present)
+        {
+            add_exact_intercepted_request_body(&mut request, &store, body_id,
+                "transportPostData", "transportPostDataEntries",
+                "transportPostDataIsByteString", "transportRequestBodyError");
+        }
+    } else if intercepted.request_body_present || intercepted.transport_request_body_present {
+        request.insert("requestBodyError".into(), Value::String("request body store unavailable".into()));
+    }
+    let request = Value::Object(request);
     let request_will_be_sent = json!({
             "requestId": intercepted.network_id,
             "loaderId": loader_id,
@@ -1636,7 +1704,8 @@ fn is_navigate_method(text: &str) -> bool {
 
 fn is_navigation_safe_body_command(text: &str) -> bool {
     serde_json::from_str::<CdpRequest>(text).is_ok_and(|request| matches!(request.method.as_str(),
-        "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody" | "IO.read" | "IO.close"))
+        "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "Network.getResponseBody"
+            | "Network.getRequestPostData" | "IO.read" | "IO.close"))
 }
 
 // Keep CDP field order, spelling and full values until the HTTP boundary.
@@ -2014,6 +2083,7 @@ async fn process_with_interception(
 
     ctx.navigating_page_id = Some(page_id.clone());
     ctx.navigating_response_bodies = Some((page_id.clone(), page.response_body_store()));
+    ctx.navigating_request_bodies = Some((page_id.clone(), page.request_body_store()));
 
     // V8 allows only ONE *entered* isolate per OS thread, but many *live*
     // ones. Since #756 every op enters its isolate only transiently (never
@@ -2216,6 +2286,7 @@ async fn process_with_interception(
     ctx.pages.push(page);
     ctx.navigating_page_id = None;
     ctx.navigating_response_bodies = None;
+    ctx.navigating_request_bodies = None;
     ctx.navigating_document_loader = None;
 
     let navigation_succeeded = navigate_result.is_ok();

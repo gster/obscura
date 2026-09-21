@@ -627,6 +627,15 @@ impl StealthHttpClient {
         self.fetch_method_with_profile(url, request, callbacks, http::Method::POST, body.as_bytes(), None).await
     }
 
+    pub async fn post_form_resource_traced(
+        &self, url: &Url, body: &str, request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>, trace: &RequestTrace,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_method_with_profile(
+            url, request, callbacks, http::Method::POST, body.as_bytes(), Some(trace),
+        ).await
+    }
+
     async fn fetch_method_with_profile(
         &self, url: &Url, mut request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>, mut method: http::Method, initial_body: &[u8],
@@ -654,7 +663,11 @@ impl StealthHttpClient {
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
             if !redirects.is_empty() {
-                if let Some(trace) = trace { trace.begin(current_url.as_str(), method.as_str(), None, request_body.len()); }
+                if let Some(trace) = trace {
+                    trace.begin(current_url.as_str(), method.as_str(), None,
+                        (method == http::Method::POST).then_some(request_body.as_slice()))
+                        .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+                }
             }
             validate_request_mode(&request, &current_url)?;
             if let Some(host) = current_url.host_str() {
@@ -728,7 +741,10 @@ impl StealthHttpClient {
 
             let (transport, prepared) = self.client.request(method.clone(), &current_url, headers, &request_body, std::time::Duration::from_secs(30))?;
             request_info.raw_headers = Some(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
-            if let Some(trace) = trace { trace.prepared(request_info.raw_headers.clone().unwrap()); }
+            if let Some(trace) = trace {
+                trace.prepared(request_info.raw_headers.clone().unwrap(), &request_body)
+                    .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+            }
             request_info.headers = request_info.raw_headers.as_ref().unwrap().text_headers();
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
@@ -933,7 +949,8 @@ impl StealthHttpClient {
             .and_then(|(_, value)| Url::parse(value).ok());
         let (transport, prepared) = self.client.request(req_method, url, headers, body, timeout)?;
         if let Some(trace) = trace {
-            trace.prepared(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
+            trace.prepared(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()), body)
+                .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         }
         if let Some((callbacks, resource_type)) = observation {
             if callbacks.has_request_callbacks().await {

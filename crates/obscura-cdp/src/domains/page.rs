@@ -1,4 +1,5 @@
 use obscura_browser::lifecycle::WaitUntil;
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
@@ -886,6 +887,12 @@ fn begin_network_request(
     params: Value,
 ) {
     let sessions = ctx.network_sessions_for_page(page_id);
+    let standard_body_id = params.get("request")
+        .and_then(|request| request.get("requestBodyRequestId"))
+        .and_then(Value::as_str).map(str::to_string);
+    let transport_body_id = params.get("request")
+        .and_then(|request| request.get("transportRequestBodyRequestId"))
+        .and_then(Value::as_str).map(str::to_string);
     let redirect_body_id = params.get("redirectResponse")
         .and_then(|response| response.get("bodyRequestId"))
         .and_then(Value::as_str)
@@ -904,7 +911,78 @@ fn begin_network_request(
         (page_id.to_string(), request_id.to_string()),
         sessions.clone(),
     );
+    ctx.remember_network_request_bodies(
+        page_id, &sessions, request_id,
+        standard_body_id.as_deref(), transport_body_id.as_deref(),
+    );
     queue_network_event(ctx, &sessions, "Network.requestWillBeSent", params);
+}
+
+fn add_exact_request_body(
+    request: &mut serde_json::Map<String, Value>,
+    store: &obscura_net::request_body::RequestBodyStore,
+    body_id: &str,
+    post_data_key: &str,
+    entries_key: &str,
+    byte_string_key: &str,
+    error_key: &str,
+) {
+    let result = store.get(body_id)
+        .ok_or_else(|| format!("request body capture missing for {body_id}"))
+        .and_then(|body| body.map_err(|error| error.to_string()))
+        .and_then(|body| body.with_bytes(|bytes| {
+            let (post_data, byte_string) = match std::str::from_utf8(bytes) {
+                Ok(text) => (text.to_owned(), false),
+                Err(_) => (bytes.iter().map(|byte| char::from(*byte)).collect(), true),
+            };
+            (post_data, byte_string,
+                base64::engine::general_purpose::STANDARD.encode(bytes))
+        }).map_err(|error| error.to_string()));
+    match result {
+        Ok((post_data, byte_string, bytes)) => {
+            request.insert(post_data_key.to_string(), Value::String(post_data));
+            request.insert(entries_key.to_string(), json!([{"bytes": bytes}]));
+            request.insert(byte_string_key.to_string(), Value::Bool(byte_string));
+        }
+        Err(error) => {
+            // Never substitute a shortened or redacted body. A read failure is
+            // an explicit terminal diagnostic while the canonical id remains
+            // present for a later retry if the backing spool recovers.
+            request.insert(error_key.to_string(), Value::String(error));
+        }
+    }
+}
+
+fn network_request_value(
+    event: &obscura_browser::NetworkEvent,
+    store: &obscura_net::request_body::RequestBodyStore,
+) -> Value {
+    let mut request = serde_json::Map::from_iter([
+        ("url".into(), Value::String(event.url.clone())),
+        ("method".into(), Value::String(event.method.clone())),
+        ("headers".into(), json!(event.headers)),
+        ("rawHeaders".into(), json!(event.request_raw_headers)),
+        ("hasPostData".into(), Value::Bool(event.request_body_present)),
+        ("bodySize".into(), json!(event.request_body_size)),
+        ("requestBodyRequestId".into(), json!(event.request_body_request_id)),
+        ("transportHasPostData".into(), Value::Bool(event.transport_request_body_present)),
+        ("transportBodySize".into(), json!(event.transport_request_body_size)),
+        ("transportRequestBodyRequestId".into(), json!(event.transport_request_body_request_id)),
+    ]);
+    if let Some(body_id) = event.request_body_request_id.as_deref()
+        .filter(|_| event.request_body_present)
+    {
+        add_exact_request_body(&mut request, store, body_id,
+            "postData", "postDataEntries", "postDataIsByteString", "requestBodyError");
+    }
+    if let Some(body_id) = event.transport_request_body_request_id.as_deref()
+        .filter(|_| event.transport_request_body_present)
+    {
+        add_exact_request_body(&mut request, store, body_id,
+            "transportPostData", "transportPostDataEntries",
+            "transportPostDataIsByteString", "transportRequestBodyError");
+    }
+    Value::Object(request)
 }
 
 pub fn emit_navigation_events(
@@ -919,6 +997,10 @@ pub fn emit_navigation_events(
     reached_network_idle: bool,
 ) {
     let generation = ctx.get_page(page_id).map_or(0, |page| page.network_document_generation);
+    let request_bodies = ctx.get_page(page_id).map(|page| page.request_body_store())
+        .or_else(|| ctx.navigating_request_bodies.as_ref()
+            .filter(|(owner, _)| owner == page_id)
+            .map(|(_, store)| store.clone()));
     let previous_loader = ctx.current_loader_ids.get(page_id).cloned().unwrap_or_else(|| format!("loader-blank-{page_id}"));
     let retired = ctx.get_page_mut(page_id).map(|page| std::mem::take(&mut page.network_retired_generations)).unwrap_or_default();
     for retired in retired { ctx.document_loaders.entry((page_id.to_string(), retired)).or_insert_with(|| previous_loader.clone()); }
@@ -939,23 +1021,22 @@ pub fn emit_navigation_events(
     // Real Chrome uses the navigation's loaderId as the main document's
     // request id, and Puppeteer/Playwright identify the navigation response
     // via `requestId === loaderId && type === "Document"` (issue #189).
-    let nav_request_ids: Vec<String> = {
-        let mut nav_seen = false;
-        network_events
-            .iter()
-            .map(|ev| {
-                if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
-                    nav_seen = true;
-                    loader_id.to_string()
-                } else {
-                    ev.request_id.clone()
-                }
-            })
-            .collect()
-    };
-    let nav_idx: Option<usize> = network_events
+    let nav_final_idx = network_events
         .iter()
-        .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
+        .rposition(|ev| ev.resource_type == "Document" && ev.url == page_url);
+    let nav_internal_id = nav_final_idx.map(|idx| network_events[idx].request_id.as_str());
+    let nav_idx = nav_internal_id.and_then(|request_id| network_events.iter().position(|event| {
+        event.resource_type == "Document" && event.request_id == request_id
+    }));
+    let nav_request_ids = network_events.iter().map(|event| {
+        if event.resource_type == "Document"
+            && nav_internal_id.is_some_and(|request_id| event.request_id.as_str() == request_id)
+        {
+            loader_id.to_string()
+        } else {
+            event.request_id.clone()
+        }
+    }).collect::<Vec<_>>();
 
     // The main resource's body is stored under its internal request id, but the
     // client sees it as `loader_id` (the requestId we report above). Alias it so
@@ -964,7 +1045,7 @@ pub fn emit_navigation_events(
     // (issue #340). Also read the real Content-Type so frameNavigated reports the
     // actual mime instead of a hardcoded text/html.
     let mut nav_mime = "text/html".to_string();
-    if let Some(idx) = nav_idx {
+    if let Some(idx) = nav_final_idx {
         let internal_id = &network_events[idx].request_id;
         if let Some(ct) = network_events[idx].response_headers.get("content-type") {
             // Strip any `; charset=...` parameter; frameNavigated wants the essence.
@@ -973,6 +1054,11 @@ pub fn emit_navigation_events(
         if internal_id != loader_id {
             if let Some(page) = ctx.get_page_mut(page_id) {
                 page.alias_response_body(internal_id, loader_id);
+                if network_events[idx].request_body_present {
+                    page.alias_request_body(internal_id, loader_id);
+                } else {
+                    page.clear_request_body_alias(loader_id);
+                }
             }
         }
     }
@@ -982,11 +1068,23 @@ pub fn emit_navigation_events(
     if let Some(idx) = nav_idx.filter(|idx| !network_events[*idx].request_started) {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
+        let request = request_bodies.as_ref().map(|store| {
+            let store = store.lock().unwrap_or_else(|error| error.into_inner());
+            network_request_value(net_event, &store)
+        }).unwrap_or_else(|| json!({
+            "url": net_event.url,
+            "method": net_event.method,
+            "headers": net_event.headers,
+            "rawHeaders": net_event.request_raw_headers,
+            "hasPostData": net_event.request_body_present,
+            "bodySize": net_event.request_body_size,
+            "requestBodyError": "request body store unavailable",
+        }));
         begin_network_request(
             ctx,
             page_id,
             rid,
-            json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": request, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
         );
     }
 
@@ -1024,15 +1122,23 @@ pub fn emit_navigation_events(
         for (i, net_event) in network_events.iter().enumerate() {
             if net_event.pending || net_event.request_started || net_event.error.is_some() { continue; }
             let rid = &nav_request_ids[i];
+            let request = request_bodies.as_ref().map(|store| {
+                let store = store.lock().unwrap_or_else(|error| error.into_inner());
+                network_request_value(net_event, &store)
+            }).unwrap_or_else(|| json!({
+                "url": net_event.url,
+                "method": net_event.method,
+                "headers": net_event.headers,
+                "rawHeaders": net_event.request_raw_headers,
+                "hasPostData": net_event.request_body_present,
+                "bodySize": net_event.request_body_size,
+                "requestBodyError": "request body store unavailable",
+            }));
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
                     "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers,
-                    },
+                    "request": request,
                     "frameId": frame_id,
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
@@ -1058,11 +1164,23 @@ pub fn emit_navigation_events(
         }
         let redirect_key = (net_event.document_generation, rid.clone());
         if Some(i) != nav_idx && !net_event.request_started {
+            let request = request_bodies.as_ref().map(|store| {
+                let store = store.lock().unwrap_or_else(|error| error.into_inner());
+                network_request_value(net_event, &store)
+            }).unwrap_or_else(|| json!({
+                "url": net_event.url,
+                "method": net_event.method,
+                "headers": net_event.headers,
+                "rawHeaders": net_event.request_raw_headers,
+                "hasPostData": net_event.request_body_present,
+                "bodySize": net_event.request_body_size,
+                "requestBodyError": "request body store unavailable",
+            }));
             begin_network_request(
                 ctx,
                 page_id,
                 rid,
-                json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": request, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             );
         }
         if net_event.redirect { redirect_responses.insert(redirect_key, network_response_value(net_event)); }
@@ -1144,6 +1262,10 @@ pub(crate) fn emit_runtime_network_events(
     if network_events.is_empty() {
         return;
     }
+    let request_bodies = ctx.get_page(page_id).map(|page| page.request_body_store())
+        .or_else(|| ctx.navigating_request_bodies.as_ref()
+            .filter(|(owner, _)| owner == page_id)
+            .map(|(_, store)| store.clone()));
     let loader_id = ctx
         .current_loader_ids
         .get(page_id)
@@ -1165,20 +1287,25 @@ pub(crate) fn emit_runtime_network_events(
         let request_id = &network_event.request_id;
         let redirect_key = (network_event.document_generation, request_id.clone());
         if !network_event.request_started {
+        let request = request_bodies.as_ref().map(|store| {
+            let store = store.lock().unwrap_or_else(|error| error.into_inner());
+            network_request_value(network_event, &store)
+        }).unwrap_or_else(|| json!({
+            "url": network_event.url,
+            "method": network_event.method,
+            "headers": network_event.headers,
+            "rawHeaders": network_event.request_raw_headers,
+            "hasPostData": network_event.request_body_present,
+            "bodySize": network_event.request_body_size,
+            "requestBodyError": "request body store unavailable",
+        }));
         begin_network_request(ctx, page_id, request_id, json!({
                 "requestId": request_id,
                 "redirectResponse": redirect_responses.remove(&redirect_key),
                 "redirectHasExtraInfo": false,
                 "loaderId": loader_id,
                 "documentURL": page_url,
-                "request": {
-                    "url": network_event.url,
-                    "method": network_event.method,
-                    "headers": network_event.headers,
-                    "rawHeaders": network_event.request_raw_headers,
-                    "hasPostData": network_event.request_body_size > 0,
-                    "bodySize": network_event.request_body_size,
-                },
+                "request": request,
                 "timestamp": network_event.timestamp,
                 "wallTime": network_event.timestamp,
                 "initiator": if let Some(parent) = &network_event.initiator_request_id {
@@ -1211,13 +1338,22 @@ fn emit_network_result(
             queue_network_event(ctx, &sessions, "Network.requestWillBeSentExtraInfo",
                 json!({"requestId": request_id, "headers": raw.text_headers(), "rawHeaders": raw,
                     "associatedCookies": [], "connectTiming": {"requestTime": event.timestamp},
-                    "bodySize": event.request_body_size}));
+                    "bodySize": event.transport_request_body_size,
+                    "requestBodyPresent": event.request_body_present,
+                    "requestBodyRequestId": event.request_body_request_id,
+                    "transportRequestBodyPresent": event.transport_request_body_present,
+                    "transportRequestBodyRequestId": event.transport_request_body_request_id}));
         }
     }
     let start_sessions = ctx.network_request_sessions
         .get(&(page_id.to_string(), request_id.to_string()))
         .cloned()
         .unwrap_or_default();
+    ctx.remember_network_request_bodies(
+        page_id, &start_sessions, request_id,
+        event.request_body_request_id.as_deref(),
+        event.transport_request_body_request_id.as_deref(),
+    );
     ctx.remember_network_body(page_id, &start_sessions, request_id);
     if let Some(body_request_id) = event.response_body_request_id.as_deref() {
         ctx.remember_network_body(page_id, &start_sessions, body_request_id);
@@ -2461,7 +2597,11 @@ mod tests {
             document_generation: 0, document_url: String::new(),
             initiator_request_id: None,
             retired_document_url: None,
-            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
+            pending: false, error: None,
+            request_body_present: false, request_body_request_id: None, request_body_size: 0,
+            transport_request_body_present: false, transport_request_body_request_id: None,
+            transport_request_body_size: 0,
+            request_started: false, redirect: false, response_body_request_id: None,
             raw_headers: None,
             request_raw_headers: None,
             request_id: "fetch-7".into(),
@@ -2537,7 +2677,12 @@ mod tests {
             retired_document_url: None,
             pending: false,
             error: None,
-            request_body_size: 3,
+            request_body_present: false,
+            request_body_request_id: None,
+            request_body_size: 0,
+            transport_request_body_present: false,
+            transport_request_body_request_id: None,
+            transport_request_body_size: 0,
             request_started: true,
             redirect: false,
             response_body_request_id: Some(request_id.to_string()),
@@ -2670,7 +2815,12 @@ mod tests {
             retired_document_url: None,
             pending: false,
             error: None,
+            request_body_present: false,
+            request_body_request_id: None,
             request_body_size: 0,
+            transport_request_body_present: false,
+            transport_request_body_request_id: None,
+            transport_request_body_size: 0,
             request_started: true,
             redirect: false,
             response_body_request_id: Some(internal_id.into()),
@@ -2705,6 +2855,111 @@ mod tests {
             "navigation-complete"
         );
         assert!(crate::domains::network::get_response_body(&ctx, &Some(late), "loader-visible").is_err());
+    }
+
+    #[test]
+    fn native_post_redirect_chain_uses_one_loader_id_in_hop_order_and_clears_current_body() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session = "network-native-redirect".to_string();
+        ctx.sessions.insert(session.clone(), page_id.clone());
+        ctx.network_enabled_sessions.insert(session.clone());
+        ctx.network_body_sessions.insert(session.clone(), Default::default());
+        ctx.network_request_body_sessions.insert(session.clone(), Default::default());
+
+        let internal_id = "navigation-internal";
+        let standard_id = "navigation-internal-request-hop-0-standard";
+        let transport_id = "navigation-internal-request-hop-0-transport";
+        {
+            let page = ctx.get_page(&page_id).unwrap();
+            let request_bodies = page.request_body_store();
+            let mut request_bodies = request_bodies.lock().unwrap();
+            request_bodies.insert(standard_id.into(), b"payload").unwrap();
+            request_bodies.insert_shared(standard_id, transport_id.into()).unwrap();
+            request_bodies.alias(standard_id, internal_id).unwrap();
+            request_bodies.clear_alias(internal_id);
+            page.response_body_store().lock().unwrap()
+                .insert(internal_id.into(), b"final", false).unwrap();
+        }
+        let generation = ctx.get_page(&page_id).unwrap().network_document_generation;
+        let make_event = |url: &str, method: &str, status: u16, redirect: bool,
+                          body_id: Option<&str>, transport_body_id: Option<&str>| {
+            obscura_browser::NetworkEvent {
+                document_generation: generation,
+                document_url: "https://example.test/final".into(),
+                initiator_request_id: None,
+                retired_document_url: None,
+                pending: false,
+                error: None,
+                request_body_present: body_id.is_some(),
+                request_body_request_id: body_id.map(str::to_string),
+                request_body_size: body_id.map_or(0, |_| 7),
+                transport_request_body_present: transport_body_id.is_some(),
+                transport_request_body_request_id: transport_body_id.map(str::to_string),
+                transport_request_body_size: transport_body_id.map_or(0, |_| 7),
+                request_started: false,
+                redirect,
+                response_body_request_id: (!redirect).then(|| internal_id.to_string()),
+                raw_headers: None,
+                request_raw_headers: None,
+                request_id: internal_id.into(),
+                url: url.into(),
+                method: method.into(),
+                resource_type: "Document".into(),
+                status,
+                status_text: String::new(),
+                headers: Default::default(),
+                response_headers: std::sync::Arc::new(std::collections::HashMap::from([
+                    ("content-type".into(), "text/html".into()),
+                ])),
+                body_size: if redirect { 0 } else { 5 },
+                timestamp: if redirect { 1.0 } else { 2.0 },
+            }
+        };
+        let events = [
+            make_event("https://example.test/start", "POST", 302, true,
+                Some(standard_id), Some(transport_id)),
+            make_event("https://example.test/final", "GET", 200, false, None, None),
+        ];
+        emit_navigation_events(
+            &mut ctx,
+            &Some(session.clone()),
+            "frame-current",
+            "loader-visible",
+            "https://example.test/final",
+            &page_id,
+            &events,
+            WaitUntil::Load,
+            false,
+        );
+
+        let starts = ctx.pending_events.iter()
+            .filter(|event| event.method == "Network.requestWillBeSent"
+                && event.session_id.as_deref() == Some(session.as_str()))
+            .map(|event| &event.params)
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["requestId"], "loader-visible");
+        assert_eq!(starts[1]["requestId"], "loader-visible");
+        assert_eq!(starts[0]["request"]["url"], "https://example.test/start");
+        assert_eq!(starts[0]["request"]["method"], "POST");
+        assert_eq!(starts[0]["request"]["postData"], "payload");
+        assert_eq!(starts[1]["request"]["url"], "https://example.test/final");
+        assert_eq!(starts[1]["request"]["method"], "GET");
+        assert_eq!(starts[1]["request"]["hasPostData"], false);
+        assert_eq!(starts[1]["redirectResponse"]["status"], 302);
+        assert!(crate::domains::network::get_request_post_data(
+            &ctx, &Some(session.clone()), "loader-visible",
+        ).is_err());
+        assert_eq!(crate::domains::network::get_request_post_data(
+            &ctx, &Some(session), standard_id,
+        ).unwrap()["postData"], "payload");
+        assert_eq!(ctx.get_page(&page_id).unwrap().get_request_body_result("loader-visible"), None);
+        assert_eq!(crate::domains::network::get_response_body(
+            &ctx, &None, "loader-visible",
+        ).unwrap()["body"], "final");
     }
 
     #[tokio::test]

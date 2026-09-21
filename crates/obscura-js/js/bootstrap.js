@@ -7889,6 +7889,7 @@ globalThis.fetch = async (input, init = {}) => {
   const initBody = init.body !== undefined
     ? init.body
     : (request ? request.body : undefined);
+  const bodyPresent = initBody !== undefined && initBody !== null;
   const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
   const fetchMode = String(init.mode || (request ? request.mode : "cors"));
@@ -7915,7 +7916,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (alreadyAborted) abort();
   let raw;
   try {
-    raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, JSON.stringify({destination, requestId, resourceType}));
+    raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, JSON.stringify({destination, requestId, resourceType, bodyPresent}));
   } catch (error) {
     if (signal && signal.aborted) throw signal.reason;
     throw error;
@@ -8098,7 +8099,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       signal: controller.signal,
       method: this._method,
       headers: this._headers,
-      body: body || undefined,
+      body: body == null ? undefined : body,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
     };
@@ -8360,7 +8361,7 @@ if (typeof Request === 'undefined') {
       else { this.url = input?.url || input?.href || String(input); }
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(init.headers);
-      this.body = init.body || null;
+      this.body = init.body ?? null;
       this.mode = init.mode || 'cors';
       this.credentials = init.credentials !== undefined
         ? String(init.credentials)

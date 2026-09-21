@@ -168,7 +168,12 @@ pub struct NetworkEvent {
     pub retired_document_url: Option<String>,
     pub pending: bool,
     pub error: Option<String>,
+    pub request_body_present: bool,
+    pub request_body_request_id: Option<String>,
     pub request_body_size: usize,
+    pub transport_request_body_present: bool,
+    pub transport_request_body_request_id: Option<String>,
+    pub transport_request_body_size: usize,
     pub request_started: bool,
     pub redirect: bool,
     pub response_body_request_id: Option<String>,
@@ -330,6 +335,7 @@ pub struct Page {
     session_storage: obscura_js::ops::SharedWebStorage,
     requested_history: Option<obscura_js::ops::HistoryNavigation>,
     pub network_events: Vec<NetworkEvent>,
+    request_bodies: Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>,
     response_bodies: Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
     js_response_body_counter: Arc<std::sync::atomic::AtomicU64>,
     network_event_counter: u32,
@@ -1190,6 +1196,7 @@ impl Page {
             session_storage: Default::default(),
             requested_history: None,
             network_events: Vec::new(),
+            request_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             response_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             js_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             network_event_counter: 0,
@@ -1791,8 +1798,12 @@ impl Page {
             .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
             .await
     }
-    async fn do_post_form(&self, url: &Url, body: &str, request: ResourceRequest) -> Result<Response, ObscuraNetError> {
-        self.stealth_client.post_form_resource_with_callbacks(url, body, request, Some(&self.callbacks)).await
+    async fn do_post_form_traced(&self, url: &Url, body: &str, request: ResourceRequest,
+        trace: &obscura_net::observation::RequestTrace,
+    ) -> Result<Response, ObscuraNetError> {
+        self.stealth_client.post_form_resource_traced(
+            url, body, request, Some(&self.callbacks), trace,
+        ).await
     }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
@@ -1828,6 +1839,7 @@ impl Page {
         rt.set_execution_cancellation(self.execution_cancellation.clone());
         self.network_document_generation += 1;
         rt.set_network_observation_context(self.network_document_generation, self.url_string(), self.network_teardown_events.clone(), self.network_teardown_notify.clone());
+        rt.set_network_request_body_store(self.request_bodies.clone());
         rt.set_network_response_body_store(self.response_bodies.clone(), self.js_response_body_counter.clone());
         rt.set_url(&self.url_string());
         rt.set_session_history(self.session_history.clone());
@@ -2013,6 +2025,7 @@ impl Page {
                     response.request_raw_headers.as_ref(),
                     &response.body,
                     false,
+                    None,
                 );
 
                 let (response_key, response_url) = canonical_stylesheet_url(response_url);
@@ -2629,6 +2642,7 @@ impl Page {
                             resp.request_raw_headers.as_ref(),
                             &resp.body,
                             false,
+                            None,
                         );
                         if !script_response_is_executable(resp.status) {
                             tracing::warn!("Refusing to execute script {} after HTTP {}", url, resp.status);
@@ -3544,6 +3558,37 @@ impl Page {
             return Ok(());
         }
 
+        // Request-body retention is part of accepting a native POST. Admit it
+        // before transport so an exhausted capture budget cannot let an
+        // unobservable body reach the network. Empty POST bodies still create
+        // a real store entry and remain distinct from body-absent GETs.
+        let navigation_request_id = if method == "POST" {
+            let request_id = self.next_network_event_id();
+            Some(request_id)
+        } else { None };
+        let navigation_trace = if let Some(request_id) = navigation_request_id.as_ref()
+            .filter(|_| !matches!(url.scheme(), "data" | "blob"))
+        {
+            let trace = obscura_net::observation::RequestTrace::new_request_only(
+                self.response_bodies.clone(), self.request_bodies.clone(), request_id.clone(),
+            );
+            if let Err(error) = trace.begin(url.as_str(), method, None, Some(body.as_bytes())) {
+                self.lifecycle = LifecycleState::Failed;
+                return Err(PageError::NetworkError(error.to_string()));
+            }
+            Some(trace)
+        } else {
+            if let Some(request_id) = &navigation_request_id {
+                if let Err(error) = self.request_bodies.lock().unwrap_or_else(|e| e.into_inner())
+                    .insert(request_id.clone(), body.as_bytes())
+                {
+                    self.lifecycle = LifecycleState::Failed;
+                    return Err(PageError::NetworkError(error.to_string()));
+                }
+            }
+            None
+        };
+
         let response = if url.scheme() == "data" {
             let content_type = url_str
                 .strip_prefix("data:")
@@ -3585,7 +3630,10 @@ impl Page {
                 request_referrer: None,
             })
         } else if method == "POST" {
-            self.do_post_form(&url, body, request).await
+            self.do_post_form_traced(
+                &url, body, request,
+                navigation_trace.as_ref().expect("non-data POST navigation trace"),
+            ).await
         } else {
             self.do_fetch(&url, request).await
         }
@@ -3598,17 +3646,22 @@ impl Page {
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
         // corrupts them (issue #340). Text-like types stay as text.
         let main_is_binary = !is_text_like_content_type(response.content_type());
-        self.record_network_event_with_body(
-            url.as_str(),
-            "GET",
-            "Document",
-            response.status,
-            &response.headers,
-            response.raw_headers.as_ref(),
-            response.request_raw_headers.as_ref(),
-            &response.body,
-            main_is_binary,
-        );
+        if let (Some(trace), Some(request_id)) = (navigation_trace.as_ref(), navigation_request_id.as_ref()) {
+            self.record_traced_navigation_events(trace.take(), request_id, &response, main_is_binary);
+        } else {
+            self.record_network_event_with_body(
+                url.as_str(),
+                method,
+                "Document",
+                response.status,
+                &response.headers,
+                response.raw_headers.as_ref(),
+                response.request_raw_headers.as_ref(),
+                &response.body,
+                main_is_binary,
+                navigation_request_id.map(|request_id| (request_id, body.len())),
+            );
+        }
 
         if matches!(response.status, 204 | 205) {
             self.lifecycle = previous_lifecycle;
@@ -4057,6 +4110,7 @@ impl Page {
                 event.response.request_raw_headers.as_ref(),
                 event.response.body.as_ref(),
                 true,
+                None,
             );
         }
     }
@@ -4406,7 +4460,13 @@ impl Page {
                 document_generation: ev.document_generation, document_url: ev.document_url,
                 retired_document_url: retired_document_url.clone(),
                 initiator_request_id: ev.initiator_request_id.clone(),
-                pending: ev.pending, error: ev.error, request_body_size: ev.request_body_size,
+                pending: ev.pending, error: ev.error,
+                request_body_present: ev.request_body_present,
+                request_body_request_id: ev.request_body_request_id,
+                request_body_size: ev.request_body_size,
+                transport_request_body_present: ev.transport_request_body_present,
+                transport_request_body_request_id: ev.transport_request_body_request_id,
+                transport_request_body_size: ev.transport_request_body_size,
                 request_started: ev.request_started, redirect: ev.redirect,
                 response_body_request_id: ev.response_body_request_id,
                 request_id: ev.request_id,
@@ -4707,6 +4767,7 @@ impl Page {
             None,
             None,
             body_size,
+            None,
         );
     }
 
@@ -4721,6 +4782,7 @@ impl Page {
         request_raw_headers: Option<&obscura_net::HeaderCapture>,
         body: &[u8],
         base64_encoded: bool,
+        request_body: Option<(String, usize)>,
     ) {
         let request_id = self.record_network_event_inner(
             url,
@@ -4731,6 +4793,7 @@ impl Page {
             raw_headers,
             request_raw_headers,
             body.len(),
+            request_body,
         );
         self.store_response_body(request_id, body, base64_encoded);
     }
@@ -4745,18 +4808,27 @@ impl Page {
         raw_headers: Option<&obscura_net::HeaderCapture>,
         request_raw_headers: Option<&obscura_net::HeaderCapture>,
         body_size: usize,
+        request_body: Option<(String, usize)>,
     ) -> String {
-        self.network_event_counter += 1;
-        let request_id = format!("{}.{}", self.id, self.network_event_counter);
+        let request_id = request_body.as_ref().map(|(request_id, _)| request_id.clone())
+            .unwrap_or_else(|| self.next_network_event_id());
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
+        let request_body_request_id = request_body.as_ref().map(|(request_id, _)| request_id.clone());
         self.network_events.push(NetworkEvent {
             document_generation: u64::MAX, document_url: String::new(),
             initiator_request_id: None,
             retired_document_url: None,
-            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
+            pending: false, error: None,
+            request_body_present: request_body.is_some(),
+            request_body_request_id: request_body_request_id.clone(),
+            request_body_size: request_body.as_ref().map_or(0, |(_, size)| *size),
+            transport_request_body_present: request_body.is_some(),
+            transport_request_body_request_id: request_body_request_id,
+            transport_request_body_size: request_body.as_ref().map_or(0, |(_, size)| *size),
+            request_started: false, redirect: false, response_body_request_id: None,
             request_id: request_id.clone(),
             url: url.to_string(),
             method: method.to_string(),
@@ -4773,9 +4845,118 @@ impl Page {
         request_id
     }
 
+    fn record_traced_navigation_events(
+        &mut self,
+        exchanges: Vec<obscura_net::observation::Exchange>,
+        request_id: &str,
+        final_response: &obscura_net::Response,
+        final_body_base64_encoded: bool,
+    ) {
+        self.store_response_body(
+            request_id.to_string(), &final_response.body, final_body_base64_encoded,
+        );
+        let count = exchanges.len();
+        for (index, exchange) in exchanges.into_iter().enumerate() {
+            let redirect = index + 1 < count;
+            let response = exchange.response.clone().unwrap_or_else(|| final_response.clone());
+            let request_raw_headers = exchange.request_headers.clone()
+                .or_else(|| response.request_raw_headers.clone());
+            self.network_events.push(NetworkEvent {
+                document_generation: u64::MAX,
+                document_url: String::new(),
+                initiator_request_id: None,
+                retired_document_url: None,
+                pending: false,
+                error: None,
+                request_body_present: exchange.request_body_present,
+                request_body_request_id: exchange.request_body_request_id,
+                request_body_size: exchange.request_body_size,
+                transport_request_body_present: exchange.transport_request_body_present,
+                transport_request_body_request_id: exchange.transport_request_body_request_id,
+                transport_request_body_size: exchange.transport_request_body_size,
+                request_started: false,
+                redirect,
+                response_body_request_id: (!redirect).then(|| request_id.to_string()),
+                request_id: request_id.to_string(),
+                url: exchange.url,
+                method: exchange.method,
+                resource_type: "Document".to_string(),
+                status: response.status,
+                status_text: String::new(),
+                headers: request_raw_headers.as_ref()
+                    .map(obscura_net::HeaderCapture::text_headers).unwrap_or_default(),
+                raw_headers: response.raw_headers,
+                request_raw_headers,
+                response_headers: Arc::new(response.headers),
+                body_size: if index + 1 == count {
+                    final_response.body.len()
+                } else {
+                    exchange.body_size
+                },
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+            });
+        }
+    }
+
+    fn next_network_event_id(&mut self) -> String {
+        self.network_event_counter += 1;
+        format!("{}.{}", self.id, self.network_event_counter)
+    }
+
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
         // Capture failure is retained by the store and returned to CDP readers.
         let _ = self.response_bodies.lock().unwrap_or_else(|e| e.into_inner()).insert(request_id, body, base64_encoded);
+    }
+
+    /// Changing request-body limits clears only request captures. Response
+    /// bodies and their Fetch stream ownership are an independent budget.
+    pub fn set_request_body_limits(&mut self, limits: obscura_net::request_body::RequestBodyLimits) {
+        *self.request_bodies.lock().unwrap_or_else(|e| e.into_inner()) =
+            obscura_net::request_body::RequestBodyStore::new(limits);
+        if let Some(js) = &self.js {
+            js.set_network_request_body_store(self.request_bodies.clone());
+        }
+    }
+
+    /// Return the exact admitted bytes. An explicit empty body is `Some(Ok(vec![]))`;
+    /// an absent body is `None`, and a sticky capture failure remains `Some(Err(_))`.
+    pub fn get_request_body_result(&self, request_id: &str) -> Option<Result<Vec<u8>, String>> {
+        self.request_bodies.lock().unwrap_or_else(|e| e.into_inner()).get(request_id).map(|body| {
+            body.map_err(|error| error.to_string()).and_then(|body| {
+                body.with_bytes(|bytes| bytes.to_vec()).map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    pub fn has_request_body(&self, request_id: &str) -> bool {
+        self.request_bodies.lock().unwrap_or_else(|e| e.into_inner()).contains(request_id)
+    }
+
+    pub fn request_body_size(&self, request_id: &str) -> Option<Result<usize, String>> {
+        self.request_bodies.lock().unwrap_or_else(|e| e.into_inner()).get(request_id).map(|body| {
+            body.map(|body| body.len()).map_err(|error| error.to_string())
+        })
+    }
+
+    pub fn request_body_store(&self) -> Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>> {
+        self.request_bodies.clone()
+    }
+
+    /// Navigation's loaderId and internal request ID resolve to the same
+    /// retained request body for direct page CDP connections.
+    pub fn alias_request_body(&mut self, from_id: &str, to_id: &str) {
+        let _ = self.request_bodies.lock().unwrap_or_else(|e| e.into_inner()).alias(from_id, to_id);
+    }
+
+    pub fn clear_request_body_alias(&mut self, request_id: &str) {
+        self.request_bodies.lock().unwrap_or_else(|e| e.into_inner()).clear_alias(request_id);
+    }
+
+    pub fn clear_request_bodies(&mut self) {
+        self.request_bodies.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Changing limits clears retained bodies; already taken streams keep ownership.
@@ -5141,7 +5322,12 @@ mod tests {
             initiator_request_id: None,
             pending: false,
             error: None,
+            request_body_present: false,
+            request_body_request_id: None,
             request_body_size: 0,
+            transport_request_body_present: false,
+            transport_request_body_request_id: None,
+            transport_request_body_size: 0,
             request_started: true,
             redirect: false,
             response_body_request_id: Some(request_id.to_string()),
@@ -5219,6 +5405,35 @@ mod tests {
     }
 
     #[test]
+    fn request_body_lookup_is_byte_exact_and_distinguishes_empty_from_absent() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "request-body-lookup".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("request-body-lookup".into(), context);
+        let binary: Vec<u8> = (0..=255).collect();
+        {
+            let store = page.request_body_store();
+            let mut store = store.lock().unwrap_or_else(|error| error.into_inner());
+            store.insert("binary".into(), &binary).unwrap();
+            store.insert("empty".into(), &[]).unwrap();
+        }
+
+        assert_eq!(page.get_request_body_result("binary"), Some(Ok(binary)));
+        assert_eq!(page.request_body_size("binary"), Some(Ok(256)));
+        assert_eq!(page.get_request_body_result("empty"), Some(Ok(Vec::new())));
+        assert_eq!(page.request_body_size("empty"), Some(Ok(0)));
+        assert!(page.has_request_body("empty"));
+        page.alias_request_body("binary", "loader-visible");
+        assert_eq!(page.get_request_body_result("loader-visible"),
+            Some(Ok((0u8..=255).collect())));
+        assert_eq!(page.get_request_body_result("absent"), None);
+        assert_eq!(page.request_body_size("absent"), None);
+        assert!(!page.has_request_body("absent"));
+    }
+
+    #[test]
     fn pages_in_one_context_keep_network_idle_accounting_isolated() {
         let context = std::sync::Arc::new(super::BrowserContext::with_options(
             "page-idle-isolation".into(),
@@ -5274,6 +5489,184 @@ mod tests {
         assert!(request.starts_with("post /login "));
         assert!(request.contains("x-transport-test: stealth\r\n"), "form bypassed the page transport");
         assert!(request.contains("content-type: application/x-www-form-urlencoded\r\n"));
+        let event = page.network_events.iter()
+            .find(|event| event.resource_type == "Document")
+            .expect("navigation event");
+        assert_eq!(event.method, "POST");
+        assert!(event.request_body_present);
+        assert!(event.transport_request_body_present);
+        assert_eq!(event.request_body_request_id.as_deref(),
+            Some(format!("{}-request-hop-0-standard", event.request_id).as_str()));
+        assert_eq!(event.transport_request_body_request_id.as_deref(),
+            Some(format!("{}-request-hop-0-transport", event.request_id).as_str()));
+        assert_eq!(event.request_body_size, b"name=value".len());
+        assert_eq!(event.transport_request_body_size, b"name=value".len());
+        assert_eq!(page.get_request_body_result(&event.request_id), Some(Ok(b"name=value".to_vec())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_post_redirects_retain_each_hop_and_clear_or_preserve_the_logical_body() {
+        use std::io::{Read, Write};
+
+        fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut data = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "request ended before its declared body");
+                data.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else { continue };
+                let headers = String::from_utf8_lossy(&data[..header_end]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap_or(0);
+                if data.len() >= header_end + content_length { return data; }
+            }
+        }
+
+        for (status, expected_method) in [(302, "GET"), (307, "POST")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = listener.accept().unwrap();
+                let first_request = read_request(&mut first);
+                first.write_all(format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ).as_bytes()).unwrap();
+                let (mut second, _) = listener.accept().unwrap();
+                let second_request = read_request(&mut second);
+                second.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 11\r\nConnection: close\r\n\r\n<p>done</p>",
+                ).unwrap();
+                (first_request, second_request)
+            });
+            let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+                format!("native-post-{status}"),
+                obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+                None, None, true,
+            ));
+            let mut page = super::Page::new(format!("native-post-{status}"), context);
+            page.navigate_with_wait_post(
+                &format!("http://{address}/start"),
+                crate::lifecycle::WaitUntil::DomContentLoaded,
+                "POST",
+                "payload",
+            ).await.unwrap();
+
+            let events = page.network_events.iter()
+                .filter(|event| event.resource_type == "Document")
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 2);
+            assert!(events[0].redirect);
+            assert!(!events[1].redirect);
+            assert_eq!(events[0].request_id, events[1].request_id);
+            assert_eq!(events[0].method, "POST");
+            assert_eq!(events[1].method, expected_method);
+            assert!(events[0].request_body_present);
+            let first_body_id = events[0].request_body_request_id.as_deref().unwrap();
+            assert_eq!(page.get_request_body_result(first_body_id), Some(Ok(b"payload".to_vec())));
+            if status == 302 {
+                assert!(!events[1].request_body_present);
+                assert!(!events[1].transport_request_body_present);
+                assert_eq!(page.get_request_body_result(&events[1].request_id), None);
+            } else {
+                assert!(events[1].request_body_present);
+                assert!(events[1].transport_request_body_present);
+                assert_eq!(page.get_request_body_result(&events[1].request_id),
+                    Some(Ok(b"payload".to_vec())));
+                assert_ne!(events[0].request_body_request_id, events[1].request_body_request_id);
+            }
+
+            let (first_request, second_request) = server.join().unwrap();
+            assert!(first_request.starts_with(b"POST /start "));
+            assert!(first_request.ends_with(b"payload"));
+            assert!(second_request.starts_with(format!("{expected_method} /final ").as_bytes()));
+            if status == 302 {
+                assert!(!second_request.ends_with(b"payload"));
+            } else {
+                assert!(second_request.ends_with(b"payload"));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_request_body_distinguishes_explicit_empty_from_absent() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "navigation-empty-body".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("navigation-empty-body".into(), context);
+
+        page.navigate_with_wait_post(
+            "data:text/html,post",
+            crate::lifecycle::WaitUntil::DomContentLoaded,
+            "POST",
+            "",
+        ).await.unwrap();
+        let post = page.network_events.iter()
+            .find(|event| event.resource_type == "Document")
+            .expect("POST navigation event");
+        assert!(post.request_body_present);
+        assert_eq!(post.request_body_size, 0);
+        assert_eq!(post.request_body_request_id.as_deref(), Some(post.request_id.as_str()));
+        assert!(post.transport_request_body_present);
+        assert_eq!(post.transport_request_body_size, 0);
+        assert_eq!(post.transport_request_body_request_id.as_deref(), Some(post.request_id.as_str()));
+        assert_eq!(page.get_request_body_result(&post.request_id), Some(Ok(Vec::new())));
+
+        page.navigate_with_wait_post(
+            "data:text/html,get",
+            crate::lifecycle::WaitUntil::DomContentLoaded,
+            "GET",
+            "",
+        ).await.unwrap();
+        let get = page.network_events.iter().rev()
+            .find(|event| event.resource_type == "Document")
+            .expect("GET navigation event");
+        assert!(!get.request_body_present);
+        assert_eq!(get.request_body_size, 0);
+        assert_eq!(get.request_body_request_id, None);
+        assert!(!get.transport_request_body_present);
+        assert_eq!(get.transport_request_body_size, 0);
+        assert_eq!(get.transport_request_body_request_id, None);
+        assert_eq!(page.get_request_body_result(&get.request_id), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_post_budget_failure_happens_before_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let context = std::sync::Arc::new(super::BrowserContext::with_storage_and_network(
+            "navigation-request-body-budget".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("navigation-request-body-budget".into(), context);
+        page.set_request_body_limits(obscura_net::request_body::RequestBodyLimits {
+            memory_threshold: 0,
+            total_bytes: 0,
+            entries: 1,
+        });
+
+        let error = page.navigate_with_wait_post(
+            &format!("http://{address}/must-not-send"),
+            crate::lifecycle::WaitUntil::DomContentLoaded,
+            "POST",
+            "x",
+        ).await.unwrap_err();
+
+        assert!(error.to_string().contains("request_body_budget_exhausted"));
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(page.network_events.is_empty());
     }
 
     use super::{

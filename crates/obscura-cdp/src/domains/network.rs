@@ -46,6 +46,7 @@ pub async fn handle(
                     // A fresh Network agent cannot read bodies from requests
                     // observed before it enabled. Repeated enable is idempotent.
                     ctx.network_body_sessions.insert(session.clone(), Default::default());
+                    ctx.network_request_body_sessions.insert(session.clone(), Default::default());
                     ctx.network_body_failure_sessions.remove(session);
                 }
             }
@@ -154,8 +155,65 @@ pub async fn handle(
 
             get_response_body(ctx, session_id, request_id)
         }
+        "getRequestPostData" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(|v| v.as_str())
+                .ok_or("Network.getRequestPostData requires requestId")?;
+            get_request_post_data(ctx, session_id, request_id)
+        }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
+}
+
+/// Chrome resolves a logical request id to the latest redirect hop. Obscura
+/// additionally accepts a per-hop `requestBodyRequestId` or
+/// `transportRequestBodyRequestId` emitted to the same Network session, so a
+/// client can retrieve every exact body rather than losing earlier or
+/// interception-overridden bytes.
+pub(super) fn get_request_post_data(
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+    request_id: &str,
+) -> Result<Value, String> {
+    let (body_id, store) = if let Some(session) = session_id {
+        let page_id = ctx.sessions.get(session)
+            .ok_or_else(|| format!("No page found for sessionId {session}"))?;
+        if !ctx.network_enabled_sessions.contains(session) {
+            return Err(format!("No post data available for requestId {request_id}"));
+        }
+        let body_id = ctx.network_request_body_sessions.get(session)
+            .and_then(|visible| visible.get(request_id)).cloned()
+            .ok_or_else(|| format!("No post data available for requestId {request_id}"))?;
+        let store = ctx.get_page(page_id).map(|page| page.request_body_store())
+            .or_else(|| ctx.navigating_request_bodies.as_ref()
+                .filter(|(owner, _)| owner == page_id)
+                .map(|(_, store)| store.clone()))
+            .ok_or_else(|| format!("No page found for sessionId {session}"))?;
+        (body_id, store)
+    } else {
+        let mut owners = ctx.pages.iter().filter(|page| page.has_request_body(request_id))
+            .map(|page| page.request_body_store()).collect::<Vec<_>>();
+        if let Some((_, store)) = &ctx.navigating_request_bodies {
+            if store.lock().unwrap_or_else(|error| error.into_inner()).contains(request_id) {
+                owners.push(store.clone());
+            }
+        }
+        if owners.len() > 1 {
+            return Err(format!("Ambiguous requestId {request_id}; supply sessionId"));
+        }
+        let store = owners.pop()
+            .ok_or_else(|| format!("No post data available for requestId {request_id}"))?;
+        (request_id.to_string(), store)
+    };
+    let body = store.lock().unwrap_or_else(|error| error.into_inner()).get(&body_id)
+        .ok_or_else(|| format!("No post data available for requestId {request_id}"))?
+        .map_err(|error| error.to_string())?;
+    let (post_data, base64_encoded) = body.with_bytes(|bytes| match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_owned(), false),
+        Err(_) => (base64::engine::general_purpose::STANDARD.encode(bytes), true),
+    }).map_err(|error| error.to_string())?;
+    Ok(json!({ "postData": post_data, "base64Encoded": base64_encoded }))
 }
 
 /// Read a completed capture without consuming its shared raw storage.
@@ -469,6 +527,64 @@ mod tests {
 
         assert_eq!(result["body"], "<html><body>hello body</body></html>");
         assert_eq!(result["base64Encoded"], false);
+    }
+
+    #[tokio::test]
+    async fn request_post_data_is_byte_exact_hop_scoped_and_session_owned() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let page_id = ctx.create_page();
+        let first = Some("request-body-first".to_string());
+        let late = Some("request-body-late".to_string());
+        ctx.sessions.insert(first.clone().unwrap(), page_id.clone());
+        ctx.sessions.insert(late.clone().unwrap(), page_id.clone());
+        handle("enable", &json!({}), &mut ctx, &first).await.unwrap();
+
+        let standard_id = "fetch-1-request-hop-0-standard";
+        let transport_id = "fetch-1-request-hop-0-transport";
+        let standard = vec![0, 0xff, b'=', 0x80];
+        let transport = vec![0xfe, 1, 0, 0xfd];
+        {
+            let store = ctx.get_page(&page_id).unwrap().request_body_store();
+            let mut store = store.lock().unwrap_or_else(|error| error.into_inner());
+            store.insert(standard_id.into(), &standard).unwrap();
+            store.insert(transport_id.into(), &transport).unwrap();
+            store.alias(standard_id, "fetch-1").unwrap();
+        }
+        ctx.remember_network_request_bodies(
+            &page_id, std::slice::from_ref(first.as_ref().unwrap()), "fetch-1",
+            Some(standard_id), Some(transport_id),
+        );
+
+        let logical = handle("getRequestPostData", &json!({"requestId":"fetch-1"}), &mut ctx, &first).await.unwrap();
+        assert_eq!(logical["base64Encoded"], true);
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(logical["postData"].as_str().unwrap()).unwrap(), standard);
+        let wire = handle("getRequestPostData", &json!({"requestId":transport_id}), &mut ctx, &first).await.unwrap();
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(wire["postData"].as_str().unwrap()).unwrap(), transport);
+
+        handle("enable", &json!({}), &mut ctx, &late).await.unwrap();
+        assert!(handle("getRequestPostData", &json!({"requestId":"fetch-1"}), &mut ctx, &late).await.is_err());
+
+        // A 302/303 next hop is body-absent for the logical Network id, while
+        // the earlier canonical id remains available to the original observer.
+        ctx.remember_network_request_bodies(
+            &page_id, std::slice::from_ref(first.as_ref().unwrap()), "fetch-1", None, None,
+        );
+        assert!(handle("getRequestPostData", &json!({"requestId":"fetch-1"}), &mut ctx, &first).await.is_err());
+        let earlier = handle("getRequestPostData", &json!({"requestId":standard_id}), &mut ctx, &first).await.unwrap();
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(earlier["postData"].as_str().unwrap()).unwrap(), standard);
+
+        let empty_id = "fetch-empty-request-hop-0-standard";
+        ctx.get_page(&page_id).unwrap().request_body_store().lock()
+            .unwrap_or_else(|error| error.into_inner()).insert(empty_id.into(), &[]).unwrap();
+        ctx.remember_network_request_bodies(
+            &page_id, std::slice::from_ref(first.as_ref().unwrap()), "fetch-empty",
+            Some(empty_id), Some(empty_id),
+        );
+        let empty = handle("getRequestPostData", &json!({"requestId":"fetch-empty"}), &mut ctx, &first).await.unwrap();
+        assert_eq!(empty, json!({"postData":"", "base64Encoded":false}));
+
+        handle("disable", &json!({}), &mut ctx, &first).await.unwrap();
+        assert!(handle("getRequestPostData", &json!({"requestId":standard_id}), &mut ctx, &first).await.is_err());
     }
 
     #[tokio::test]

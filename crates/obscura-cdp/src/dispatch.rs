@@ -54,6 +54,9 @@ pub struct CdpContext {
     /// The Page is temporarily moved into the navigation task, but response
     /// pause commands still need its page-owned capture store.
     pub(crate) navigating_response_bodies: Option<(String, Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>)>,
+    /// Request post data has the same Page lifetime and must remain available
+    /// while navigation temporarily moves the Page out of `pages`.
+    pub(crate) navigating_request_bodies: Option<(String, Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>)>,
     /// Fetch.disable/detach may arrive while the Page is in the navigation
     /// task. Apply the policy reset before returning that Page to `pages`.
     pub(crate) pending_fetch_policy_cleanup: HashSet<String>,
@@ -77,6 +80,11 @@ pub struct CdpContext {
     /// Response bodies visible to each Network agent. Chrome invalidates this
     /// view on Network.disable without deleting a sibling session's cache.
     pub(crate) network_body_sessions: HashMap<String, HashSet<String>>,
+    /// Logical Network request ids and Obscura per-hop body ids visible to
+    /// each Network agent. Values are exact request-store ids; a redirect hop
+    /// with no body removes the logical id without discarding older per-hop
+    /// entries that the same agent already observed.
+    pub(crate) network_request_body_sessions: HashMap<String, HashMap<String, String>>,
     /// A page body store stops accepting entries after its first budget or I/O
     /// failure. One capability bit per observing session preserves that exact
     /// terminal error without retaining every later failed request ID.
@@ -202,6 +210,7 @@ impl CdpContext {
             pages: Vec::new(),
             navigating_page_id: None,
             navigating_response_bodies: None,
+            navigating_request_bodies: None,
             pending_fetch_policy_cleanup: HashSet::new(),
             navigating_document_loader: None,
             sessions: HashMap::new(),
@@ -211,6 +220,7 @@ impl CdpContext {
             network_enabled_sessions: HashSet::new(),
             network_request_sessions: HashMap::new(),
             network_body_sessions: HashMap::new(),
+            network_request_body_sessions: HashMap::new(),
             network_body_failure_sessions: HashSet::new(),
             network_observation_failure_sessions: HashSet::new(),
             nav_events_emitted: std::collections::HashSet::new(),
@@ -582,11 +592,47 @@ impl CdpContext {
     pub(crate) fn disable_network_session(&mut self, session_id: &str) {
         self.network_enabled_sessions.remove(session_id);
         self.network_body_sessions.remove(session_id);
+        self.network_request_body_sessions.remove(session_id);
         self.network_body_failure_sessions.remove(session_id);
         self.network_observation_failure_sessions
             .retain(|(_, session)| session != session_id);
         for sessions in self.network_request_sessions.values_mut() {
             sessions.retain(|session| session != session_id);
+        }
+    }
+
+    pub(crate) fn remember_network_request_bodies(
+        &mut self,
+        page_id: &str,
+        sessions: &[String],
+        request_id: &str,
+        standard_body_id: Option<&str>,
+        transport_body_id: Option<&str>,
+    ) {
+        let store = self.get_page(page_id).map(|page| page.request_body_store())
+            .or_else(|| self.navigating_request_bodies.as_ref()
+                .filter(|(owner, _)| owner == page_id)
+                .map(|(_, store)| store.clone()));
+        let Some(store) = store else { return; };
+        let store = store.lock().unwrap_or_else(|error| error.into_inner());
+        for session in sessions {
+            if !self.network_enabled_sessions.contains(session)
+                || !self.sessions.get(session).is_some_and(|owner| owner == page_id)
+            {
+                continue;
+            }
+            let visible = self.network_request_body_sessions.entry(session.clone()).or_default();
+            // Chrome resolves Network.getRequestPostData against the current
+            // redirect hop. A 301/302/303 POST-to-GET transition therefore
+            // makes the logical request id body-less.
+            visible.remove(request_id);
+            if let Some(body_id) = standard_body_id.filter(|id| store.contains(id)) {
+                visible.insert(request_id.to_string(), body_id.to_string());
+                visible.insert(body_id.to_string(), body_id.to_string());
+            }
+            if let Some(body_id) = transport_body_id.filter(|id| store.contains(id)) {
+                visible.insert(body_id.to_string(), body_id.to_string());
+            }
         }
     }
 
@@ -709,6 +755,8 @@ mod context_ownership_tests {
             ctx.sessions.insert(session_id.clone(), page_id.clone());
             ctx.network_enabled_sessions.insert(session_id.clone());
             ctx.network_body_sessions.entry(session_id.clone()).or_default().insert("request".into());
+            ctx.network_request_body_sessions.entry(session_id.clone()).or_default()
+                .insert("request".into(), "request".into());
             ctx.network_body_failure_sessions.insert(session_id.clone());
             ctx.network_observation_failure_sessions
                 .insert((page_id.clone(), session_id.clone()));
@@ -730,6 +778,7 @@ mod context_ownership_tests {
             assert!(ctx.runtime_enabled_sessions.is_empty());
             assert!(ctx.network_enabled_sessions.is_empty());
             assert!(ctx.network_body_sessions.is_empty());
+            assert!(ctx.network_request_body_sessions.is_empty());
             assert!(ctx.network_body_failure_sessions.is_empty());
             assert!(ctx.network_observation_failure_sessions.is_empty());
             assert!(ctx.network_request_sessions.is_empty());
@@ -913,6 +962,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Network.deleteCookies"
             | "Network.clearBrowserCookies"
             | "Network.getResponseBody"
+            | "Network.getRequestPostData"
             | "Fetch.continueRequest"
             | "Fetch.fulfillRequest"
             | "Fetch.failRequest"

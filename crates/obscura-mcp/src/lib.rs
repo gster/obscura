@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 #[cfg(feature = "render")]
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use obscura_browser::{
     AutomationWait, AutomationWaitError, BrowserContext, DocumentIdentity, NetworkEvent, NetworkEventPhase, Page,
 };
@@ -1195,7 +1196,11 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
 fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     let page = state.page_mut();
     page.sync_js_network_events();
-    let events = page.network_events.iter().map(network_event_projection).collect::<Vec<_>>();
+    let request_bodies = page.request_body_store();
+    let request_bodies = request_bodies.lock().unwrap_or_else(|error| error.into_inner());
+    let events = page.network_events.iter()
+        .map(|event| network_event_projection(event, &request_bodies))
+        .collect::<Result<Vec<_>, _>>()?;
     let terminal_failure = page.network_observation_failure().map(|failure| {
         serde_json::to_value(failure)
             .expect("NetworkObservationFailure serialization is infallible")
@@ -1216,14 +1221,43 @@ fn network_requests_payload(
     Value::Object(payload)
 }
 
-fn network_event_projection(event: &NetworkEvent) -> Value {
+fn request_body_projection(
+    store: &obscura_net::request_body::RequestBodyStore,
+    present: bool,
+    body_id: Option<&str>,
+) -> Result<Value, String> {
+    if !present { return Ok(Value::Null); }
+    let body_id = body_id.ok_or("request body is present without a capture id")?;
+    let body = store.get(body_id)
+        .ok_or_else(|| format!("request body capture missing for {body_id}"))?
+        .map_err(|error| error.to_string())?;
+    body.with_bytes(|bytes| match std::str::from_utf8(bytes) {
+        Ok(text) => json!({"body": text, "base64_encoded": false}),
+        Err(_) => json!({
+            "body": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "base64_encoded": true,
+        }),
+    }).map_err(|error| error.to_string())
+}
+
+fn network_event_projection(
+    event: &NetworkEvent,
+    request_bodies: &obscura_net::request_body::RequestBodyStore,
+) -> Result<Value, String> {
     let phase = match event.phase() {
         NetworkEventPhase::Started => "started",
         NetworkEventPhase::Redirect => "redirect",
         NetworkEventPhase::Completed => "completed",
         NetworkEventPhase::Failed => "failed",
     };
-    json!({
+    let request_body = request_body_projection(
+        request_bodies, event.request_body_present, event.request_body_request_id.as_deref(),
+    )?;
+    let transport_request_body = request_body_projection(
+        request_bodies, event.transport_request_body_present,
+        event.transport_request_body_request_id.as_deref(),
+    )?;
+    Ok(json!({
         "phase": phase,
         "document_generation": event.document_generation,
         "document_url": event.document_url,
@@ -1237,7 +1271,14 @@ fn network_event_projection(event: &NetworkEvent) -> Value {
         "url": event.url,
         "method": event.method,
         "resource_type": event.resource_type,
+        "request_body_present": event.request_body_present,
+        "request_body_request_id": event.request_body_request_id,
         "request_body_size": event.request_body_size,
+        "request_body": request_body,
+        "transport_request_body_present": event.transport_request_body_present,
+        "transport_request_body_request_id": event.transport_request_body_request_id,
+        "transport_request_body_size": event.transport_request_body_size,
+        "transport_request_body": transport_request_body,
         "headers": event.headers,
         "request_raw_headers": event.request_raw_headers,
         "status": event.status,
@@ -1247,7 +1288,7 @@ fn network_event_projection(event: &NetworkEvent) -> Value {
         "response_body_request_id": event.response_body_request_id,
         "body_size": event.body_size,
         "timestamp": event.timestamp,
-    })
+    }))
 }
 
 fn tool_console_messages(state: &mut BrowserState) -> Result<String, String> {
@@ -2345,12 +2386,17 @@ mod tests {
 
     #[test]
     fn network_projection_preserves_lifecycle_and_lossless_headers() {
+        const STANDARD_ID: &str = "fetch-1-request-hop-0-standard";
+        const TRANSPORT_ID: &str = "fetch-1-request-hop-0-transport";
         fn observation() -> NetworkEvent {
             NetworkEvent {
                 document_generation: 7, document_url: "https://example.test/".into(),
                 retired_document_url: Some("https://example.test/old".into()),
                 initiator_request_id: None, pending: false, error: None,
-                request_body_size: 3, request_started: true, redirect: false,
+                request_body_present: true, request_body_request_id: Some(STANDARD_ID.into()), request_body_size: 3,
+                transport_request_body_present: true,
+                transport_request_body_request_id: Some(TRANSPORT_ID.into()), transport_request_body_size: 3,
+                request_started: true, redirect: false,
                 response_body_request_id: Some("fetch-1-hop-0".into()),
                 request_id: "fetch-1".into(), url: "https://example.test/api".into(),
                 method: "POST".into(), resource_type: "Fetch".into(), status: 200,
@@ -2359,6 +2405,9 @@ mod tests {
                 request_raw_headers: None, body_size: 4, timestamp: 123.5,
             }
         }
+        let mut request_bodies = obscura_net::request_body::RequestBodyStore::default();
+        request_bodies.insert(STANDARD_ID.into(), &[0, 0xff, b'=']).unwrap();
+        request_bodies.insert_shared(STANDARD_ID, TRANSPORT_ID.into()).unwrap();
         let mut event = observation();
         let capture = obscura_net::HeaderCapture {
             capture_stage: "transportResponse", encoding: "base64",
@@ -2372,7 +2421,7 @@ mod tests {
             capture_stage: "transportRequest", ..capture.clone()
         });
         event.headers.insert("Authorization".into(), "Bearer secret".into());
-        let projected = network_event_projection(&event);
+        let projected = network_event_projection(&event, &request_bodies).unwrap();
         assert_eq!(projected["phase"], "completed");
         assert_eq!(projected["headers"]["Authorization"], "Bearer secret");
         assert_eq!(projected["raw_headers"], serde_json::to_value(&capture).unwrap());
@@ -2380,26 +2429,29 @@ mod tests {
         assert_eq!(projected["raw_headers"]["fields"].as_array().unwrap().len(), 2);
         assert_eq!(projected["document_generation"], 7);
         assert_eq!(projected["response_body_request_id"], "fetch-1-hop-0");
+        assert_eq!(projected["request_body"]["body"], "AP89");
+        assert_eq!(projected["request_body"]["base64_encoded"], true);
+        assert_eq!(projected["transport_request_body"], projected["request_body"]);
         assert_eq!(projected["timestamp"], 123.5);
-        assert_eq!(projected.as_object().unwrap().len(), 23);
+        assert_eq!(projected.as_object().unwrap().len(), 30);
         event.pending = true;
-        let started = network_event_projection(&event);
+        let started = network_event_projection(&event, &request_bodies).unwrap();
         assert_eq!(started["phase"], "started");
         assert_eq!(started["request_id"], projected["request_id"]);
         event.pending = false;
         event.redirect = true;
-        assert_eq!(network_event_projection(&event)["phase"], "redirect");
+        assert_eq!(network_event_projection(&event, &request_bodies).unwrap()["phase"], "redirect");
         event.redirect = false;
         event.pending = true;
         event.resource_type = "Preflight".into();
         event.initiator_request_id = Some("fetch-parent".into());
-        let preflight = network_event_projection(&event);
+        let preflight = network_event_projection(&event, &request_bodies).unwrap();
         assert_eq!(preflight["phase"], "started");
         assert_eq!(preflight["initiator_request_id"], "fetch-parent");
         assert_eq!(preflight["resource_type"], "Preflight");
         event.pending = false;
         event.error = Some("CORS denied".into());
-        let failed = network_event_projection(&event);
+        let failed = network_event_projection(&event, &request_bodies).unwrap();
         assert_eq!(failed["phase"], "failed");
         assert_eq!(failed["error"], "CORS denied");
     }

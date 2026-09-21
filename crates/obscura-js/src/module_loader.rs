@@ -255,8 +255,8 @@ impl ModuleLoader for ObscuraModuleLoader {
                     return Err(io_err(failure.to_string()));
                 }
                 Some(crate::ops::NetworkRequest::new(
-                    state, None, &url, "GET", None, 0, obscura_net::ResourceType::Script,
-                ))
+                    state, None, &url, "GET", None, None, obscura_net::ResourceType::Script,
+                ).map_err(|error| io_err(error.to_string()))?)
             } else {
                 None
             };
