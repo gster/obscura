@@ -156,6 +156,10 @@ outer I/O task cancellation 与 sticky server shutdown 的完整 connection 回�
 
 新增 `tools/unblocked/cdp_multi_worker.py`：先用 host socket table 证明零字节首连接已经由父进程接纳并连到 worker，再要求后续 discovery 完整 200；随后用完成 101 的真实 WebSocket 占满 aggregate relay，要求一个超过 4 KiB 且未 half-close 的请求得到完整 503。主动 masked Close 一条后，barrier 必须同时证明另一条 WS 仍映射且安静，再要求 HTTP 恢复、剩余 WS 的 raw `Browser.getVersion id=2` 成功，最后用新 WS 完成 id=1 往返。每个 request/response/frame/payload/socket probe、host command stdout/stderr、server byte stream、异常 traceback 和 hash 都原样保留，不脱敏、不截断、不删字段；进程组清理不依赖 parent 仍存活。Rust 聚焦 render 回归 **5/5** 两轮通过；完整工具 unittest **72/72**。Astra light 针对代码与最终工具证据分别复核，均为 0 blocker、0 major、0 minor。
 
+最终门禁使用提交 `a82aab13cca8f0227b6ccb28dc46f628f5fdca55` 的 render binary，版本字符串 `0.1.0-dev+a82aab1`，SHA-256 `e180178c997dbd51b824e0cd8784638dba81ba0f0aa5d53ca173f7d6cf994a67`，120504448 bytes。no-render 聚焦 **5/5**（run `e2ea8835-36f2-4622-8805-35090b234385`），no-render CLI **86/86**（2 leaky，run `ee40c6ab-ad08-4634-990b-1f2ea1bcd022`），release/render 全工作区 **2316/2316**、4 skipped（run `a8c502f1-90e5-45da-b39c-93652587197a`）；两种 exact CLI build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 的 obstacle **33/33**、官方 Playwright Python 1.60.0 smoke 与完整 **37-method** protocol profile 均通过。
+
+最终 Darwin 24.6.0 arm64 multi-worker 原始运行使用 2 workers、每 worker 1 connection、aggregate relay 2：零字节 barrier 为 1 条 accepted client 和 1 条 parent-to-worker mapping，后续 discovery 200；容量 barrier 为 2 条完成 101 的 WS 和 2 条 mapping，超额大请求取得完整 503/`max-relays`；主动 Close 一条后剩余 mapping 精确为 1，HTTP 200、剩余 WS id=2、新 WS 101/id=1 全部成功，最终 mapping 归零。进程组 SIGTERM 后消失，无 forced kill 或 signal error。manifest SHA-256 为 `d4c9430fe9d3a6ed39b61b78cf9918909a57cdcc80c1a4036b35f1dae1ce6d59`，139 个登记 artifact，完整目录 `/private/tmp/ob034-multiworker-final.adE5nF/evidence/`。
+
 该切片没有资格化 worker readiness、child crash/reap、parent-only shutdown、所有 serve 参数向 worker 的传递、Linux/Windows/container、kernel listen backlog 或总 FD/task/RSS/V8/socket-buffer 上限；这些边界继续保留，OB-034 仍未关闭。
 
 ### OB-037 · P0 · 定性并恢复 obstacle 门禁

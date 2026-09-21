@@ -16,6 +16,8 @@ OB-034 multi-worker parent relay 已移除无 timeout `peek()`、request-line �
 
 `tools/unblocked/cdp_multi_worker.py` 用 host socket table barrier 证明真实零字节首 client 已由父进程接纳并连到 worker，再要求后续 discovery 完整 200；容量阶段用完成 101 的 WS 占满 aggregate relay，要求大于 4 KiB 且不 half-close 的请求取得完整 503。主动 Close 一条后，另一条必须仍映射且完成 raw `Browser.getVersion id=2`，HTTP 与全新 WS id=1 也必须恢复。全部 request/response/frame/payload、socket probes、host command/server streams、traceback 与 hashes 原样保留。完整工具 unittest **72/72**，Astra light 工具与既有原始证据终审为 0 blocker、0 major、0 minor。worker readiness/crash/reap、parent-only shutdown、参数完整传递及 Linux/Windows/container 仍未资格化。
 
+最终资格二进制来自提交 `a82aab13cca8f0227b6ccb28dc46f628f5fdca55`，版本 `0.1.0-dev+a82aab1`，render SHA-256 `e180178c997dbd51b824e0cd8784638dba81ba0f0aa5d53ca173f7d6cf994a67`，120504448 bytes。no-render 聚焦 **5/5**、CLI **86/86**（2 leaky），release/render 全工作区 **2316/2316**、4 skipped；两种 exact build、固定 benchmark obstacle **33/33**、官方 Playwright 1.60.0 smoke 与 **37-method** 原始 protocol profile 均通过。最终 Darwin 2 workers x 1 connection 运行通过所有 barrier，完整 raw evidence 位于 `/private/tmp/ob034-multiworker-final.adE5nF/evidence/`，manifest SHA-256 `d4c9430fe9d3a6ed39b61b78cf9918909a57cdcc80c1a4036b35f1dae1ce6d59`，139 个登记 artifact；TERM 后 process group 完全消失，无 forced kill。
+
 OB-034 现有单 worker 实际 OS listen backlog 资格工具。它在 readiness 与基线 snapshot 后向整个服务进程组发送 `SIGSTOP`，由内核确认 stopped 后再同时释放完整 discovery 请求；成功连接因此只能留在 kernel listen queue，不会先进入 256 条 accepted silent-pending。通过条件同时包括目标 queue 达其报告 maximum、服务数字 FD 不增长、压力项只能是 connect timeout、恢复后所有已发送请求取得完整 200、queue/FD 回到基线，以及新 WebSocket 完成 101 和 raw `Browser.getVersion` 往返。所有 request/response、frames、host command stdout/stderr、server byte streams、snapshot、failure traceback 和 hashes 完整保留。
 
 最终本机 Darwin 24.6.0 arm64 运行使用上一切片的最终 render binary：240 次并发 connect 中 128 次完整请求进入 `128/128` listen queue，112 次 connect timeout，其他 client failure 为 0；进程 stopped 期间数字 FD 和 RSS 保持 16、19232 KiB，128 条恢复响应全部完整 200。恢复后 queue 为 0、FD 为 16，HTTP 200、WebSocket 101、CDP response id=1 和 masked Close 后 clean EOF 均成功；RSS 为 20624 KiB，server stderr 0 bytes，SIGTERM returncode 0。RSS 只是采样，不是上限。Astra light 三轮审核推动修复失败路径死锁、伪 pressure、平台解析、异常证据丢失和 executor post-enqueue submit failure，最终 0 blocker、0 major、0 minor。该结果不外推 Linux、Windows、容器、multi-worker、总 RSS 或其他三层逻辑容量，OB-034 仍开放。
@@ -181,6 +183,16 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/private/tmp/ob034-capacity-live-final-reviewed.log`
 - `/private/tmp/ob034-capacity-tools-unittest-review-final.log`
 - `/private/tmp/ob034-capacity-unit-review-fixes-4.log`
+- `/private/tmp/ob034-multiworker-final.adE5nF/evidence/`
+- `/private/tmp/ob034-multiworker-playwright.QU2VUu/`
+- `/private/tmp/ob034-multiworker-benchmark.UKr86Z/repo/`
+- `/private/tmp/ob034-multiworker-focused-no-render.log`
+- `/private/tmp/ob034-multiworker-cli-no-render-nextest.log`
+- `/private/tmp/ob034-multiworker-full-nextest.log`
+- `/private/tmp/ob034-multiworker-build-no-render-final.log`
+- `/private/tmp/ob034-multiworker-build-render-final.log`
+- `/private/tmp/ob034-multiworker-obstacle.log`
+- `/private/tmp/ob034-multiworker-tools-unittest.log`
 - `/tmp/ob021-fetch-stream-net-focused.log`
 - `/tmp/ob021-fetch-stream-cdp-focused.log`
 - `/tmp/ob021-fetch-stream-cdp-focused-rerun.log`
