@@ -12,13 +12,13 @@
 
 ## 最近完成的阶段
 
-OB-034 的 server-side terminal-source 切片现把 writer I/O failure、writer timeout、server shutdown 与 outer I/O task cancellation 连接到同一 connection-local sticky cancellation。生产 writer helper 的两项回归使用受控 `Sink` 和 active standalone V8，证明失败后 outbound 关闭、同步无限执行被终止且 reservation 释放；这不是实际 TCP writer 故障注入。outer I/O task cancellation 与 server shutdown 使用完整 connection 路径，证明 active main-realm V8 被终止、socket 关闭、`max_connections` slot 回收；尚未扩展到 iframe/Worker 的 server-side source 矩阵。
+OB-034 的 server-side terminal-source 现把 writer I/O failure、writer timeout、server shutdown 与 outer I/O task cancellation 连接到同一 connection-local sticky cancellation。生产默认仍是 10 秒 writer/flush deadline；私有测试 policy 只缩短 deadline 并被动回报终态，不暴露产品配置。真实 loopback TCP 用例在 active Dedicated Worker 存活时分别用 server socket `shutdown(Write)` 和小 TCP buffer + 不读客户端 + 8 MiB 合法响应制造 `WriterIo` 与 `WriterTimeout`，同时核对完整 writer 日志、socket 关闭和 slot 回收。原受控 `Sink` 用例保留为 unit helper，不再称作 wire 资格。
 
-server shutdown 由 sticky watch 发布，并以 Mio OS waker 立即唤醒 accept Poll，覆盖 cancel-before-register 和 idle accept。listener readiness 保持事件驱动；单轮最多 accept 256 个，但只在观察到 `WouldBlock` 后重新阻塞 Poll，批次间检查 shutdown 并处理已接收请求。同步 HTTP discovery 设置 1 秒 socket 读写超时，拒绝路径设置 100ms socket 读写超时。最初 10ms polling 版本使 200 轮交替 `/json/version` median 相对基线回退到 5.07 倍，已弃用；最终版本对 `757e8a0` 的 median 为 1.763ms 对 1.994ms（0.884 倍），p95 为 2.050ms 对 2.251ms。Astra light 首审指出 batch 未 drain 到 `WouldBlock` 就重新 Poll 的风险，修复后复审 0 findings。一次 320 并发 discovery 测试与既有 256 silent-pending 上限耦合而产生空响应，已删除该不可靠测试，不据此宣称 backlog burst 资格。OB-034 继续开放。
+server shutdown 由 sticky watch 发布，并以 Mio OS waker 立即唤醒 accept Poll，覆盖 cancel-before-register 和 idle accept。listener readiness 保持事件驱动；生产 loop 使用的确定性批次状态机证明单轮命中 256 accept 上限后下一 sweep 跳过 Poll，只有 `WouldBlock` 才重新阻塞，并且该回归不接触同为 256 的 silent-pending 上限。同步 HTTP discovery 设置 1 秒 socket 读写超时，拒绝路径设置 100ms socket 读写超时。最初 10ms polling 版本使 200 轮交替 `/json/version` median 相对基线回退到 5.07 倍，已弃用；最终版本对 `757e8a0` 的 median 为 1.763ms 对 1.994ms（0.884 倍），p95 为 2.050ms 对 2.251ms。该确定性测试不是 OS backlog burst 或 admission 前 TCP/kernel/container capacity 资格。OB-034 继续开放。
 
 OB-034 的直接客户端断连矩阵现在覆盖 WebSocket Close、原始 FIN、linger-zero RST x main、iframe、active Dedicated Worker 的 3 x 3 组合。main/iframe 以第一轮同步循环 console marker、Worker 以第一轮 `postMessage("started")` 证明执行已进入对应 realm；Close 保留并排空旧 socket，FIN 保留读半边，避免测试输入被客户端 drop 改写。每项都在 `max_connections=1` 下要求旧 slot 释放并由新连接执行 `42`。
 
-connection cancellation 同时通过 sticky watch 主动唤醒仅等待 `commands.recv()` 的 idle Worker，以及停在远期 timer/I/O autonomous future 的 Worker。owner 与 Worker object 保持存活的精确测试先观察真实 wait-state，再要求 lease 在一秒内归零。Astra light 首审发现非 idle biased select 会饥饿 autonomous progress，以及 Close 用例可能退化成其他断连输入；两项修复后终审为 0 blocker、0 major、0 minor。当前未完成边界以上述 server-side source 的真实 TCP 与 iframe/Worker 资格限制为准。
+connection cancellation 同时通过 sticky watch 主动唤醒仅等待 `commands.recv()` 的 idle Worker，以及停在远期 timer/I/O autonomous future 的 Worker。owner 与 Worker object 保持存活的精确测试先观察真实 wait-state，再要求 lease 在一秒内归零。server shutdown 与 outer I/O cancellation 的完整 connection 回归现各自覆盖 main、iframe 和 active Worker；main/iframe 保留后续命令未执行证据，Worker 以 `postMessage` 证明先进入同步循环。slot 归零只证明 processor/Page 已释放，不单独证明 Worker thread/lease 已退出；后者仍由既有 owner-alive 精确测试提供。main/iframe 后续命令也没有独立 admission barrier，不外推成精确入队竞态资格。
 
 Fetch response stream 已完成 shared-consumption 边界。Page 的 canonical response body 不再因 `takeResponseBodyAsStream` 被替换为 consumed tombstone；Network/Page、persistent history 和 stream 共享 immutable raw backing。Fetch 自身仍按 Chrome 契约维护 canonical access 状态：重复 `Fetch.getResponseBody` 可用，但 get 与一次 take 互斥，alias 不能绕过；普通 `Network.getResponseBody` 在 stream 打开后仍返回完整正文。Fulfill replacement 产生新 generation，Network 读新 body，旧 stream 继续读旧 body。
 
@@ -71,6 +71,11 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 该阶段只修复 native passive callback ownership。callback panic 仍未隔离；CDP 多 session `Network.enable` subscription/fanout 已由最新阶段完成，但上游 JS/Worker 4096 oldest-drop、持久 observation history 或请求正文保留仍未解决。
 
 ## 验证结果
+
+- 最新真实 writer/Mio 切片聚焦 release nextest 在 render/no-render 下均为 6/6（runs `1caf4a9c-62d1-4467-b911-e66402ca4bdf`、`91614911-e7f3-4a16-944d-091bfd6d1621`）；render CDP 全量 371/371、3 skipped（run `4dd5d821-01f1-4dd7-98c4-b62ec2a8000f`），no-render 排除既有 render-only `input_key_event_escaping` binary 后 308/308、3 skipped（run `a9e5dfd0-73f7-49f6-a3cb-0a2247ed3077`）。
+- 根 release/render nextest 为 2311/2311、4 skipped（run `d7b1445e-1de4-43fb-960c-a249fd834813`）；exact render 与 no-default-features CLI build 均成功。最终 render SHA-256 `91931ebd5e54467c809c2d4522a8d35cf8bc96b17bb9136325baf437e3e2092b`，120471088 bytes。
+- benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33；同一最终二进制通过官方 Playwright Python 1.60.0 smoke，完整原始协议日志匹配 37-method profile。
+- 200 轮交替 discovery 探针中，基线/候选 median 为 1.762/1.514ms，p95 为 2.031/1.805ms，median 比率 0.859。Astra light 独立终审为 0 blocker、0 major、0 minor；残余资格边界见本交接顶部。
 
 - 最新 server-side terminal-source 聚焦 release nextest 在 render/no-render 下均为 7/7（runs `f8b3c02a-3aaa-4b8f-b6ff-be26e26f999a`、`b6667ede-5039-402a-9c54-a4f8becafddc` 中的相同七项）；render CDP 全量 367/367、3 skipped（run `86164ddd-458f-48a4-b896-c5efec8ecacb`）。
 - no-render CDP 排除既有 render-only `input_key_event_escaping` binary 后 304/304、3 skipped（run `b6667ede-5039-402a-9c54-a4f8becafddc`）；原始全量的 6 个 `INPUT_UNSUPPORTED_WITHOUT_RENDER` 失败证据保留，不把该配置报告为全绿。
@@ -134,8 +139,8 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 为真实 TCP writer failure/timeout 建立可控故障注入，并把 server shutdown、outer I/O task cancellation 扩展到 active iframe/Worker；继续证明 slot、queued command 与 Worker 清理边界，不把受控 `Sink` 单测称为 wire 资格。
-2. 为 Mio batch-limit/backlog 建立不与 256 silent-pending 上限耦合的确定性回归，再推进 admission 前 TCP/kernel/container capacity 与剩余 input qualification；不要把三层逻辑 payload 预算外推为总 RSS 上限。
+1. 为 main/iframe 后续命令增加独立 server admission barrier，并为 server-side source 建立直接 Worker thread/lease 退出证据；需要产品资格的平台分别运行真实 writer 测试，不把本机 active-Worker 结果外推为跨平台或 writer source x 三 realm 全矩阵。
+2. 继续推进不与 silent-pending 上限耦合的实际 OS backlog burst、admission 前 TCP/kernel/container capacity 与剩余 input qualification；不要把 Mio 控制流回归或三层逻辑 payload 预算外推为总 RSS 上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -260,6 +265,17 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/tmp/ob034-disconnect-render-rebuild-after-clean.log`
 - `/tmp/ob034-disconnect-obstacle.log`
 - `/tmp/ob034-disconnect-playwright.6n2Ie6/`
+- `/tmp/ob034-wire-focused-render.log`
+- `/tmp/ob034-wire-focused-render-rerun.log`
+- `/tmp/ob034-wire-focused-no-render.log`
+- `/tmp/ob034-wire-cdp-render.log`
+- `/tmp/ob034-wire-cdp-no-render-valid.log`
+- `/tmp/ob034-wire-workspace-render.log`
+- `/tmp/ob034-wire-build-no-render.log`
+- `/tmp/ob034-wire-build-render.log`
+- `/tmp/ob034-wire-obstacle.log`
+- `/tmp/ob034-wire-accept-latency.json`
+- `/tmp/ob034-wire-playwright.pZWZ7W/`
 
 这些路径属于原始运行主机的临时文件，不是仓库内的持久接口。可持续引用的结论和能力边界以本页、[SUMMARY](SUMMARY.md) 及对应提交中的测试为准。处理这些日志时保留原始字段和完整内容。
 

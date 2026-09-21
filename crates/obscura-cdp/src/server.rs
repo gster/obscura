@@ -54,6 +54,36 @@ const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 // deadline bounds the one envelope currently held by the websocket sink.
 const OUTBOUND_SEND_TIMEOUT_MS: u64 = 10_000;
 
+#[derive(Clone)]
+struct ConnectionIoPolicy {
+    outbound_send_timeout: tokio::time::Duration,
+    #[cfg(test)]
+    terminal_reason_tx: Option<tokio::sync::mpsc::UnboundedSender<OutboundCloseReason>>,
+}
+
+impl Default for ConnectionIoPolicy {
+    fn default() -> Self {
+        Self {
+            outbound_send_timeout: tokio::time::Duration::from_millis(
+                OUTBOUND_SEND_TIMEOUT_MS,
+            ),
+            #[cfg(test)]
+            terminal_reason_tx: None,
+        }
+    }
+}
+
+impl ConnectionIoPolicy {
+    fn report_terminal_reason(&self, reason: OutboundCloseReason) {
+        #[cfg(test)]
+        if let Some(sender) = &self.terminal_reason_tx {
+            let _ = sender.send(reason);
+        }
+        #[cfg(not(test))]
+        let _ = reason;
+    }
+}
+
 // Give a processor whose input side just closed a short opportunity to abort
 // Fetch pauses and drop its owned pages. A separate abort handle then cancels
 // async navigation/network waits; synchronous V8 is interrupted immediately by
@@ -454,9 +484,9 @@ async fn start_with_serve_options_access_limit_and_shutdown(
         .spawn(move || {
             let mut accept_events = mio::Events::with_capacity(8);
             let mut pending: Vec<(std::net::TcpStream, std::time::Instant)> = Vec::new();
-            let mut accept_backlog_may_remain = false;
+            let mut accept_drain = AcceptDrainState::default();
             'accept: while !accept_shutdown.is_cancelled() {
-                if !accept_backlog_may_remain {
+                if accept_drain.should_poll() {
                     let poll_timeout = if pending.is_empty() {
                         ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL
                     } else {
@@ -481,33 +511,25 @@ async fn start_with_serve_options_access_limit_and_shutdown(
                 // hitting the batch limit means the next sweep must continue
                 // accepting without another blocking poll. Only WouldBlock
                 // proves that the readiness edge has been fully drained.
-                let mut drained_to_would_block = false;
-                for _ in 0..MAX_ACCEPTS_PER_SWEEP {
-                    match accept_listener.accept() {
-                        Ok((stream, _)) => {
-                            let stream: std::net::TcpStream = stream.into();
-                            let _ = stream.set_nonblocking(true);
-                            if pending.len() < MAX_SILENT_PENDING {
-                                pending.push((stream, std::time::Instant::now()));
-                            } else {
-                                warn!(
-                                    "dropping connection: {} connections parked without a request head",
-                                    MAX_SILENT_PENDING
-                                );
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            drained_to_would_block = true;
-                            break;
-                        }
-                        Err(e) => {
-                            error!("Accept error: {}", e);
-                            std::thread::sleep(ACCEPT_POLL_INTERVAL);
-                            break;
-                        }
+                let batch = drain_accept_batch(|| {
+                    let (stream, _) = accept_listener.accept()?;
+                    let stream: std::net::TcpStream = stream.into();
+                    let _ = stream.set_nonblocking(true);
+                    if pending.len() < MAX_SILENT_PENDING {
+                        pending.push((stream, std::time::Instant::now()));
+                    } else {
+                        warn!(
+                            "dropping connection: {} connections parked without a request head",
+                            MAX_SILENT_PENDING
+                        );
                     }
+                    Ok(())
+                });
+                if let AcceptBatchStop::Error(error) = &batch.stop {
+                    error!("Accept error: {}", error);
+                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
                 }
-                accept_backlog_may_remain = !drained_to_would_block;
+                accept_drain.observe(&batch);
                 if accept_shutdown.is_cancelled() {
                     break;
                 }
@@ -789,6 +811,26 @@ fn run_connection(
     shutdown: ServerShutdown,
     live_connections: Arc<AtomicUsize>,
 ) -> Option<tokio::task::AbortHandle> {
+    run_connection_with_io_policy(
+        std_stream,
+        context_template,
+        persistence_context,
+        persistence_lock,
+        shutdown,
+        live_connections,
+        ConnectionIoPolicy::default(),
+    )
+}
+
+fn run_connection_with_io_policy(
+    std_stream: std::net::TcpStream,
+    context_template: Arc<obscura_browser::BrowserContext>,
+    persistence_context: Arc<obscura_browser::BrowserContext>,
+    persistence_lock: Arc<std::sync::Mutex<()>>,
+    shutdown: ServerShutdown,
+    live_connections: Arc<AtomicUsize>,
+    io_policy: ConnectionIoPolicy,
+) -> Option<tokio::task::AbortHandle> {
     // Releases the slot reserved by the accept loop when the thread unwinds,
     // however it exits — clean close, error return, or panic. A plain
     // decrement at the end of the closure would leak slots on the early
@@ -932,7 +974,12 @@ fn run_connection(
         let handler_tx = msg_tx.clone();
         let handler_cancellation = teardown.cancellation.clone();
         tokio::select! {
-            result = handle_connection_ws(tokio_stream, handler_tx, handler_cancellation) => {
+            result = handle_connection_ws_with_io_policy(
+                tokio_stream,
+                handler_tx,
+                handler_cancellation,
+                io_policy,
+            ) => {
                 if let Err(error) = result {
                     error!("WebSocket connection error: {}", error);
                 }
@@ -1019,6 +1066,49 @@ const ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL: std::time::Duration =
 /// Cap each backlog-drain pass so a connect flood cannot starve shutdown or
 /// the already accepted request-head queue.
 const MAX_ACCEPTS_PER_SWEEP: usize = 256;
+
+#[derive(Debug)]
+enum AcceptBatchStop {
+    WouldBlock,
+    Limit,
+    Error(std::io::Error),
+}
+
+#[derive(Debug)]
+struct AcceptBatchResult {
+    stop: AcceptBatchStop,
+}
+
+#[derive(Default)]
+struct AcceptDrainState {
+    backlog_may_remain: bool,
+}
+
+impl AcceptDrainState {
+    fn should_poll(&self) -> bool { !self.backlog_may_remain }
+
+    fn observe(&mut self, result: &AcceptBatchResult) {
+        self.backlog_may_remain = !matches!(result.stop, AcceptBatchStop::WouldBlock);
+    }
+}
+
+fn drain_accept_batch<F>(mut accept_one: F) -> AcceptBatchResult
+where
+    F: FnMut() -> std::io::Result<()>,
+{
+    for _ in 0..MAX_ACCEPTS_PER_SWEEP {
+        match accept_one() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return AcceptBatchResult { stop: AcceptBatchStop::WouldBlock };
+            }
+            Err(error) => {
+                return AcceptBatchResult { stop: AcceptBatchStop::Error(error) };
+            }
+        }
+    }
+    AcceptBatchResult { stop: AcceptBatchStop::Limit }
+}
 
 /// The discovery response is small and its request head was already observed,
 /// but the accept thread must still never depend on a peer completing blocking
@@ -2730,10 +2820,26 @@ async fn run_outbound_writer<S>(
     }
 }
 
+#[cfg(test)]
 async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: ServerMessageSender,
     execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
+) -> anyhow::Result<()> {
+    handle_connection_ws_with_io_policy(
+        stream,
+        msg_tx,
+        execution_cancellation,
+        ConnectionIoPolicy::default(),
+    )
+    .await
+}
+
+async fn handle_connection_ws_with_io_policy(
+    stream: TcpStream,
+    msg_tx: ServerMessageSender,
+    execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
+    io_policy: ConnectionIoPolicy,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -2775,7 +2881,7 @@ async fn handle_connection_ws(
         reply_rx,
         writer_reply_tx,
         writer_cancellation,
-        tokio::time::Duration::from_millis(OUTBOUND_SEND_TIMEOUT_MS),
+        io_policy.outbound_send_timeout,
     ));
     struct AbortTaskOnDrop(tokio::task::AbortHandle);
     impl Drop for AbortTaskOnDrop {
@@ -2832,13 +2938,16 @@ async fn handle_connection_ws(
                             // independent delivery acknowledgement.
                             reply_tx.close(OutboundCloseReason::ConnectionClosed);
                             if tokio::time::timeout(
-                                tokio::time::Duration::from_millis(OUTBOUND_SEND_TIMEOUT_MS),
+                                io_policy.outbound_send_timeout,
                                 reply_tx.wait_empty(),
                             )
                             .await
                             .is_err()
                             {
-                                warn!("Browser.close response flush timed out after {OUTBOUND_SEND_TIMEOUT_MS}ms");
+                                warn!(
+                                    "Browser.close response flush timed out after {}ms",
+                                    io_policy.outbound_send_timeout.as_millis(),
+                                );
                             }
                             break;
                         }
@@ -2872,6 +2981,9 @@ async fn handle_connection_ws(
     }
 
     reply_tx.close(OutboundCloseReason::ConnectionClosed);
+    if let Some(reason) = reply_tx.close_reason() {
+        io_policy.report_terminal_reason(reason);
+    }
     if !writer_joined {
         if !send_task.is_finished() {
             send_task.abort();
@@ -3093,6 +3205,27 @@ pub(crate) mod tests {
         tokio::task::AbortHandle,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        let (client, io_abort, live, _control, _terminal_reason_rx) =
+            start_direct_connection_with_io_policy(
+                shutdown,
+                super::ConnectionIoPolicy::default(),
+                false,
+            )
+            .await;
+        (client, io_abort, live)
+    }
+
+    async fn start_direct_connection_with_io_policy(
+        shutdown: super::ServerShutdown,
+        io_policy: super::ConnectionIoPolicy,
+        constrain_tcp_buffers: bool,
+    ) -> (
+        TestWebSocket,
+        tokio::task::AbortHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+        std::net::TcpStream,
+        tokio::sync::mpsc::UnboundedReceiver<crate::outbound::CloseReason>,
+    ) {
         initialize_v8_on_current_thread();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3105,42 +3238,148 @@ pub(crate) mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let std_stream = stream.into_std().unwrap();
         std_stream.set_nonblocking(true).unwrap();
+        if constrain_tcp_buffers {
+            socket2::SockRef::from(&std_stream)
+                .set_send_buffer_size(4 * 1024)
+                .expect("constrain server TCP send buffer");
+        }
+        let control = std_stream.try_clone().expect("clone server TCP fault handle");
 
         let persona = obscura_net::EffectivePersona::builtin(
             obscura_net::StealthProfile::WindowsChrome145,
         );
-        let context = crate::dispatch::CdpContext::new(persona).default_context;
+        let context = Arc::new(obscura_browser::BrowserContext::with_options(
+            "test-default".into(),
+            persona,
+            obscura_browser::BrowserContextOptions {
+                allow_private_network: true,
+                ..Default::default()
+            },
+        ));
         let persistence = Arc::new(context.isolated_copy("test-persistence".into(), true));
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let io_abort = super::run_connection(
+        let (reason_tx, terminal_reason_rx) = tokio::sync::mpsc::unbounded_channel();
+        let io_policy = super::ConnectionIoPolicy {
+            terminal_reason_tx: Some(reason_tx),
+            ..io_policy
+        };
+        let io_abort = super::run_connection_with_io_policy(
             std_stream,
             context,
             persistence,
             Arc::new(std::sync::Mutex::new(())),
             shutdown,
             live.clone(),
+            io_policy,
         ).expect("connection tasks");
-        (client.await.unwrap(), io_abort, live)
+        let client = client.await.unwrap();
+        if constrain_tcp_buffers {
+            let tokio_tungstenite::MaybeTlsStream::Plain(stream) = client.get_ref() else {
+                panic!("wire writer qualification requires a plain loopback socket");
+            };
+            socket2::SockRef::from(stream)
+                .set_recv_buffer_size(4 * 1024)
+                .expect("constrain client TCP receive buffer");
+        }
+        (client, io_abort, live, control, terminal_reason_rx)
     }
 
-    async fn enter_infinite_page_script(
+    #[derive(Clone, Copy, Debug)]
+    enum ActiveExecutionRealm {
+        Main,
+        Iframe,
+        Worker,
+    }
+
+    async fn enter_active_page_realm(
         socket: &mut TestWebSocket,
         capture: &CompleteLogCapture,
-        marker: &'static str,
-        queued_marker: &'static str,
-    ) {
+        realm: ActiveExecutionRealm,
+        case: &str,
+    ) -> Option<String> {
         use futures_util::SinkExt as _;
         let session = create_test_page(socket).await;
-        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
-            "id": 2,
-            "method": "Runtime.evaluate",
-            "sessionId": session.clone(),
-            "params": {
-                "expression": format!("console.info('{}'); while (true) {{}}", marker),
-                "returnByValue": true
+        let active_marker = format!("{case}-active");
+        let queued_marker = format!("{case}-queued");
+        match realm {
+            ActiveExecutionRealm::Main => {
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session.clone(),
+                    "params": {
+                        "expression": format!("console.info('{}'); while (true) {{}}", active_marker),
+                        "returnByValue": true
+                    }
+                }).to_string().into())).await.unwrap();
+                wait_for_log(capture, &active_marker).await;
             }
-        }).to_string().into())).await.unwrap();
-        wait_for_log(capture, marker).await;
+            ActiveExecutionRealm::Iframe => {
+                let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let fixture_port = fixture.local_addr().unwrap().port();
+                let requested = Arc::new(tokio::sync::Notify::new());
+                let fixture_requested = requested.clone();
+                let fixture_marker = active_marker.clone();
+                tokio::task::spawn_local(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let (mut stream, _) = fixture.accept().await.unwrap();
+                    let mut request = [0_u8; 2048];
+                    let _complete_request = stream.read(&mut request).await.unwrap();
+                    let body = format!(
+                        "<!doctype html><script>console.info('{fixture_marker}'); while(true) {{}}</script>"
+                    );
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                    stream.flush().await.unwrap();
+                    fixture_requested.notify_one();
+                });
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session.clone(),
+                    "params": {
+                        "expression": format!("(function(){{const frame=document.createElement('iframe');frame.src='http://127.0.0.1:{fixture_port}/child';document.body.appendChild(frame);return 'created'}})()"),
+                        "returnByValue": true
+                    }
+                }).to_string().into())).await.unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    requested.notified(),
+                ).await.expect("iframe fixture was not requested");
+                wait_for_log(capture, &active_marker).await;
+            }
+            ActiveExecutionRealm::Worker => {
+                let worker_source = format!(
+                    "postMessage({}); while(true) {{}}",
+                    serde_json::to_string(&active_marker).unwrap(),
+                );
+                let expression = format!(
+                    "new Promise(resolve=>{{const source={};const worker=new Worker(URL.createObjectURL(new Blob([source],{{type:'application/javascript'}})));globalThis.__serverTerminalWorker=worker;worker.onmessage=event=>resolve(event.data)}})",
+                    serde_json::to_string(&worker_source).unwrap(),
+                );
+                let response = websocket_command(
+                    socket,
+                    2,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expression,
+                        "awaitPromise": true,
+                        "returnByValue": true,
+                    }),
+                    Some(&session),
+                ).await;
+                assert_eq!(
+                    response["result"]["result"]["value"],
+                    active_marker,
+                    "Worker did not enter its synchronous script: {response}",
+                );
+                return None;
+            }
+        }
         socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
             "id": 3,
             "method": "Runtime.evaluate",
@@ -3151,6 +3390,7 @@ pub(crate) mod tests {
             }
         }).to_string().into())).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Some(queued_marker)
     }
 
     fn assert_log_absent(capture: &CompleteLogCapture, marker: &str) {
@@ -3159,6 +3399,58 @@ pub(crate) mod tests {
             !bytes.windows(marker.len()).any(|window| window == marker.as_bytes()),
             "queued command ran after connection cancellation: {marker}",
         );
+    }
+
+    #[test]
+    fn accept_batch_limit_continues_without_poll_until_would_block() {
+        let mut state = super::AcceptDrainState::default();
+        let mut remaining = super::MAX_ACCEPTS_PER_SWEEP + 1;
+        let accept_calls = std::cell::Cell::new(0);
+        let mut scripted_accept = || {
+            accept_calls.set(accept_calls.get() + 1);
+            if remaining == 0 {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            } else {
+                remaining -= 1;
+                Ok(())
+            }
+        };
+
+        assert!(state.should_poll());
+        let first = super::drain_accept_batch(&mut scripted_accept);
+        assert_eq!(accept_calls.get(), super::MAX_ACCEPTS_PER_SWEEP);
+        assert!(matches!(first.stop, super::AcceptBatchStop::Limit));
+        state.observe(&first);
+        assert!(
+            !state.should_poll(),
+            "edge-triggered listener must continue draining after the batch limit",
+        );
+
+        let second = super::drain_accept_batch(&mut scripted_accept);
+        assert!(matches!(second.stop, super::AcceptBatchStop::WouldBlock));
+        state.observe(&second);
+        assert!(state.should_poll(), "WouldBlock must re-arm the Mio poll boundary");
+        assert_eq!(accept_calls.get(), super::MAX_ACCEPTS_PER_SWEEP + 2);
+    }
+
+    #[test]
+    fn accept_batch_early_would_block_rearms_poll_without_silent_pending() {
+        let mut state = super::AcceptDrainState::default();
+        let mut remaining = 3;
+        let mut accept_calls = 0;
+        let batch = super::drain_accept_batch(|| {
+            accept_calls += 1;
+            if remaining == 0 {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            } else {
+                remaining -= 1;
+                Ok(())
+            }
+        });
+        assert_eq!(accept_calls, 4);
+        assert!(matches!(batch.stop, super::AcceptBatchStop::WouldBlock));
+        state.observe(&batch);
+        assert!(state.should_poll());
     }
 
     fn request_pause(resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>) -> InterceptedPause {
@@ -3381,7 +3673,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn writer_io_failure_closes_outbound_and_interrupts_active_v8() {
+    async fn controlled_sink_io_failure_unit_closes_outbound_and_interrupts_active_v8() {
         writer_failure_interrupts_active_v8(
             ControlledSink::Io,
             crate::outbound::CloseReason::WriterIo,
@@ -3391,13 +3683,116 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn writer_timeout_closes_outbound_and_interrupts_active_v8() {
+    async fn controlled_sink_timeout_unit_closes_outbound_and_interrupts_active_v8() {
         writer_failure_interrupts_active_v8(
             ControlledSink::Pending,
             crate::outbound::CloseReason::WriterTimeout,
             std::time::Duration::from_millis(25),
             "obscura-writer-timeout-active",
         ).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum WireWriterFault {
+        Io,
+        Timeout,
+    }
+
+    async fn qualify_wire_writer_fault(
+        fault: WireWriterFault,
+        timeout: std::time::Duration,
+        case: &str,
+    ) {
+        use futures_util::SinkExt as _;
+
+        let capture = install_complete_log_capture();
+        let policy = super::ConnectionIoPolicy {
+            outbound_send_timeout: timeout,
+            terminal_reason_tx: None,
+        };
+        let shutdown = super::ServerShutdown::new();
+        let (mut client, _io_abort, live, control, mut terminal_reason_rx) =
+            start_direct_connection_with_io_policy(shutdown, policy, true).await;
+        assert!(
+            enter_active_page_realm(
+                &mut client,
+                &capture,
+                ActiveExecutionRealm::Worker,
+                case,
+            )
+            .await
+            .is_none(),
+        );
+        let response_session = create_test_page(&mut client).await;
+
+        let started = std::time::Instant::now();
+        client.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+            "id": 20,
+            "method": "Runtime.evaluate",
+            "sessionId": response_session,
+            "params": {
+                "expression": "'x'.repeat(8 * 1024 * 1024)",
+                "returnByValue": true
+            }
+        }).to_string().into())).await.unwrap();
+        client.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+            "id": 21,
+            "method": "Browser.getVersion",
+            "params": {}
+        }).to_string().into())).await.unwrap();
+
+        let (expected, log_marker) = match fault {
+            WireWriterFault::Io => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                control
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("inject server TCP write-half failure");
+                (crate::outbound::CloseReason::WriterIo, "WS write error:")
+            }
+            WireWriterFault::Timeout => (
+                crate::outbound::CloseReason::WriterTimeout,
+                "WS write timed out after",
+            ),
+        };
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            terminal_reason_rx.recv(),
+        )
+        .await
+        .expect("real TCP writer fault did not terminate the connection")
+        .expect("connection ended without reporting its terminal reason");
+        assert_eq!(reason, expected);
+        if matches!(fault, WireWriterFault::Timeout) {
+            assert!(
+                started.elapsed() >= timeout,
+                "writer timeout fired before its configured deadline",
+            );
+        }
+        wait_for_log(&capture, log_marker).await;
+        wait_for_socket_close(&mut client).await;
+        wait_for_live_connections(&live, 0).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_tcp_write_half_failure_interrupts_active_worker_and_releases_slot() {
+        tokio::task::LocalSet::new()
+            .run_until(qualify_wire_writer_fault(
+                WireWriterFault::Io,
+                std::time::Duration::from_secs(2),
+                "obscura-wire-writer-io",
+            ))
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_tcp_backpressure_timeout_interrupts_active_worker_and_releases_slot() {
+        tokio::task::LocalSet::new()
+            .run_until(qualify_wire_writer_fault(
+                WireWriterFault::Timeout,
+                std::time::Duration::from_millis(250),
+                "obscura-wire-writer-timeout",
+            ))
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3644,20 +4039,25 @@ pub(crate) mod tests {
     async fn cancelling_outer_io_task_interrupts_active_v8_and_releases_slot() {
         tokio::task::LocalSet::new().run_until(async {
             let capture = install_complete_log_capture();
-            let shutdown = super::ServerShutdown::new();
-            let (mut client, io_abort, live) = start_direct_connection(shutdown).await;
-            enter_infinite_page_script(
-                &mut client,
-                &capture,
-                "obscura-outer-io-active",
-                "obscura-outer-io-queued",
-            ).await;
+            for (index, realm) in [
+                ActiveExecutionRealm::Main,
+                ActiveExecutionRealm::Iframe,
+                ActiveExecutionRealm::Worker,
+            ].into_iter().enumerate() {
+                let shutdown = super::ServerShutdown::new();
+                let (mut client, io_abort, live) = start_direct_connection(shutdown).await;
+                let case = format!("obscura-outer-io-{index}");
+                let queued_marker =
+                    enter_active_page_realm(&mut client, &capture, realm, &case).await;
 
-            io_abort.abort();
-            wait_for_socket_close(&mut client).await;
-            wait_for_live_connections(&live, 0).await;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert_log_absent(&capture, "obscura-outer-io-queued");
+                io_abort.abort();
+                wait_for_socket_close(&mut client).await;
+                wait_for_live_connections(&live, 0).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if let Some(queued_marker) = queued_marker {
+                    assert_log_absent(&capture, &queued_marker);
+                }
+            }
         }).await;
     }
 
@@ -3679,54 +4079,59 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn sticky_server_shutdown_interrupts_active_v8_and_drains_connection_slot() {
         tokio::task::LocalSet::new().run_until(async {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = probe.local_addr().unwrap();
-            drop(probe);
-            let shutdown = super::ServerShutdown::new();
-            let server_shutdown = shutdown.clone();
-            let server = tokio::task::spawn_local(async move {
-                super::start_with_serve_options_access_limit_and_shutdown(
-                    address.port(),
-                    "127.0.0.1",
-                    None,
-                    false,
-                    None,
-                    true,
-                    1,
-                    crate::access::CdpAccessOptions::default(),
-                    obscura_net::EffectivePersona::builtin(
-                        obscura_net::StealthProfile::WindowsChrome145,
-                    ),
-                    server_shutdown,
-                    false,
-                ).await
-            });
-
             let capture = install_complete_log_capture();
-            let mut client = connect_with_retry(address).await;
-            enter_infinite_page_script(
-                &mut client,
-                &capture,
-                "obscura-server-shutdown-active",
-                "obscura-server-shutdown-queued",
-            ).await;
+            for (index, realm) in [
+                ActiveExecutionRealm::Main,
+                ActiveExecutionRealm::Iframe,
+                ActiveExecutionRealm::Worker,
+            ].into_iter().enumerate() {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = probe.local_addr().unwrap();
+                drop(probe);
+                let shutdown = super::ServerShutdown::new();
+                let server_shutdown = shutdown.clone();
+                let server = tokio::task::spawn_local(async move {
+                    super::start_with_serve_options_access_limit_and_shutdown(
+                        address.port(),
+                        "127.0.0.1",
+                        None,
+                        false,
+                        None,
+                        true,
+                        1,
+                        crate::access::CdpAccessOptions::default(),
+                        obscura_net::EffectivePersona::builtin(
+                            obscura_net::StealthProfile::WindowsChrome145,
+                        ),
+                        server_shutdown,
+                        false,
+                    ).await
+                });
 
-            shutdown.cancel();
-            wait_for_socket_close(&mut client).await;
-            tokio::time::timeout(std::time::Duration::from_secs(2), server)
-                .await
-                .expect("server shutdown waited for the V8 watchdog or drain deadline")
-                .expect("server task")
-                .expect("server shutdown");
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert_log_absent(&capture, "obscura-server-shutdown-queued");
-            assert!(
-                std::net::TcpStream::connect_timeout(
-                    &address,
-                    std::time::Duration::from_millis(100),
-                ).is_err(),
-                "accept thread and listener remained live after server shutdown",
-            );
+                let mut client = connect_with_retry(address).await;
+                let case = format!("obscura-server-shutdown-{index}");
+                let queued_marker =
+                    enter_active_page_realm(&mut client, &capture, realm, &case).await;
+
+                shutdown.cancel();
+                wait_for_socket_close(&mut client).await;
+                tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                    .await
+                    .expect("server shutdown waited for the V8 watchdog or drain deadline")
+                    .expect("server task")
+                    .expect("server shutdown");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if let Some(queued_marker) = queued_marker {
+                    assert_log_absent(&capture, &queued_marker);
+                }
+                assert!(
+                    std::net::TcpStream::connect_timeout(
+                        &address,
+                        std::time::Duration::from_millis(100),
+                    ).is_err(),
+                    "accept thread and listener remained live after {realm:?} shutdown",
+                );
+            }
         }).await;
     }
 
