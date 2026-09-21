@@ -5,12 +5,18 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`fe7d23dd1a8ad2ad428120ce864148427eed0e80`，`Complete native Network lifecycle projection`；其实现基线为 `42bbedbafd552bc93359f82cb2b487da57a7d6f9`。
+- 最近完成的实现提交：`90b075becae164b35ae3defb7e9cc44e692c9bd2`，`Complete Fetch response stream sharing`；其实现基线为 `c9277bd252b792e0f2a0c756626bce9fa88e3ad0`。
 - 该实现提交已推送到 `origin/main`；本交接更新提交完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
 - 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
 
 ## 最近完成的阶段
+
+Fetch response stream 已完成 shared-consumption 边界。Page 的 canonical response body 不再因 `takeResponseBodyAsStream` 被替换为 consumed tombstone；Network/Page、persistent history 和 stream 共享 immutable raw backing。Fetch 自身仍按 Chrome 契约维护 canonical access 状态：重复 `Fetch.getResponseBody` 可用，但 get 与一次 take 互斥，alias 不能绕过；普通 `Network.getResponseBody` 在 stream 打开后仍返回完整正文。Fulfill replacement 产生新 generation，Network 读新 body，旧 stream 继续读旧 body。
+
+Fetch IO handle 归属 target：同 target sibling flattened session 可顺序 `IO.read`/`IO.close`，其他 target 和失效 session 拒绝。disable、导航和 Page body clear 保留 handle；last target detach、target/Page close、context/connection teardown 回收 Fetch handle；PDF 等非 Fetch handle 保持 exact-session 原语义。长度读取、IO admission 和 Fetch access 转换位于同一 Page body-store guard 内，commit 再核对实际长度，关闭了并发 Fulfill replacement 绕过预算和计数下溢窗口。Chrome 152 原始探针确认 get/take、sibling、disable 和 last-detach 边界；未解除的 response pause 上 Network body 仍不可读。
+
+Astra light 首审发现 replacement/reservation 竞态；完整 CDP 首轮暴露 PDF stream 误清理。两处修复后终审为 0 blocker、0 major、0 minor。该 Fetch stream 边界已完成，OB-021 的其他迁移项与 OB-034 仍未关闭。以下更早阶段末尾的“未完成”列表是各阶段当时的历史快照，当前边界以上述最新结论为准。
 
 Document、Stylesheet、classic Script 与 render Image/Font 已通过共享 `RequestTrace` 接入普通 native Network lifecycle：最终 prepared raw request headers/body 已知后、首次 transport send 前同步接纳 Started，并以同一 logical request ID 产生 exactly-one Redirect/Finished/Failed terminal。每个 redirect hop 保留完整响应 headers/body；无效 Location、SSRF/mode 拒绝与 redirect 上限直接形成带真实响应事实的 Failed。普通请求先写 context-owned persistent history，再进入 Page/CDP live queue；导航期间共享 Notify 实时 drain，跨 batch 保留 `redirectResponse` 并清理 retired generation 状态。Page response-body store 预算失败仍显式暴露，但 persistent history 可按自身预算保存生产者已完整取得的 raw body。
 
@@ -18,7 +24,7 @@ render Page/runtime 关闭会先拒绝新 start、发布 cancellation、终止�
 
 `Network.enable` 的 `maxTotalBufferSize`、`maxResourceBufferSize` 与 `maxPostDataSize` 现按有效 Page session 独立保存。`maxPostDataSize` 按 raw UTF-8 byte length 只投影标准 `requestWillBeSent.request.postData`、`postDataEntries` 及扩展 `postDataIsByteString`；canonical standard/transport body、raw headers、Fetch pause 与 `Network.getRequestPostData` 保持完整。省略、null、0、负数不限，正整数 exact threshold，浮点/字符串拒绝，未知字段接受；重复 enable 只影响未来事件，disable 清理该 session 参数与读取资格。Chrome 152 原始探针确认上述语义。
 
-Astra light 三轮复核推动修复 redirect 策略失败终态、跨批次 `redirectResponse`、render close terminal 与 start/close 窄竞态，最终为 0 blocker、0 major、0 minor。普通 native start、Page body budget 与 per-agent `maxPostDataSize` 这一相邻边界已完成；下一段是 Fetch stream 多消费者。OB-021 整体仍未关闭。以下更早阶段末尾的“未完成”列表是各阶段当时的历史快照，当前边界以上述最新结论为准。
+Astra light 三轮复核推动修复 redirect 策略失败终态、跨批次 `redirectResponse`、render close terminal 与 start/close 窄竞态，最终为 0 blocker、0 major、0 minor。普通 native start、Page body budget 与 per-agent `maxPostDataSize` 这一相邻边界已完成；该阶段当时的下一段 Fetch stream 已由上方最新切片完成。OB-021 整体仍未关闭。
 
 每个 `BrowserContext` 现拥有 append-only `NetworkHistory`。记录使用全局单调 sequence 与永不复用的 page-instance ID，跨导航、Page 关闭和同一 context 多 Page 保留完整 observation metadata、精确 raw request/response headers 及 immutable request、transport-request、response body 引用。默认边界为 4096 条记录和 4096 个 page instance、64 MiB metadata、16 MiB 单条、512 MiB unique body bytes、32768 个 body entry、640 MiB persistent journal。首次 count/bytes/serialization/I/O/producer/close failure 保留 accepted prefix 并成为 context-wide sticky terminal，停止现有 sibling runtime、Worker 和 native producer 的后续网络工作；不 eviction、不截断、不脱敏。
 
@@ -57,6 +63,14 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 该阶段只修复 native passive callback ownership。callback panic 仍未隔离；CDP 多 session `Network.enable` subscription/fanout 已由最新阶段完成，但上游 JS/Worker 4096 oldest-drop、持久 observation history 或请求正文保留仍未解决。
 
 ## 验证结果
+
+- Fetch/IO/PDF/target review-fix 定向回归 6/6（run `011162eb-00aa-4309-9e4a-ba3147de8740`）。
+- `obscura-cdp` release/render 全量 359/359，3 skipped（run `ecebb351-1585-422a-b31b-ea8eb9bc4134`）。
+- 根 release/render nextest 2296/2296，4 skipped（run `4ee20af2-0968-4fe3-a859-6af72abed67a`）。
+- exact no-default-features 与 render CLI build 均成功；最终 render SHA-256 `9b1f39d1ec2e232bad17d17a84b926ac5a39fd3a3954db5b01b018230d19fa94`，120496336 bytes。
+- benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33。
+- 同一二进制通过官方 Playwright Python 1.60.0 automation smoke；完整原始协议日志通过 37-method profile 校验。
+- Astra light 第二轮终审无 blocker、major 或 minor；`git diff --check` 通过。
 
 - latest race/close/redirect focused release 回归 5/5（run `7b5ddeca-936c-4950-b7c3-2e11a9259705`）。
 - latest affected net/js/browser/cdp release/render nextest 1475/1475，3 skipped（run `9c356372-cca7-429d-bfce-219385c8b605`）。
@@ -102,8 +116,8 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 补齐 Fetch stream 多消费者语义。
-2. 再按实际风险推进其余 input qualification、disconnect 矩阵和 idle Worker cancellation wake。
+1. 按实际风险推进其余 input qualification 与 disconnect 组合矩阵。
+2. 补齐仅等待 `commands.recv()` 的 idle Worker cancellation wake。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -120,6 +134,24 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 
 生成本交接的主机上曾保留以下完整临时证据：
 
+- `/tmp/ob021-fetch-stream-net-focused.log`
+- `/tmp/ob021-fetch-stream-cdp-focused.log`
+- `/tmp/ob021-fetch-stream-cdp-focused-rerun.log`
+- `/tmp/ob021-fetch-stream-js-focused.log`
+- `/tmp/ob021-fetch-stream-review-fixes.log`
+- `/tmp/ob021-fetch-stream-review-fixes-rerun.log`
+- `/tmp/ob021-fetch-stream-cdp-full.log`
+- `/tmp/ob021-fetch-stream-cdp-full-rerun.log`
+- `/tmp/ob021-fetch-stream-workspace-full.log`
+- `/tmp/ob021-fetch-stream-build-no-render.log`
+- `/tmp/ob021-fetch-stream-build-render.log`
+- `/tmp/ob021-fetch-stream-build-render-final.log`
+- `/tmp/ob021-fetch-stream-obstacle.log`
+- `/tmp/chrome152_fetch_stream_probe.py`
+- `/tmp/chrome152_fetch_stream_probe.jsonl`
+- `/tmp/chrome152_fetch_stream_probe.jsonl.failed`
+- `/tmp/chrome152_fetch_stream_matrix.jsonl`
+- `/tmp/ob021-fetch-stream-playwright.tkwjmf/`
 - `/tmp/ob021-request-body-focused.log`
 - `/tmp/ob021-request-body-focused-expanded.log`
 - `/tmp/ob021-request-body-astra-fixes.log`
