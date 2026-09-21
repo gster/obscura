@@ -131,6 +131,45 @@ struct ServerShutdown {
     inner: Arc<ServerShutdownInner>,
 }
 
+/// Process-local control for an embedded CDP server.
+///
+/// The ordinary public entry points install their own signal handler. The
+/// controlled entry point instead makes its caller the lifecycle owner; the
+/// CLI multi-worker supervisor uses this handle as the explicit
+/// parent-to-child shutdown path so a signal sent only to the parent still
+/// reaches every worker.
+#[derive(Clone)]
+pub struct CdpServerControl {
+    shutdown: ServerShutdown,
+}
+
+impl CdpServerControl {
+    pub fn new() -> Self {
+        Self {
+            shutdown: ServerShutdown::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.shutdown.cancel();
+    }
+
+    pub async fn cancelled(&self) {
+        self.shutdown.cancelled().await;
+    }
+}
+
+impl Default for CdpServerControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdpServerReady {
+    pub local_addr: SocketAddr,
+}
+
 struct ServerShutdownInner {
     closed: AtomicBool,
     signal: tokio::sync::watch::Sender<bool>,
@@ -417,6 +456,44 @@ pub async fn start_with_serve_options_access_and_limit(
     .await
 }
 
+/// Start a CDP server with an explicit lifecycle control channel.
+///
+/// `ready` is sent only after the listener, access policy, accept thread,
+/// shutdown waker, and one-time V8 initialization all succeeded. Dropping the
+/// receiver is treated as a startup failure so a supervised worker cannot run
+/// without a parent that observed its exact readiness record.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_with_serve_options_access_limit_and_control(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+    max_connections: usize,
+    access_options: CdpAccessOptions,
+    persona: obscura_net::EffectivePersona,
+    control: CdpServerControl,
+    ready: tokio::sync::oneshot::Sender<CdpServerReady>,
+) -> anyhow::Result<()> {
+    start_with_serve_options_access_limit_shutdown_and_ready(
+        port,
+        host,
+        proxy,
+        allow_file_access,
+        storage_dir,
+        allow_private_network,
+        max_connections,
+        access_options,
+        persona,
+        control.shutdown,
+        false,
+        ConnectionIoPolicy::default(),
+        Some(ready),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_with_serve_options_access_limit_and_shutdown(
     port: u16,
@@ -431,6 +508,40 @@ async fn start_with_serve_options_access_limit_and_shutdown(
     shutdown: ServerShutdown,
     install_signal_handler: bool,
     connection_io_policy: ConnectionIoPolicy,
+) -> anyhow::Result<()> {
+    start_with_serve_options_access_limit_shutdown_and_ready(
+        port,
+        host,
+        proxy,
+        allow_file_access,
+        storage_dir,
+        allow_private_network,
+        max_connections,
+        access_options,
+        persona,
+        shutdown,
+        install_signal_handler,
+        connection_io_policy,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_with_serve_options_access_limit_shutdown_and_ready(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+    max_connections: usize,
+    access_options: CdpAccessOptions,
+    persona: obscura_net::EffectivePersona,
+    shutdown: ServerShutdown,
+    install_signal_handler: bool,
+    connection_io_policy: ConnectionIoPolicy,
+    ready: Option<tokio::sync::oneshot::Sender<CdpServerReady>>,
 ) -> anyhow::Result<()> {
     obscura_net::activate_process_persona(&persona)?;
     let ip: std::net::IpAddr = host
@@ -672,6 +783,22 @@ async fn start_with_serve_options_access_limit_and_shutdown(
     // InitializeBuiltinJSDispatchTable (#430 thread-per-connection). Building and
     // dropping one runtime here does the one-time setup single-threaded.
     drop(obscura_js::runtime::ObscuraJsRuntime::new(persona));
+
+    if let Some(ready) = ready {
+        if ready
+            .send(CdpServerReady {
+                local_addr: actual_addr,
+            })
+            .is_err()
+        {
+            shutdown.cancel();
+            if accept_thread.join().is_err() {
+                warn!("CDP accept thread panicked after readiness receiver closed");
+            }
+            shutdown.clear_accept_waker();
+            anyhow::bail!("CDP supervisor dropped readiness receiver");
+        }
+    }
 
     cap_malloc_arenas();
 

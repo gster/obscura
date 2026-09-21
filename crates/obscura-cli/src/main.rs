@@ -123,6 +123,11 @@ enum Command {
         #[arg(long = "font-dir", value_name = "DIR")]
         font_dirs: Vec<std::path::PathBuf>,
 
+        /// Internal parent/child lifecycle channel. Not a supported user
+        /// interface; multi-worker supervisors set this on their children.
+        #[arg(long, hide = true, value_name = "INDEX")]
+        supervised_worker: Option<u16>,
+
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
         #[arg(long)]
@@ -478,6 +483,7 @@ fn resolve_persona(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let verbose = args.verbose;
 
     let persona_input = args
         .persona
@@ -534,6 +540,7 @@ async fn main() -> anyhow::Result<()> {
             allow_file_access,
             storage_dir,
             font_dirs,
+            supervised_worker,
             quiet: _,
         }) => {
             if workers > 1 && port == 0 {
@@ -558,8 +565,22 @@ async fn main() -> anyhow::Result<()> {
                 allow_unauthenticated_remote,
             };
             access.options().validate_for_bind(&host, port)?;
+            if workers > 1 && storage_dir.is_some() {
+                anyhow::bail!(
+                    "serve --storage-dir is not supported with --workers greater than 1; \
+                     sharing one persistence directory across worker processes has no defined ownership"
+                );
+            }
+            if supervised_worker.is_some() && workers > 1 {
+                anyhow::bail!("--supervised-worker requires --workers 1");
+            }
+            if supervised_worker.is_some() && storage_dir.is_some() {
+                anyhow::bail!("--supervised-worker does not support --storage-dir");
+            }
             configure_font_directories(&font_dirs)?;
-            print_banner(&host, port);
+            if supervised_worker.is_none() {
+                print_banner(&host, port);
+            }
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -581,6 +602,24 @@ async fn main() -> anyhow::Result<()> {
                     font_dirs,
                     max_connections,
                     access,
+                    persona.clone(),
+                    allow_file_access,
+                    args.allow_private_network,
+                    v8_flags.clone(),
+                    verbose,
+                    quiet,
+                )
+                .await?;
+            } else if let Some(worker_index) = supervised_worker {
+                run_supervised_multi_worker_child(
+                    worker_index,
+                    port,
+                    &host,
+                    proxy,
+                    allow_file_access,
+                    args.allow_private_network,
+                    max_connections,
+                    access.options(),
                     persona.clone(),
                 )
                 .await?;
@@ -728,6 +767,536 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+const MULTI_WORKER_CONTROL_PROTOCOL: &str = "obscura-multi-worker-control";
+const MULTI_WORKER_CONTROL_VERSION: u8 = 1;
+const MULTI_WORKER_SHUTDOWN_COMMAND: &[u8] = b"shutdown\n";
+const MULTI_WORKER_CONTROL_LINE_LIMIT: u64 = 4_096;
+const MULTI_WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const MULTI_WORKER_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
+const MULTI_WORKER_CHILD_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
+const MULTI_WORKER_CHILD_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+const MULTI_WORKER_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultiWorkerReadyRecord {
+    protocol: String,
+    version: u8,
+    event: String,
+    worker: u16,
+    port: u16,
+    pid: u32,
+}
+
+struct SupervisedWorker {
+    index: u16,
+    port: u16,
+    pid: u32,
+    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    stdout: BufReader<tokio::process::ChildStdout>,
+    exit_status: Option<std::process::ExitStatus>,
+    shutdown_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MultiWorkerParentSignal {
+    Interrupt,
+    Terminate,
+}
+
+#[cfg(unix)]
+struct MultiWorkerParentSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl MultiWorkerParentSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) -> MultiWorkerParentSignal {
+        tokio::select! {
+            _ = self.interrupt.recv() => MultiWorkerParentSignal::Interrupt,
+            _ = self.terminate.recv() => MultiWorkerParentSignal::Terminate,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct MultiWorkerParentSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+#[cfg(windows)]
+impl MultiWorkerParentSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+        })
+    }
+
+    async fn recv(&mut self) -> MultiWorkerParentSignal {
+        let _ = self.ctrl_c.recv().await;
+        MultiWorkerParentSignal::Interrupt
+    }
+}
+
+async fn run_supervised_multi_worker_child(
+    worker_index: u16,
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    allow_file_access: bool,
+    allow_private_network: bool,
+    max_connections: usize,
+    access: obscura_cdp::CdpAccessOptions,
+    persona: obscura_net::EffectivePersona,
+) -> anyhow::Result<()> {
+    if host != "127.0.0.1" {
+        anyhow::bail!("supervised workers must bind 127.0.0.1, got {host:?}");
+    }
+    let control = obscura_cdp::CdpServerControl::new();
+    let stdin_control = control.clone();
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = BufReader::new(tokio::io::stdin());
+        let mut command = Vec::new();
+        let read = (&mut stdin)
+            .take(MULTI_WORKER_CONTROL_LINE_LIMIT + 1)
+            .read_until(b'\n', &mut command)
+            .await;
+        match read {
+            Ok(0) => tracing::info!("multi-worker parent control pipe closed"),
+            Ok(_) if command == MULTI_WORKER_SHUTDOWN_COMMAND => {
+                tracing::info!("multi-worker parent requested shutdown")
+            }
+            Ok(_) => tracing::error!(
+                raw = ?command,
+                "invalid multi-worker parent control record ({} raw bytes)",
+                command.len()
+            ),
+            Err(error) => tracing::error!("multi-worker parent control read failed: {error}"),
+        }
+        stdin_control.cancel();
+    });
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = obscura_cdp::start_with_serve_options_access_limit_and_control(
+        port,
+        host,
+        proxy,
+        allow_file_access,
+        None,
+        allow_private_network,
+        max_connections,
+        access,
+        persona,
+        control,
+        ready_tx,
+    );
+    tokio::pin!(server);
+    let ready = tokio::select! {
+        result = &mut server => {
+            stdin_task.abort();
+            let _ = stdin_task.await;
+            return match result {
+                Ok(()) => Err(anyhow::anyhow!("supervised CDP worker exited before readiness")),
+                Err(error) => Err(error),
+            };
+        }
+        ready = ready_rx => ready.map_err(|_| anyhow::anyhow!(
+            "supervised CDP worker lost readiness channel"
+        ))?,
+    };
+    if ready.local_addr.port() != port {
+        stdin_task.abort();
+        let _ = stdin_task.await;
+        anyhow::bail!(
+            "supervised CDP worker bound unexpected port {} instead of {}",
+            ready.local_addr.port(),
+            port
+        );
+    }
+    let record = MultiWorkerReadyRecord {
+        protocol: MULTI_WORKER_CONTROL_PROTOCOL.to_string(),
+        version: MULTI_WORKER_CONTROL_VERSION,
+        event: "ready".to_string(),
+        worker: worker_index,
+        port,
+        pid: std::process::id(),
+    };
+    let mut stdout = tokio::io::stdout();
+    stdout
+        .write_all(format!("{}\n", serde_json::to_string(&record)?).as_bytes())
+        .await?;
+    stdout.flush().await?;
+
+    let result = server.await;
+    stdin_task.abort();
+    let _ = stdin_task.await;
+    result
+}
+
+fn poll_supervised_worker_exit(
+    worker: &mut SupervisedWorker,
+) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    poll_supervised_process_exit(
+        worker.index,
+        worker.port,
+        worker.pid,
+        &mut worker.child,
+        &mut worker.exit_status,
+    )
+}
+
+fn poll_supervised_process_exit(
+    worker_index: u16,
+    worker_port: u16,
+    worker_pid: u32,
+    child: &mut tokio::process::Child,
+    exit_status: &mut Option<std::process::ExitStatus>,
+) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    if let Some(status) = *exit_status {
+        return Ok(Some(status));
+    }
+    let status = child.try_wait().map_err(|error| {
+        anyhow::anyhow!(
+            "poll worker {} (pid {}, port {}): {}",
+            worker_index,
+            worker_pid,
+            worker_port,
+            error
+        )
+    })?;
+    if let Some(status) = status {
+        *exit_status = Some(status);
+    }
+    Ok(status)
+}
+
+fn unexpected_supervised_worker_exit(
+    workers: &mut [SupervisedWorker],
+) -> anyhow::Result<Option<anyhow::Error>> {
+    for worker in workers {
+        if let Some(status) = poll_supervised_worker_exit(worker)? {
+            if !worker.shutdown_requested {
+                return Ok(Some(anyhow::anyhow!(
+                    "multi-worker child {} (pid {}, port {}) exited unexpectedly with {}",
+                    worker.index,
+                    worker.pid,
+                    worker.port,
+                    status
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn validate_multi_worker_ready_record(
+    line: &[u8],
+    worker_index: u16,
+    worker_port: u16,
+    worker_pid: u32,
+) -> anyhow::Result<()> {
+    if line.len() as u64 > MULTI_WORKER_CONTROL_LINE_LIMIT || !line.ends_with(b"\n") {
+        anyhow::bail!(
+            "worker {} readiness record is incomplete or exceeds {} bytes",
+            worker_index,
+            MULTI_WORKER_CONTROL_LINE_LIMIT
+        );
+    }
+    let record: MultiWorkerReadyRecord = serde_json::from_slice(line)
+        .map_err(|error| anyhow::anyhow!("parse worker {} readiness record: {error}", worker_index))?;
+    if record.protocol != MULTI_WORKER_CONTROL_PROTOCOL
+        || record.version != MULTI_WORKER_CONTROL_VERSION
+        || record.event != "ready"
+        || record.worker != worker_index
+        || record.port != worker_port
+        || record.pid != worker_pid
+    {
+        anyhow::bail!(
+            "worker {} readiness record mismatch: protocol={:?} version={} event={:?} worker={} port={} pid={} expected port={} pid={}",
+            worker_index,
+            record.protocol,
+            record.version,
+            record.event,
+            record.worker,
+            record.port,
+            record.pid,
+            worker_port,
+            worker_pid
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_multi_worker_readiness(
+    workers: &mut [SupervisedWorker],
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + MULTI_WORKER_STARTUP_TIMEOUT;
+    for worker in workers {
+        let worker_index = worker.index;
+        let worker_port = worker.port;
+        let worker_pid = worker.pid;
+        let (stdout, child, exit_status) = (
+            &mut worker.stdout,
+            &mut worker.child,
+            &mut worker.exit_status,
+        );
+        let mut line = Vec::new();
+        let mut limited = stdout.take(MULTI_WORKER_CONTROL_LINE_LIMIT + 1);
+        let read = limited.read_until(b'\n', &mut line);
+        tokio::pin!(read);
+        let mut poll = tokio::time::interval(MULTI_WORKER_HEALTH_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                result = &mut read => {
+                    let bytes = result.map_err(|error| anyhow::anyhow!(
+                        "read worker {} readiness: {error}", worker_index
+                    ))?;
+                    if bytes == 0 {
+                        let status = child.wait().await.map_err(|error| anyhow::anyhow!(
+                            "wait worker {} (pid {}, port {}) after readiness EOF: {}",
+                            worker_index,
+                            worker_pid,
+                            worker_port,
+                            error
+                        ))?;
+                        *exit_status = Some(status);
+                        anyhow::bail!(
+                            "worker {} (pid {}, port {}) exited before readiness with {}",
+                            worker_index,
+                            worker_pid,
+                            worker_port,
+                            status
+                        );
+                    }
+                    let mut stdout = tokio::io::stdout();
+                    stdout.write_all(&line).await?;
+                    stdout.flush().await?;
+                    validate_multi_worker_ready_record(
+                        &line,
+                        worker_index,
+                        worker_port,
+                        worker_pid,
+                    )?;
+                    tracing::info!(
+                        "Worker {} ready on port {} (pid {})",
+                        worker_index,
+                        worker_port,
+                        worker_pid
+                    );
+                    break;
+                }
+                _ = poll.tick() => {
+                    if let Some(status) = poll_supervised_process_exit(
+                        worker_index,
+                        worker_port,
+                        worker_pid,
+                        child,
+                        exit_status,
+                    )? {
+                        anyhow::bail!(
+                            "worker {} (pid {}, port {}) exited before readiness with {}",
+                            worker_index,
+                            worker_pid,
+                            worker_port,
+                            status
+                        );
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    anyhow::bail!(
+                        "worker {} (pid {}, port {}) did not become ready within {:?}",
+                        worker_index,
+                        worker_pid,
+                        worker_port,
+                        MULTI_WORKER_STARTUP_TIMEOUT
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn request_multi_worker_children_shutdown(
+    workers: &mut [SupervisedWorker],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for worker in workers {
+        worker.shutdown_requested = true;
+        if worker.exit_status.is_some() {
+            continue;
+        }
+        if let Some(mut stdin) = worker.stdin.take() {
+            if let Err(error) = stdin.write_all(MULTI_WORKER_SHUTDOWN_COMMAND).await {
+                errors.push(format!(
+                    "write shutdown to worker {} (pid {}): {}",
+                    worker.index, worker.pid, error
+                ));
+            } else if let Err(error) = stdin.flush().await {
+                errors.push(format!(
+                    "flush shutdown to worker {} (pid {}): {}",
+                    worker.index, worker.pid, error
+                ));
+            }
+            if let Err(error) = stdin.shutdown().await {
+                errors.push(format!(
+                    "close control pipe for worker {} (pid {}): {}",
+                    worker.index, worker.pid, error
+                ));
+            }
+        }
+    }
+    errors
+}
+
+async fn reap_multi_worker_children(workers: &mut [SupervisedWorker]) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    let graceful_deadline =
+        tokio::time::Instant::now() + MULTI_WORKER_CHILD_GRACEFUL_TIMEOUT;
+    loop {
+        let mut all_exited = true;
+        for worker in workers.iter_mut() {
+            match poll_supervised_worker_exit(worker) {
+                Ok(Some(_)) => {}
+                Ok(None) => all_exited = false,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    all_exited = false;
+                }
+            }
+        }
+        if all_exited || tokio::time::Instant::now() >= graceful_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    for worker in workers.iter_mut().filter(|worker| worker.exit_status.is_none()) {
+        tracing::warn!(
+            "force-killing worker {} (pid {}) after {:?}",
+            worker.index,
+            worker.pid,
+            MULTI_WORKER_CHILD_GRACEFUL_TIMEOUT
+        );
+        if let Err(error) = worker.child.start_kill() {
+            errors.push(format!(
+                "force-kill worker {} (pid {}): {}",
+                worker.index, worker.pid, error
+            ));
+        }
+    }
+
+    let kill_deadline = tokio::time::Instant::now() + MULTI_WORKER_CHILD_KILL_TIMEOUT;
+    for worker in workers.iter_mut().filter(|worker| worker.exit_status.is_none()) {
+        match tokio::time::timeout_at(kill_deadline, worker.child.wait()).await {
+            Ok(Ok(status)) => worker.exit_status = Some(status),
+            Ok(Err(error)) => errors.push(format!(
+                "wait worker {} (pid {}) after kill: {}",
+                worker.index, worker.pid, error
+            )),
+            Err(_) => errors.push(format!(
+                "worker {} (pid {}) was not reaped within {:?} after kill",
+                worker.index, worker.pid, MULTI_WORKER_CHILD_KILL_TIMEOUT
+            )),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("multi-worker child cleanup failed: {}", errors.join("; "))
+    }
+}
+
+async fn finish_multi_worker_children(
+    workers: &mut [SupervisedWorker],
+) -> anyhow::Result<()> {
+    let request_errors = request_multi_worker_children_shutdown(workers).await;
+    let reap = reap_multi_worker_children(workers).await;
+    match (request_errors.is_empty(), reap) {
+        (true, result) => result,
+        (false, Ok(())) => anyhow::bail!(
+            "multi-worker child shutdown request failed: {}",
+            request_errors.join("; ")
+        ),
+        (false, Err(error)) => anyhow::bail!(
+            "multi-worker child shutdown request failed: {}; {}",
+            request_errors.join("; "),
+            error
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn configure_multi_worker_child_command(
+    command: &mut std::process::Command,
+    v8_flags: &str,
+    verbose: bool,
+    quiet: bool,
+    worker_index: u16,
+    worker_port: u16,
+    max_connections: usize,
+    allow_file_access: bool,
+    allow_private_network: bool,
+    persona_json: &str,
+    proxy: Option<&str>,
+    access: &CdpServeAccess,
+    font_dirs: &[std::path::PathBuf],
+) {
+    command.arg("--v8-flags").arg(v8_flags);
+    if verbose {
+        command.arg("--verbose");
+    }
+    command
+        .arg("serve")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(worker_port.to_string())
+        .arg("--workers")
+        .arg("1")
+        .arg("--max-connections")
+        .arg(max_connections.to_string())
+        .arg("--supervised-worker")
+        .arg(worker_index.to_string());
+    if quiet {
+        command.arg("--quiet");
+    }
+    if allow_file_access {
+        command.arg("--allow-file-access");
+    }
+    if allow_private_network {
+        command.arg("--allow-private-network");
+    }
+    command.env_remove("OBSCURA_PERSONA");
+    command.env("OBSCURA_PERSONA_JSON", persona_json);
+    match proxy {
+        Some(proxy) => {
+            // Credentials remain outside argv and are inherited only by the
+            // worker process that needs them.
+            command.env("OBSCURA_PROXY", proxy);
+        }
+        None => {
+            command.env_remove("OBSCURA_PROXY");
+        }
+    }
+    access.configure_worker(command);
+    for directory in font_dirs {
+        command.arg("--font-dir").arg(directory);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_multi_worker_serve(
     port: u16,
     host: String,
@@ -737,68 +1306,222 @@ async fn run_multi_worker_serve(
     max_connections: usize,
     access: CdpServeAccess,
     persona: obscura_net::EffectivePersona,
+    allow_file_access: bool,
+    allow_private_network: bool,
+    v8_flags: String,
+    verbose: bool,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     use tokio::net::TcpListener;
 
-    let exe = std::env::current_exe()?;
-    let mut children = Vec::new();
     let worker_ports = multi_worker_ports(port, workers)?;
     let relay_limit = multi_worker_relay_limit(workers, max_connections)?;
+    let mut signals = MultiWorkerParentSignals::new()
+        .map_err(|error| anyhow::anyhow!("install multi-worker signal handlers: {error}"))?;
 
-    for (i, worker_port) in worker_ports.iter().copied().enumerate() {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("serve")
-            .arg("--port")
-            .arg(worker_port.to_string())
-            .arg("--max-connections")
-            .arg(max_connections.to_string());
-        // Internal workers must consume the already-compiled snapshot. An
-        // inherited selector could otherwise win in resolve_persona and make
-        // the child reread a preset or mutable JSON file.
-        cmd.env_remove("OBSCURA_PERSONA");
-        cmd.env("OBSCURA_PERSONA_JSON", serde_json::to_string(&persona.to_spec())?);
-        if let Some(ref p) = proxy {
-            // Pass the proxy (which may embed credentials) via the environment,
-            // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
-            // to any local user; OBSCURA_PROXY is only readable by the owner
-            // (issue #366). The worker's serve path reads this env as a fallback.
-            cmd.env("OBSCURA_PROXY", p);
-        }
-        access.configure_worker(&mut cmd);
-        for directory in &font_dirs {
-            cmd.arg("--font-dir").arg(directory);
-        }
-        // Keep worker output attached to the supervisor so operational and
-        // failure evidence is not silently discarded in multi-worker mode.
-        cmd.stdout(std::process::Stdio::inherit());
+    // Bind the public listener before any child exists. A public-port conflict
+    // therefore cannot strand workers that the failing parent never reaps.
+    let listener = TcpListener::bind((host.as_str(), port))
+        .await
+        .map_err(|error| anyhow::anyhow!("bind multi-worker listener {host}:{port}: {error}"))?;
+
+    let exe = std::env::current_exe()?;
+    let persona_json = serde_json::to_string(&persona.to_spec())?;
+    let mut supervised = Vec::new();
+    for (offset, worker_port) in worker_ports.iter().copied().enumerate() {
+        let index = u16::try_from(offset + 1).expect("worker index comes from u16 count");
+        let mut cmd = TokioCommand::new(&exe);
+        cmd.kill_on_drop(true);
+        configure_multi_worker_child_command(
+            cmd.as_std_mut(),
+            &v8_flags,
+            verbose,
+            quiet,
+            index,
+            worker_port,
+            max_connections,
+            allow_file_access,
+            allow_private_network,
+            &persona_json,
+            proxy.as_deref(),
+            &access,
+            &font_dirs,
+        );
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::inherit());
 
-        let child = cmd.spawn()?;
-        tracing::info!("Worker {} on port {}", i + 1, worker_port);
-        children.push(child);
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let cleanup = finish_multi_worker_children(&mut supervised).await;
+                return match cleanup {
+                    Ok(()) => Err(anyhow::anyhow!(
+                        "spawn multi-worker child {index} on port {worker_port}: {error}"
+                    )),
+                    Err(cleanup) => Err(anyhow::anyhow!(
+                        "spawn multi-worker child {index} on port {worker_port}: {error}; cleanup: {cleanup}"
+                    )),
+                };
+            }
+        };
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let cleanup = finish_multi_worker_children(&mut supervised).await;
+                let error = anyhow::anyhow!(
+                    "spawned worker {index} on port {worker_port} has no process id"
+                );
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!("child cleanup also failed: {cleanup}"))),
+                };
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let cleanup = finish_multi_worker_children(&mut supervised).await;
+                let error = anyhow::anyhow!(
+                    "spawned worker {index} (pid {pid}) has no control stdin"
+                );
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!("child cleanup also failed: {cleanup}"))),
+                };
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let cleanup = finish_multi_worker_children(&mut supervised).await;
+                let error = anyhow::anyhow!(
+                    "spawned worker {index} (pid {pid}) has no readiness stdout"
+                );
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!("child cleanup also failed: {cleanup}"))),
+                };
+            }
+        };
+        supervised.push(SupervisedWorker {
+            index,
+            port: worker_port,
+            pid,
+            child,
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+            exit_status: None,
+            shutdown_requested: false,
+        });
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    enum StartupOutcome {
+        Ready(anyhow::Result<()>),
+        Signal(MultiWorkerParentSignal),
+    }
+    let startup = {
+        let readiness = wait_for_multi_worker_readiness(&mut supervised);
+        tokio::pin!(readiness);
+        tokio::select! {
+            biased;
+            signal = signals.recv() => StartupOutcome::Signal(signal),
+            result = &mut readiness => StartupOutcome::Ready(result),
+        }
+    };
+    match startup {
+        StartupOutcome::Ready(Ok(())) => {}
+        StartupOutcome::Ready(Err(error)) => {
+            tracing::error!("multi-worker startup failed: {error}");
+            let cleanup = finish_multi_worker_children(&mut supervised).await;
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!("child cleanup also failed: {cleanup}"))),
+            };
+        }
+        StartupOutcome::Signal(signal) => {
+            tracing::info!("multi-worker parent received {:?} during startup", signal);
+            return finish_multi_worker_children(&mut supervised).await;
+        }
+    }
 
-    // Bind the load balancer to the requested host, not hardcoded loopback.
-    // With --host 0.0.0.0 (e.g. in Docker) the single-worker path already binds
-    // all interfaces; the multi-worker balancer must too, or the mapped port is
-    // refused from outside the container (issue #336). Workers stay on loopback
-    // and are only reached by the balancer.
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!(
-        "Load balancer on {}:{}, {} workers, {} relay slots",
+        "Load balancer on {}:{}, {} ready workers, {} relay slots",
         host,
         port,
         workers,
         relay_limit
     );
-
     let worker_addrs = worker_ports
         .into_iter()
         .map(|worker_port| std::net::SocketAddr::from(([127, 0, 0, 1], worker_port)))
         .collect();
-    run_multi_worker_relay_loop(listener, worker_addrs, relay_limit).await
+    let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::oneshot::channel();
+    let relay = run_multi_worker_relay_loop(
+        listener,
+        worker_addrs,
+        relay_limit,
+        relay_shutdown_rx,
+    );
+    tokio::pin!(relay);
+    let mut health = tokio::time::interval(MULTI_WORKER_HEALTH_INTERVAL);
+    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut primary_error = None;
+    let mut relay_result = None;
+    tokio::select! {
+        biased;
+        signal = signals.recv() => {
+            tracing::info!("multi-worker parent received {:?}", signal);
+        }
+        result = &mut relay => {
+            primary_error = Some(match &result {
+                Ok(()) => anyhow::anyhow!("multi-worker relay loop stopped without a shutdown request"),
+                Err(error) => anyhow::anyhow!(error.to_string()),
+            });
+            relay_result = Some(result);
+        }
+        error = async {
+            loop {
+                health.tick().await;
+                match unexpected_supervised_worker_exit(&mut supervised) {
+                    Ok(Some(error)) => break error,
+                    Ok(None) => {}
+                    Err(error) => break error,
+                }
+            }
+        } => {
+            primary_error = Some(error);
+        }
+    }
+
+    let _ = relay_shutdown_tx.send(());
+    let relay_result = match relay_result {
+        Some(result) => result,
+        None => relay.await,
+    };
+    let request_errors = request_multi_worker_children_shutdown(&mut supervised).await;
+    let reap_result = reap_multi_worker_children(&mut supervised).await;
+    let cleanup_error = match (request_errors.is_empty(), relay_result, reap_result) {
+        (true, Ok(()), Ok(())) => None,
+        (request_ok, relay, reap) => Some(anyhow::anyhow!(
+            "multi-worker shutdown incomplete: request_errors={:?}; relay={:?}; children={:?}",
+            if request_ok { Vec::<String>::new() } else { request_errors },
+            relay.err().map(|error| error.to_string()),
+            reap.err().map(|error| error.to_string())
+        )),
+    };
+    match (primary_error, cleanup_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(error),
+        (None, Some(error)) => Err(error),
+        (Some(error), Some(cleanup)) => Err(error.context(cleanup.to_string())),
+    }
 }
 
 const MULTI_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -919,16 +1642,20 @@ async fn relay_multi_worker_connection(
     }
 }
 
-fn report_multi_worker_task(result: Result<(), tokio::task::JoinError>) {
-    if let Err(error) = result {
+fn multi_worker_task_error(
+    result: Result<(), tokio::task::JoinError>,
+) -> Option<anyhow::Error> {
+    result.err().map(|error| {
         tracing::error!("multi-worker relay task failed: {}", error);
-    }
+        anyhow::anyhow!("multi-worker relay task failed: {error}")
+    })
 }
 
 async fn run_multi_worker_relay_loop(
     listener: tokio::net::TcpListener,
     worker_addrs: Vec<std::net::SocketAddr>,
     relay_limit: usize,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     if worker_addrs.is_empty() {
         anyhow::bail!("multi-worker relay requires at least one worker address");
@@ -938,15 +1665,28 @@ async fn run_multi_worker_relay_loop(
     let rejection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_MULTI_WORKER_REJECTIONS));
     let mut tasks = tokio::task::JoinSet::new();
     let mut next_worker = 0usize;
+    let mut terminal_error = None;
 
-    loop {
+    'accept: loop {
         while let Some(result) = tasks.try_join_next() {
-            report_multi_worker_task(result);
+            if let Some(error) = multi_worker_task_error(result) {
+                terminal_error = Some(error);
+                break 'accept;
+            }
         }
 
         tokio::select! {
+            _ = &mut shutdown => break,
             accepted = listener.accept() => {
-                let (client, peer_addr) = accepted?;
+                let (client, peer_addr) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        terminal_error = Some(anyhow::anyhow!(
+                            "accept multi-worker client: {error}"
+                        ));
+                        break 'accept;
+                    }
+                };
                 let permit = match relay_slots.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -984,7 +1724,73 @@ async fn run_multi_worker_relay_loop(
                 ));
             }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                report_multi_worker_task(result);
+                if let Some(error) = multi_worker_task_error(result) {
+                    terminal_error = Some(error);
+                    break 'accept;
+                }
+            }
+        }
+    }
+
+    drop(listener);
+    if terminal_error.is_some() {
+        tasks.abort_all();
+    }
+    if tasks.is_empty() {
+        return match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        };
+    }
+
+    let drain = tokio::time::sleep(MULTI_WORKER_RELAY_DRAIN_TIMEOUT);
+    tokio::pin!(drain);
+    loop {
+        tokio::select! {
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(result) = result {
+                    if let Err(error) = result {
+                        if !error.is_cancelled() {
+                            tracing::error!("multi-worker relay task failed: {}", error);
+                            if terminal_error.is_none() {
+                                terminal_error = Some(anyhow::anyhow!(
+                                    "multi-worker relay task failed: {error}"
+                                ));
+                            }
+                            tasks.abort_all();
+                        }
+                    }
+                }
+                if tasks.is_empty() {
+                    return match terminal_error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    };
+                }
+            }
+            _ = &mut drain => {
+                tracing::warn!(
+                    "aborting {} multi-worker relay task(s) after {:?}",
+                    tasks.len(),
+                    MULTI_WORKER_RELAY_DRAIN_TIMEOUT
+                );
+                tasks.abort_all();
+                while let Some(result) = tasks.join_next().await {
+                    if let Err(error) = result {
+                        if !error.is_cancelled() {
+                            tracing::error!("multi-worker relay task failed during abort: {}", error);
+                            if terminal_error.is_none() {
+                                terminal_error = Some(anyhow::anyhow!(
+                                    "multi-worker relay task failed during abort: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                return match terminal_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                };
             }
         }
     }
@@ -2236,14 +3042,16 @@ fn dump_assets(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
+        configure_fetch_navigation_timeout, configure_multi_worker_child_command,
+        effective_v8_flags, extract_assets,
         effective_cdp_allowed_hosts,
         extract_readable_text, fetch_original_bytes, fetch_process_hard_timeout,
         is_quiet_command, link_kind_from_rel,
         merge_proxy, multi_worker_ports, multi_worker_relay_limit, normalize_v8_flags,
         read_urls_from_file, resolve_asset_url, run_multi_worker_relay_loop, select_log_filter,
-        resolve_persona, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
-        DEFAULT_V8_FLAGS, MULTI_WORKER_BAD_GATEWAY_RESPONSE,
+        resolve_persona, validate_multi_worker_ready_record, write_or_print,
+        write_or_print_bytes, Args, CdpServeAccess, Command, DumpFormat, DEFAULT_V8_FLAGS,
+        MULTI_WORKER_BAD_GATEWAY_RESPONSE, MULTI_WORKER_CONTROL_LINE_LIMIT,
         MULTI_WORKER_RELAY_LIMIT_RESPONSE,
     };
     use clap::Parser;
@@ -2278,17 +3086,23 @@ mod tests {
     async fn spawn_test_relay(
         worker_addr: std::net::SocketAddr,
         relay_limit: usize,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(run_multi_worker_relay_loop(
             listener,
             vec![worker_addr],
             relay_limit,
+            shutdown_rx,
         ));
-        (addr, task)
+        (addr, shutdown_tx, task)
     }
 
     async fn round_trip_and_close(addr: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -2318,10 +3132,119 @@ mod tests {
         assert!(error.to_string().contains("overflow"));
     }
 
+    #[test]
+    fn multi_worker_readiness_record_is_exact_and_bounded() {
+        let valid = br#"{"protocol":"obscura-multi-worker-control","version":1,"event":"ready","worker":2,"port":9224,"pid":1234}
+"#;
+        validate_multi_worker_ready_record(valid, 2, 9_224, 1_234).unwrap();
+
+        for invalid in [
+            br#"{"protocol":"obscura-multi-worker-control","version":1,"event":"ready","worker":3,"port":9224,"pid":1234}
+"#.as_slice(),
+            br#"{"protocol":"obscura-multi-worker-control","version":1,"event":"ready","worker":2,"port":9225,"pid":1234}
+"#.as_slice(),
+            br#"{"protocol":"obscura-multi-worker-control","version":1,"event":"ready","worker":2,"port":9224,"pid":9999}
+"#.as_slice(),
+            br#"{"protocol":"obscura-multi-worker-control","version":1,"event":"ready","worker":2,"port":9224,"pid":1234,"extra":true}
+"#.as_slice(),
+            br#"{"protocol":"obscura-multi-worker-control","version":1,"event":"ready","worker":2,"port":9224,"pid":1234}"#.as_slice(),
+        ] {
+            assert!(validate_multi_worker_ready_record(invalid, 2, 9_224, 1_234).is_err());
+        }
+
+        let oversized = vec![b'x'; MULTI_WORKER_CONTROL_LINE_LIMIT as usize + 1];
+        assert!(validate_multi_worker_ready_record(&oversized, 2, 9_224, 1_234).is_err());
+    }
+
+    #[test]
+    fn multi_worker_child_command_propagates_runtime_options_without_secret_argv() {
+        let access = CdpServeAccess {
+            allowed_hosts: vec!["public.example:9443".into()],
+            allowed_origins: vec!["https://console.example".into()],
+            bearer_token: Some("complete-token-secret".into()),
+            advertised_websocket_url: Some("wss://public.example/cdp".into()),
+            allow_unauthenticated_remote: false,
+        };
+        let mut command = std::process::Command::new("obscura");
+        configure_multi_worker_child_command(
+            &mut command,
+            "--max-old-space-size=1024 --expose-gc",
+            true,
+            true,
+            2,
+            9_224,
+            7,
+            true,
+            true,
+            r#"{"persona_id":"complete-persona"}"#,
+            Some("http://user:complete-proxy-secret@gate.example:8080"),
+            &access,
+            &[std::path::PathBuf::from("/complete/fonts")],
+        );
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--v8-flags",
+                "--max-old-space-size=1024 --expose-gc",
+                "--verbose",
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9224",
+                "--workers",
+                "1",
+                "--max-connections",
+                "7",
+                "--supervised-worker",
+                "2",
+                "--quiet",
+                "--allow-file-access",
+                "--allow-private-network",
+                "--allow-host",
+                "public.example:9443",
+                "--allow-origin",
+                "https://console.example",
+                "--advertise-websocket-url",
+                "wss://public.example/cdp",
+                "--font-dir",
+                "/complete/fonts",
+            ]
+        );
+        let argv = args.join(" ");
+        assert!(!argv.contains("complete-token-secret"));
+        assert!(!argv.contains("complete-proxy-secret"));
+
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(env["OBSCURA_CDP_TOKEN"].as_deref(), Some("complete-token-secret"));
+        assert_eq!(
+            env["OBSCURA_PROXY"].as_deref(),
+            Some("http://user:complete-proxy-secret@gate.example:8080")
+        );
+        assert_eq!(
+            env["OBSCURA_PERSONA_JSON"].as_deref(),
+            Some(r#"{"persona_id":"complete-persona"}"#)
+        );
+        assert_eq!(env["OBSCURA_PERSONA"], None);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn silent_client_does_not_block_following_byte_transparent_relay() {
         let (worker_addr, mut worker_events, worker_task) = spawn_echo_worker().await;
-        let (relay_addr, relay_task) = spawn_test_relay(worker_addr, 2).await;
+        let (relay_addr, relay_shutdown, relay_task) = spawn_test_relay(worker_addr, 2).await;
 
         let silent = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
         assert_eq!(
@@ -2347,7 +3270,8 @@ mod tests {
         assert_eq!(echoed, payload);
 
         drop(silent);
-        relay_task.abort();
+        relay_shutdown.send(()).unwrap();
+        relay_task.await.unwrap().unwrap();
         worker_task.abort();
     }
 
@@ -2356,7 +3280,7 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let (worker_addr, mut worker_events, worker_task) = spawn_echo_worker().await;
-        let (relay_addr, relay_task) = spawn_test_relay(worker_addr, 2).await;
+        let (relay_addr, relay_shutdown, relay_task) = spawn_test_relay(worker_addr, 2).await;
         let first = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
         let second = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
         for _ in 0..2 {
@@ -2413,7 +3337,8 @@ mod tests {
         assert_eq!(recovered, b"recovered\x00\xff");
 
         drop(second);
-        relay_task.abort();
+        relay_shutdown.send(()).unwrap();
+        relay_task.await.unwrap().unwrap();
         worker_task.abort();
     }
 
@@ -2426,7 +3351,7 @@ mod tests {
             .unwrap();
         let worker_addr = reservation.local_addr().unwrap();
         drop(reservation);
-        let (relay_addr, relay_task) = spawn_test_relay(worker_addr, 1).await;
+        let (relay_addr, relay_shutdown, relay_task) = spawn_test_relay(worker_addr, 1).await;
 
         let request = b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         let mut first = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
@@ -2456,7 +3381,8 @@ mod tests {
         .expect("worker connect failure must release the relay permit");
         assert_eq!(recovered, b"after-502");
 
-        relay_task.abort();
+        relay_shutdown.send(()).unwrap();
+        relay_task.await.unwrap().unwrap();
         worker_task.abort();
     }
 
