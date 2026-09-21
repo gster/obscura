@@ -84,7 +84,7 @@ fn watchdog_loop(s: Arc<Shared>) {
 
 /// Handle to an armed command; pass to [`disarm`].
 pub struct Armed {
-    gen: u64,
+    gen: Option<u64>,
     fired: Arc<AtomicBool>,
 }
 
@@ -111,17 +111,59 @@ pub fn arm_until(handle: IsolateHandle, deadline: Instant) -> Armed {
         },
     );
     s.cv.notify_one();
-    Armed { gen, fired }
+    Armed { gen: Some(gen), fired }
 }
 
 /// Disarm the command's watchdog. Returns true if it had already fired
 /// (terminated the isolate), in which case the caller must clear the V8
 /// termination flag before the next command runs.
-pub fn disarm(armed: Armed) -> bool {
-    let s = shared();
-    let mut guard = s.state.lock().unwrap();
-    guard.0.remove(&armed.gen);
-    // Wake the worker so it recomputes its sleep if we removed the nearest slot.
-    s.cv.notify_one();
+pub fn disarm(mut armed: Armed) -> bool {
+    armed.remove_slot();
     armed.fired.load(Ordering::SeqCst)
+}
+
+impl Armed {
+    fn remove_slot(&mut self) {
+        let Some(gen) = self.gen.take() else {
+            return;
+        };
+        let s = shared();
+        let mut guard = s.state.lock().unwrap();
+        guard.0.remove(&gen);
+        // Wake the worker so it recomputes its sleep if we removed the nearest slot.
+        s.cv.notify_one();
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        // Dispatch futures can be cancelled and malformed methods can return
+        // early. Never leave a detached slot which may terminate a reused or
+        // already-dropped isolate at the old deadline.
+        self.remove_slot();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dropping_armed_watchdog_removes_its_future_termination() {
+        let mut runtime = crate::runtime::ObscuraJsRuntime::new(
+            obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        );
+        let watchdog = super::arm(
+            runtime.isolate_handle(),
+            std::time::Duration::from_millis(50),
+        );
+        drop(watchdog);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            runtime
+                .execute_script("after-dropped-watchdog", "globalThis.ok = true")
+                .is_ok(),
+            "a dropped watchdog must not terminate later work"
+        );
+    }
 }

@@ -1,4 +1,5 @@
 pub mod cdp_watchdog;
+pub mod execution_cancellation;
 pub mod frame;
 mod import_map;
 pub mod markdown;

@@ -280,6 +280,7 @@ pub struct Page {
     /// purpose: a realm holds a V8 handle into that isolate, and fields drop in
     /// declaration order, so the frames must go first.
     pub frames: Vec<FrameRealm>,
+    execution_cancellation: Option<obscura_js::execution_cancellation::ExecutionCancellation>,
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
@@ -1166,6 +1167,7 @@ impl Page {
             url: None,
             dom: None,
             frames: Vec::new(),
+            execution_cancellation: None,
             js: None,
             lifecycle: LifecycleState::Idle,
             http_client,
@@ -1215,6 +1217,18 @@ impl Page {
     /// not set it retain the existing environment-configurable 30s default.
     pub fn set_navigation_timeout(&mut self, timeout: std::time::Duration) {
         self.navigation_timeout = Some(timeout);
+    }
+
+    /// Attach every current and future document runtime to its owning
+    /// connection's sticky cancellation source.
+    pub fn set_execution_cancellation(
+        &mut self,
+        cancellation: Option<obscura_js::execution_cancellation::ExecutionCancellation>,
+    ) {
+        self.execution_cancellation = cancellation.clone();
+        if let Some(js) = self.js.as_mut() {
+            js.set_execution_cancellation(cancellation);
+        }
     }
 
     /// Return the effective end-to-end navigation deadline for this page.
@@ -1807,6 +1821,7 @@ impl Page {
             self.context.proxy_url.clone(),
             self.context.persona().clone(),
         );
+        rt.set_execution_cancellation(self.execution_cancellation.clone());
         self.network_document_generation += 1;
         rt.set_network_observation_context(self.network_document_generation, self.url_string(), self.network_teardown_events.clone(), self.network_teardown_notify.clone());
         rt.set_network_response_body_store(self.response_bodies.clone(), self.js_response_body_counter.clone());

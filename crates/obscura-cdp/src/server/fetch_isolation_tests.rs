@@ -114,7 +114,12 @@ async fn client() -> (Client, tokio::task::JoinHandle<()>) {
     let context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
         "multi-page-pause".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,
     ));
-    let processor = tokio::task::spawn_local(cdp_processor(rx, context, Arc::new(Notify::new())));
+    let processor = tokio::task::spawn_local(cdp_processor(
+        rx,
+        context,
+        Arc::new(Notify::new()),
+        obscura_js::execution_cancellation::ExecutionCancellation::default(),
+    ));
     tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
     let mut client = Client { tx, replies, reply_tx, events: Vec::new(), id: 0 };
     assert_eq!(client.recv().await["__init"], true);

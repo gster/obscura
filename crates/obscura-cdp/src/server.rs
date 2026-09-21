@@ -53,8 +53,9 @@ const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 const OUTBOUND_SEND_TIMEOUT_MS: u64 = 10_000;
 
 // Give a processor whose input side just closed a short opportunity to abort
-// Fetch pauses and drop its owned pages before the connection thread tears
-// down the LocalSet. Synchronous V8 work remains bounded by its own watchdog.
+// Fetch pauses and drop its owned pages. A separate abort handle then cancels
+// async navigation/network waits; synchronous V8 is interrupted immediately by
+// the connection execution cancellation source.
 const CONNECTION_PROCESSOR_DRAIN_MS: u64 = 1_000;
 
 // Sent to a client that arrives while the server is at `max_connections`, in
@@ -613,12 +614,11 @@ fn release_idle_connection_memory() {
     }
 }
 
-/// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
-/// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
-/// `CdpContext` and pages) and its frame reader. Confining a connection's pages
-/// to one thread is what removes the #430 abort; the interception handshake and
-/// the nav `spawn_local` all stay on this one thread, so no cross-thread V8
-/// plumbing is needed.
+/// Run one connection with WebSocket I/O on the server runtime and all V8 work
+/// on a dedicated OS thread. The separation is required for disconnect
+/// cancellation: a synchronous V8 loop may pin the processor thread, but it can
+/// no longer starve the socket reader which observes FIN/RST and terminates the
+/// connection's active isolate through its thread-safe handle.
 fn run_connection(
     std_stream: std::net::TcpStream,
     context_template: Arc<obscura_browser::BrowserContext>,
@@ -645,10 +645,27 @@ fn run_connection(
         }
     }
 
+    let (msg_tx, msg_rx) = inbound::channel::<ServerMessage>();
+    let execution_cancellation = obscura_js::execution_cancellation::ExecutionCancellation::default();
+    let processor_cancellation = execution_cancellation.clone();
+    let io_cancellation = execution_cancellation.clone();
+    let processor_shutdown = shutdown_notify.clone();
+    let io_shutdown = shutdown_notify;
+    let (processor_abort_tx, processor_abort_rx) = std::sync::mpsc::sync_channel(1);
+    let (processor_done_tx, processor_done_rx) = tokio::sync::oneshot::channel();
     let slot = live_connections.clone();
     let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
         .spawn(move || {
+            struct DoneGuard(Option<tokio::sync::oneshot::Sender<()>>);
+            impl Drop for DoneGuard {
+                fn drop(&mut self) {
+                    if let Some(sender) = self.0.take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+            let _done_guard = DoneGuard(Some(processor_done_tx));
             let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(
                 context_template.isolated_copy("default".to_string(), true),
@@ -662,40 +679,20 @@ fn run_connection(
                 Ok(r) => r,
                 Err(e) => {
                     error!("connection runtime build failed: {}", e);
+                    let _ = processor_abort_tx.send(None);
                     return;
                 }
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let tokio_stream = match TcpStream::from_std(std_stream) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("TcpStream::from_std failed: {}", e);
-                        return;
-                    }
-                };
-                let (msg_tx, msg_rx) = inbound::channel::<ServerMessage>();
-                let mut processor = tokio::task::spawn_local(cdp_processor(
+                let processor = tokio::task::spawn_local(cdp_processor(
                     msg_rx,
                     default_context,
-                    shutdown_notify,
+                    processor_shutdown,
+                    processor_cancellation,
                 ));
-                if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
-                    error!("WebSocket connection error: {}", e);
-                }
-                // Dropping the handler's input sender closes the processor
-                // channel. Let it run its Fetch-pause cleanup before using
-                // abort as a bounded backstop for an in-flight operation.
-                if tokio::time::timeout(
-                    tokio::time::Duration::from_millis(CONNECTION_PROCESSOR_DRAIN_MS),
-                    &mut processor,
-                )
-                .await
-                .is_err()
-                {
-                    processor.abort();
-                    let _ = processor.await;
-                }
+                let _ = processor_abort_tx.send(Some(processor.abort_handle()));
+                let _ = processor.await;
             });
 
             // `LocalSet` owns any detached local navigation tasks, and the
@@ -726,8 +723,74 @@ fn run_connection(
     // reserved slot here or the cap drifts down on every failed spawn.
     if let Err(e) = spawned {
         error!("connection thread spawn failed: {}", e);
+        execution_cancellation.cancel();
         live_connections.fetch_sub(1, Ordering::AcqRel);
+        refuse_connection(std_stream);
+        return;
     }
+
+    let processor_abort = match processor_abort_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        Ok(Some(abort)) => abort,
+        Ok(None) | Err(_) => {
+            error!("connection processor failed to initialize");
+            execution_cancellation.cancel();
+            refuse_connection(std_stream);
+            return;
+        }
+    };
+
+    // This task never enters V8. Its drop guard covers server-runtime shutdown
+    // and task cancellation in addition to the explicit WebSocket exit paths.
+    tokio::spawn(async move {
+        struct TeardownOnDrop {
+            cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
+            processor_abort: tokio::task::AbortHandle,
+            armed: bool,
+        }
+        impl Drop for TeardownOnDrop {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.cancellation.cancel();
+                    self.processor_abort.abort();
+                }
+            }
+        }
+        let mut teardown = TeardownOnDrop {
+            cancellation: io_cancellation,
+            processor_abort,
+            armed: true,
+        };
+        let tokio_stream = match TcpStream::from_std(std_stream) {
+            Ok(stream) => stream,
+            Err(error) => {
+                error!("TcpStream::from_std failed: {}", error);
+                return;
+            }
+        };
+        let handler_tx = msg_tx.clone();
+        tokio::select! {
+            result = handle_connection_ws(tokio_stream, handler_tx) => {
+                if let Err(error) = result {
+                    error!("WebSocket connection error: {}", error);
+                }
+            }
+            _ = io_shutdown.notified() => {
+                info!("Shutdown signal received (WebSocket connection)");
+            }
+        }
+        teardown.cancellation.cancel();
+        drop(msg_tx);
+        if tokio::time::timeout(
+            tokio::time::Duration::from_millis(CONNECTION_PROCESSOR_DRAIN_MS),
+            processor_done_rx,
+        )
+        .await
+        .is_err()
+        {
+            teardown.processor_abort.abort();
+        }
+        teardown.armed = false;
+    });
 }
 
 /// Turn away a connection that arrived while the server was at its limit.
@@ -933,8 +996,10 @@ async fn cdp_processor(
     mut rx: ServerMessageReceiver,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
+    execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
 ) {
     let mut ctx = CdpContext::new_with_shared_context(default_context);
+    ctx.execution_cancellation = Some(execution_cancellation);
     let (itx, irx) = mpsc::unbounded_channel::<crate::domains::fetch::RoutedInterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<crate::domains::fetch::RoutedInterceptedRequest>> = Some(irx);
@@ -2246,7 +2311,7 @@ async fn handle_connection_ws(
     }
 
     let writer_reply_tx = reply_tx.clone();
-    let mut send_task = tokio::task::spawn_local(async move {
+    let mut send_task = tokio::spawn(async move {
         while let Some(envelope) = reply_rx.recv().await {
             if envelope.as_str().contains("\"__init\"") {
                 continue;
@@ -2273,6 +2338,13 @@ async fn handle_connection_ws(
             }
         }
     });
+    struct AbortTaskOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortTaskOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _send_task_abort = AbortTaskOnDrop(send_task.abort_handle());
 
     let mut writer_joined = false;
     loop {
@@ -2476,6 +2548,7 @@ pub(crate) mod tests {
                     server_rx,
                     default_context,
                     shutdown,
+                    obscura_js::execution_cancellation::ExecutionCancellation::default(),
                 ));
 
                 server_tx
@@ -2634,6 +2707,62 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_connection_handler_aborts_detached_writer() {
+        use futures_util::StreamExt as _;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (server_tx, mut server_rx) = crate::inbound::channel();
+
+                let processor = tokio::task::spawn_local(async move {
+                    if let Some(message) = server_rx.recv().await {
+                        let super::ServerMessage::NewConnection { reply_tx } = message.into_parts().0 else {
+                            panic!("first message must initialize the connection");
+                        };
+                        reply_tx.send(json!({"__init": true}).to_string()).unwrap();
+                    }
+                    while server_rx.recv().await.is_some() {}
+                });
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    super::handle_connection_ws(stream, server_tx).await
+                });
+
+                let (mut client, _) = tokio_tungstenite::connect_async(
+                    format!("ws://{address}/devtools/browser"),
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                server.abort();
+                let _ = server.await;
+
+                let closed = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.next(),
+                )
+                .await
+                .expect("client socket remained open after handler cancellation");
+                assert!(
+                    matches!(
+                        &closed,
+                        None
+                            | Some(Err(_))
+                            | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                    ),
+                    "cancelled handler must not leave its writer/socket alive: {closed:?}"
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor sender stayed alive after handler cancellation")
+                    .expect("mock processor task");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn websocket_inbound_overflow_closes_without_queueing_the_later_command() {
         use futures_util::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::Message;
@@ -2735,6 +2864,7 @@ pub(crate) mod tests {
                     server_rx,
                     default_context,
                     shutdown,
+                    obscura_js::execution_cancellation::ExecutionCancellation::default(),
                 ));
 
                 server_tx

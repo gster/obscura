@@ -18,6 +18,7 @@ use crate::worker_queue::{self as queue, Size};
 pub struct WorkerRegistry {
     pub(crate) resources: std::sync::Arc<queue::Resources>,
     policy: std::sync::Arc<std::sync::Mutex<WorkerPolicy>>,
+    pub(crate) execution_cancellation: Option<crate::execution_cancellation::ExecutionCancellation>,
     pub next_id: u32,
     pub workers: HashMap<u32, WorkerInstance>,
 }
@@ -223,6 +224,7 @@ struct WorkerConfig {
     in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     console_enabled: bool,
     runtime_events_enabled: bool,
+    execution_cancellation: Option<crate::execution_cancellation::ExecutionCancellation>,
 }
 
 fn exception_text(
@@ -916,6 +918,7 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         response_bodies: parent.network_response_bodies.clone(),
         in_flight: parent.page_in_flight.clone(), console_enabled: parent.console_messages_enabled,
         runtime_events_enabled: parent.runtime_events_enabled,
+        execution_cancellation: registry.borrow().execution_cancellation.clone(),
     };
     drop(parent);
     let (commands, command_rx) = queue::channel(resources.clone());
@@ -946,6 +949,7 @@ async fn run_worker(id: u32, config: WorkerConfig,
         None,
         config.persona.clone(),
     );
+    rt.set_execution_cancellation(config.execution_cancellation.clone());
     {
         let mut handle = control.isolate.lock().unwrap();
         *handle = Some(rt.isolate_handle());

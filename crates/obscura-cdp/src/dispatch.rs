@@ -133,6 +133,9 @@ pub struct CdpContext {
     /// process-wide lock, so connections run in parallel (measured ~2x at
     /// concurrency 2, ~3x at 4) instead of serializing all V8 on one mutex.
     pub v8_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Sticky disconnect cancellation shared by every runtime this connection
+    /// creates. Direct embedder contexts leave this unset.
+    pub(crate) execution_cancellation: Option<obscura_js::execution_cancellation::ExecutionCancellation>,
 }
 
 impl CdpContext {
@@ -212,6 +215,7 @@ impl CdpContext {
             page_isolated_worlds: HashMap::new(),
             io_streams: crate::domains::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
+            execution_cancellation: None,
         }
     }
 
@@ -268,6 +272,7 @@ impl CdpContext {
         self.page_counter += 1;
         let page_id = format!("page-{}", self.page_counter);
         let mut page = Page::new(page_id.clone(), context);
+        page.set_execution_cancellation(self.execution_cancellation.clone());
         page.navigate_blank();
         self.pages.push(page);
         self.current_loader_ids
