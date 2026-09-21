@@ -40,7 +40,7 @@ V8 相关测试按项目要求使用 nextest 的进程隔离。当前测试覆�
 
 当前已确认的缺口包括 Beacon 空成功、部分 CDP 域占位成功、对象检查副作用、localStorage 未落盘，以及 Cookie 的完整 SameSite/分区资格仍未完成。Southwest 的历史成功样本不能覆盖后续 403，当前没有可宣称恢复的现场证据。详见 [核验摘要](docs/SUMMARY.md)。
 
-CDP 是高权限控制接口，当前没有内建鉴权；默认保持 loopback。V8 在进程内执行，watchdog 不替代 OS 隔离。[安全边界](SECURITY.md)与[部署说明](docs/Run-in-production-at-scale.md)描述现有保护和限制。
+CDP 是高权限控制接口。默认保持 loopback，并对 discovery 与 WebSocket 同时执行精确 Host/Origin 策略；可通过 token 文件或 `OBSCURA_CDP_TOKEN` 启用 Bearer 鉴权。非 loopback 默认要求显式 Host allowlist 和 token，除非明确选择只适用于已有外部鉴权边界的危险豁免。V8 在进程内执行，watchdog 不替代 OS 隔离。[安全边界](SECURITY.md)与[部署说明](docs/Run-in-production-at-scale.md)描述现有保护和限制。
 
 ## 文档
 

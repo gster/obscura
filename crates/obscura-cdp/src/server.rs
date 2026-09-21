@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
+use crate::access::{AccessFailure, AuthorizedRequest, CdpAccessOptions, CdpAccessPolicy, RequestRoute};
 use crate::dispatch::{self, CdpContext};
 use crate::inbound::{self, Envelope as InboundEnvelope};
 use crate::outbound::{CloseReason as OutboundCloseReason, OutboundSender};
@@ -219,6 +220,35 @@ pub async fn start_with_serve_options_and_limit(
     max_connections: usize,
     persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
+    start_with_serve_options_access_and_limit(
+        port,
+        host,
+        proxy,
+        allow_file_access,
+        storage_dir,
+        allow_private_network,
+        max_connections,
+        CdpAccessOptions::default(),
+        persona,
+    )
+    .await
+}
+
+/// As `start_with_serve_options_and_limit`, with an explicit CDP ingress
+/// policy. The policy gates discovery and WebSocket requests on the accept
+/// thread before they consume a live-connection slot or create V8 state.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_with_serve_options_access_and_limit(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+    max_connections: usize,
+    access_options: CdpAccessOptions,
+    persona: obscura_net::EffectivePersona,
+) -> anyhow::Result<()> {
     obscura_net::activate_process_persona(&persona)?;
     let ip: std::net::IpAddr = host
         .parse()
@@ -234,17 +264,19 @@ pub async fn start_with_serve_options_and_limit(
     // forwarded to the existing LocalSet for CDP processing.
     let std_listener = std::net::TcpListener::bind(addr)
         .map_err(|e| anyhow::anyhow!("bind {}:{}: {}", host, port, e))?;
+    let actual_addr = std_listener
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("read bound CDP address: {}", e))?;
+    let actual_port = actual_addr.port();
+    let access_policy = Arc::new(access_options.compile(ip, actual_port)?);
     // Non-blocking so the accept thread can alternate between draining the
     // backlog and re-polling parked connections (see the accept thread below).
     std_listener
         .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
 
-    info!("Obscura CDP server listening on ws://{}:{}", host, port);
-    info!(
-        "DevTools endpoint: ws://{}:{}/devtools/browser",
-        host, port
-    );
+    info!("Obscura CDP server listening on ws://{}", actual_addr);
+    info!("DevTools endpoint: ws://{}/devtools/browser", actual_addr);
     if allow_file_access {
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
@@ -278,6 +310,7 @@ pub async fn start_with_serve_options_and_limit(
     // under a connection burst.
     let accept_flag = shutdown_flag.clone();
     let accept_persona = persona.clone();
+    let accept_access_policy = access_policy.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -333,8 +366,20 @@ pub async fn start_with_serve_options_and_limit(
                     match peek_request_head(&stream) {
                         PeekStatus::NotReady => pending.push((stream, since)),
                         PeekStatus::Closed => {}
+                        PeekStatus::TooLarge => {
+                            reject_http(
+                                stream,
+                                &AccessFailure::request_header_fields_too_large().response(),
+                            );
+                        }
                         PeekStatus::Head(head) => {
-                            if let Err(e) = accept_dispatch(stream, port, &ws_tx, &head, &accept_persona) {
+                            if let Err(e) = accept_dispatch(
+                                stream,
+                                &ws_tx,
+                                &head,
+                                &accept_access_policy,
+                                &accept_persona,
+                            ) {
                                 if !format!("{}", e).contains("close") {
                                     error!("Accept dispatch error: {}", e);
                                 }
@@ -690,6 +735,12 @@ fn run_connection(
 /// Best-effort: the socket is going away either way, so a failed write just
 /// means the client sees a reset instead of the 503.
 fn refuse_connection(stream: std::net::TcpStream) {
+    reject_http(stream, CONNECTION_LIMIT_RESPONSE.as_bytes());
+}
+
+/// Consume the bounded request head and return a fixed, non-reflective HTTP
+/// response before closing the socket.
+fn reject_http(stream: std::net::TcpStream, response: &[u8]) {
     use std::io::{Read, Write};
     let mut stream = stream;
     let _ = stream.set_nonblocking(false);
@@ -712,7 +763,7 @@ fn refuse_connection(stream: std::net::TcpStream) {
             Err(_) => break,
         }
     }
-    let _ = stream.write_all(CONNECTION_LIMIT_RESPONSE.as_bytes());
+    let _ = stream.write_all(response);
     let _ = stream.flush();
     let _ = stream.shutdown(std::net::Shutdown::Write);
 }
@@ -741,15 +792,14 @@ enum PeekStatus {
     /// Peer went away without sending a full head.
     Closed,
     /// A classifiable request head.
-    Head(String),
+    Head(Vec<u8>),
+    /// The request head filled the admission buffer before its terminator.
+    TooLarge,
 }
 
 /// Peek — without consuming — at a freshly accepted connection's request
-/// head. `GET` requests are only classified once the terminating blank line
-/// has arrived, so `/json` route matching never sees a truncated head;
-/// anything that cannot be a `GET` is handed over immediately so non-HTTP
-/// garbage still gets tungstenite's prompt rejection instead of waiting out
-/// the silent-connection TTL.
+/// head. Every request is classified only after the terminating blank line
+/// arrives, so admission never parses a truncated or lossy request.
 fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
     let mut buf = [0u8; HTTP_PEEK_BUF];
     let n = match stream.peek(&mut buf) {
@@ -759,16 +809,13 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
         Err(_) => return PeekStatus::Closed,
     };
     let head = &buf[..n];
-    if n >= 4 && head[..4] != *b"GET " {
-        return PeekStatus::Head(String::from_utf8_lossy(head).into_owned());
+    if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+        return PeekStatus::Head(head[..end + 4].to_vec());
     }
-    // A head that overflows the peek buffer is classified with what arrived,
-    // matching the pre-polling behavior for oversized headers.
-    let complete = n == HTTP_PEEK_BUF || head.windows(4).any(|w| w == b"\r\n\r\n");
-    if !complete {
-        return PeekStatus::NotReady;
+    if n == HTTP_PEEK_BUF {
+        return PeekStatus::TooLarge;
     }
-    PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
+    PeekStatus::NotReady
 }
 
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
@@ -780,30 +827,31 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
 /// - WebSocket: forward to the LocalSet for CDP processing.
 fn accept_dispatch(
     stream: std::net::TcpStream,
-    port: u16,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
-    head: &str,
+    head: &[u8],
+    access_policy: &CdpAccessPolicy,
     persona: &obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
-    let endpoint = if head.contains("/json/version") {
-        Some("version")
-    } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
-        Some("list")
-    } else if head.contains("/json/protocol") {
-        Some("protocol")
-    } else {
-        None
+    let authorized = match access_policy.authorize(head) {
+        Ok(authorized) => authorized,
+        Err(rejection) => {
+            warn!("rejecting CDP admission: {}", rejection.reason);
+            reject_http(stream, &rejection.response());
+            return Ok(());
+        }
     };
 
-    if let Some(ep) = endpoint {
+    if authorized.route != RequestRoute::WebSocket {
         // The request head is already sitting in the kernel receive buffer;
         // switch back to blocking mode for the synchronous /json serve.
         let _ = stream.set_nonblocking(false);
-        return handle_http_json_blocking(stream, port, ep, head, persona);
+        return handle_http_json_blocking(
+            stream,
+            &authorized,
+            access_policy,
+            persona,
+        );
     }
-    // Fall through: GET request that isn't a /json endpoint → treat as
-    // WebSocket upgrade (Chromium DevTools clients issue GET with
-    // Upgrade: websocket).
 
     // Try to hand off the WS stream to the LocalSet. If the bounded channel
     // is full the LocalSet is saturated — drop the connection cleanly
@@ -825,69 +873,46 @@ fn accept_dispatch(
 /// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.
 fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
-    port: u16,
-    endpoint: &str,
-    request_head: &str,
+    request: &AuthorizedRequest,
+    access_policy: &CdpAccessPolicy,
     persona: &obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
     let mut buf = vec![0u8; 4096];
     let _ = stream.read(&mut buf)?;
-    let authority = websocket_authority(request_head, port);
 
-    let body = match endpoint {
-        "version" => serde_json::to_string_pretty(&json!({
+    let body = match request.route {
+        RequestRoute::Version => serde_json::to_string_pretty(&json!({
             "Browser": format!("Chrome/{}", persona.full_version()),
             "Protocol-Version": "1.3",
             "User-Agent": persona.user_agent(),
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
-            "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
+            "webSocketDebuggerUrl": request.websocket_url(access_policy, "/devtools/browser"),
         }))?,
-        "list" => serde_json::to_string_pretty(&json!([{
+        RequestRoute::List => serde_json::to_string_pretty(&json!([{
             "description": "",
             "devtoolsFrontendUrl": "",
             "id": "page-1",
             "title": "",
             "type": "page",
             "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://{}/devtools/page/page-1", authority),
+            "webSocketDebuggerUrl": request.websocket_url(access_policy, "/devtools/page/page-1"),
         }]))?,
-        "protocol" => {
+        RequestRoute::Protocol => {
             serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
         }
-        _ => "{}".to_string(),
+        RequestRoute::WebSocket => unreachable!("WebSocket routes are handed off"),
     };
 
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         body.len(), body,
     );
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
-}
-
-fn websocket_authority(request_head: &str, port: u16) -> String {
-    request_head
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
-        .map(|(_, value)| value.trim())
-        .filter(|value| {
-            let Ok(url) = url::Url::parse(&format!("http://{value}/")) else {
-                return false;
-            };
-            url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.path() == "/"
-                && url.query().is_none()
-                && url.fragment().is_none()
-        })
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("127.0.0.1:{port}"))
 }
 
 /// Per-connection CDP processor. Each connection runs its own processor (with
@@ -2348,7 +2373,7 @@ async fn handle_connection_ws(
 pub(crate) mod tests {
     use super::{
         browser_close_response, handle_fetch_resolution, is_navigate_method,
-        parse_cdp_headers, raw_header_bytes_to_cdp_string, websocket_authority, InterceptedPause,
+        parse_cdp_headers, raw_header_bytes_to_cdp_string, InterceptedPause,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
@@ -2683,18 +2708,6 @@ pub(crate) mod tests {
                 handler.await.unwrap().expect("connection handler");
             })
             .await;
-    }
-
-    #[test]
-    fn discovery_uses_the_client_facing_http_authority() {
-        let request = "GET /json/version HTTP/1.1\r\nhOsT: cdp.example.test:9222\r\n\r\n";
-        assert_eq!(
-            websocket_authority(request, 9223),
-            "cdp.example.test:9222"
-        );
-
-        let malformed = "GET /json/version HTTP/1.1\r\nHost: attacker.test/path\r\n\r\n";
-        assert_eq!(websocket_authority(malformed, 9223), "127.0.0.1:9223");
     }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {

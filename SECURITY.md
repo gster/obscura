@@ -48,6 +48,11 @@ security boundaries Obscura is meant to hold, and which are in scope:
 
 - **Egress / SSRF control.** Page content reaching loopback, RFC 1918, or
   link-local addresses without `--allow-private-network` being set.
+- **CDP control-plane admission.** Discovery and WebSocket upgrade enforce an
+  exact Host allowlist, browser Origin policy, and configured Bearer token
+  before CDP/V8 work begins. Non-loopback listeners require explicit Host and
+  token configuration unless the operator deliberately delegates
+  authentication to an outer boundary.
 - **Availability.** A page, script, or DOM structure that defeats the V8
   termination watchdog, the CLI hard deadline, or the panic guards and so hangs
   or aborts the process.
@@ -95,6 +100,9 @@ system isolation:
   of aborting the process inside V8's FFI frame; `panic = "unwind"` is pinned in
   the release profile.
 - The **default network egress policy** blocks private and loopback ranges.
+- The **default CDP listener** is loopback-only and accepts only its exact local
+  authorities; operators can configure Bearer authentication for local or
+  remote use.
 
 These measures protect availability and limit egress. They do **not** claim to
 contain a hostile page that achieves native code execution through a V8 exploit.

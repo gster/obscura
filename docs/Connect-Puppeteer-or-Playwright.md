@@ -42,6 +42,16 @@ Use `connect_over_cdp`, not `connect`. Playwright's `connect` speaks
 Playwright's own protocol, which Obscura does not implement. The qualified
 client version is pinned in [SUMMARY](SUMMARY.md).
 
+If CDP Bearer authentication is configured, use the official Python client's
+`headers` option:
+
+```python
+browser = await pw.chromium.connect_over_cdp(
+    "http://127.0.0.1:9222",
+    headers={"Authorization": f"Bearer {token}"},
+)
+```
+
 ## `waitUntil`
 
 Specify the client wait condition explicitly. Playwright defaults to `load` and

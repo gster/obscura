@@ -75,6 +75,20 @@ Per-command deadline for the CDP server. The dispatcher arms the V8 watchdog aro
 OBSCURA_CDP_COMMAND_TIMEOUT_MS=30000 obscura serve
 ```
 
+### `OBSCURA_CDP_TOKEN`
+
+Static Bearer token required by every CDP discovery and WebSocket request when
+configured. Use at least 32 visible ASCII bytes without whitespace. This is an
+alternative to `serve --auth-token-file`; configuring both is an error. The
+token is admission metadata: it is not placed in discovery URLs, logs, or CDP
+network events. Page-request Authorization headers remain complete in the
+normal observation pipeline.
+
+```bash
+OBSCURA_CDP_TOKEN='replace-with-at-least-32-visible-bytes' \
+  obscura --persona windows_chrome145 serve --port 9222
+```
+
 ### `OBSCURA_FETCH_TIMEOUT_MS`
 
 Request timeout for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads. Without it a request to a server that accepts the connection but never responds (including a CORS preflight) hangs forever and the XHR is stuck with no completion event. Default 30000 (30 seconds).

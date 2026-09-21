@@ -33,6 +33,20 @@ asyncio.run(main())
 Use `connect_over_cdp`, not `connect`. Playwright's `connect` speaks
 Playwright's own protocol, which Obscura does not implement.
 
+When the server has a CDP token, pass the same header through the official
+client. The header is used for both HTTP discovery and WebSocket upgrade:
+
+```python
+browser = await pw.chromium.connect_over_cdp(
+    "http://127.0.0.1:9222",
+    headers={"Authorization": f"Bearer {token}"},
+)
+```
+
+For browser-originated WebSocket clients, the `Origin` must match the validated
+Host or an explicit `--allow-origin`. This control is separate from page
+navigation and fetch SSRF policy.
+
 The remaining snippets assume `page`, `context`, and `browser` are inside the
 `main()` function above.
 

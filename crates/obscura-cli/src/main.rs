@@ -67,6 +67,30 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
+        /// Exact Host authorities accepted by the CDP control plane. Repeat
+        /// for reverse-proxy and alternate public authorities.
+        #[arg(long = "allow-host", value_name = "HOST[:PORT]")]
+        allowed_hosts: Vec<String>,
+
+        /// Additional browser Origin values accepted by the CDP control plane.
+        #[arg(long = "allow-origin", value_name = "ORIGIN")]
+        allowed_origins: Vec<String>,
+
+        /// Read the CDP Bearer token from this file. The
+        /// OBSCURA_CDP_TOKEN environment variable is the container-friendly
+        /// alternative; configuring both is an error.
+        #[arg(long, value_name = "FILE")]
+        auth_token_file: Option<std::path::PathBuf>,
+
+        /// Public root ws:// or wss:// URL returned by discovery endpoints.
+        #[arg(long, value_name = "WS_URL")]
+        advertise_websocket_url: Option<String>,
+
+        /// Permit a non-loopback listener without a Bearer token. Use only
+        /// behind a separately authenticated boundary.
+        #[arg(long)]
+        allow_unauthenticated_remote: bool,
+
         #[arg(long)]
         proxy: Option<String>,
 
@@ -215,7 +239,14 @@ enum DumpFormat {
     Cookies,
 }
 
-fn print_banner(port: u16) {
+fn print_banner(host: &str, port: u16) {
+    let authority = host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| match ip {
+            std::net::IpAddr::V4(ip) => format!("{ip}:{port}"),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+        })
+        .unwrap_or_else(|_| format!("{host}:{port}"));
     println!(
         r#"
    ____  _                              
@@ -226,11 +257,103 @@ fn print_banner(port: u16) {
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
   Headless Browser v{}
-  CDP server: ws://127.0.0.1:{}/devtools/browser
+  CDP server: ws://{}/devtools/browser
 "#,
         env!("OBSCURA_BUILD_VERSION"),
-        port
+        authority
     );
+}
+
+fn load_cdp_access_token(
+    token_file: Option<&std::path::Path>,
+) -> anyhow::Result<Option<String>> {
+    let environment = match std::env::var("OBSCURA_CDP_TOKEN") {
+        Ok(token) => Some(token),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("OBSCURA_CDP_TOKEN must be valid UTF-8")
+        }
+    };
+    if token_file.is_some() && environment.is_some() {
+        anyhow::bail!(
+            "configure the CDP token with either --auth-token-file or OBSCURA_CDP_TOKEN, not both"
+        );
+    }
+    if let Some(path) = token_file {
+        let mut token = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("read --auth-token-file: {error}"))?;
+        while token.ends_with(['\r', '\n']) {
+            token.pop();
+        }
+        return Ok(Some(token));
+    }
+    Ok(environment)
+}
+
+fn effective_cdp_allowed_hosts(
+    host: &str,
+    port: u16,
+    configured: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    if !configured.is_empty() {
+        return Ok(configured);
+    }
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid --host {host:?}: {error}"))?;
+    if !ip.is_loopback() {
+        return Ok(Vec::new());
+    }
+    // Leave loopback defaults unresolved when the OS chooses the port. The
+    // server compiles the policy after bind against the actual local address.
+    if port == 0 {
+        return Ok(Vec::new());
+    }
+    let direct = match ip {
+        std::net::IpAddr::V4(ip) => format!("{ip}:{port}"),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    };
+    Ok(vec![direct, format!("localhost:{port}")])
+}
+
+#[derive(Clone)]
+struct CdpServeAccess {
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    bearer_token: Option<String>,
+    advertised_websocket_url: Option<String>,
+    allow_unauthenticated_remote: bool,
+}
+
+impl CdpServeAccess {
+    fn options(&self) -> obscura_cdp::CdpAccessOptions {
+        obscura_cdp::CdpAccessOptions::new()
+            .with_allowed_hosts(self.allowed_hosts.clone())
+            .with_allowed_origins(self.allowed_origins.clone())
+            .with_bearer_token(self.bearer_token.clone())
+            .with_advertised_websocket_url(self.advertised_websocket_url.clone())
+            .allow_unauthenticated_remote(self.allow_unauthenticated_remote)
+    }
+
+    fn configure_worker(&self, command: &mut std::process::Command) {
+        match &self.bearer_token {
+            Some(token) => {
+                command.env("OBSCURA_CDP_TOKEN", token);
+            }
+            None => {
+                command.env_remove("OBSCURA_CDP_TOKEN");
+            }
+        }
+        for allowed_host in &self.allowed_hosts {
+            command.arg("--allow-host").arg(allowed_host);
+        }
+        for allowed_origin in &self.allowed_origins {
+            command.arg("--allow-origin").arg(allowed_origin);
+        }
+        if let Some(url) = &self.advertised_websocket_url {
+            command.arg("--advertise-websocket-url").arg(url);
+        }
+    }
 }
 
 fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
@@ -393,6 +516,11 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Serve {
             port,
             host,
+            allowed_hosts,
+            allowed_origins,
+            auth_token_file,
+            advertise_websocket_url,
+            allow_unauthenticated_remote,
             proxy,
             workers,
             max_connections,
@@ -401,6 +529,9 @@ async fn main() -> anyhow::Result<()> {
             font_dirs,
             quiet: _,
         }) => {
+            if workers > 1 && port == 0 {
+                anyhow::bail!("serve --workers greater than 1 requires a nonzero --port");
+            }
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
             // putting credentials on the command line. The multi-worker load
             // balancer passes the proxy to each worker this way (issue #366).
@@ -409,8 +540,19 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
+            let bearer_token = load_cdp_access_token(auth_token_file.as_deref())?;
+            let effective_allowed_hosts =
+                effective_cdp_allowed_hosts(&host, port, allowed_hosts)?;
+            let access = CdpServeAccess {
+                allowed_hosts: effective_allowed_hosts,
+                allowed_origins,
+                bearer_token,
+                advertised_websocket_url: advertise_websocket_url,
+                allow_unauthenticated_remote,
+            };
+            access.options().validate_for_bind(&host, port)?;
             configure_font_directories(&font_dirs)?;
-            print_banner(port);
+            print_banner(&host, port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -430,11 +572,13 @@ async fn main() -> anyhow::Result<()> {
                     workers,
                     proxy,
                     font_dirs,
+                    max_connections,
+                    access,
                     persona.clone(),
                 )
                 .await?;
             } else {
-                obscura_cdp::start_with_serve_options_and_limit(
+                obscura_cdp::start_with_serve_options_access_and_limit(
                     port,
                     &host,
                     proxy,
@@ -442,6 +586,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    access.options(),
                     persona.clone(),
                 )
                 .await?;
@@ -551,11 +696,24 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         None => {
-            print_banner(args.port);
+            print_banner("127.0.0.1", args.port);
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, persona).await?;
+            let access = obscura_cdp::CdpAccessOptions::new()
+                .with_bearer_token(load_cdp_access_token(None)?);
+            obscura_cdp::start_with_serve_options_access_and_limit(
+                args.port,
+                "127.0.0.1",
+                args.proxy,
+                false,
+                None,
+                false,
+                obscura_cdp::DEFAULT_MAX_CONNECTIONS,
+                access,
+                persona,
+            )
+            .await?;
         }
     }
 
@@ -568,6 +726,8 @@ async fn run_multi_worker_serve(
     workers: u16,
     proxy: Option<String>,
     font_dirs: Vec<std::path::PathBuf>,
+    max_connections: usize,
+    access: CdpServeAccess,
     persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
@@ -579,7 +739,11 @@ async fn run_multi_worker_serve(
     for i in 0..workers {
         let worker_port = port + 1 + i;
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        cmd.arg("serve")
+            .arg("--port")
+            .arg(worker_port.to_string())
+            .arg("--max-connections")
+            .arg(max_connections.to_string());
         // Internal workers must consume the already-compiled snapshot. An
         // inherited selector could otherwise win in resolve_persona and make
         // the child reread a preset or mutable JSON file.
@@ -592,11 +756,14 @@ async fn run_multi_worker_serve(
             // (issue #366). The worker's serve path reads this env as a fallback.
             cmd.env("OBSCURA_PROXY", p);
         }
+        access.configure_worker(&mut cmd);
         for directory in &font_dirs {
             cmd.arg("--font-dir").arg(directory);
         }
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        // Keep worker output attached to the supervisor so operational and
+        // failure evidence is not silently discarded in multi-worker mode.
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
 
         let child = cmd.spawn()?;
         tracing::info!("Worker {} on port {}", i + 1, worker_port);
@@ -1941,6 +2108,7 @@ fn dump_assets(page: &Page) -> String {
 mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
+        effective_cdp_allowed_hosts,
         extract_readable_text, fetch_original_bytes, fetch_process_hard_timeout,
         is_quiet_command, link_kind_from_rel,
         merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
@@ -2052,6 +2220,58 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn serve_access_flags_and_loopback_hosts_are_explicit() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "serve",
+            "--allow-host",
+            "cdp.example.test:443",
+            "--allow-origin",
+            "https://cdp.example.test",
+            "--auth-token-file",
+            "/run/secrets/cdp-token",
+            "--advertise-websocket-url",
+            "wss://cdp.example.test",
+        ])
+        .unwrap();
+        let Some(Command::Serve {
+            allowed_hosts,
+            allowed_origins,
+            auth_token_file,
+            advertise_websocket_url,
+            ..
+        }) = args.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(allowed_hosts, ["cdp.example.test:443"]);
+        assert_eq!(allowed_origins, ["https://cdp.example.test"]);
+        assert_eq!(
+            auth_token_file.unwrap(),
+            std::path::PathBuf::from("/run/secrets/cdp-token")
+        );
+        assert_eq!(
+            advertise_websocket_url.as_deref(),
+            Some("wss://cdp.example.test")
+        );
+
+        assert_eq!(
+            effective_cdp_allowed_hosts("127.0.0.1", 9222, Vec::new()).unwrap(),
+            ["127.0.0.1:9222", "localhost:9222"]
+        );
+        assert!(
+            effective_cdp_allowed_hosts("0.0.0.0", 9222, Vec::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            effective_cdp_allowed_hosts("127.0.0.1", 0, Vec::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

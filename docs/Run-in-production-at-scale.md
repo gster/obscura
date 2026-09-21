@@ -101,26 +101,51 @@ docker run --memory=4g --cpus=2 ...
 Expose obscura on TLS through nginx or caddy:
 
 ```nginx
-location /obscura/ {
-  proxy_pass http://127.0.0.1:9222/;
+location / {
+  proxy_pass http://127.0.0.1:9222;
   proxy_http_version 1.1;
+  proxy_set_header Host cdp.example.com;
   proxy_set_header Upgrade $http_upgrade;
   proxy_set_header Connection "upgrade";
   proxy_read_timeout 86400;
 }
 ```
 
-CDP needs WebSocket upgrade and long read timeouts.
+CDP needs WebSocket upgrade and long read timeouts. Start the backend with the
+public and backend authorities it will actually receive, plus the public URL
+returned by discovery:
+
+```bash
+OBSCURA_CDP_TOKEN='replace-with-at-least-32-visible-bytes' \
+  obscura --persona windows_chrome145 serve \
+  --host 127.0.0.1 --port 9222 \
+  --allow-host cdp.example.com \
+  --allow-origin https://cdp.example.com \
+  --advertise-websocket-url wss://cdp.example.com
+```
+
+Forwarded headers are not trusted. The proxy must set exactly one configured
+Host. If it rewrites Host to the backend authority, list that exact authority
+instead. TLS should terminate at the proxy for remote Bearer use.
 
 ## Authentication
 
-Obscura's CDP server has no built-in auth. Anyone who can reach the port can drive the browser. Options:
+Obscura applies the same admission policy to discovery and WebSocket upgrade:
+exact Host allowlisting, same-origin or explicit Origin checks, and optional
+static Bearer authentication. The default loopback listener remains
+unauthenticated for local native clients. A non-loopback listener fails startup
+unless it has explicit `--allow-host` entries and a token from
+`--auth-token-file` or `OBSCURA_CDP_TOKEN`.
+
+Operational options:
 
 - Bind to `127.0.0.1` and require SSH for access (default).
-- Put it behind a reverse proxy that enforces auth.
+- Configure the built-in Bearer token and terminate TLS at a reverse proxy.
+- Add independent reverse-proxy authentication for defense in depth.
 - Use Docker network isolation.
 
-Never bind `0.0.0.0` on a public IP without one of the above.
+`--allow-unauthenticated-remote` is only for an already authenticated outer
+boundary. Never bind `0.0.0.0` on a public IP without authentication and TLS.
 
 ## MCP HTTP transport
 

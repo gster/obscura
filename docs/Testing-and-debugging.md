@@ -146,6 +146,21 @@ CDP server as described in [Use with Playwright](Use-with-Playwright.md). The
 private Python SDK and independent runtime are historical migration inputs and
 are no longer current test targets.
 
+For CDP access-policy changes, run the dedicated official-client and
+multi-worker gate with the pinned Playwright 1.60.0 environment:
+
+```bash
+tools/unblocked/.venv/bin/python3 tools/unblocked/cdp_access_smoke.py \
+  --obscura-bin target/release/obscura \
+  --output /tmp/ob034-access-smoke
+```
+
+It preserves exact HTTP request/response bytes, process stdout/stderr, the
+synthetic test token, and official-client observations without redaction. It
+checks single-worker refusal/status behavior, header propagation across
+discovery and WebSocket upgrade, and that direct access to a loopback worker
+cannot bypass Host or Bearer admission.
+
 The companion `obscura-benchmark` repository is separate. Check out a fixed revision, then execute from that repository with an absolute candidate path:
 
 ```bash

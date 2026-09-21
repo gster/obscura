@@ -65,6 +65,14 @@ Run the CDP server. The supported client path is official Playwright Python over
 ```
 -p, --port <PORT>            CDP port (default 9222)
     --host <HOST>            Bind host (default 127.0.0.1)
+    --allow-host <HOST[:PORT]>  Accepted CDP Host authority (repeatable)
+    --allow-origin <ORIGIN>  Additional accepted browser Origin (repeatable)
+    --auth-token-file <FILE> Read the CDP Bearer token from a file
+    --advertise-websocket-url <WS_URL>
+                             Public root ws:// or wss:// discovery URL
+    --allow-unauthenticated-remote
+                             Permit remote bind without a token; unsafe unless
+                             another authenticated boundary protects it
     --proxy <URL>            HTTP or SOCKS5 proxy
     --workers <N>            Worker processes (default 1)
     --max-connections <N>    Maximum simultaneous CDP connections (default 128)
@@ -76,7 +84,18 @@ Run the CDP server. The supported client path is official Playwright Python over
 -v, --verbose                Enable info logging
 ```
 
-Default endpoint is `ws://127.0.0.1:9222`.
+Default endpoint is `ws://127.0.0.1:9222`. Loopback accepts only the exact
+listener authority (plus `localhost` at the same port). Native clients may omit
+`Origin`; a supplied Origin must be same-origin or listed by `--allow-origin`.
+Non-loopback binds require at least one `--allow-host` and, by default, a token
+from `--auth-token-file` or `OBSCURA_CDP_TOKEN`. These ingress controls are
+independent of outbound `--allow-private-network`. Host authorities are exact:
+if an allowlist entry includes a port, the request Host must include that port;
+an entry without a port matches only a Host without a port.
+
+The exact HTTP discovery routes are `/json`, `/json/`, `/json/list`,
+`/json/version`, `/json/version/` (used by Playwright 1.60), and
+`/json/protocol`. Query-bearing and substring-lookalike routes are rejected.
 
 ## `obscura scrape [URLS]...`
 
