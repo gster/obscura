@@ -5,12 +5,16 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`875f16692ca95faf64d4498669b8a7ac94a75eef`，`Cancel active CDP execution on server termination`；其实现基线为 `757e8a0ab636bd51b0f43b7c4d85e4c0d666b947`。
-- 该实现提交已推送到 `origin/main`；本交接更新提交完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
+- 最近完成的实现提交：`bc0d557edba3e49a6066da6ec887571dd5236f4e`，`Qualify CDP admission and Worker teardown`；其实现基线为 `4b1af1a28fbb401f09453a4a5664bef4a3a30d21`。
+- 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
 - 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
 
 ## 最近完成的阶段
+
+OB-034 的 server admission 与 Worker terminal-boundary 资格切片已移除此前两处推断。main/iframe 在 active 同步循环后发出的 id=3 只有在真实 WebSocket reader 成功调用 inbound `send` 后才由 per-server test observer 确认；outer I/O abort、sticky server shutdown 和真实 writer 两类终止源都等待该 barrier，再断言 queued marker 未执行。Dedicated Worker 则通过 connection-local thread registration 从 1 到 0，直接证明 runtime/lease 已释放、completion handoff 已尝试且 closure 到达 terminal return boundary；这不是 OS thread join 声明。
+
+真实 loopback TCP writer 的 server write-half failure 与小 buffer/non-reading client backpressure timeout 现各自覆盖 main、iframe、active Worker。main/iframe 在 8 MiB 合法响应已排入 writer 后进入同步循环并将后续命令准确入队；Worker 先以 `postMessage` 和 thread count 证明活跃。每项同时核对精确 terminal reason、新 writer 日志、socket close、slot 与 Worker lifecycle 回收。本机聚焦 render 为 CDP 4/4 加 Worker 1/1，no-render 为合并 5/5；Astra light 在推动修复 owner-alive 计数等待竞态后复核为 0 blocker、0 major、0 minor。该结果不外推到其他产品平台，OB-034 仍开放。
 
 OB-034 的 server-side terminal-source 现把 writer I/O failure、writer timeout、server shutdown 与 outer I/O task cancellation 连接到同一 connection-local sticky cancellation。生产默认仍是 10 秒 writer/flush deadline；私有测试 policy 只缩短 deadline 并被动回报终态，不暴露产品配置。真实 loopback TCP 用例在 active Dedicated Worker 存活时分别用 server socket `shutdown(Write)` 和小 TCP buffer + 不读客户端 + 8 MiB 合法响应制造 `WriterIo` 与 `WriterTimeout`，同时核对完整 writer 日志、socket 关闭和 slot 回收。原受控 `Sink` 用例保留为 unit helper，不再称作 wire 资格。
 
@@ -71,6 +75,10 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 该阶段只修复 native passive callback ownership。callback panic 仍未隔离；CDP 多 session `Network.enable` subscription/fanout 已由最新阶段完成，但上游 JS/Worker 4096 oldest-drop、持久 observation history 或请求正文保留仍未解决。
 
 ## 验证结果
+
+- 最新 admission/Worker terminal-boundary 切片聚焦 release nextest 在 render/no-render 下均为 5/5（runs `f7b25746-13fc-4ac6-8711-a9ec88f7ba13`、`d49e1e5a-9876-4bd7-9243-25c487833e8a`）；render CDP 全量 371/371、3 skipped（run `37b79f7e-ad15-48da-a42c-f9f62d6cbeec`），no-render 排除既有 render-only `input_key_event_escaping` binary 后 308/308、3 skipped（run `a21a55a9-05ad-4bd2-b800-02201138d56b`）。
+- 根 release/render nextest 为 2311/2311、4 skipped（run `01fb85ca-4e2a-4bfc-bca2-c22efdc5eb82`）；exact render 与 no-default-features CLI build 均成功。最终 render SHA-256 `ea23d498afe9988536ed1860012a5c4e550e9c89e0fd6fad1a73a0947dcecee7`，120491552 bytes。
+- benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33；首次漏传必填 persona 的 0/33 配置失败原样保留。同一最终二进制通过官方 Playwright Python 1.60.0 smoke，完整原始协议日志匹配 37-method profile。Astra light 最终复核为 0 blocker、0 major、0 minor。
 
 - 最新真实 writer/Mio 切片聚焦 release nextest 在 render/no-render 下均为 6/6（runs `1caf4a9c-62d1-4467-b911-e66402ca4bdf`、`91614911-e7f3-4a16-944d-091bfd6d1621`）；render CDP 全量 371/371、3 skipped（run `4dd5d821-01f1-4dd7-98c4-b62ec2a8000f`），no-render 排除既有 render-only `input_key_event_escaping` binary 后 308/308、3 skipped（run `a9e5dfd0-73f7-49f6-a3cb-0a2247ed3077`）。
 - 根 release/render nextest 为 2311/2311、4 skipped（run `d7b1445e-1de4-43fb-960c-a249fd834813`）；exact render 与 no-default-features CLI build 均成功。最终 render SHA-256 `91931ebd5e54467c809c2d4522a8d35cf8bc96b17bb9136325baf437e3e2092b`，120471088 bytes。
@@ -139,7 +147,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 为 main/iframe 后续命令增加独立 server admission barrier，并为 server-side source 建立直接 Worker thread/lease 退出证据；需要产品资格的平台分别运行真实 writer 测试，不把本机 active-Worker 结果外推为跨平台或 writer source x 三 realm 全矩阵。
+1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
 2. 继续推进不与 silent-pending 上限耦合的实际 OS backlog burst、admission 前 TCP/kernel/container capacity 与剩余 input qualification；不要把 Mio 控制流回归或三层逻辑 payload 预算外推为总 RSS 上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
