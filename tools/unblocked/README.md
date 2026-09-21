@@ -180,6 +180,46 @@ records its assertions and errors in JSON. CI uploads the complete directory
 on success or failure and validates the combined regular-smoke and migration
 protocol inventory against the declared CDP profile.
 
+## Single-worker OS backlog qualification
+
+`cdp_capacity.py` qualifies the actual IPv4 loopback listen queue in front of
+one `obscura serve` worker on Darwin or Linux. It first proves discovery is
+ready, records a baseline host snapshot, and then sends `SIGSTOP` to the whole
+server process group. A concurrent TCP burst is released only after the stop is
+observed, so completed connections can remain only in the kernel listen queue,
+not in Obscura's accepted silent-pending queue. Each client sends a complete
+`/json/version` request while the process is stopped. The run passes only if
+the reported queue reaches its own platform capacity, some connect attempts
+observe timeout pressure, server FD count does not grow, every admitted request
+returns a complete HTTP 200 after `SIGCONT`, and queue/FD state recovers. A new
+WebSocket must then complete both the 101 upgrade and a raw
+`Browser.getVersion` CDP round trip.
+
+Use a release binary and a new output path outside the repository. The output
+path must not already exist:
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+python3 tools/unblocked/cdp_capacity.py \
+  --binary target/release/obscura \
+  --output "$RUN_ROOT/cdp-capacity" \
+  --burst 240
+```
+
+The runner retains every request, response, client result, host-command stdout
+and stderr stream, WebSocket frame, server stdout/stderr stream, exception
+traceback, and hash without redaction, truncation, or field removal. Connect,
+thread-start, snapshot, response-drain, and shutdown failures still close owned
+sockets, resume a stopped server before termination, and write the evidence
+manifest. The caller owns the output directory and decides when to remove it.
+
+The result is deliberately host-specific. It does not qualify the multi-worker
+supervisor, a container namespace or published-port proxy, total kernel TCP
+memory, a total RSS bound, silent-pending capacity, WebSocket handoff capacity,
+live connection slots, or any other operating system/kernel. A Linux run must
+be performed on Linux; a Darwin result cannot be copied into the release
+matrix. Windows lacks this SIGSTOP method and remains unqualified by this tool.
+
 ## Trace comparison
 
 Each successful mode writes one trace and `result.json` reports the first exact
