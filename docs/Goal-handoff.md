@@ -5,38 +5,38 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`09e577adb218b459a588880ac2a78f4b506c6cbc`，`Bound CDP inbound and pending events`。
+- 最近完成的实现提交：`b2dc8b7a1d400b0093f806b3be201ac99e460665`，`Secure CDP control-plane admission`。
 - 写入本交接前，该提交已在 `origin/main` 和本地主仓库 `main` 上对齐，相关工作树保持干净。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 相关实现入口：[`inbound.rs`](../crates/obscura-cdp/src/inbound.rs)、[`pending_events.rs`](../crates/obscura-cdp/src/pending_events.rs)、[`outbound.rs`](../crates/obscura-cdp/src/outbound.rs)、[`server.rs`](../crates/obscura-cdp/src/server.rs) 和 [Native execution](Native-execution.md)。
+- 相关实现入口：[`access.rs`](../crates/obscura-cdp/src/access.rs)、[`server.rs`](../crates/obscura-cdp/src/server.rs)、[`main.rs`](../crates/obscura-cli/src/main.rs)、[`cdp_access_smoke.py`](../tools/unblocked/cdp_access_smoke.py) 和 [Native execution](Native-execution.md)。
 
 ## 最近完成的阶段
 
-每个 CDP 连接的 inbound `ServerMessage` 现在最多接受 1024 条、128 MiB text 总量和 64 MiB 单消息，WebSocket 单 frame 为 16 MiB。reservation 持续穿过 channel、命令执行和 navigation deferred queue，不在 dequeue 时提前释放。
+CDP discovery 与 WebSocket upgrade 现在在 handoff、live connection slot 和 V8 前经过同一套 byte-level admission。HTTP 路由、Host authority、可选 Origin 与 Bearer 都按精确值处理；query 和 substring lookalike 不再落入其他处理路径，显式无效端口不会退化成无端口 Host。官方 Playwright 1.60 所需的 `/json/version/` 作为单独精确兼容路由保留。
 
-`CdpContext.pending_events` 现在最多保留 1024 条、128 MiB 完整 event envelope 序列化 UTF-8 bytes 和 80 MiB 单事件。counting writer 精确计数，批量 admission 全有或全无。inbound 或 pending 的首个 count/bytes/single-message/serialization 失败会 sticky close 同一连接，既有 accepted events 不会部分发送，后续命令也不再执行。malformed CDP 日志保留完整原始 text，pending event 转发与直接 serde JSON 逐字节一致。
+loopback 默认只允许实际监听端口的本机 authority，并兼容无 Origin、无 token 的 native client。配置 `OBSCURA_CDP_TOKEN` 或 `--auth-token-file` 后，默认无子命令、单 worker、多 worker balancer 与 direct worker 都要求同一 Bearer。non-loopback 默认还要求显式 Host allowlist；只有 `--allow-unauthenticated-remote` 才把鉴权责任明确交给外层边界。discovery 对外 ws/wss URL 与请求 Host 校验分开配置。
 
-inbound、pending events 和已有 outbound 是三个独立逻辑 payload 预算，不是 128 MiB 总连接内存或 RSS 上限。它们不覆盖 admission 前构造、容器 capacity、Tungstenite/TCP、上游 observation queue、响应正文、Host/Origin/auth 或同步 V8 中立即断连。公开 `CdpContext.pending_events` 从 `Vec<CdpEvent>` 改为只读 Vec-like `PendingEvents`，依赖具体 Vec 类型或可变迭代的低层调用方需要适配。
+访问策略只控制 CDP 入口，不改写或脱敏授权连接中的 page/CDP 原始数据，也不参与出站 SSRF。采集 smoke 为每次 readiness 尝试保留独立 request、已收到的 response bytes 和完整错误；异常或重试不覆盖前一份证据。inbound、pending events 与 outbound 的既有三个逻辑 payload 预算继续有效，但它们和本次 admission 都不是总连接内存或 RSS 上限；同步 V8 中立即断连等边界仍未完成。
 
 ## 验证结果
 
-- focused release/render nextest：12/12，run `948fdc7d-c690-47ac-bbf9-44437259bbd1`。
-- full release/render nextest：2203/2203，4 skipped，run `83dd6c65-38e4-4369-ad88-a25481d5566b`。
-- no-render transport 定向：24/24，run `22b925cc-8da5-4731-baa4-5505abf3f5e8`。
-- render build：SHA-256 `8a536e24acba04d23f1d61f7667b63bfa76cd6a2195e6eb20e88d7fe590b762b`，119396128 bytes。
-- no-render build：SHA-256 `838b7a33bda0c9e26216b5c09c02651c13702d7e28a242abb208b92a89d9ab9d`，77430944 bytes；随后恢复 render build，并核对到相同的冻结 hash。
+- focused release/render nextest：15/15，run `0888f887-84be-458f-91d9-3104047534d1`。
+- full release/render nextest：2214/2214，4 skipped，run `ed34dab5-c3a5-42a8-b53e-07706d8cc777`。
+- no-render access 定向：15/15，run `f399723d-7903-4037-9471-078edd93e070`。
+- render build：SHA-256 `6872b9d8e2e550ae03805695fdfa8df11814f1dc6eee470821a6aceb57d73afc`，119418656 bytes。
+- no-render build：SHA-256 `11aad4b682be83d7a68fef1d50aceac5bb94c263fbdbe92107e270fa4aeff457`，77529584 bytes；随后恢复 exact render build，并核对到相同的冻结 hash。
 - benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`：在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33，包括 `observer-intersection`。
-- 官方 Playwright Python 1.60.0 smoke 和三项 migration gate 通过，raw protocol 分别与 37-method profile 及合并 40-method profile 一致。
-- manifests 有效，Python 工具测试 51/51。
-- Standards、Spec 和 Astra light 最终独立审核均未发现阻塞项。
+- 官方 Playwright Python 1.60.0 的默认入口、鉴权单 worker、多 worker/direct worker smoke，以及默认 loopback automation smoke 全部通过。
+- manifests 有效，Python 工具测试 52/52。
+- Standards 与 Spec 复核无遗留 finding；Astra light 首审的三项 blocker 全部修复，最终复审为 0 blocker。
 
 ## 后续执行顺序
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 单独定义 CDP Host、Origin 和鉴权访问策略，不要把它们与 SSRF 或默认 loopback binding 混为一体。
-2. 继续补齐任意同步 V8 执行的 disconnect/cancellation matrix；现有 V8 watchdog 仍是最终保护。
-3. 继续处理 [TODO](TODO.md) 中 OB-021 剩余的 input qualification 和 observation ownership 项目。
+1. 继续补齐任意同步 V8 执行的 disconnect/cancellation matrix；现有 V8 watchdog 仍是最终保护。
+2. 继续处理 [TODO](TODO.md) 中 OB-021 剩余的 input qualification 和 observation ownership 项目。
+3. 继续区分 admission、已授权命令 ownership 和 TCP/kernel/container 总资源边界，不把本切片扩大成完整授权或 RSS 证明。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -53,13 +53,14 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 
 生成本交接的主机上曾保留以下完整临时证据：
 
-- `/tmp/ob034-inbound-full-nextest.log`
-- `/tmp/ob034-inbound-render-build.log`
-- `/tmp/ob034-inbound-no-render-build.log`
-- `/tmp/ob034-inbound-no-render-focused.log`
-- `/tmp/ob034-inbound-obstacle.log`
-- `/tmp/ob034-inbound-python.log`
-- `/tmp/ob034-inbound-playwright.eGHx5F`
+- `/tmp/ob034-access-full-nextest-review-final.log`
+- `/tmp/ob034-access-render-build-release-candidate.log`
+- `/tmp/ob034-access-no-render-build-review-final.log`
+- `/tmp/ob034-access-no-render-focused-review-final.log`
+- `/tmp/ob034-access-obstacle-release-candidate.log`
+- `/tmp/ob034-access-tools-unittest-review-final.log`
+- `/tmp/ob034-access-smoke-review-final/`
+- `/tmp/ob034-access-automation-smoke-review-final.json`
 - `/tmp/ob034-inbound-benchmark.cEiFsw`
 
 这些路径属于原始运行主机的临时文件，不是仓库内的持久接口。可持续引用的结论和能力边界以本页、[SUMMARY](SUMMARY.md) 及对应提交中的测试为准。处理这些日志时保留原始字段和完整内容。
