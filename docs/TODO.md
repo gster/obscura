@@ -83,6 +83,8 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 
 进展（CDP outbound reservation 切片）：每个连接的 outbound 保留队列上限为 1024 条、128 MiB 总 UTF-8 bytes，单条消息上限 80 MiB；reservation 在正常 writer 路径覆盖从入队到完整 socket send，而不是在 dequeue 时释放。单次 socket 写有 10 秒 deadline。count、总 bytes、单条 bytes overflow，以及 writer I/O、writer timeout、connection shutdown 均 sticky close，关闭后停止后续命令排队；服务不会靠静默丢弃、截断或脱敏消息维持连接。合法 `Browser.close` 会先封闭新消息，再以 10 秒总预算尝试 flush 已接受 envelope；写失败或超时则断开，reservation 释放本身不是送达确认。该切片仍未覆盖序列化瞬时内存、inbound `ServerMessage`、`pending_events`、Host/Origin/auth，或任意同步 V8 执行期间的立即断连；OB-021/OB-034 仍未关闭。
 
+进展（CDP inbound 与 pending event 切片）：每连接 inbound `ServerMessage` 现限制 1024 条、128 MiB text、64 MiB 单消息，并显式固定 16 MiB WebSocket 单 frame；reservation 覆盖 channel、processor 执行中的命令及 navigation deferred queue。`CdpContext.pending_events` 现限制 1024 条、128 MiB 完整 event envelope 序列化 UTF-8 bytes、80 MiB 单事件；批量 admission 全有或全无，首个 count/bytes/single-event/serialization failure 与 inbound overflow 均进入同一 sticky connection close，后续命令不执行，不靠丢字段、脱敏、截断或 oldest-drop 继续连接。正常转发与直接 serde JSON 逐字节一致，malformed CDP 日志保留完整原始 text；`Target.sendMessageToTarget` 不再用空对象替代无法序列化的 inner response。三阶段预算彼此独立，不能外推成 128 MiB 总连接内存或 RSS；admission 前构造、容器 capacity、Tungstenite/TCP、上游 JS/Worker observation queue、响应正文、Host/Origin/auth 和同步 V8 中立即断连仍未覆盖。公开 `CdpContext.pending_events` 从 `Vec<CdpEvent>` 改为只读 Vec-like `PendingEvents`，直接依赖具体 Vec 类型或可变迭代的低层调用方需要适配；OB-021/OB-034 仍未关闭。
+
 ### OB-011 · P0 · Cookie 请求上下文与无损状态往返
 
 状态：未关闭。
@@ -106,7 +108,7 @@ P0 为当前主链或发布阻断；P1 为随后完成的能力与质量工作�
 动作：在已有连接/延迟消息上限之外，补入出站队列 count/bytes、帧大小、慢读与超载；核查认证、Host/Origin、默认 loopback；定义 owner 与关闭契约。
 完成：慢客户端/大消息/导航中断不会无界堆积；明确错误且资源回收；授权客户端可正常连接；未获准客户端被拒绝；取消/重连不自动重放输入。
 
-当前 outbound 边界：每连接保留 1024 条、128 MiB 总 bytes、单消息 80 MiB；reservation 在正常 writer 路径持续到 envelope 完成 socket send；单次写最多 10 秒。overflow、I/O、timeout、connection shutdown sticky close 并停止后续命令排队，服务不会靠静默丢弃、截断或脱敏消息维持连接。合法 `Browser.close` 会封闭新消息并在 10 秒总预算内尝试 flush 已接受 envelope；写失败或超时则断开，reservation 释放本身不是送达确认。尚未覆盖序列化瞬时内存、inbound `ServerMessage`、`pending_events`、Host/Origin/auth 及任意同步 V8 中的立即断连。
+当前 transport 边界：inbound、pending events 和 outbound 分别有独立的 1024 条/128 MiB 预算；单项上限依次为 64 MiB text、80 MiB event、80 MiB outbound message，WebSocket 单 frame 为 16 MiB。inbound reservation 持续到命令执行或 deferred 结束；pending event 按完整序列化 envelope 精确计数且批量原子 admission；outbound reservation 持续到 socket send 完成，单次写最多 10 秒。overflow、I/O、timeout、unsupported binary message 和 connection shutdown sticky close 并停止后续命令排队，服务不会靠静默丢弃、截断或脱敏维持连接。合法 `Browser.close` 只对已接受 outbound envelope 做 10 秒有界 flush。三层逻辑 payload 预算不是总 RSS 上限；尚未覆盖 admission 前构造、容器 capacity、Tungstenite/TCP、上游 observation queue、响应正文、Host/Origin/auth 及任意同步 V8 中的立即断连。
 
 ### OB-037 · P0 · 定性并恢复 obstacle 门禁
 

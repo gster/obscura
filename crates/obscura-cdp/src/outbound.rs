@@ -24,6 +24,14 @@ pub enum CloseReason {
     MessageBytes,
     WriterIo,
     WriterTimeout,
+    InboundCount,
+    InboundBytes,
+    InboundMessageBytes,
+    InboundMessageType,
+    PendingEventsCount,
+    PendingEventsBytes,
+    PendingEventBytes,
+    PendingEventSerialization,
     ConnectionClosed,
 }
 

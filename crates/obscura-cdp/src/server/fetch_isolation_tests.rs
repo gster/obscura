@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Client {
-    tx: mpsc::UnboundedSender<ServerMessage>,
+    tx: ServerMessageSender,
     replies: OutboundReceiver,
     reply_tx: OutboundSender,
     events: Vec<Value>,
@@ -109,7 +109,7 @@ async fn fixture_with_requests() -> (String, tokio::task::JoinHandle<()>, Arc<st
 }
 
 async fn client() -> (Client, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = crate::inbound::channel();
     let (reply_tx, replies, _) = crate::outbound::channel();
     let context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
         "multi-page-pause".into(), obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None, None, true,

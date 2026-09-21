@@ -73,7 +73,7 @@ pub struct CdpContext {
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
-    pub pending_events: Vec<CdpEvent>,
+    pub pending_events: crate::pending_events::PendingEvents,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
     #[cfg(feature = "render")]
@@ -187,7 +187,7 @@ impl CdpContext {
             network_owners: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
-            pending_events: Vec::new(),
+            pending_events: crate::pending_events::PendingEvents::default(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
             #[cfg(feature = "render")]
@@ -1229,7 +1229,17 @@ async fn dispatch_send_message_to_target(req: &CdpRequest, ctx: &mut CdpContext)
 
     // Re-emit the inner response as the legacy event headless_chrome (and
     // older Puppeteer) listen for instead of correlating responses by id.
-    let inner_serialized = serde_json::to_string(&inner_response).unwrap_or_else(|_| "{}".into());
+    let inner_serialized = match serde_json::to_string(&inner_response) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            return CdpResponse::error(
+                req.id,
+                -32603,
+                format!("could not serialize inner CDP response: {error}"),
+                req.session_id.clone(),
+            );
+        }
+    };
     ctx.pending_events.push(CdpEvent {
         method: "Target.receivedMessageFromTarget".to_string(),
         params: json!({

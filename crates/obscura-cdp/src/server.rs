@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+use crate::inbound::{self, Envelope as InboundEnvelope};
 use crate::outbound::{CloseReason as OutboundCloseReason, OutboundSender};
 
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
@@ -74,6 +75,28 @@ enum ServerMessage {
     NewConnection {
         reply_tx: OutboundSender,
     },
+}
+
+impl inbound::MessageSize for ServerMessage {
+    fn message_bytes(&self) -> usize {
+        match self {
+            ServerMessage::Cdp(message) => message.text.len(),
+            ServerMessage::NewConnection { .. } => 0,
+        }
+    }
+}
+
+type ServerMessageSender = inbound::Sender<ServerMessage>;
+type ServerMessageReceiver = inbound::Receiver<ServerMessage>;
+type ServerMessageEnvelope = InboundEnvelope<ServerMessage>;
+
+fn inbound_close_reason(reason: inbound::CloseReason) -> OutboundCloseReason {
+    match reason {
+        inbound::CloseReason::Count => OutboundCloseReason::InboundCount,
+        inbound::CloseReason::Bytes => OutboundCloseReason::InboundBytes,
+        inbound::CloseReason::MessageBytes => OutboundCloseReason::InboundMessageBytes,
+        inbound::CloseReason::ConnectionClosed => OutboundCloseReason::ConnectionClosed,
+    }
 }
 
 fn browser_close_response(req: &CdpRequest) -> Option<(CdpResponse, bool)> {
@@ -606,7 +629,7 @@ fn run_connection(
                         return;
                     }
                 };
-                let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+                let (msg_tx, msg_rx) = inbound::channel::<ServerMessage>();
                 let mut processor = tokio::task::spawn_local(cdp_processor(
                     msg_rx,
                     default_context,
@@ -882,7 +905,7 @@ struct InterceptedPause {
 type InterceptedPauses = HashMap<(Option<String>, String), InterceptedPause>;
 
 async fn cdp_processor(
-    mut rx: mpsc::UnboundedReceiver<ServerMessage>,
+    mut rx: ServerMessageReceiver,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
 ) {
@@ -898,7 +921,7 @@ async fn cdp_processor(
     // tripped V8's TryGetCurrent invariant. Drained at the top of each
     // outer iteration so they get processed sequentially with no other nav
     // in flight.
-    let mut deferred: std::collections::VecDeque<ServerMessage> =
+    let mut deferred: std::collections::VecDeque<ServerMessageEnvelope> =
         std::collections::VecDeque::new();
 
     // Graceful shutdown: one signal watcher on the accept side flips the flag
@@ -1042,9 +1065,11 @@ async fn cdp_processor(
             break;
         }
 
+        let (msg, _inbound_reservation) = msg.into_parts();
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
+                ctx.pending_events.bind_close_handle(reply_tx.clone());
                 let _ = reply_tx.send(
                     json!({"__init": true})
                         .to_string(),
@@ -1413,9 +1438,22 @@ fn forward_pending_events(
     let Some(reply_tx) = reply_tx else {
         return;
     };
+    if let Some(reason) = ctx.pending_events.close_reason() {
+        warn!("closing CDP connection after pending event admission failure: {reason:?}");
+        ctx.pending_events.clear();
+        return;
+    }
     for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
+        let json = match serde_json::to_string(&event) {
+            Ok(json) => json,
+            Err(error) => {
+                warn!("closing CDP connection after pending event serialization failure: {error}");
+                reply_tx.close(OutboundCloseReason::PendingEventSerialization);
+                return;
+            }
+        };
+        if reply_tx.send(json).is_err() {
+            return;
         }
     }
 }
@@ -1791,10 +1829,10 @@ async fn process_with_interception(
     text: &str,
     ctx: &mut CdpContext,
     reply_tx: &OutboundSender,
-    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    rx: &mut ServerMessageReceiver,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<crate::domains::fetch::RoutedInterceptedRequest>>,
     intercepted_paused: &mut InterceptedPauses,
-    deferred: &mut std::collections::VecDeque<ServerMessage>,
+    deferred: &mut std::collections::VecDeque<ServerMessageEnvelope>,
     send_command_response: bool,
 ) {
     if reply_tx.is_closed() {
@@ -1803,7 +1841,7 @@ async fn process_with_interception(
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid CDP: {}", e);
+            warn!("Invalid CDP: {}: {}", e, text);
             return;
         }
     };
@@ -1963,7 +2001,7 @@ async fn process_with_interception(
                     continue;
                 }
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
-                match msg {
+                match msg.get() {
                     ServerMessage::NewConnection { reply_tx: new_tx } => {
                         // Safe: no V8 enter, just bookkeeping.
                         let pid = ctx.create_page();
@@ -1971,17 +2009,17 @@ async fn process_with_interception(
                         ctx.sessions.insert(sid.clone(), pid.clone());
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
-                    ServerMessage::Cdp(msg) => {
+                    ServerMessage::Cdp(cdp_message) => {
                         let lifecycle_released = abort_navigating_fetch_owner_for_lifecycle(
-                            &msg.text, ctx, intercepted_paused,
+                            &cdp_message.text, ctx, intercepted_paused,
                         );
-                        if (msg.text.contains("Fetch.") || msg.text.contains("Network.getResponseBody")) && handle_fetch_resolution(
-                            &msg.text, ctx, &msg.reply_tx, intercepted_paused,
+                        if (cdp_message.text.contains("Fetch.") || cdp_message.text.contains("Network.getResponseBody")) && handle_fetch_resolution(
+                            &cdp_message.text, ctx, &cdp_message.reply_tx, intercepted_paused,
                         ) {
                             // Safe: resolves the pause or rejects a premature
                             // body read without entering V8.
-                        } else if is_navigation_safe_body_command(&msg.text) {
-                            process_cdp_message(&msg.text, ctx, &msg.reply_tx).await;
+                        } else if is_navigation_safe_body_command(&cdp_message.text) {
+                            process_cdp_message(&cdp_message.text, ctx, &cdp_message.reply_tx).await;
                         } else {
                             // UNSAFE during nav: would route through dispatch,
                             // which can `suspend_js` other pages and trip the
@@ -1991,7 +2029,7 @@ async fn process_with_interception(
                             // in flight.
                             if deferred.len() >= MAX_DEFERRED_MESSAGES && !lifecycle_released {
                                 tracing::warn!("INTERCEPTION: deferred queue full ({}), returning error to client", MAX_DEFERRED_MESSAGES);
-                                if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
+                                if let Ok(req) = serde_json::from_str::<CdpRequest>(&cdp_message.text) {
                                     let resp = crate::types::CdpResponse::error(
                                         req.id,
                                         -32000,
@@ -1999,12 +2037,12 @@ async fn process_with_interception(
                                         req.session_id,
                                     );
                                     if let Ok(json) = serde_json::to_string(&resp) {
-                                        let _ = msg.reply_tx.send(json);
+                                        let _ = cdp_message.reply_tx.send(json);
                                     }
                                 }
                             } else {
                                 tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
-                                deferred.push_back(ServerMessage::Cdp(msg));
+                                deferred.push_back(msg);
                             }
                         }
                     }
@@ -2083,11 +2121,7 @@ async fn process_with_interception(
             tracing::warn!("could not produce post-navigation screencast frame: {error}");
         }
     }
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
-        }
-    }
+    forward_pending_events(ctx, Some(reply_tx));
 }
 
 async fn process_cdp_message(
@@ -2101,7 +2135,7 @@ async fn process_cdp_message(
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid CDP: {}: {}", e, crate::util::truncate_on_char_boundary(text, 200));
+            warn!("Invalid CDP: {}: {}", e, text);
             return;
         }
     };
@@ -2118,11 +2152,7 @@ async fn process_cdp_message(
     // Playwright awaits the response and immediately reads state wired up
     // by those events; if the response lands first, accessing
     // Target._page errors with "Cannot read properties of undefined".
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
-        }
-    }
+    forward_pending_events(ctx, Some(reply_tx));
 
     if let Ok(json) = serde_json::to_string(&response) {
         let _ = reply_tx.send(json);
@@ -2141,11 +2171,7 @@ async fn process_cdp_message(
             session_id: req.session_id.clone(),
         };
         let _ = dispatch::dispatch(&nav_req, ctx).await;
-        for event in ctx.pending_events.drain(..) {
-            if let Ok(json) = serde_json::to_string(&event) {
-                let _ = reply_tx.send(json);
-            }
-        }
+        forward_pending_events(ctx, Some(reply_tx));
     }
 }
 
@@ -2159,7 +2185,7 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
 
 async fn handle_connection_ws(
     stream: TcpStream,
-    msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    msg_tx: ServerMessageSender,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -2170,17 +2196,22 @@ async fn handle_connection_ws(
     let mut cfg = WebSocketConfig::default();
     cfg.write_buffer_size = 0;
     cfg.max_write_buffer_size = crate::outbound::DEFAULT_MAX_BYTES;
+    cfg.max_message_size = Some(inbound::DEFAULT_MAX_MESSAGE_BYTES);
+    cfg.max_frame_size = Some(inbound::DEFAULT_MAX_FRAME_BYTES);
     let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     let (reply_tx, mut reply_rx, mut outbound_closed) = crate::outbound::channel();
 
-    if msg_tx.send(ServerMessage::NewConnection {
+    if let Err(error) = msg_tx.send(ServerMessage::NewConnection {
         reply_tx: reply_tx.clone(),
-    }).is_err() {
-        reply_tx.close(OutboundCloseReason::ConnectionClosed);
-        return Err(anyhow::anyhow!("CDP processor closed before connection init"));
+    }) {
+        reply_tx.close(inbound_close_reason(error.reason));
+        return Err(anyhow::anyhow!(
+            "CDP processor rejected connection init: {:?}",
+            error.reason
+        ));
     }
     if let Some(init_msg) = reply_rx.recv().await {
         let init_msg = init_msg.as_str();
@@ -2278,16 +2309,25 @@ async fn handle_connection_ws(
                     }
                 }
 
-                if msg_tx.send(ServerMessage::Cdp(CdpMessage {
+                if let Err(error) = msg_tx.send(ServerMessage::Cdp(CdpMessage {
                     text: text.to_string(),
                     reply_tx: reply_tx.clone(),
-                })).is_err() {
-                    reply_tx.close(OutboundCloseReason::ConnectionClosed);
+                })) {
+                    warn!(
+                        "closing CDP connection after inbound admission failure: {:?}",
+                        error.reason
+                    );
+                    reply_tx.close(inbound_close_reason(error.reason));
                     break;
                 }
             }
             Message::Close(_) => {
                 info!("WS closed by client");
+                break;
+            }
+            Message::Binary(_) => {
+                warn!("closing CDP connection after unsupported binary WebSocket message");
+                reply_tx.close(OutboundCloseReason::InboundMessageType);
                 break;
             }
             _ => {}
@@ -2330,6 +2370,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pending_event_forwarding_preserves_complete_serialized_envelope() {
+        let mut ctx = crate::dispatch::CdpContext::new(
+            obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        );
+        let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
+        ctx.pending_events.bind_close_handle(reply_tx.clone());
+        let event = crate::types::CdpEvent {
+            method: "Network.requestWillBeSentExtraInfo".into(),
+            params: json!({
+                "headers": {
+                    "Authorization": "Bearer complete-secret",
+                    "Cookie": "session=complete-secret",
+                    "X-Raw": "é\\\"\u{0000}"
+                },
+                "associatedCookies": [{"cookie": {"name": "session", "value": "complete-secret"}}]
+            }),
+            session_id: Some("complete-session".into()),
+        };
+        let expected = serde_json::to_string(&event).unwrap();
+        ctx.pending_events.push(event);
+
+        super::forward_pending_events(&mut ctx, Some(&reply_tx));
+
+        assert_eq!(reply_rx.try_recv().unwrap().as_str(), expected);
+        assert!(reply_rx.try_recv().is_err());
+        assert!(!reply_tx.is_closed());
+    }
+
+    #[test]
     fn invalid_browser_close_is_an_error_and_keeps_the_connection_open() {
         let invalid: crate::types::CdpRequest = serde_json::from_value(json!({
             "id": 7,
@@ -2366,7 +2437,7 @@ pub(crate) mod tests {
     async fn outbound_overflow_stops_before_later_queued_commands() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (server_tx, server_rx) = crate::inbound::channel();
                 let (reply_tx, mut reply_rx, mut closed) =
                     crate::outbound::channel_with_limits(1, 1024 * 1024, 1024 * 1024);
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -2477,11 +2548,11 @@ pub(crate) mod tests {
             .run_until(async {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
-                let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (server_tx, mut server_rx) = crate::inbound::channel();
 
                 let processor = tokio::task::spawn_local(async move {
                     while let Some(message) = server_rx.recv().await {
-                        match message {
+                        match message.into_parts().0 {
                             super::ServerMessage::NewConnection { reply_tx } => {
                                 reply_tx.send(json!({"__init": true}).to_string()).unwrap();
                             }
@@ -2537,6 +2608,83 @@ pub(crate) mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_inbound_overflow_closes_without_queueing_the_later_command() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (server_tx, mut server_rx) =
+                    crate::inbound::channel_with_limits::<super::ServerMessage>(1, 1024, 1024);
+                let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+
+                let handler = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    super::handle_connection_ws(stream, server_tx).await
+                });
+                let inspector = tokio::task::spawn_local(async move {
+                    let (init, init_reservation) = server_rx
+                        .recv()
+                        .await
+                        .expect("connection init")
+                        .into_parts();
+                    match init {
+                        super::ServerMessage::NewConnection { reply_tx } => {
+                            reply_tx.send(json!({"__init": true}).to_string()).unwrap();
+                        }
+                        super::ServerMessage::Cdp(_) => panic!("CDP command arrived before init"),
+                    }
+                    drop(init_reservation);
+
+                    let held = server_rx.recv().await.expect("first command");
+                    let first_text = match held.get() {
+                        super::ServerMessage::Cdp(message) => message.text.clone(),
+                        super::ServerMessage::NewConnection { .. } => {
+                            panic!("unexpected second connection init")
+                        }
+                    };
+                    let _ = held_tx.send(());
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_secs(2), server_rx.recv())
+                            .await
+                            .expect("handler should close the inbound sender")
+                            .is_none(),
+                        "overflowing command must not enter the processor queue"
+                    );
+                    drop(held);
+                    first_text
+                });
+
+                let url = format!("ws://{address}/devtools/browser");
+                let (mut client, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+                let first = json!({"id": 1, "method": "Browser.getVersion"}).to_string();
+                let overflow = json!({"id": 2, "method": "Browser.getVersion"}).to_string();
+                client.send(Message::Text(first.clone().into())).await.unwrap();
+                held_rx.await.expect("inspector should hold the first reservation");
+                client.send(Message::Text(overflow.into())).await.unwrap();
+
+                let transport_closed = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.next(),
+                )
+                .await
+                .expect("overflow should close the websocket promptly");
+                assert!(
+                    matches!(
+                        transport_closed,
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+                    ),
+                    "overflow must close instead of returning a partial success"
+                );
+                assert_eq!(inspector.await.unwrap(), first);
+                handler.await.unwrap().expect("connection handler");
+            })
+            .await;
+    }
+
     #[test]
     fn discovery_uses_the_client_facing_http_authority() {
         let request = "GET /json/version HTTP/1.1\r\nhOsT: cdp.example.test:9222\r\n\r\n";
@@ -2566,7 +2714,7 @@ pub(crate) mod tests {
     async fn page_runtime_advances_while_cdp_client_is_silent() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (server_tx, server_rx) = crate::inbound::channel();
                 let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
                 let default_context = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)).default_context;
