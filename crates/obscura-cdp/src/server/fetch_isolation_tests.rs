@@ -116,7 +116,7 @@ async fn client() -> (Client, tokio::task::JoinHandle<()>) {
     let processor = tokio::task::spawn_local(cdp_processor(
         rx,
         context,
-        Arc::new(Notify::new()),
+        ServerShutdown::new(),
         obscura_js::execution_cancellation::ExecutionCancellation::default(),
     ));
     tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();

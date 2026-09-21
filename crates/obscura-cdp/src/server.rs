@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use crate::access::{AccessFailure, AuthorizedRequest, CdpAccessOptions, CdpAccessPolicy, RequestRoute};
 use crate::dispatch::{self, CdpContext};
 use crate::inbound::{self, Envelope as InboundEnvelope};
-use crate::outbound::{CloseReason as OutboundCloseReason, OutboundSender};
+use crate::outbound::{CloseReason as OutboundCloseReason, OutboundReceiver, OutboundSender};
 use crate::types::CdpEvent;
 
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
@@ -68,6 +68,97 @@ const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
 use crate::types::CdpRequest;
 use crate::types::CdpResponse;
+
+#[derive(Clone)]
+struct ServerShutdown {
+    inner: Arc<ServerShutdownInner>,
+}
+
+struct ServerShutdownInner {
+    closed: AtomicBool,
+    signal: tokio::sync::watch::Sender<bool>,
+    accept_waker: std::sync::Mutex<Option<Arc<mio::Waker>>>,
+}
+
+impl ServerShutdown {
+    fn new() -> Self {
+        let (signal, _) = tokio::sync::watch::channel(false);
+        Self {
+            inner: Arc::new(ServerShutdownInner {
+                closed: AtomicBool::new(false),
+                signal,
+                accept_waker: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    fn register_accept_waker(&self, waker: Arc<mio::Waker>) {
+        *self
+            .inner
+            .accept_waker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(waker.clone());
+        // Cancellation may win the race before the OS waker is stored. Mio
+        // retains the readiness event until the accept poll observes it.
+        if self.is_cancelled() {
+            if let Err(error) = waker.wake() {
+                warn!("could not wake CDP accept poll after registration: {error}");
+            }
+        }
+    }
+
+    fn clear_accept_waker(&self) {
+        self.inner
+            .accept_waker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn accept_waker_is_registered(&self) -> bool {
+        self.inner
+            .accept_waker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
+    fn cancel(&self) {
+        if !self.inner.closed.swap(true, Ordering::SeqCst) {
+            self.inner.signal.send_replace(true);
+        }
+        // Waking is an optimization, not a correctness dependency: the idle
+        // poll also has a finite timeout and rechecks `closed`.
+        let waker = self
+            .inner
+            .accept_waker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(waker) = waker {
+            if let Err(error) = waker.wake() {
+                warn!("could not wake CDP accept poll during shutdown: {error}");
+            }
+        }
+    }
+
+    async fn cancelled(&self) {
+        let mut signal = self.inner.signal.subscribe();
+        if *signal.borrow_and_update() {
+            return;
+        }
+        while signal.changed().await.is_ok() {
+            if *signal.borrow_and_update() {
+                return;
+            }
+        }
+    }
+}
 
 struct CdpMessage {
     text: String,
@@ -252,6 +343,36 @@ pub async fn start_with_serve_options_access_and_limit(
     access_options: CdpAccessOptions,
     persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
+    start_with_serve_options_access_limit_and_shutdown(
+        port,
+        host,
+        proxy,
+        allow_file_access,
+        storage_dir,
+        allow_private_network,
+        max_connections,
+        access_options,
+        persona,
+        ServerShutdown::new(),
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_with_serve_options_access_limit_and_shutdown(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+    max_connections: usize,
+    access_options: CdpAccessOptions,
+    persona: obscura_net::EffectivePersona,
+    shutdown: ServerShutdown,
+    install_signal_handler: bool,
+) -> anyhow::Result<()> {
     obscura_net::activate_process_persona(&persona)?;
     let ip: std::net::IpAddr = host
         .parse()
@@ -286,9 +407,26 @@ pub async fn start_with_serve_options_access_and_limit(
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
 
-    // Ctrl-C / graceful shutdown coordination.
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_notify = Arc::new(Notify::new());
+    // Mio lets one blocking poll observe both listener readiness and the
+    // server-owned shutdown waker. New connections therefore retain the
+    // kernel-driven accept latency of a blocking listener, while shutdown no
+    // longer depends on a self-connection or periodic latency polling.
+    let mut accept_poll = mio::Poll::new()
+        .map_err(|error| anyhow::anyhow!("create CDP accept poll: {error}"))?;
+    let mut accept_listener = mio::net::TcpListener::from_std(std_listener);
+    accept_poll
+        .registry()
+        .register(
+            &mut accept_listener,
+            ACCEPT_LISTENER_TOKEN,
+            mio::Interest::READABLE,
+        )
+        .map_err(|error| anyhow::anyhow!("register CDP listener poll: {error}"))?;
+    let accept_waker = Arc::new(
+        mio::Waker::new(accept_poll.registry(), ACCEPT_SHUTDOWN_TOKEN)
+            .map_err(|error| anyhow::anyhow!("create CDP shutdown waker: {error}"))?,
+    );
+    shutdown.register_accept_waker(accept_waker);
 
     // Dedicated accept thread: drains the kernel backlog immediately and
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
@@ -304,65 +442,82 @@ pub async fn start_with_serve_options_access_and_limit(
     // every ACCEPT_POLL_INTERVAL, and dropped once they outlive
     // SILENT_CONNECTION_TTL without sending a request head.
     //
-    // While nothing is parked the thread blocks in accept() itself, the
-    // pre-#715 fast path: zero added latency for the next connection and no
-    // CPU while idle. Blocking on the listener is safe — it waits for the
-    // kernel, not for client bytes. While something is parked, the listener
-    // is drained without blocking at least once per 1 ms poll round, far
-    // above any real connect rate, so the kernel backlog cannot overflow
-    // under a connection burst.
-    let accept_flag = shutdown_flag.clone();
+    // The listener remains non-blocking so shutdown never depends on making a
+    // self-connection to interrupt accept(). Mio wakes immediately for either
+    // listener readiness or the shutdown token. A finite idle timeout remains
+    // the independent correctness backstop if the explicit wake fails.
+    let accept_shutdown = shutdown.clone();
     let accept_persona = persona.clone();
     let accept_access_policy = access_policy.clone();
-    std::thread::Builder::new()
+    let accept_thread = std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
+            let mut accept_events = mio::Events::with_capacity(8);
             let mut pending: Vec<(std::net::TcpStream, std::time::Instant)> = Vec::new();
-            while !accept_flag.load(Ordering::Relaxed) {
-                if pending.is_empty() {
-                    // Fast path: nothing parked, block until a connection
-                    // arrives, then classify it in the sweep below.
-                    let _ = std_listener.set_nonblocking(false);
-                    match std_listener.accept() {
+            let mut accept_backlog_may_remain = false;
+            'accept: while !accept_shutdown.is_cancelled() {
+                if !accept_backlog_may_remain {
+                    let poll_timeout = if pending.is_empty() {
+                        ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL
+                    } else {
+                        ACCEPT_POLL_INTERVAL
+                    };
+                    match accept_poll.poll(&mut accept_events, Some(poll_timeout)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            error!("CDP accept poll error: {error}");
+                            accept_shutdown.cancel();
+                            break 'accept;
+                        }
+                    }
+                }
+                if accept_shutdown.is_cancelled() {
+                    break;
+                }
+                // Drain a bounded batch from the kernel backlog. A continuous
+                // connection flood must not keep this loop away from the
+                // shutdown check forever. Mio readiness is edge-triggered, so
+                // hitting the batch limit means the next sweep must continue
+                // accepting without another blocking poll. Only WouldBlock
+                // proves that the readiness edge has been fully drained.
+                let mut drained_to_would_block = false;
+                for _ in 0..MAX_ACCEPTS_PER_SWEEP {
+                    match accept_listener.accept() {
                         Ok((stream, _)) => {
+                            let stream: std::net::TcpStream = stream.into();
                             let _ = stream.set_nonblocking(true);
-                            pending.push((stream, std::time::Instant::now()));
+                            if pending.len() < MAX_SILENT_PENDING {
+                                pending.push((stream, std::time::Instant::now()));
+                            } else {
+                                warn!(
+                                    "dropping connection: {} connections parked without a request head",
+                                    MAX_SILENT_PENDING
+                                );
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            drained_to_would_block = true;
+                            break;
                         }
                         Err(e) => {
                             error!("Accept error: {}", e);
-                            // A persistent error (e.g. EMFILE) must not turn
-                            // into a log flood while the thread idles.
                             std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                            break;
                         }
                     }
-                    let _ = std_listener.set_nonblocking(true);
-                } else {
-                    // Drain everything the kernel has already queued for us.
-                    loop {
-                        match std_listener.accept() {
-                            Ok((stream, _)) => {
-                                let _ = stream.set_nonblocking(true);
-                                if pending.len() < MAX_SILENT_PENDING {
-                                    pending.push((stream, std::time::Instant::now()));
-                                } else {
-                                    warn!(
-                                        "dropping connection: {} connections parked without a request head",
-                                        MAX_SILENT_PENDING
-                                    );
-                                }
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(e) => {
-                                error!("Accept error: {}", e);
-                                break;
-                            }
-                        }
-                    }
+                }
+                accept_backlog_may_remain = !drained_to_would_block;
+                if accept_shutdown.is_cancelled() {
+                    break;
                 }
                 // Give every parked connection a chance to speak; keep the
                 // ones still silent and inside the TTL, dispatch the ones
                 // with a request head. Dropping a stream closes its socket.
                 for (stream, since) in std::mem::take(&mut pending) {
+                    if accept_shutdown.is_cancelled() {
+                        break;
+                    }
                     if since.elapsed() >= SILENT_CONNECTION_TTL {
                         continue;
                     }
@@ -390,8 +545,8 @@ pub async fn start_with_serve_options_access_and_limit(
                         }
                     }
                 }
-                if !pending.is_empty() {
-                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                if accept_shutdown.is_cancelled() {
+                    break;
                 }
             }
         })?;
@@ -419,14 +574,12 @@ pub async fn start_with_serve_options_access_and_limit(
     let persistence_ctx = Arc::new(shared_ctx.isolated_copy("persistence".to_string(), true));
     let persistence_lock = Arc::new(std::sync::Mutex::new(()));
 
-    // One graceful-shutdown watcher for the whole server. It flips the accept
-    // flag (stopping the accept thread) and wakes every connection processor via
-    // `notify_waiters()`. On its own thread so it needs no LocalSet and cannot be
-    // starved by a connection's V8 work. Watches SIGTERM as well as Ctrl-C so
-    // `docker stop` / `kill` also flush cookies (issue #333).
-    {
-        let sf = shutdown_flag.clone();
-        let sn = shutdown_notify.clone();
+    // One sticky graceful-shutdown source for the whole server. The signal
+    // thread publishes it and unparks the accept thread directly. Late
+    // connection subscribers still observe the closed value. This thread owns
+    // no LocalSet, so connection V8 work cannot starve SIGTERM/Ctrl-C handling.
+    if install_signal_handler {
+        let signal_shutdown = shutdown.clone();
         std::thread::Builder::new()
             .name("obscura-cdp-signal".into())
             .spawn(move || {
@@ -456,8 +609,7 @@ pub async fn start_with_serve_options_access_and_limit(
                         }
                     });
                 }
-                sf.store(true, Ordering::Relaxed);
-                sn.notify_waiters();
+                signal_shutdown.cancel();
             })
             .ok();
     }
@@ -482,12 +634,16 @@ pub async fn start_with_serve_options_access_and_limit(
     loop {
         let stream = tokio::select! {
             stream = ws_rx.recv() => stream,
-            _ = shutdown_notify.notified() => None,
+            _ = shutdown.cancelled() => None,
         };
         let stream = match stream {
             Some(s) => s,
             None => break,
         };
+        if shutdown.is_cancelled() {
+            drop(stream);
+            break;
+        }
         // Nagle off + nonblocking on the std socket before it moves to the
         // connection thread. CDP exchanges many small (~100-byte) frames during
         // newPage()/navigate; with Nagle on, each small write waits on an ACK or
@@ -516,12 +672,12 @@ pub async fn start_with_serve_options_access_and_limit(
             refuse_connection(stream);
             continue;
         }
-        run_connection(
+        let _ = run_connection(
             stream,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
-            shutdown_notify.clone(),
+            shutdown.clone(),
             live_connections.clone(),
         );
     }
@@ -531,8 +687,8 @@ pub async fn start_with_serve_options_access_and_limit(
     // loses it, and the process then exits and kills the thread mid-flight.
     // Before the per-connection move, the single processor saved on its own way
     // out, ordered against all connection work on one LocalSet -- draining here
-    // is what restores that ordering. `notify_waiters` above has already woken
-    // every processor, so this is bounded in practice; the deadline only covers
+    // is what restores that ordering. Sticky shutdown has already woken every
+    // connection I/O task, so this is bounded in practice; the deadline covers
     // a connection wedged in V8, where its own command watchdog is the backstop.
     let drain_deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_millis(SHUTDOWN_DRAIN_MS);
@@ -551,6 +707,10 @@ pub async fn start_with_serve_options_access_and_limit(
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
+    if accept_thread.join().is_err() {
+        warn!("CDP accept thread panicked during shutdown");
+    }
+    shutdown.clear_accept_waker();
     persistence_ctx.save_cookies();
     Ok(())
 }
@@ -626,9 +786,9 @@ fn run_connection(
     context_template: Arc<obscura_browser::BrowserContext>,
     persistence_context: Arc<obscura_browser::BrowserContext>,
     persistence_lock: Arc<std::sync::Mutex<()>>,
-    shutdown_notify: Arc<Notify>,
+    shutdown: ServerShutdown,
     live_connections: Arc<AtomicUsize>,
-) {
+) -> Option<tokio::task::AbortHandle> {
     // Releases the slot reserved by the accept loop when the thread unwinds,
     // however it exits — clean close, error return, or panic. A plain
     // decrement at the end of the closure would leak slots on the early
@@ -651,8 +811,8 @@ fn run_connection(
     let execution_cancellation = obscura_js::execution_cancellation::ExecutionCancellation::default();
     let processor_cancellation = execution_cancellation.clone();
     let io_cancellation = execution_cancellation.clone();
-    let processor_shutdown = shutdown_notify.clone();
-    let io_shutdown = shutdown_notify;
+    let processor_shutdown = shutdown.clone();
+    let io_shutdown = shutdown;
     let (processor_abort_tx, processor_abort_rx) = std::sync::mpsc::sync_channel(1);
     let (processor_done_tx, processor_done_rx) = tokio::sync::oneshot::channel();
     let slot = live_connections.clone();
@@ -728,7 +888,7 @@ fn run_connection(
         execution_cancellation.cancel();
         live_connections.fetch_sub(1, Ordering::AcqRel);
         refuse_connection(std_stream);
-        return;
+        return None;
     }
 
     let processor_abort = match processor_abort_rx.recv_timeout(std::time::Duration::from_secs(1)) {
@@ -737,13 +897,13 @@ fn run_connection(
             error!("connection processor failed to initialize");
             execution_cancellation.cancel();
             refuse_connection(std_stream);
-            return;
+            return None;
         }
     };
 
     // This task never enters V8. Its drop guard covers server-runtime shutdown
     // and task cancellation in addition to the explicit WebSocket exit paths.
-    tokio::spawn(async move {
+    let io_task = tokio::spawn(async move {
         struct TeardownOnDrop {
             cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
             processor_abort: tokio::task::AbortHandle,
@@ -770,13 +930,14 @@ fn run_connection(
             }
         };
         let handler_tx = msg_tx.clone();
+        let handler_cancellation = teardown.cancellation.clone();
         tokio::select! {
-            result = handle_connection_ws(tokio_stream, handler_tx) => {
+            result = handle_connection_ws(tokio_stream, handler_tx, handler_cancellation) => {
                 if let Err(error) = result {
                     error!("WebSocket connection error: {}", error);
                 }
             }
-            _ = io_shutdown.notified() => {
+            _ = io_shutdown.cancelled() => {
                 info!("Shutdown signal received (WebSocket connection)");
             }
         }
@@ -793,6 +954,7 @@ fn run_connection(
         }
         teardown.armed = false;
     });
+    Some(io_task.abort_handle())
 }
 
 /// Turn away a connection that arrived while the server was at its limit.
@@ -814,6 +976,7 @@ fn reject_http(stream: std::net::TcpStream, response: &[u8]) {
     // bounded HTTP header before closing: Windows resets a socket closed with
     // unread receive data, which can discard the queued 503 response.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
     let mut request = [0u8; HTTP_PEEK_BUF];
     let mut received = 0;
     while received < request.len() {
@@ -834,6 +997,8 @@ fn reject_http(stream: std::net::TcpStream, response: &[u8]) {
 }
 
 const HTTP_PEEK_BUF: usize = 4096;
+const ACCEPT_LISTENER_TOKEN: mio::Token = mio::Token(0);
+const ACCEPT_SHUTDOWN_TOKEN: mio::Token = mio::Token(1);
 
 /// How long a freshly accepted connection may sit without sending a request
 /// head before the accept thread drops it. Real clients send their handshake
@@ -842,9 +1007,23 @@ const SILENT_CONNECTION_TTL: std::time::Duration = std::time::Duration::from_sec
 
 /// How often the accept thread re-polls parked connections that have not sent
 /// a request head yet. Also the retry delay on a persistent accept error, so
-/// it cannot become a log flood. Only paid while something is actually
-/// parked; an idle server blocks in accept() and polls nothing.
+/// it cannot become a log flood.
 const ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Upper bound for an idle accept thread to notice shutdown if the explicit
+/// Mio wake fails. Listener readiness still wakes the poll immediately, so
+/// this backstop is not paid as connection admission latency.
+const ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+/// Cap each backlog-drain pass so a connect flood cannot starve shutdown or
+/// the already accepted request-head queue.
+const MAX_ACCEPTS_PER_SWEEP: usize = 256;
+
+/// The discovery response is small and its request head was already observed,
+/// but the accept thread must still never depend on a peer completing blocking
+/// I/O before it can observe server shutdown.
+const HTTP_CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Cap on connections parked without a request head. Bounds the accept
 /// thread's polling work and the server's fd usage under probe floods.
@@ -944,6 +1123,8 @@ fn handle_http_json_blocking(
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
+    stream.set_read_timeout(Some(HTTP_CONTROL_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_CONTROL_IO_TIMEOUT))?;
     let mut buf = vec![0u8; 4096];
     let _ = stream.read(&mut buf)?;
 
@@ -997,7 +1178,7 @@ type InterceptedPauses = HashMap<(Option<String>, String), InterceptedPause>;
 async fn cdp_processor(
     mut rx: ServerMessageReceiver,
     default_context: Arc<obscura_browser::BrowserContext>,
-    shutdown_notify: Arc<Notify>,
+    shutdown: ServerShutdown,
     execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
 ) {
     let mut ctx = CdpContext::new_with_shared_context(default_context);
@@ -1016,11 +1197,9 @@ async fn cdp_processor(
     let mut deferred: std::collections::VecDeque<ServerMessageEnvelope> =
         std::collections::VecDeque::new();
 
-    // Graceful shutdown: one signal watcher on the accept side flips the flag
-    // and calls `notify_waiters()`. Polled once here (via the select! below) it
-    // registers and stays registered across iterations, so a later
-    // `notify_waiters()` wakes this processor even while it is mid-dispatch.
-    let mut shutdown = Box::pin(shutdown_notify.notified());
+    // Graceful shutdown is sticky: a processor which subscribes after the
+    // server-wide signal still observes it on its first poll.
+    let mut shutdown_wait = Box::pin(shutdown.cancelled());
     // Chromium's PageHandler receives compositor video frames continuously.
     // Obscura has no separate compositor thread yet, so active screencasts get
     // a bounded 30 Hz opportunity on this connection's owning LocalSet.
@@ -1064,7 +1243,7 @@ async fn cdp_processor(
                     Some(m) => Some(m),
                     None => break,
                 },
-                _ = &mut shutdown => {
+                _ = &mut shutdown_wait => {
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
                 },
@@ -2512,9 +2691,49 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
     page.take_pending_navigation()
 }
 
+async fn run_outbound_writer<S>(
+    mut sink: S,
+    mut reply_rx: OutboundReceiver,
+    reply_tx: OutboundSender,
+    execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
+    send_timeout: tokio::time::Duration,
+) where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    while let Some(envelope) = reply_rx.recv().await {
+        if envelope.as_str().contains("\"__init\"") {
+            continue;
+        }
+        let (message, reservation) = envelope.into_parts();
+        let result = tokio::time::timeout(
+            send_timeout,
+            sink.send(Message::Text(message.into())),
+        )
+        .await;
+        drop(reservation);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!("WS write error: {error}");
+                reply_tx.close(OutboundCloseReason::WriterIo);
+                execution_cancellation.cancel();
+                break;
+            }
+            Err(_) => {
+                warn!("WS write timed out after {}ms", send_timeout.as_millis());
+                reply_tx.close(OutboundCloseReason::WriterTimeout);
+                execution_cancellation.cancel();
+                break;
+            }
+        }
+    }
+}
+
 async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: ServerMessageSender,
+    execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -2529,7 +2748,7 @@ async fn handle_connection_ws(
     cfg.max_frame_size = Some(inbound::DEFAULT_MAX_FRAME_BYTES);
     let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
     info!("WebSocket connected");
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let (ws_sender, mut ws_receiver) = ws_stream.split();
 
     let (reply_tx, mut reply_rx, mut outbound_closed) = crate::outbound::channel();
 
@@ -2550,33 +2769,14 @@ async fn handle_connection_ws(
     }
 
     let writer_reply_tx = reply_tx.clone();
-    let mut send_task = tokio::spawn(async move {
-        while let Some(envelope) = reply_rx.recv().await {
-            if envelope.as_str().contains("\"__init\"") {
-                continue;
-            }
-            let (message, reservation) = envelope.into_parts();
-            let result = tokio::time::timeout(
-                tokio::time::Duration::from_millis(OUTBOUND_SEND_TIMEOUT_MS),
-                ws_sender.send(Message::Text(message.into())),
-            )
-            .await;
-            drop(reservation);
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    warn!("WS write error: {error}");
-                    writer_reply_tx.close(OutboundCloseReason::WriterIo);
-                    break;
-                }
-                Err(_) => {
-                    warn!("WS write timed out after {OUTBOUND_SEND_TIMEOUT_MS}ms");
-                    writer_reply_tx.close(OutboundCloseReason::WriterTimeout);
-                    break;
-                }
-            }
-        }
-    });
+    let writer_cancellation = execution_cancellation.clone();
+    let mut send_task = tokio::spawn(run_outbound_writer(
+        ws_sender,
+        reply_rx,
+        writer_reply_tx,
+        writer_cancellation,
+        tokio::time::Duration::from_millis(OUTBOUND_SEND_TIMEOUT_MS),
+    ));
     struct AbortTaskOnDrop(tokio::task::AbortHandle);
     impl Drop for AbortTaskOnDrop {
         fn drop(&mut self) {
@@ -2601,6 +2801,7 @@ async fn handle_connection_ws(
                     warn!("CDP writer task failed: {error}");
                 }
                 reply_tx.close(OutboundCloseReason::WriterIo);
+                execution_cancellation.cancel();
                 break;
             }
             message = ws_receiver.next() => message,
@@ -2689,9 +2890,276 @@ pub(crate) mod tests {
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
+    use futures_util::Sink;
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    #[derive(Clone, Default)]
+    struct CompleteLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CompleteLogWriter(CompleteLogCapture);
+
+    impl std::io::Write for CompleteLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CompleteLogCapture {
+        type Writer = CompleteLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer { CompleteLogWriter(self.clone()) }
+    }
+
+    fn install_complete_log_capture() -> CompleteLogCapture {
+        static CAPTURE: std::sync::OnceLock<CompleteLogCapture> = std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let capture = CompleteLogCapture::default();
+            let _ = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(capture.clone())
+                .try_init();
+            capture
+        }).clone()
+    }
+
+    async fn wait_for_log(capture: &CompleteLogCapture, marker: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let bytes = capture.0.lock().unwrap().clone();
+                if bytes.windows(marker.len()).any(|window| window == marker.as_bytes()) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("active V8 marker was not emitted");
+    }
+
+    fn spawn_active_runtime(
+        cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
+        marker: &'static str,
+    ) -> std::sync::mpsc::Receiver<Result<(), String>> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let persona = obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            );
+            let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new(persona);
+            runtime.set_execution_cancellation(Some(cancellation));
+            let source = format!("console.info('{}'); while (true) {{}}", marker);
+            let result = runtime.execute_script("server-active-execution", &source);
+            let _ = done_tx.send(result);
+        });
+        done_rx
+    }
+
+    fn initialize_v8_on_current_thread() {
+        drop(obscura_js::runtime::ObscuraJsRuntime::new(
+            obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+        ));
+    }
+
+    enum ControlledSink {
+        Io,
+        Pending,
+    }
+
+    impl Sink<tokio_tungstenite::tungstenite::Message> for ControlledSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            match &*self {
+                Self::Io => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected writer I/O failure",
+                ))),
+                Self::Pending => Poll::Pending,
+            }
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: tokio_tungstenite::tungstenite::Message,
+        ) -> Result<(), Self::Error> {
+            match &*self {
+                Self::Io => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected writer I/O failure",
+                )),
+                Self::Pending => Ok(()),
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    type TestWebSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn websocket_command(
+        socket: &mut TestWebSocket,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+        session_id: Option<&str>,
+    ) -> serde_json::Value {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let mut request = json!({"id": id, "method": method, "params": params});
+        if let Some(session_id) = session_id {
+            request["sessionId"] = serde_json::Value::String(session_id.to_string());
+        }
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            request.to_string().into(),
+        )).await.unwrap();
+        loop {
+            let message = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                socket.next(),
+            ).await
+                .expect("CDP response timeout")
+                .expect("CDP socket closed")
+                .expect("CDP websocket error");
+            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if response.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                return response;
+            }
+        }
+    }
+
+    async fn create_test_page(socket: &mut TestWebSocket) -> String {
+        let response = websocket_command(
+            socket,
+            1,
+            "Target.createTarget",
+            json!({"url": "about:blank"}),
+            None,
+        ).await;
+        let target = response["result"]["targetId"].as_str().unwrap();
+        format!("{target}-session")
+    }
+
+    async fn wait_for_socket_close(socket: &mut TestWebSocket) {
+        use futures_util::StreamExt as _;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_))
+                    | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return,
+                    Some(Ok(_)) => {}
+                }
+            }
+        }).await.expect("connection socket did not close");
+    }
+
+    async fn wait_for_live_connections(live: &std::sync::atomic::AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while live.load(std::sync::atomic::Ordering::Acquire) != expected {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("live connection slot did not converge");
+    }
+
+    async fn start_direct_connection(
+        shutdown: super::ServerShutdown,
+    ) -> (
+        TestWebSocket,
+        tokio::task::AbortHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        initialize_v8_on_current_thread();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::task::spawn_local(async move {
+            tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser"))
+                .await
+                .unwrap()
+                .0
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let std_stream = stream.into_std().unwrap();
+        std_stream.set_nonblocking(true).unwrap();
+
+        let persona = obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        );
+        let context = crate::dispatch::CdpContext::new(persona).default_context;
+        let persistence = Arc::new(context.isolated_copy("test-persistence".into(), true));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let io_abort = super::run_connection(
+            std_stream,
+            context,
+            persistence,
+            Arc::new(std::sync::Mutex::new(())),
+            shutdown,
+            live.clone(),
+        ).expect("connection tasks");
+        (client.await.unwrap(), io_abort, live)
+    }
+
+    async fn enter_infinite_page_script(
+        socket: &mut TestWebSocket,
+        capture: &CompleteLogCapture,
+        marker: &'static str,
+        queued_marker: &'static str,
+    ) {
+        use futures_util::SinkExt as _;
+        let session = create_test_page(socket).await;
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+            "id": 2,
+            "method": "Runtime.evaluate",
+            "sessionId": session.clone(),
+            "params": {
+                "expression": format!("console.info('{}'); while (true) {{}}", marker),
+                "returnByValue": true
+            }
+        }).to_string().into())).await.unwrap();
+        wait_for_log(capture, marker).await;
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+            "id": 3,
+            "method": "Runtime.evaluate",
+            "sessionId": session,
+            "params": {
+                "expression": format!("console.info('{}'); 43", queued_marker),
+                "returnByValue": true
+            }
+        }).to_string().into())).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    fn assert_log_absent(capture: &CompleteLogCapture, marker: &str) {
+        let bytes = capture.0.lock().unwrap().clone();
+        assert!(
+            !bytes.windows(marker.len()).any(|window| window == marker.as_bytes()),
+            "queued command ran after connection cancellation: {marker}",
+        );
+    }
 
     fn request_pause(resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>) -> InterceptedPause {
         InterceptedPause { stage: obscura_js::ops::InterceptionStage::Request, redirect_response: false, resolver }
@@ -2879,6 +3347,59 @@ pub(crate) mod tests {
         assert!(browser_close_response(&other).is_none());
     }
 
+    async fn writer_failure_interrupts_active_v8(
+        sink: ControlledSink,
+        expected: crate::outbound::CloseReason,
+        timeout: std::time::Duration,
+        marker: &'static str,
+    ) {
+        let capture = install_complete_log_capture();
+        initialize_v8_on_current_thread();
+        let cancellation = obscura_js::execution_cancellation::ExecutionCancellation::default();
+        let completed = spawn_active_runtime(cancellation.clone(), marker);
+        wait_for_log(&capture, marker).await;
+
+        let (reply_tx, reply_rx, _) = crate::outbound::channel();
+        reply_tx.send("writer-probe".to_string()).unwrap();
+        super::run_outbound_writer(
+            sink,
+            reply_rx,
+            reply_tx.clone(),
+            cancellation,
+            timeout,
+        ).await;
+
+        assert_eq!(reply_tx.close_reason(), Some(expected));
+        assert_eq!(reply_tx.usage(), (0, 0), "writer reservation must be released");
+        assert!(
+            completed
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("writer failure did not terminate active V8")
+                .is_err(),
+            "connection-fatal writer outcome must not let the infinite script succeed",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_io_failure_closes_outbound_and_interrupts_active_v8() {
+        writer_failure_interrupts_active_v8(
+            ControlledSink::Io,
+            crate::outbound::CloseReason::WriterIo,
+            std::time::Duration::from_secs(1),
+            "obscura-writer-io-active",
+        ).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_timeout_closes_outbound_and_interrupts_active_v8() {
+        writer_failure_interrupts_active_v8(
+            ControlledSink::Pending,
+            crate::outbound::CloseReason::WriterTimeout,
+            std::time::Duration::from_millis(25),
+            "obscura-writer-timeout-active",
+        ).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn outbound_overflow_stops_before_later_queued_commands() {
         tokio::task::LocalSet::new()
@@ -2886,7 +3407,7 @@ pub(crate) mod tests {
                 let (server_tx, server_rx) = crate::inbound::channel();
                 let (reply_tx, mut reply_rx, mut closed) =
                     crate::outbound::channel_with_limits(1, 1024 * 1024, 1024 * 1024);
-                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let shutdown = super::ServerShutdown::new();
                 let default_context = crate::dispatch::CdpContext::new(
                     obscura_net::EffectivePersona::builtin(
                         obscura_net::StealthProfile::WindowsChrome145,
@@ -3011,7 +3532,11 @@ pub(crate) mod tests {
                 });
                 let server = tokio::task::spawn_local(async move {
                     let (stream, _) = listener.accept().await.unwrap();
-                    super::handle_connection_ws(stream, server_tx).await
+                    super::handle_connection_ws(
+                        stream,
+                        server_tx,
+                        obscura_js::execution_cancellation::ExecutionCancellation::default(),
+                    ).await
                 });
 
                 let (mut client, _) = tokio_tungstenite::connect_async(
@@ -3076,7 +3601,11 @@ pub(crate) mod tests {
                 });
                 let server = tokio::task::spawn_local(async move {
                     let (stream, _) = listener.accept().await.unwrap();
-                    super::handle_connection_ws(stream, server_tx).await
+                    super::handle_connection_ws(
+                        stream,
+                        server_tx,
+                        obscura_js::execution_cancellation::ExecutionCancellation::default(),
+                    ).await
                 });
 
                 let (mut client, _) = tokio_tungstenite::connect_async(
@@ -3112,6 +3641,170 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_outer_io_task_interrupts_active_v8_and_releases_slot() {
+        tokio::task::LocalSet::new().run_until(async {
+            let capture = install_complete_log_capture();
+            let shutdown = super::ServerShutdown::new();
+            let (mut client, io_abort, live) = start_direct_connection(shutdown).await;
+            enter_infinite_page_script(
+                &mut client,
+                &capture,
+                "obscura-outer-io-active",
+                "obscura-outer-io-queued",
+            ).await;
+
+            io_abort.abort();
+            wait_for_socket_close(&mut client).await;
+            wait_for_live_connections(&live, 0).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_log_absent(&capture, "obscura-outer-io-queued");
+        }).await;
+    }
+
+    async fn connect_with_retry(address: std::net::SocketAddr) -> TestWebSocket {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match tokio_tungstenite::connect_async(
+                format!("ws://{address}/devtools/browser"),
+            ).await {
+                Ok((socket, _)) => return socket,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("CDP test server did not start: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sticky_server_shutdown_interrupts_active_v8_and_drains_connection_slot() {
+        tokio::task::LocalSet::new().run_until(async {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = probe.local_addr().unwrap();
+            drop(probe);
+            let shutdown = super::ServerShutdown::new();
+            let server_shutdown = shutdown.clone();
+            let server = tokio::task::spawn_local(async move {
+                super::start_with_serve_options_access_limit_and_shutdown(
+                    address.port(),
+                    "127.0.0.1",
+                    None,
+                    false,
+                    None,
+                    true,
+                    1,
+                    crate::access::CdpAccessOptions::default(),
+                    obscura_net::EffectivePersona::builtin(
+                        obscura_net::StealthProfile::WindowsChrome145,
+                    ),
+                    server_shutdown,
+                    false,
+                ).await
+            });
+
+            let capture = install_complete_log_capture();
+            let mut client = connect_with_retry(address).await;
+            enter_infinite_page_script(
+                &mut client,
+                &capture,
+                "obscura-server-shutdown-active",
+                "obscura-server-shutdown-queued",
+            ).await;
+
+            shutdown.cancel();
+            wait_for_socket_close(&mut client).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("server shutdown waited for the V8 watchdog or drain deadline")
+                .expect("server task")
+                .expect("server shutdown");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_log_absent(&capture, "obscura-server-shutdown-queued");
+            assert!(
+                std::net::TcpStream::connect_timeout(
+                    &address,
+                    std::time::Duration::from_millis(100),
+                ).is_err(),
+                "accept thread and listener remained live after server shutdown",
+            );
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_shutdown_is_sticky_for_late_subscribers() {
+        let shutdown = super::ServerShutdown::new();
+        shutdown.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            shutdown.cancelled(),
+        ).await.expect("late shutdown subscriber missed cancellation");
+    }
+
+    #[test]
+    fn cancellation_before_accept_waker_registration_wakes_its_first_poll() {
+        let shutdown = super::ServerShutdown::new();
+        shutdown.cancel();
+        let mut poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(
+            poll.registry(),
+            super::ACCEPT_SHUTDOWN_TOKEN,
+        ).unwrap());
+        shutdown.register_accept_waker(waker);
+        let mut events = mio::Events::with_capacity(1);
+        let started = std::time::Instant::now();
+        poll.poll(&mut events, Some(std::time::Duration::from_secs(5))).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "accept poll consumed its full timeout after sticky cancellation: {elapsed:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.token() == super::ACCEPT_SHUTDOWN_TOKEN),
+            "sticky cancellation did not publish the shutdown token",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sticky_server_shutdown_stops_an_idle_accept_thread() {
+        tokio::task::LocalSet::new().run_until(async {
+            let shutdown = super::ServerShutdown::new();
+            let server_shutdown = shutdown.clone();
+            let server = tokio::task::spawn_local(async move {
+                super::start_with_serve_options_access_limit_and_shutdown(
+                    0,
+                    "127.0.0.1",
+                    None,
+                    false,
+                    None,
+                    true,
+                    1,
+                    crate::access::CdpAccessOptions::default(),
+                    obscura_net::EffectivePersona::builtin(
+                        obscura_net::StealthProfile::WindowsChrome145,
+                    ),
+                    server_shutdown,
+                    false,
+                ).await
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !shutdown.accept_waker_is_registered() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("idle accept thread was not registered");
+
+            shutdown.cancel();
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("idle accept thread did not observe server shutdown")
+                .expect("server task")
+                .expect("idle server shutdown");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn websocket_inbound_overflow_closes_without_queueing_the_later_command() {
         use futures_util::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::Message;
@@ -3126,7 +3819,11 @@ pub(crate) mod tests {
 
                 let handler = tokio::task::spawn_local(async move {
                     let (stream, _) = listener.accept().await.unwrap();
-                    super::handle_connection_ws(stream, server_tx).await
+                    super::handle_connection_ws(
+                        stream,
+                        server_tx,
+                        obscura_js::execution_cancellation::ExecutionCancellation::default(),
+                    ).await
                 });
                 let inspector = tokio::task::spawn_local(async move {
                     let (init, init_reservation) = server_rx
@@ -3207,7 +3904,7 @@ pub(crate) mod tests {
             .run_until(async {
                 let (server_tx, server_rx) = crate::inbound::channel();
                 let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
-                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let shutdown = super::ServerShutdown::new();
                 let default_context = crate::dispatch::CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)).default_context;
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
