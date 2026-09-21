@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use obscura_browser::{BrowserContext, Page};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
@@ -94,13 +94,17 @@ enum Command {
         #[arg(long)]
         proxy: Option<String>,
 
-        #[arg(long, default_value_t = 1)]
+        /// Number of worker processes. In multi-worker mode each worker gets
+        /// its own `--max-connections` allowance.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
         workers: u16,
 
         /// Maximum live CDP connections. Each connection runs on its own OS
         /// thread with its own V8 isolates, so this bounds the server's thread
-        /// and memory footprint. Connections beyond the limit are refused with
-        /// a 503 rather than queued.
+        /// and memory footprint. This limit is per worker when `--workers` is
+        /// greater than one; the parent admits at most workers times this many
+        /// simultaneous byte-transparent relays. Connections beyond the limit
+        /// are refused with a 503 rather than queued.
         #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
         max_connections: usize,
 
@@ -734,14 +738,14 @@ async fn run_multi_worker_serve(
     access: CdpServeAccess,
     persona: obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
 
     let exe = std::env::current_exe()?;
     let mut children = Vec::new();
+    let worker_ports = multi_worker_ports(port, workers)?;
+    let relay_limit = multi_worker_relay_limit(workers, max_connections)?;
 
-    for i in 0..workers {
-        let worker_port = port + 1 + i;
+    for (i, worker_port) in worker_ports.iter().copied().enumerate() {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve")
             .arg("--port")
@@ -782,86 +786,207 @@ async fn run_multi_worker_serve(
     // refused from outside the container (issue #336). Workers stay on loopback
     // and are only reached by the balancer.
     let listener = TcpListener::bind((host.as_str(), port)).await?;
-    tracing::info!("Load balancer on {}:{}, {} workers", host, port, workers);
+    tracing::info!(
+        "Load balancer on {}:{}, {} workers, {} relay slots",
+        host,
+        port,
+        workers,
+        relay_limit
+    );
 
-    let mut next_worker: u16 = 0;
+    let worker_addrs = worker_ports
+        .into_iter()
+        .map(|worker_port| std::net::SocketAddr::from(([127, 0, 0, 1], worker_port)))
+        .collect();
+    run_multi_worker_relay_loop(listener, worker_addrs, relay_limit).await
+}
 
-    loop {
-        let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
-        next_worker = next_worker.wrapping_add(1);
+const MULTI_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const MULTI_WORKER_REJECTION_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_MULTI_WORKER_REJECTIONS: usize = 16;
+const MULTI_WORKER_RELAY_LIMIT_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+Content-Length: 0\r\nConnection: close\r\n\
+X-Obscura-Reason: max-relays\r\n\r\n";
+const MULTI_WORKER_BAD_GATEWAY_RESPONSE: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\
+Content-Length: 0\r\nConnection: close\r\n\
+X-Obscura-Reason: worker-unreachable\r\n\r\n";
 
-        tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
+fn multi_worker_ports(port: u16, workers: u16) -> anyhow::Result<Vec<u16>> {
+    (1..=workers)
+        .map(|offset| {
+            port.checked_add(offset).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "serve --workers {} requires ports through {}, beyond u16 range",
+                    workers,
+                    u32::from(port) + u32::from(workers)
+                )
+            })
+        })
+        .collect()
+}
 
-        let mut peek_buf = [0u8; 4];
-        client_stream.peek(&mut peek_buf).await?;
+fn multi_worker_relay_limit(workers: u16, max_connections: usize) -> anyhow::Result<usize> {
+    let limit = usize::from(workers)
+        .checked_mul(max_connections)
+        .ok_or_else(|| anyhow::anyhow!("multi-worker relay limit overflow"))?;
+    if limit > tokio::sync::Semaphore::MAX_PERMITS {
+        anyhow::bail!(
+            "multi-worker relay limit {} exceeds runtime maximum {}",
+            limit,
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+    Ok(limit)
+}
 
-        if &peek_buf == b"GET " {
-            let mut full_peek = [0u8; 256];
-            let n = client_stream.peek(&mut full_peek).await?;
-            let request_line = String::from_utf8_lossy(&full_peek[..n]);
-
-            if request_line.contains("/json") {
-                let worker_addr = format!("127.0.0.1:{}", worker_port);
-                match tokio::net::TcpStream::connect(&worker_addr).await {
-                    Ok(mut worker_stream) => {
-                        tokio::spawn(async move {
-                            let std_stream = match client_stream.into_std() {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::error!(
-                                        "/json: failed to convert client to std stream: {}",
-                                        e
-                                    );
-                                    return;
-                                }
-                            };
-                            let mut client = match tokio::net::TcpStream::from_std(std_stream) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::error!(
-                                        "/json: failed to recreate tokio TcpStream: {}",
-                                        e
-                                    );
-                                    return;
-                                }
-                            };
-                            let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream)
-                                .await;
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("/json worker {} unreachable: {}", worker_addr, e);
-                        tokio::spawn(async move {
-                            let mut s = client_stream;
-                            let _ = s
-                                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                                .await;
-                            let _ = s.shutdown().await;
-                        });
-                    }
-                }
-                continue;
+async fn reject_multi_worker_client(
+    mut client: tokio::net::TcpStream,
+    response: &'static [u8],
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let result = timeout(MULTI_WORKER_REJECTION_TIMEOUT, async {
+        // Send first so a slow or oversized request head cannot consume the
+        // whole rejection budget before the fixed response is written. Keep
+        // the socket open after shutting down the write half and drain input
+        // within the same total deadline. This gives the peer time to receive
+        // the complete response without allowing an unbounded drain task.
+        client.write_all(response).await?;
+        client.flush().await?;
+        client.shutdown().await?;
+        let mut discard = [0u8; 4096];
+        loop {
+            if client.read(&mut discard).await? == 0 {
+                return Ok::<(), std::io::Error>(());
             }
         }
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::debug!("failed to send relay refusal: {}", error),
+        Err(_) => tracing::debug!(
+            "timed out sending relay refusal after {:?}",
+            MULTI_WORKER_REJECTION_TIMEOUT
+        ),
+    }
+}
 
-        let worker_addr = format!("127.0.0.1:{}", worker_port);
-        tokio::spawn(async move {
-            match tokio::net::TcpStream::connect(&worker_addr).await {
-                Ok(mut worker_stream) => {
-                    let mut client = client_stream;
-                    let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
-                }
-                Err(e) => {
-                    tracing::warn!("worker {} unreachable: {}", worker_addr, e);
-                    let mut s = client_stream;
-                    let _ = s
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                        .await;
-                    let _ = s.shutdown().await;
-                }
+async fn relay_multi_worker_connection(
+    mut client: tokio::net::TcpStream,
+    peer_addr: std::net::SocketAddr,
+    worker_addr: std::net::SocketAddr,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let mut worker = match timeout(
+        MULTI_WORKER_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(worker_addr),
+    )
+    .await
+    {
+        Ok(Ok(worker)) => worker,
+        Ok(Err(error)) => {
+            tracing::warn!("worker {} unreachable for {}: {}", worker_addr, peer_addr, error);
+            reject_multi_worker_client(client, MULTI_WORKER_BAD_GATEWAY_RESPONSE, permit).await;
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                "worker {} connect timed out for {} after {:?}",
+                worker_addr,
+                peer_addr,
+                MULTI_WORKER_CONNECT_TIMEOUT
+            );
+            reject_multi_worker_client(client, MULTI_WORKER_BAD_GATEWAY_RESPONSE, permit).await;
+            return;
+        }
+    };
+    let _permit = permit;
+
+    match tokio::io::copy_bidirectional(&mut client, &mut worker).await {
+        Ok((client_to_worker, worker_to_client)) => tracing::debug!(
+            "relay {} <-> {} closed after {} client bytes and {} worker bytes",
+            peer_addr,
+            worker_addr,
+            client_to_worker,
+            worker_to_client
+        ),
+        Err(error) => tracing::debug!(
+            "relay {} <-> {} ended with I/O error: {}",
+            peer_addr,
+            worker_addr,
+            error
+        ),
+    }
+}
+
+fn report_multi_worker_task(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::error!("multi-worker relay task failed: {}", error);
+    }
+}
+
+async fn run_multi_worker_relay_loop(
+    listener: tokio::net::TcpListener,
+    worker_addrs: Vec<std::net::SocketAddr>,
+    relay_limit: usize,
+) -> anyhow::Result<()> {
+    if worker_addrs.is_empty() {
+        anyhow::bail!("multi-worker relay requires at least one worker address");
+    }
+
+    let relay_slots = Arc::new(tokio::sync::Semaphore::new(relay_limit));
+    let rejection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_MULTI_WORKER_REJECTIONS));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut next_worker = 0usize;
+
+    loop {
+        while let Some(result) = tasks.try_join_next() {
+            report_multi_worker_task(result);
+        }
+
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (client, peer_addr) = accepted?;
+                let permit = match relay_slots.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            "refusing multi-worker relay: at aggregate relay limit ({})",
+                            relay_limit
+                        );
+                        match rejection_slots.clone().try_acquire_owned() {
+                            Ok(rejection_permit) => {
+                                tasks.spawn(reject_multi_worker_client(
+                                    client,
+                                    MULTI_WORKER_RELAY_LIMIT_RESPONSE,
+                                    rejection_permit,
+                                ));
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "dropping multi-worker relay refusal: {} rejection tasks already active",
+                                    MAX_MULTI_WORKER_REJECTIONS
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+                let worker_addr = worker_addrs[next_worker % worker_addrs.len()];
+                next_worker = next_worker.wrapping_add(1);
+                tracing::debug!("Routing {} to worker {}", peer_addr, worker_addr);
+                tasks.spawn(relay_multi_worker_connection(
+                    client,
+                    peer_addr,
+                    worker_addr,
+                    permit,
+                ));
             }
-        });
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                report_multi_worker_task(result);
+            }
+        }
     }
 }
 
@@ -2115,12 +2240,225 @@ mod tests {
         effective_cdp_allowed_hosts,
         extract_readable_text, fetch_original_bytes, fetch_process_hard_timeout,
         is_quiet_command, link_kind_from_rel,
-        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
+        merge_proxy, multi_worker_ports, multi_worker_relay_limit, normalize_v8_flags,
+        read_urls_from_file, resolve_asset_url, run_multi_worker_relay_loop, select_log_filter,
         resolve_persona, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
-        DEFAULT_V8_FLAGS,
+        DEFAULT_V8_FLAGS, MULTI_WORKER_BAD_GATEWAY_RESPONSE,
+        MULTI_WORKER_RELAY_LIMIT_RESPONSE,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+
+    async fn spawn_echo_worker(
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let events_tx = events_tx.clone();
+                events_tx.send("accepted").unwrap();
+                tokio::spawn(async move {
+                    let (mut read, mut write) = stream.into_split();
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                    let _ = events_tx.send("closed");
+                });
+            }
+        });
+        (addr, events_rx, task)
+    }
+
+    async fn spawn_test_relay(
+        worker_addr: std::net::SocketAddr,
+        relay_limit: usize,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(run_multi_worker_relay_loop(
+            listener,
+            vec![worker_addr],
+            relay_limit,
+        ));
+        (addr, task)
+    }
+
+    async fn round_trip_and_close(addr: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        for chunk in payload.chunks(137) {
+            stream.write_all(chunk).await.unwrap();
+        }
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        response
+    }
+
+    #[test]
+    fn multi_worker_ports_reject_wraparound_before_spawn() {
+        assert_eq!(multi_worker_ports(9_222, 2).unwrap(), [9_223, 9_224]);
+        let error = multi_worker_ports(u16::MAX - 1, 2).unwrap_err();
+        assert!(error.to_string().contains("beyond u16 range"));
+    }
+
+    #[test]
+    fn multi_worker_relay_limit_is_aggregate_and_checked() {
+        assert_eq!(multi_worker_relay_limit(3, 7).unwrap(), 21);
+        assert_eq!(multi_worker_relay_limit(2, 0).unwrap(), 0);
+        let error = multi_worker_relay_limit(2, usize::MAX).unwrap_err();
+        assert!(error.to_string().contains("overflow"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn silent_client_does_not_block_following_byte_transparent_relay() {
+        let (worker_addr, mut worker_events, worker_task) = spawn_echo_worker().await;
+        let (relay_addr, relay_task) = spawn_test_relay(worker_addr, 2).await;
+
+        let silent = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), worker_events.recv())
+                .await
+                .unwrap(),
+            Some("accepted")
+        );
+
+        let payload: Vec<u8> = (0..8_192)
+            .map(|index| match index % 257 {
+                0 => 0,
+                1 => 0xff,
+                _ => (index % 251) as u8,
+            })
+            .collect();
+        let echoed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            round_trip_and_close(relay_addr, &payload),
+        )
+        .await
+        .expect("a silent first client must not stall the accept loop");
+        assert_eq!(echoed, payload);
+
+        drop(silent);
+        relay_task.abort();
+        worker_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_limit_is_explicit_and_recovers_after_release() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (worker_addr, mut worker_events, worker_task) = spawn_echo_worker().await;
+        let (relay_addr, relay_task) = spawn_test_relay(worker_addr, 2).await;
+        let first = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        let second = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), worker_events.recv())
+                    .await
+                    .unwrap(),
+                Some("accepted")
+            );
+        }
+
+        let mut request = b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Fill: ".to_vec();
+        request.extend(std::iter::repeat(b'x').take(6_000));
+        request.extend_from_slice(b"\r\n\r\n");
+        let mut refused = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        refused.write_all(&request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            refused.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response, MULTI_WORKER_RELAY_LIMIT_RESPONSE);
+        assert!(worker_events.try_recv().is_err());
+
+        drop(first);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), worker_events.recv())
+                .await
+                .unwrap(),
+            Some("closed")
+        );
+
+        let recovery_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let recovered = loop {
+            let response = tokio::time::timeout_at(
+                recovery_deadline,
+                round_trip_and_close(relay_addr, b"recovered\x00\xff"),
+            )
+            .await
+            .expect("a released relay permit must admit a later client");
+            if response == b"recovered\x00\xff" {
+                break response;
+            }
+            assert_eq!(response, MULTI_WORKER_RELAY_LIMIT_RESPONSE);
+            assert!(
+                tokio::time::Instant::now() < recovery_deadline,
+                "a released relay permit must admit a later client"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(recovered, b"recovered\x00\xff");
+
+        drop(second);
+        relay_task.abort();
+        worker_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreachable_worker_returns_complete_502_and_releases_permit() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let worker_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let (relay_addr, relay_task) = spawn_test_relay(worker_addr, 1).await;
+
+        let request = b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let mut first = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        first.write_all(request).await.unwrap();
+        first.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            first.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response, MULTI_WORKER_BAD_GATEWAY_RESPONSE);
+
+        let worker = tokio::net::TcpListener::bind(worker_addr).await.unwrap();
+        let worker_task = tokio::spawn(async move {
+            let (stream, _) = worker.accept().await.unwrap();
+            let (mut read, mut write) = stream.into_split();
+            tokio::io::copy(&mut read, &mut write).await.unwrap();
+        });
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            round_trip_and_close(relay_addr, b"after-502"),
+        )
+        .await
+        .expect("worker connect failure must release the relay permit");
+        assert_eq!(recovered, b"after-502");
+
+        relay_task.abort();
+        worker_task.abort();
+    }
 
     #[test]
     fn startup_persona_is_required_and_compiled_before_work_begins() {
