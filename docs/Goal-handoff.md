@@ -5,12 +5,18 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`1b9de24276cbcf484f3e1988516c11fc728a9b03`，`Retain exact request bodies`；其实现基线为 `cddec40372f3fc7a93965f3a5fbdf434f63701d4`。
+- 最近完成的实现提交：`04559e64212a7cb754437d9a2dbc9472e241317f`，`Persist Network observation history`；其实现基线为 `acd6078bb9802de607e1080cad54082ba4c28a97`。
 - 该实现提交已推送到 `origin/main`；本交接更新提交完成后须再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 相关实现入口：[`request_body.rs`](../crates/obscura-net/src/request_body.rs) 的 Page-owned raw store、[`page.rs`](../crates/obscura-browser/src/page.rs) 的原生导航/redirect 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker 接入，以及 [`network.rs`](../crates/obscura-cdp/src/domains/network.rs)、[`server.rs`](../crates/obscura-cdp/src/server.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的读取与投影。
+- 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
 
 ## 最近完成的阶段
+
+每个 `BrowserContext` 现拥有 append-only `NetworkHistory`。记录使用全局单调 sequence 与永不复用的 page-instance ID，跨导航、Page 关闭和同一 context 多 Page 保留完整 observation metadata、精确 raw request/response headers 及 immutable request、transport-request、response body 引用。默认边界为 4096 条记录和 4096 个 page instance、64 MiB metadata、16 MiB 单条、512 MiB unique body bytes、32768 个 body entry、640 MiB persistent journal。首次 count/bytes/serialization/I/O/producer/close failure 保留 accepted prefix 并成为 context-wide sticky terminal，停止现有 sibling runtime、Worker 和 native producer 的后续网络工作；不 eviction、不截断、不脱敏。
+
+不指定存储目录时历史在 context 生命周期内以内存形式提供；`serve`/`mcp --storage-dir` 使用 versioned manifest 与 checksummed length-framed journal，完整 frame 写入并 `sync_data` 后才算接纳。恢复只接受 checksum-valid committed prefix，并把 incomplete/corrupt/over-limit tail 或 missing body 作为结构化 recovery failure 独立暴露。MCP 的 `browser_network_requests` 已改读该 authority，并新增 `browser_network_histories`、`browser_network_history`、`browser_network_body`；CDP browser-level 扩展新增 `Obscura.getNetworkHistories`、`Obscura.getNetworkHistory`、`Obscura.getNetworkBody`。两侧均支持 bounded sequence/page-instance 查询和 repeatable body chunk 读取。
+
+Astra light 独立审核发现并推动修复 producer queue failure 早于 accepted prefix、native POST redirect 中间 response body 缺失、CDP discovery 不报告损坏 archive、response-stage Fulfill 保留旧 body、以及 sibling Page 未共享 context-wide upstream stop 五类问题；最终复审无 blocker、major 或 minor。普通非拦截资源 start emission、Page body budget 与 Chrome per-agent `Network.enable.maxPostDataSize`、Fetch stream 多消费者仍未完成，OB-021 保持未关闭。
 
 Page 现有独立 request-body store：默认 2 MiB 后 spool、256 MiB unique raw bytes、16384 canonical entries，支持三项 `OBSCURA_NETWORK_REQUEST_BODY_*` 环境配置。预算失败和 I/O 失败 sticky，保留 accepted prefix，并在发送前拒绝后续需要新增正文 capture 的请求；无正文请求不受该正文预算影响。不 eviction、不截断、不脱敏。显式空 body 与缺省 body 严格区分；相同 standard/transport 或 307/308 redirect body 共享 raw bytes 但各占 canonical entry，bodyless logical alias 不积累 tombstone。
 
@@ -44,6 +50,13 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 ## 验证结果
 
+- persistent history browser+CDP release 回归 678/678，3 skipped（run `a61a325c-82a0-48f8-aa15-654a4373f685`）。
+- full release/render nextest 最终复跑 2277/2277，4 skipped（run `90245ddb-30df-43d2-bc7a-aed6d1a67219`）。首次全量唯一失败为既有 MCP `test_evaluate` 空标题；源码未改的两项复跑 2/2（run `49ed9390-3de4-4f72-89d2-a427bc803d00`）后全量干净通过，不把该偶发复跑通过称作修复。
+- render 和 no-default-features 两种 exact CLI release build 均成功；最终 exact render SHA-256 `e92740a871748d0588e66e8a3473d00eb6cd9aeae7efc2eb8d06550ffe3dc48b`，120453184 bytes。
+- benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33。
+- 同一二进制通过官方 Playwright Python 1.60.0 automation smoke，完整协议日志匹配 37-method profile。
+- Astra light 终审无 blocker、major 或 minor；`git diff --check` 通过。
+
 - request-body 聚焦批次 18/18、14/14、review fixes 6/6、CDP redirect fixes 4/4。
 - full release/render nextest 2255/2255，4 skipped（run `4a6d3e2f-b260-4acb-8f30-0f84dcf0d814`）。
 - render 和 no-default-features 两种 exact CLI release build 均成功；最终 exact render SHA-256 `20b8ef6e6cead3235f0a0c96bc3d31b235c5821de7a790a07a78ca20375cde8e`，119759824 bytes。
@@ -73,9 +86,8 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
-1. 建立导航/多页面持久 observation history；当前 active Page 内存历史不能作为 append-only 或崩溃恢复证据。
-2. 统一普通非拦截资源 start emission 与 Page body budget/Chrome per-agent 参数契约，包括 `Network.enable.maxPostDataSize`。
-3. 补齐 Fetch stream 多消费者语义，再按实际风险推进其余 input qualification、disconnect 矩阵和 idle Worker cancellation wake。
+1. 统一普通非拦截资源 start emission 与 Page body budget/Chrome per-agent 参数契约，包括 `Network.enable.maxPostDataSize`。
+2. 补齐 Fetch stream 多消费者语义，再按实际风险推进其余 input qualification、disconnect 矩阵和 idle Worker cancellation wake。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -130,6 +142,14 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/tmp/ob021-network-observation-build-render.log`
 - `/tmp/ob021-network-observation-obstacle.log`
 - `/tmp/ob021-network-observation-playwright.xICldu/`
+- `/tmp/ob021-network-history-review-fixes.log`
+- `/tmp/ob021-network-history-full-nextest.log`
+- `/tmp/ob021-network-history-mcp-evaluate-rerun.log`
+- `/tmp/ob021-network-history-full-nextest-rerun.log`
+- `/tmp/ob021-network-history-build-no-render.log`
+- `/tmp/ob021-network-history-build-render.log`
+- `/tmp/ob021-network-history-obstacle.log`
+- `/tmp/ob021-network-history-playwright.1FYhiN/`
 - `/tmp/ob034-inbound-benchmark.cEiFsw`
 
 这些路径属于原始运行主机的临时文件，不是仓库内的持久接口。可持续引用的结论和能力边界以本页、[SUMMARY](SUMMARY.md) 及对应提交中的测试为准。处理这些日志时保留原始字段和完整内容。
