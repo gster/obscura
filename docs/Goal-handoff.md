@@ -5,12 +5,16 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`bc0d557edba3e49a6066da6ec887571dd5236f4e`，`Qualify CDP admission and Worker teardown`；其实现基线为 `4b1af1a28fbb401f09453a4a5664bef4a3a30d21`。
+- 最近完成的实现提交：`9f559eac0d8eda453ab813305cc1df39b5901a75`，`Add CDP backlog qualification`；其实现基线为 `610adb2244881a89a5114f74017cdb1c8353054c`。
 - 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
 - 相关实现入口：[`network_history.rs`](../crates/obscura-browser/src/network_history.rs) 的 context-owned journal、[`context.rs`](../crates/obscura-browser/src/context.rs) 与 [`page.rs`](../crates/obscura-browser/src/page.rs) 的 ownership/producer 接入、[`ops.rs`](../crates/obscura-js/src/ops.rs) 与 [`worker.rs`](../crates/obscura-js/src/worker.rs) 的 scripted/Worker barrier，以及 [`obscura.rs`](../crates/obscura-cdp/src/domains/obscura.rs)、[`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 和 [`lib.rs`](../crates/obscura-mcp/src/lib.rs) 的恢复、读取与投影。
 
 ## 最近完成的阶段
+
+OB-034 现有单 worker 实际 OS listen backlog 资格工具。它在 readiness 与基线 snapshot 后向整个服务进程组发送 `SIGSTOP`，由内核确认 stopped 后再同时释放完整 discovery 请求；成功连接因此只能留在 kernel listen queue，不会先进入 256 条 accepted silent-pending。通过条件同时包括目标 queue 达其报告 maximum、服务数字 FD 不增长、压力项只能是 connect timeout、恢复后所有已发送请求取得完整 200、queue/FD 回到基线，以及新 WebSocket 完成 101 和 raw `Browser.getVersion` 往返。所有 request/response、frames、host command stdout/stderr、server byte streams、snapshot、failure traceback 和 hashes 完整保留。
+
+最终本机 Darwin 24.6.0 arm64 运行使用上一切片的最终 render binary：240 次并发 connect 中 128 次完整请求进入 `128/128` listen queue，112 次 connect timeout，其他 client failure 为 0；进程 stopped 期间数字 FD 和 RSS 保持 16、19232 KiB，128 条恢复响应全部完整 200。恢复后 queue 为 0、FD 为 16，HTTP 200、WebSocket 101、CDP response id=1 和 masked Close 后 clean EOF 均成功；RSS 为 20624 KiB，server stderr 0 bytes，SIGTERM returncode 0。RSS 只是采样，不是上限。Astra light 三轮审核推动修复失败路径死锁、伪 pressure、平台解析、异常证据丢失和 executor post-enqueue submit failure，最终 0 blocker、0 major、0 minor。该结果不外推 Linux、Windows、容器、multi-worker、总 RSS 或其他三层逻辑容量，OB-034 仍开放。
 
 OB-034 的 server admission 与 Worker terminal-boundary 资格切片已移除此前两处推断。main/iframe 在 active 同步循环后发出的 id=3 只有在真实 WebSocket reader 成功调用 inbound `send` 后才由 per-server test observer 确认；outer I/O abort、sticky server shutdown 和真实 writer 两类终止源都等待该 barrier，再断言 queued marker 未执行。Dedicated Worker 则通过 connection-local thread registration 从 1 到 0，直接证明 runtime/lease 已释放、completion handoff 已尝试且 closure 到达 terminal return boundary；这不是 OS thread join 声明。
 
@@ -75,6 +79,9 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 该阶段只修复 native passive callback ownership。callback panic 仍未隔离；CDP 多 session `Network.enable` subscription/fanout 已由最新阶段完成，但上游 JS/Worker 4096 oldest-drop、持久 observation history 或请求正文保留仍未解决。
 
 ## 验证结果
+
+- 最新单 worker OS backlog 工具定向 unittest 14/14；完整 `tools/unblocked` unittest 66/66。最终本机资格运行 `status=passed`：240 attempted、128 TCP/request sent、112 connect timeout pressure、0 other client failures；queue `0/128 -> 128/128 -> 0/128`，server FD `16 -> 16 -> 16`，128/128 完整 HTTP 200，无 response error；恢复 HTTP 200/完整 body、WebSocket 101、`Browser.getVersion` id=1 成功，server stderr 0 bytes，SIGTERM returncode 0。
+- 最终 raw manifest `/private/tmp/ob034-capacity-final-reviewed.IlqITE/evidence/evidence.json` SHA-256 `1dde72f3b0ecba3e8621cec1ed9e5fccca5697f70242009cf4cb599e425b907a`，共引用 1055 个原始 artifact；目录中实际含 manifest 在内 1056 个文件、约 4.0 MiB。Astra light 第三轮终审为 0 blocker、0 major、0 minor。
 
 - 最新 admission/Worker terminal-boundary 切片聚焦 release nextest 在 render/no-render 下均为 5/5（runs `f7b25746-13fc-4ac6-8711-a9ec88f7ba13`、`d49e1e5a-9876-4bd7-9243-25c487833e8a`）；render CDP 全量 371/371、3 skipped（run `37b79f7e-ad15-48da-a42c-f9f62d6cbeec`），no-render 排除既有 render-only `input_key_event_escaping` binary 后 308/308、3 skipped（run `a21a55a9-05ad-4bd2-b800-02201138d56b`）。
 - 根 release/render nextest 为 2311/2311、4 skipped（run `01fb85ca-4e2a-4bfc-bca2-c22efdc5eb82`）；exact render 与 no-default-features CLI build 均成功。最终 render SHA-256 `ea23d498afe9988536ed1860012a5c4e550e9c89e0fd6fad1a73a0947dcecee7`，120491552 bytes。
@@ -148,7 +155,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
 1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
-2. 继续推进不与 silent-pending 上限耦合的实际 OS backlog burst、admission 前 TCP/kernel/container capacity 与剩余 input qualification；不要把 Mio 控制流回归或三层逻辑 payload 预算外推为总 RSS 上限。
+2. 在 Linux release 平台运行 `tools/unblocked/cdp_capacity.py`，保留完整原始目录；当前只有 Darwin 单 worker 资格，不能复制结论。随后修复并独立资格化 `--workers > 1` 父 listener 的无 timeout `peek()` 和无界 per-connection relay task，再推进 container network namespace、silent-pending、WS handoff、live slot 与剩余 input qualification。不要把本机 kernel queue、Mio 控制流、四层逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -165,6 +172,11 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 
 生成本交接的主机上曾保留以下完整临时证据：
 
+- `/private/tmp/ob034-capacity-final-reviewed.IlqITE/evidence/`
+- `/private/tmp/ob034-capacity-close.SfPdJq/evidence/`（要求 server Close echo 的被拒绝门禁，完整失败证据）
+- `/private/tmp/ob034-capacity-live-final-reviewed.log`
+- `/private/tmp/ob034-capacity-tools-unittest-review-final.log`
+- `/private/tmp/ob034-capacity-unit-review-fixes-4.log`
 - `/tmp/ob021-fetch-stream-net-focused.log`
 - `/tmp/ob021-fetch-stream-cdp-focused.log`
 - `/tmp/ob021-fetch-stream-cdp-focused-rerun.log`
