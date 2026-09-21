@@ -10170,10 +10170,13 @@ return {before,removed,reinsert,moved,cleared};
         rt.run_event_loop_bounded(250).await.unwrap();
         assert_eq!(rt.evaluate("__workerCancellationReady").unwrap(), serde_json::json!(true));
         assert_eq!(resources.active_workers(), 1);
+        assert_eq!(cancellation.active_worker_thread_count(), 1);
 
         cancellation.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while resources.active_workers() != 0 {
+            while resources.active_workers() != 0
+                || cancellation.active_worker_thread_count() != 0
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }).await.expect("connection cancellation must stop active Worker V8 before owner drop");
@@ -10182,6 +10185,7 @@ return {before,removed,reinsert,moved,cleared};
         // resource reaching zero therefore cannot be explained by Page or
         // WorkerRegistry teardown.
         assert_eq!(resources.active_workers(), 0);
+        assert_eq!(cancellation.active_worker_thread_count(), 0);
         drop(rt);
     }
 

@@ -20,6 +20,7 @@ struct Registry {
     closed: AtomicBool,
     slots: Mutex<Vec<Weak<ExecutionSlot>>>,
     signal: tokio::sync::watch::Sender<bool>,
+    active_worker_threads: AtomicUsize,
 }
 
 /// Cancellation source shared by every V8 runtime owned by one connection.
@@ -40,6 +41,7 @@ impl Default for ExecutionCancellation {
                 closed: AtomicBool::new(false),
                 slots: Mutex::new(Vec::new()),
                 signal,
+                active_worker_threads: AtomicUsize::new(0),
             }),
         }
     }
@@ -69,6 +71,22 @@ impl ExecutionCancellation {
 
     pub fn is_cancelled(&self) -> bool {
         self.registry.closed.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    /// Number of Dedicated Worker thread closures which have started and have
+    /// not yet reached their terminal return boundary. This connection-local
+    /// lifecycle count reaches zero only after each thread has dropped its
+    /// runtime and resource lease and attempted to send its completion result.
+    pub fn active_worker_thread_count(&self) -> usize {
+        self.registry.active_worker_threads.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn register_worker_thread(&self) -> WorkerThreadRegistration {
+        self.registry.active_worker_threads.fetch_add(1, Ordering::SeqCst);
+        WorkerThreadRegistration {
+            cancellation: self.clone(),
+        }
     }
 
     /// Wait until this connection is cancelled. The signal is sticky, so a
@@ -111,6 +129,19 @@ impl ExecutionCancellation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+}
+
+pub(crate) struct WorkerThreadRegistration {
+    cancellation: ExecutionCancellation,
+}
+
+impl Drop for WorkerThreadRegistration {
+    fn drop(&mut self) {
+        self.cancellation
+            .registry
+            .active_worker_threads
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 

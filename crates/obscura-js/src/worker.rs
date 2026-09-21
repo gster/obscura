@@ -1127,7 +1127,11 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
     registry.next_id = registry.next_id.saturating_add(1);
     let id = registry.next_id;
     let (completion_tx, completion) = std::sync::mpsc::channel();
+    let completion_cancellation = config.execution_cancellation.clone();
     let thread = std::thread::Builder::new().name(format!("obscura-worker-{id}")).spawn(move || {
+        let _thread_registration = completion_cancellation
+            .as_ref()
+            .map(crate::execution_cancellation::ExecutionCancellation::register_worker_thread);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _lease = lease;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
@@ -1146,6 +1150,10 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
                 Err(format!("Worker thread panicked: {message}"))
             }
         };
+        // `_thread_registration` outlives this existing completion handoff.
+        // Its final decrement therefore proves that the runtime and lease have
+        // dropped, the result handoff was attempted, and the thread closure
+        // reached its terminal return boundary.
         let _ = completion_tx.send(completion);
     });
     let Ok(thread) = thread else { return 0; };

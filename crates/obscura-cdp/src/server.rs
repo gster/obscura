@@ -59,6 +59,12 @@ struct ConnectionIoPolicy {
     outbound_send_timeout: tokio::time::Duration,
     #[cfg(test)]
     terminal_reason_tx: Option<tokio::sync::mpsc::UnboundedSender<OutboundCloseReason>>,
+    #[cfg(test)]
+    admitted_request_tx: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+    #[cfg(test)]
+    execution_cancellation_tx: Option<tokio::sync::mpsc::UnboundedSender<
+        obscura_js::execution_cancellation::ExecutionCancellation,
+    >>,
 }
 
 impl Default for ConnectionIoPolicy {
@@ -69,6 +75,10 @@ impl Default for ConnectionIoPolicy {
             ),
             #[cfg(test)]
             terminal_reason_tx: None,
+            #[cfg(test)]
+            admitted_request_tx: None,
+            #[cfg(test)]
+            execution_cancellation_tx: None,
         }
     }
 }
@@ -81,6 +91,23 @@ impl ConnectionIoPolicy {
         }
         #[cfg(not(test))]
         let _ = reason;
+    }
+
+    #[cfg(test)]
+    fn report_admitted_request(&self, request_id: u64) {
+        if let Some(sender) = &self.admitted_request_tx {
+            let _ = sender.send(request_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn report_execution_cancellation(
+        &self,
+        cancellation: &obscura_js::execution_cancellation::ExecutionCancellation,
+    ) {
+        if let Some(sender) = &self.execution_cancellation_tx {
+            let _ = sender.send(cancellation.clone());
+        }
     }
 }
 
@@ -385,6 +412,7 @@ pub async fn start_with_serve_options_access_and_limit(
         persona,
         ServerShutdown::new(),
         true,
+        ConnectionIoPolicy::default(),
     )
     .await
 }
@@ -402,6 +430,7 @@ async fn start_with_serve_options_access_limit_and_shutdown(
     persona: obscura_net::EffectivePersona,
     shutdown: ServerShutdown,
     install_signal_handler: bool,
+    connection_io_policy: ConnectionIoPolicy,
 ) -> anyhow::Result<()> {
     obscura_net::activate_process_persona(&persona)?;
     let ip: std::net::IpAddr = host
@@ -694,13 +723,14 @@ async fn start_with_serve_options_access_limit_and_shutdown(
             refuse_connection(stream);
             continue;
         }
-        let _ = run_connection(
+        let _ = run_connection_with_io_policy(
             stream,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
             shutdown.clone(),
             live_connections.clone(),
+            connection_io_policy.clone(),
         );
     }
 
@@ -803,25 +833,6 @@ fn release_idle_connection_memory() {
 /// cancellation: a synchronous V8 loop may pin the processor thread, but it can
 /// no longer starve the socket reader which observes FIN/RST and terminates the
 /// connection's active isolate through its thread-safe handle.
-fn run_connection(
-    std_stream: std::net::TcpStream,
-    context_template: Arc<obscura_browser::BrowserContext>,
-    persistence_context: Arc<obscura_browser::BrowserContext>,
-    persistence_lock: Arc<std::sync::Mutex<()>>,
-    shutdown: ServerShutdown,
-    live_connections: Arc<AtomicUsize>,
-) -> Option<tokio::task::AbortHandle> {
-    run_connection_with_io_policy(
-        std_stream,
-        context_template,
-        persistence_context,
-        persistence_lock,
-        shutdown,
-        live_connections,
-        ConnectionIoPolicy::default(),
-    )
-}
-
 fn run_connection_with_io_policy(
     std_stream: std::net::TcpStream,
     context_template: Arc<obscura_browser::BrowserContext>,
@@ -851,6 +862,8 @@ fn run_connection_with_io_policy(
 
     let (msg_tx, msg_rx) = inbound::channel::<ServerMessage>();
     let execution_cancellation = obscura_js::execution_cancellation::ExecutionCancellation::default();
+    #[cfg(test)]
+    io_policy.report_execution_cancellation(&execution_cancellation);
     let processor_cancellation = execution_cancellation.clone();
     let io_cancellation = execution_cancellation.clone();
     let processor_shutdown = shutdown.clone();
@@ -2955,6 +2968,10 @@ async fn handle_connection_ws_with_io_policy(
                     }
                 }
 
+                #[cfg(test)]
+                let admitted_request_id = serde_json::from_str::<CdpRequest>(&text)
+                    .ok()
+                    .map(|request| request.id);
                 if let Err(error) = msg_tx.send(ServerMessage::Cdp(CdpMessage {
                     text: text.to_string(),
                     reply_tx: reply_tx.clone(),
@@ -2965,6 +2982,10 @@ async fn handle_connection_ws_with_io_policy(
                     );
                     reply_tx.close(inbound_close_reason(error.reason));
                     break;
+                }
+                #[cfg(test)]
+                if let Some(request_id) = admitted_request_id {
+                    io_policy.report_admitted_request(request_id);
                 }
             }
             Message::Close(_) => {
@@ -3042,10 +3063,21 @@ pub(crate) mod tests {
     }
 
     async fn wait_for_log(capture: &CompleteLogCapture, marker: &str) {
+        wait_for_log_after(capture, marker, 0).await;
+    }
+
+    async fn wait_for_log_after(
+        capture: &CompleteLogCapture,
+        marker: &str,
+        offset: usize,
+    ) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let bytes = capture.0.lock().unwrap().clone();
-                if bytes.windows(marker.len()).any(|window| window == marker.as_bytes()) {
+                if bytes[offset.min(bytes.len())..]
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes())
+                {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -3198,21 +3230,54 @@ pub(crate) mod tests {
         }).await.expect("live connection slot did not converge");
     }
 
+    struct ConnectionLifecycleProbe {
+        admitted_request_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
+        execution_cancellation:
+            obscura_js::execution_cancellation::ExecutionCancellation,
+    }
+
+    impl ConnectionLifecycleProbe {
+        async fn wait_for_admission(&mut self, request_id: u64) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    match self.admitted_request_rx.recv().await {
+                        Some(admitted) if admitted == request_id => break,
+                        Some(_) => {}
+                        None => panic!("server admission observer closed before request {request_id}"),
+                    }
+                }
+            })
+            .await
+            .expect("CDP request did not cross the server inbound admission boundary");
+        }
+
+        async fn wait_for_worker_threads(&self, expected: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while self.execution_cancellation.active_worker_thread_count() != expected {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("connection Worker thread count did not converge");
+        }
+    }
+
     async fn start_direct_connection(
         shutdown: super::ServerShutdown,
     ) -> (
         TestWebSocket,
         tokio::task::AbortHandle,
         Arc<std::sync::atomic::AtomicUsize>,
+        ConnectionLifecycleProbe,
     ) {
-        let (client, io_abort, live, _control, _terminal_reason_rx) =
+        let (client, io_abort, live, _control, _terminal_reason_rx, lifecycle) =
             start_direct_connection_with_io_policy(
                 shutdown,
                 super::ConnectionIoPolicy::default(),
                 false,
             )
             .await;
-        (client, io_abort, live)
+        (client, io_abort, live, lifecycle)
     }
 
     async fn start_direct_connection_with_io_policy(
@@ -3225,6 +3290,7 @@ pub(crate) mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         std::net::TcpStream,
         tokio::sync::mpsc::UnboundedReceiver<crate::outbound::CloseReason>,
+        ConnectionLifecycleProbe,
     ) {
         initialize_v8_on_current_thread();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3259,8 +3325,14 @@ pub(crate) mod tests {
         let persistence = Arc::new(context.isolated_copy("test-persistence".into(), true));
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let (reason_tx, terminal_reason_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (admitted_request_tx, admitted_request_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (execution_cancellation_tx, mut execution_cancellation_rx) =
+            tokio::sync::mpsc::unbounded_channel();
         let io_policy = super::ConnectionIoPolicy {
             terminal_reason_tx: Some(reason_tx),
+            admitted_request_tx: Some(admitted_request_tx),
+            execution_cancellation_tx: Some(execution_cancellation_tx),
             ..io_policy
         };
         let io_abort = super::run_connection_with_io_policy(
@@ -3272,6 +3344,10 @@ pub(crate) mod tests {
             live.clone(),
             io_policy,
         ).expect("connection tasks");
+        let execution_cancellation = execution_cancellation_rx
+            .recv()
+            .await
+            .expect("connection did not publish its execution cancellation source");
         let client = client.await.unwrap();
         if constrain_tcp_buffers {
             let tokio_tungstenite::MaybeTlsStream::Plain(stream) = client.get_ref() else {
@@ -3281,7 +3357,17 @@ pub(crate) mod tests {
                 .set_recv_buffer_size(4 * 1024)
                 .expect("constrain client TCP receive buffer");
         }
-        (client, io_abort, live, control, terminal_reason_rx)
+        (
+            client,
+            io_abort,
+            live,
+            control,
+            terminal_reason_rx,
+            ConnectionLifecycleProbe {
+                admitted_request_rx,
+                execution_cancellation,
+            },
+        )
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3294,11 +3380,31 @@ pub(crate) mod tests {
     async fn enter_active_page_realm(
         socket: &mut TestWebSocket,
         capture: &CompleteLogCapture,
+        lifecycle: &mut ConnectionLifecycleProbe,
         realm: ActiveExecutionRealm,
         case: &str,
     ) -> Option<String> {
-        use futures_util::SinkExt as _;
         let session = create_test_page(socket).await;
+        enter_active_page_realm_on_session(
+            socket,
+            capture,
+            lifecycle,
+            realm,
+            case,
+            session,
+        )
+        .await
+    }
+
+    async fn enter_active_page_realm_on_session(
+        socket: &mut TestWebSocket,
+        capture: &CompleteLogCapture,
+        lifecycle: &mut ConnectionLifecycleProbe,
+        realm: ActiveExecutionRealm,
+        case: &str,
+        session: String,
+    ) -> Option<String> {
+        use futures_util::SinkExt as _;
         let active_marker = format!("{case}-active");
         let queued_marker = format!("{case}-queued");
         match realm {
@@ -3389,7 +3495,7 @@ pub(crate) mod tests {
                 "returnByValue": true
             }
         }).to_string().into())).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        lifecycle.wait_for_admission(3).await;
         Some(queued_marker)
     }
 
@@ -3701,6 +3807,7 @@ pub(crate) mod tests {
     async fn qualify_wire_writer_fault(
         fault: WireWriterFault,
         timeout: std::time::Duration,
+        realm: ActiveExecutionRealm,
         case: &str,
     ) {
         use futures_util::SinkExt as _;
@@ -3709,21 +3816,26 @@ pub(crate) mod tests {
         let policy = super::ConnectionIoPolicy {
             outbound_send_timeout: timeout,
             terminal_reason_tx: None,
+            ..Default::default()
         };
         let shutdown = super::ServerShutdown::new();
-        let (mut client, _io_abort, live, control, mut terminal_reason_rx) =
+        let (mut client, _io_abort, live, control, mut terminal_reason_rx, mut lifecycle) =
             start_direct_connection_with_io_policy(shutdown, policy, true).await;
-        assert!(
-            enter_active_page_realm(
+        let active_session = create_test_page(&mut client).await;
+        let response_session = create_test_page(&mut client).await;
+        if matches!(realm, ActiveExecutionRealm::Worker) {
+            assert!(enter_active_page_realm_on_session(
                 &mut client,
                 &capture,
-                ActiveExecutionRealm::Worker,
+                &mut lifecycle,
+                realm,
                 case,
+                active_session.clone(),
             )
             .await
-            .is_none(),
-        );
-        let response_session = create_test_page(&mut client).await;
+            .is_none());
+            lifecycle.wait_for_worker_threads(1).await;
+        }
 
         let started = std::time::Instant::now();
         client.send(tokio_tungstenite::tungstenite::Message::Text(json!({
@@ -3740,7 +3852,20 @@ pub(crate) mod tests {
             "method": "Browser.getVersion",
             "params": {}
         }).to_string().into())).await.unwrap();
+        let queued_marker = if matches!(realm, ActiveExecutionRealm::Worker) {
+            None
+        } else {
+            enter_active_page_realm_on_session(
+                &mut client,
+                &capture,
+                &mut lifecycle,
+                realm,
+                case,
+                active_session,
+            ).await
+        };
 
+        let log_offset = capture.0.lock().unwrap().len();
         let (expected, log_marker) = match fault {
             WireWriterFault::Io => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3768,31 +3893,49 @@ pub(crate) mod tests {
                 "writer timeout fired before its configured deadline",
             );
         }
-        wait_for_log(&capture, log_marker).await;
+        wait_for_log_after(&capture, log_marker, log_offset).await;
         wait_for_socket_close(&mut client).await;
         wait_for_live_connections(&live, 0).await;
+        lifecycle.wait_for_worker_threads(0).await;
+        if let Some(queued_marker) = queued_marker {
+            assert_log_absent(&capture, &queued_marker);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn real_tcp_write_half_failure_interrupts_active_worker_and_releases_slot() {
-        tokio::task::LocalSet::new()
-            .run_until(qualify_wire_writer_fault(
-                WireWriterFault::Io,
-                std::time::Duration::from_secs(2),
-                "obscura-wire-writer-io",
-            ))
-            .await;
+    async fn real_tcp_write_half_failure_interrupts_all_active_realms_and_releases_slot() {
+        tokio::task::LocalSet::new().run_until(async {
+            for (index, realm) in [
+                ActiveExecutionRealm::Main,
+                ActiveExecutionRealm::Iframe,
+                ActiveExecutionRealm::Worker,
+            ].into_iter().enumerate() {
+                qualify_wire_writer_fault(
+                    WireWriterFault::Io,
+                    std::time::Duration::from_secs(5),
+                    realm,
+                    &format!("obscura-wire-writer-io-{index}"),
+                ).await;
+            }
+        }).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn real_tcp_backpressure_timeout_interrupts_active_worker_and_releases_slot() {
-        tokio::task::LocalSet::new()
-            .run_until(qualify_wire_writer_fault(
-                WireWriterFault::Timeout,
-                std::time::Duration::from_millis(250),
-                "obscura-wire-writer-timeout",
-            ))
-            .await;
+    async fn real_tcp_backpressure_timeout_interrupts_all_active_realms_and_releases_slot() {
+        tokio::task::LocalSet::new().run_until(async {
+            for (index, realm) in [
+                ActiveExecutionRealm::Main,
+                ActiveExecutionRealm::Iframe,
+                ActiveExecutionRealm::Worker,
+            ].into_iter().enumerate() {
+                qualify_wire_writer_fault(
+                    WireWriterFault::Timeout,
+                    std::time::Duration::from_secs(2),
+                    realm,
+                    &format!("obscura-wire-writer-timeout-{index}"),
+                ).await;
+            }
+        }).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4045,14 +4188,25 @@ pub(crate) mod tests {
                 ActiveExecutionRealm::Worker,
             ].into_iter().enumerate() {
                 let shutdown = super::ServerShutdown::new();
-                let (mut client, io_abort, live) = start_direct_connection(shutdown).await;
+                let (mut client, io_abort, live, mut lifecycle) =
+                    start_direct_connection(shutdown).await;
                 let case = format!("obscura-outer-io-{index}");
                 let queued_marker =
-                    enter_active_page_realm(&mut client, &capture, realm, &case).await;
+                    enter_active_page_realm(
+                        &mut client,
+                        &capture,
+                        &mut lifecycle,
+                        realm,
+                        &case,
+                    ).await;
+                if matches!(realm, ActiveExecutionRealm::Worker) {
+                    lifecycle.wait_for_worker_threads(1).await;
+                }
 
                 io_abort.abort();
                 wait_for_socket_close(&mut client).await;
                 wait_for_live_connections(&live, 0).await;
+                lifecycle.wait_for_worker_threads(0).await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 if let Some(queued_marker) = queued_marker {
                     assert_log_absent(&capture, &queued_marker);
@@ -4090,6 +4244,15 @@ pub(crate) mod tests {
                 drop(probe);
                 let shutdown = super::ServerShutdown::new();
                 let server_shutdown = shutdown.clone();
+                let (admitted_request_tx, admitted_request_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let (execution_cancellation_tx, mut execution_cancellation_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let connection_io_policy = super::ConnectionIoPolicy {
+                    admitted_request_tx: Some(admitted_request_tx),
+                    execution_cancellation_tx: Some(execution_cancellation_tx),
+                    ..Default::default()
+                };
                 let server = tokio::task::spawn_local(async move {
                     super::start_with_serve_options_access_limit_and_shutdown(
                         address.port(),
@@ -4105,13 +4268,31 @@ pub(crate) mod tests {
                         ),
                         server_shutdown,
                         false,
+                        connection_io_policy,
                     ).await
                 });
 
                 let mut client = connect_with_retry(address).await;
+                let execution_cancellation = execution_cancellation_rx
+                    .recv()
+                    .await
+                    .expect("server connection did not publish its cancellation source");
+                let mut lifecycle = ConnectionLifecycleProbe {
+                    admitted_request_rx,
+                    execution_cancellation,
+                };
                 let case = format!("obscura-server-shutdown-{index}");
                 let queued_marker =
-                    enter_active_page_realm(&mut client, &capture, realm, &case).await;
+                    enter_active_page_realm(
+                        &mut client,
+                        &capture,
+                        &mut lifecycle,
+                        realm,
+                        &case,
+                    ).await;
+                if matches!(realm, ActiveExecutionRealm::Worker) {
+                    lifecycle.wait_for_worker_threads(1).await;
+                }
 
                 shutdown.cancel();
                 wait_for_socket_close(&mut client).await;
@@ -4120,6 +4301,7 @@ pub(crate) mod tests {
                     .expect("server shutdown waited for the V8 watchdog or drain deadline")
                     .expect("server task")
                     .expect("server shutdown");
+                lifecycle.wait_for_worker_threads(0).await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 if let Some(queued_marker) = queued_marker {
                     assert_log_absent(&capture, &queued_marker);
@@ -4191,6 +4373,7 @@ pub(crate) mod tests {
                     ),
                     server_shutdown,
                     false,
+                    super::ConnectionIoPolicy::default(),
                 ).await
             });
 
