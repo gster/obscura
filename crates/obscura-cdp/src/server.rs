@@ -23,19 +23,17 @@ use crate::types::CdpEvent;
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
 
-// The WS-stream forwarding channel must also be bounded: if the LocalSet
-// (CDP processor + nav tasks) stalls, the accept thread keeps pushing
-// `std::net::TcpStream`s into the queue. An unbounded channel would let
-// that queue grow without limit and OOM the process. With a bounded
-// capacity, when the LocalSet is saturated the accept thread closes the
-// new connection on the spot instead of buffering it — the kernel TCP
-// backlog still absorbs short-term spikes, but a long-term stall now
-// fails loudly at accept time rather than silently piling up FDs.
+// The WS-stream forwarding channel has an independent burst bound in addition
+// to the shared queued+active admission budget. If the LocalSet stalls while a
+// caller configured a connection limit above this queue capacity, a complete
+// authorized upgrade request receives an explicit 503 rather than accumulating
+// more socket FDs.
 const MAX_PENDING_WS_HANDOFFS: usize = 128;
 
-// Cap on *live* CDP connections, each of which costs one OS thread and its own
-// V8 isolates. `MAX_PENDING_WS_HANDOFFS` above bounds only the handoff queue —
-// connections that have already been handed off are unbounded without this.
+// Cap on admitted CDP WebSockets. The configured cap is reserved before an
+// authorized upgrade enters `MAX_PENDING_WS_HANDOFFS`, so queued handoffs and
+// active processors are one admission pool. Silent/incomplete HTTP request
+// heads have their own separate count and TTL below.
 //
 // 128 matches the handoff bound and is well above any real client fan-out
 // (Playwright/Puppeteer use one connection per browser). Threads are what this
@@ -58,6 +56,10 @@ const OUTBOUND_SEND_TIMEOUT_MS: u64 = 10_000;
 struct ConnectionIoPolicy {
     outbound_send_timeout: tokio::time::Duration,
     #[cfg(test)]
+    ws_handoff_receive_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    ws_handoff_queued_tx: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
+    #[cfg(test)]
     terminal_reason_tx: Option<tokio::sync::mpsc::UnboundedSender<OutboundCloseReason>>,
     #[cfg(test)]
     admitted_request_tx: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
@@ -73,6 +75,10 @@ impl Default for ConnectionIoPolicy {
             outbound_send_timeout: tokio::time::Duration::from_millis(
                 OUTBOUND_SEND_TIMEOUT_MS,
             ),
+            #[cfg(test)]
+            ws_handoff_receive_gate: None,
+            #[cfg(test)]
+            ws_handoff_queued_tx: None,
             #[cfg(test)]
             terminal_reason_tx: None,
             #[cfg(test)]
@@ -123,8 +129,100 @@ const CONNECTION_PROCESSOR_DRAIN_MS: u64 = 1_000;
 const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
+const WS_HANDOFF_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+    Content-Length: 0\r\nConnection: close\r\n\
+    X-Obscura-Reason: ws-handoff-saturated\r\n\r\n";
 use crate::types::CdpRequest;
 use crate::types::CdpResponse;
+
+/// Admission budget for authorized WebSocket upgrades.
+///
+/// A permit is acquired on the accept thread before an upgrade enters the
+/// handoff queue and remains owned by that connection until its processor has
+/// released all Page/V8 state. This makes `--max-connections` cover queued
+/// handoffs and active connections as one invariant instead of two additive
+/// socket pools.
+#[derive(Clone)]
+struct WebSocketAdmissionBudget {
+    inner: Arc<WebSocketAdmissionBudgetInner>,
+}
+
+struct WebSocketAdmissionBudgetInner {
+    limit: usize,
+    admitted: AtomicUsize,
+    #[cfg(test)]
+    queued_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<usize>>>,
+}
+
+impl WebSocketAdmissionBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(WebSocketAdmissionBudgetInner {
+                limit,
+                admitted: AtomicUsize::new(0),
+                #[cfg(test)]
+                queued_tx: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_queued_observer(&self, tx: tokio::sync::mpsc::UnboundedSender<usize>) {
+        *self
+            .inner
+            .queued_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+    }
+
+    #[cfg(test)]
+    fn report_queued(&self) {
+        let observer = self
+            .inner
+            .queued_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            let _ = observer.send(self.admitted());
+        }
+    }
+
+    fn try_acquire(&self) -> Option<WebSocketAdmissionPermit> {
+        self.inner
+            .admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < self.inner.limit).then_some(admitted + 1)
+            })
+            .ok()
+            .map(|_| WebSocketAdmissionPermit {
+                inner: Some(self.inner.clone()),
+            })
+    }
+
+    #[cfg(test)]
+    fn admitted(&self) -> usize {
+        self.inner.admitted.load(Ordering::Acquire)
+    }
+}
+
+struct WebSocketAdmissionPermit {
+    inner: Option<Arc<WebSocketAdmissionBudgetInner>>,
+}
+
+impl Drop for WebSocketAdmissionPermit {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let previous = inner.admitted.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0, "WebSocket admission counter underflow");
+        }
+    }
+}
+
+struct PendingWebSocket {
+    stream: std::net::TcpStream,
+    admission: WebSocketAdmissionPermit,
+}
 
 #[derive(Clone)]
 struct ServerShutdown {
@@ -396,9 +494,10 @@ pub async fn start_with_full_serve_options(
     .await
 }
 
-/// As `start_with_full_serve_options`, with an explicit cap on live CDP
-/// connections. Each connection owns an OS thread and its pages' V8 isolates,
-/// so this is what bounds the server's thread and memory footprint.
+/// As `start_with_full_serve_options`, with an explicit cap on admitted CDP
+/// WebSockets. Authorized handoffs waiting for a processor and active
+/// connections share this allowance. Each active connection owns an OS thread
+/// and its pages' V8 isolates.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_with_serve_options_and_limit(
     port: u16,
@@ -426,7 +525,7 @@ pub async fn start_with_serve_options_and_limit(
 
 /// As `start_with_serve_options_and_limit`, with an explicit CDP ingress
 /// policy. The policy gates discovery and WebSocket requests on the accept
-/// thread before they consume a live-connection slot or create V8 state.
+/// thread before they consume a WebSocket admission permit or create V8 state.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_with_serve_options_access_and_limit(
     port: u16,
@@ -575,7 +674,12 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
 
-    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+    let websocket_admission = WebSocketAdmissionBudget::new(max_connections);
+    #[cfg(test)]
+    if let Some(observer) = &connection_io_policy.ws_handoff_queued_tx {
+        websocket_admission.set_queued_observer(observer.clone());
+    }
+    let (ws_tx, mut ws_rx) = mpsc::channel::<PendingWebSocket>(MAX_PENDING_WS_HANDOFFS);
 
     // Mio lets one blocking poll observe both listener readiness and the
     // server-owned shutdown waker. New connections therefore retain the
@@ -619,6 +723,7 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
     let accept_shutdown = shutdown.clone();
     let accept_persona = persona.clone();
     let accept_access_policy = access_policy.clone();
+    let accept_websocket_admission = websocket_admission.clone();
     let accept_thread = std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -699,6 +804,7 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
                                 &head,
                                 &accept_access_policy,
                                 &accept_persona,
+                                &accept_websocket_admission,
                             ) {
                                 if !format!("{}", e).contains("close") {
                                     error!("Accept dispatch error: {}", e);
@@ -802,26 +908,36 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
 
     cap_malloc_arenas();
 
-    // Live CDP connections, incremented on accept and decremented when a
-    // connection thread exits (see `run_connection`).
+    // Active processor connections are tracked separately from WebSocket
+    // admission. The admission permit already caps queued + active sockets;
+    // this counter exists for shutdown drain and idle-memory trimming only.
     let live_connections = Arc::new(AtomicUsize::new(0));
     info!("Connection limit: {}", max_connections);
+
+    #[cfg(test)]
+    if let Some(gate) = &connection_io_policy.ws_handoff_receive_gate {
+        tokio::select! {
+            _ = gate.notified() => {}
+            _ = shutdown.cancelled() => {}
+        }
+    }
 
     // Accept loop: hand each WebSocket connection to its own OS thread so its
     // pages' isolates live on a dedicated thread.
     loop {
-        let stream = tokio::select! {
+        let pending = tokio::select! {
             stream = ws_rx.recv() => stream,
             _ = shutdown.cancelled() => None,
         };
-        let stream = match stream {
-            Some(s) => s,
+        let pending = match pending {
+            Some(pending) => pending,
             None => break,
         };
         if shutdown.is_cancelled() {
-            drop(stream);
+            drop(pending);
             break;
         }
+        let PendingWebSocket { stream, admission } = pending;
         // Nagle off + nonblocking on the std socket before it moves to the
         // connection thread. CDP exchanges many small (~100-byte) frames during
         // newPage()/navigate; with Nagle on, each small write waits on an ACK or
@@ -834,22 +950,7 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
             .set_nodelay(true)
             .map_err(|e| error!("set_nodelay on WS stream: {}", e))
             .ok();
-        // Reserve a slot before spawning. `fetch_update` (rather than a load
-        // then a store) keeps the check atomic against the accept thread
-        // handing off the next stream concurrently.
-        let reserved = live_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max_connections).then_some(n + 1)
-            })
-            .is_ok();
-        if !reserved {
-            warn!(
-                "refusing CDP connection: at --max-connections ({})",
-                max_connections
-            );
-            refuse_connection(stream);
-            continue;
-        }
+        live_connections.fetch_add(1, Ordering::AcqRel);
         let _ = run_connection_with_io_policy(
             stream,
             shared_ctx.clone(),
@@ -857,9 +958,20 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
             persistence_lock.clone(),
             shutdown.clone(),
             live_connections.clone(),
+            admission,
             connection_io_policy.clone(),
         );
     }
+
+    // No queued authorized upgrade may keep an admission permit while
+    // shutdown waits for active processors. Closing the receiver rejects
+    // racing sends; dropping every queued envelope closes its socket and
+    // releases its RAII permit before the active-only drain begins.
+    ws_rx.close();
+    while let Ok(pending) = ws_rx.try_recv() {
+        drop(pending);
+    }
+    drop(ws_rx);
 
     // Server is shutting down. Connection threads are detached, so saving the
     // jar right here would race them: a connection still writing a Set-Cookie
@@ -967,18 +1079,28 @@ fn run_connection_with_io_policy(
     persistence_lock: Arc<std::sync::Mutex<()>>,
     shutdown: ServerShutdown,
     live_connections: Arc<AtomicUsize>,
+    admission: WebSocketAdmissionPermit,
     io_policy: ConnectionIoPolicy,
 ) -> Option<tokio::task::AbortHandle> {
     // Releases the slot reserved by the accept loop when the thread unwinds,
     // however it exits — clean close, error return, or panic. A plain
     // decrement at the end of the closure would leak slots on the early
     // returns below until the cap wedged the server shut.
-    struct SlotGuard(Option<Arc<AtomicUsize>>);
+    struct SlotGuard {
+        live: Option<Arc<AtomicUsize>>,
+        admission: Option<WebSocketAdmissionPermit>,
+    }
     impl SlotGuard {
         fn release(&mut self) -> Option<usize> {
-            self.0
+            let remaining = self
+                .live
                 .take()
-                .map(|counter| counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1))
+                .map(|counter| counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1));
+            // Keep the admission permit until the active processor has dropped
+            // its Page/V8 state and persistence snapshot. Socket teardown alone
+            // is not sufficient to admit another memory-owning connection.
+            self.admission.take();
+            remaining
         }
     }
     impl Drop for SlotGuard {
@@ -1010,7 +1132,10 @@ fn run_connection_with_io_policy(
                 }
             }
             let _done_guard = DoneGuard(Some(processor_done_tx));
-            let mut slot_guard = SlotGuard(Some(slot));
+            let mut slot_guard = SlotGuard {
+                live: Some(slot),
+                admission: Some(admission),
+            };
             let default_context = Arc::new(
                 context_template.isolated_copy("default".to_string(), true),
             );
@@ -1301,10 +1426,11 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
 /// - WebSocket: forward to the LocalSet for CDP processing.
 fn accept_dispatch(
     stream: std::net::TcpStream,
-    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    ws_tx: &mpsc::Sender<PendingWebSocket>,
     head: &[u8],
     access_policy: &CdpAccessPolicy,
     persona: &obscura_net::EffectivePersona,
+    websocket_admission: &WebSocketAdmissionBudget,
 ) -> anyhow::Result<()> {
     let authorized = match access_policy.authorize(head) {
         Ok(authorized) => authorized,
@@ -1327,21 +1453,40 @@ fn accept_dispatch(
         );
     }
 
-    // Try to hand off the WS stream to the LocalSet. If the bounded channel
-    // is full the LocalSet is saturated — drop the connection cleanly
-    // rather than blocking the accept thread (which would freeze the HTTP
-    // control plane that this whole rework exists to keep alive). The
-    // dropped `stream` closes itself; the client will see ECONNRESET and
-    // can retry.
-    ws_tx
-        .try_send(stream)
-        .map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => {
-                warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
-                anyhow::anyhow!("ws handoff channel full")
-            }
-            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
-        })
+    let Some(admission) = websocket_admission.try_acquire() else {
+        warn!(
+            "refusing authorized WebSocket upgrade: at --max-connections ({})",
+            websocket_admission.inner.limit
+        );
+        reject_http(stream, CONNECTION_LIMIT_RESPONSE.as_bytes());
+        return Ok(());
+    };
+    let pending = PendingWebSocket { stream, admission };
+
+    // The admission permit covers both this bounded handoff and the active
+    // processor. A saturated/closed receiver returns ownership of the
+    // envelope so we can send a deterministic error before its socket and
+    // permit are released.
+    match ws_tx.try_send(pending) {
+        Ok(()) => {
+            #[cfg(test)]
+            websocket_admission.report_queued();
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(pending)) => {
+            warn!(
+                "WS handoff channel full ({}); refusing authorized WebSocket upgrade",
+                MAX_PENDING_WS_HANDOFFS
+            );
+            reject_http(pending.stream, WS_HANDOFF_LIMIT_RESPONSE.as_bytes());
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(pending)) => {
+            warn!("WS handoff receiver closed; refusing authorized WebSocket upgrade");
+            reject_http(pending.stream, WS_HANDOFF_LIMIT_RESPONSE.as_bytes());
+            Ok(())
+        }
+    }
 }
 
 /// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.
@@ -3238,6 +3383,139 @@ pub(crate) mod tests {
         ));
     }
 
+    fn websocket_upgrade_request(port: u16) -> Vec<u8> {
+        format!(
+            "GET /devtools/browser HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    async fn dispatch_test_websocket(
+        ws_tx: &tokio::sync::mpsc::Sender<super::PendingWebSocket>,
+        budget: &super::WebSocketAdmissionBudget,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = websocket_upgrade_request(address.port());
+        client.write_all(&request).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let server = server.into_std().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let policy = crate::access::CdpAccessOptions::default()
+            .compile(address.ip(), address.port())
+            .unwrap();
+        let persona = obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        );
+        super::accept_dispatch(
+            server,
+            ws_tx,
+            &request,
+            &policy,
+            &persona,
+            budget,
+        )
+        .unwrap();
+        client
+    }
+
+    async fn read_complete_http_response(mut client: tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("fixed HTTP rejection did not close")
+        .expect("read fixed HTTP rejection");
+        response
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_websocket_handoff_owns_shared_admission() {
+        let budget = super::WebSocketAdmissionBudget::new(1);
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(2);
+
+        let first_client = dispatch_test_websocket(&ws_tx, &budget).await;
+        assert_eq!(budget.admitted(), 1, "queued handoff must own the slot");
+
+        let refused = dispatch_test_websocket(&ws_tx, &budget).await;
+        assert_eq!(
+            read_complete_http_response(refused).await,
+            super::CONNECTION_LIMIT_RESPONSE.as_bytes(),
+        );
+        assert_eq!(
+            budget.admitted(),
+            1,
+            "capacity refusal must not consume another slot",
+        );
+
+        let first = ws_rx.recv().await.expect("first authorized handoff");
+        drop(first);
+        drop(first_client);
+        assert_eq!(budget.admitted(), 0, "dropping the handoff must release its slot");
+
+        let third_client = dispatch_test_websocket(&ws_tx, &budget).await;
+        assert_eq!(budget.admitted(), 1, "released capacity must be reusable");
+        drop(ws_rx.recv().await.expect("replacement authorized handoff"));
+        drop(third_client);
+        assert_eq!(budget.admitted(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_websocket_handoff_returns_complete_503_and_releases_permit() {
+        let budget = super::WebSocketAdmissionBudget::new(2);
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(1);
+
+        let first_client = dispatch_test_websocket(&ws_tx, &budget).await;
+        assert_eq!(budget.admitted(), 1);
+
+        let refused = dispatch_test_websocket(&ws_tx, &budget).await;
+        assert_eq!(
+            read_complete_http_response(refused).await,
+            super::WS_HANDOFF_LIMIT_RESPONSE.as_bytes(),
+        );
+        assert_eq!(
+            budget.admitted(),
+            1,
+            "failed handoff must return its admission permit",
+        );
+
+        drop(ws_rx.recv().await.expect("queued authorized handoff"));
+        drop(first_client);
+        assert_eq!(budget.admitted(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_websocket_handoff_returns_complete_503_and_releases_permit() {
+        let budget = super::WebSocketAdmissionBudget::new(1);
+        let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(1);
+        drop(ws_rx);
+
+        let refused = dispatch_test_websocket(&ws_tx, &budget).await;
+        assert_eq!(
+            read_complete_http_response(refused).await,
+            super::WS_HANDOFF_LIMIT_RESPONSE.as_bytes(),
+        );
+        assert_eq!(
+            budget.admitted(),
+            0,
+            "closed handoff must return its admission permit",
+        );
+    }
+
     enum ControlledSink {
         Io,
         Pending,
@@ -3451,6 +3729,10 @@ pub(crate) mod tests {
         ));
         let persistence = Arc::new(context.isolated_copy("test-persistence".into(), true));
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let admission_budget = super::WebSocketAdmissionBudget::new(1);
+        let admission = admission_budget
+            .try_acquire()
+            .expect("direct test connection admission");
         let (reason_tx, terminal_reason_rx) = tokio::sync::mpsc::unbounded_channel();
         let (admitted_request_tx, admitted_request_rx) =
             tokio::sync::mpsc::unbounded_channel();
@@ -3469,6 +3751,7 @@ pub(crate) mod tests {
             Arc::new(std::sync::Mutex::new(())),
             shutdown,
             live.clone(),
+            admission,
             io_policy,
         ).expect("connection tasks");
         let execution_cancellation = execution_cancellation_rx
@@ -4355,6 +4638,295 @@ pub(crate) mod tests {
                 Err(error) => panic!("CDP test server did not start: {error}"),
             }
         }
+    }
+
+    async fn connect_tcp_with_retry(address: std::net::SocketAddr) -> tokio::net::TcpStream {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(stream) => return stream,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("CDP test listener did not start: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_gate_proves_queued_upgrade_owns_slot_and_shutdown_drops_queue() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = probe.local_addr().unwrap();
+                drop(probe);
+
+                let shutdown = super::ServerShutdown::new();
+                let server_shutdown = shutdown.clone();
+                let receive_gate = Arc::new(tokio::sync::Notify::new());
+                let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel();
+                let policy = super::ConnectionIoPolicy {
+                    ws_handoff_receive_gate: Some(receive_gate),
+                    ws_handoff_queued_tx: Some(queued_tx),
+                    ..Default::default()
+                };
+                let server = tokio::task::spawn_local(async move {
+                    super::start_with_serve_options_access_limit_and_shutdown(
+                        address.port(),
+                        "127.0.0.1",
+                        None,
+                        false,
+                        None,
+                        true,
+                        1,
+                        crate::access::CdpAccessOptions::default(),
+                        obscura_net::EffectivePersona::builtin(
+                            obscura_net::StealthProfile::WindowsChrome145,
+                        ),
+                        server_shutdown,
+                        false,
+                        policy,
+                    )
+                    .await
+                });
+
+                let request = websocket_upgrade_request(address.port());
+                let mut queued_client = connect_tcp_with_retry(address).await;
+                queued_client.write_all(&request).await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        queued_rx.recv(),
+                    )
+                    .await
+                    .expect("authorized upgrade did not enter the handoff")
+                    .expect("handoff observer closed"),
+                    1,
+                    "the queued upgrade must own the only admission slot",
+                );
+
+                let mut refused = connect_tcp_with_retry(address).await;
+                refused.write_all(&request).await.unwrap();
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    refused.read_to_end(&mut response),
+                )
+                .await
+                .expect("capacity refusal did not close")
+                .expect("read capacity refusal");
+                assert_eq!(response, super::CONNECTION_LIMIT_RESPONSE.as_bytes());
+
+                let started = std::time::Instant::now();
+                shutdown.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                    .await
+                    .expect("queued handoff made shutdown wait for the active drain deadline")
+                    .expect("server task")
+                    .expect("server shutdown");
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "queued handoff was counted as an active processor",
+                );
+
+                let mut byte = [0u8; 1];
+                let closed = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    queued_client.read(&mut byte),
+                )
+                .await
+                .expect("queued upgrade socket remained open after shutdown");
+                match closed {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::NotConnected
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) => {}
+                    Ok(bytes) => panic!(
+                        "queued upgrade received {bytes} byte(s) after shutdown instead of closing"
+                    ),
+                    Err(error) => panic!(
+                        "queued upgrade failed with non-close error after shutdown: {error}"
+                    ),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_client_reset_before_receive_releases_admission_after_gate_opens() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                use tokio::io::AsyncWriteExt as _;
+
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = probe.local_addr().unwrap();
+                drop(probe);
+
+                let shutdown = super::ServerShutdown::new();
+                let server_shutdown = shutdown.clone();
+                let receive_gate = Arc::new(tokio::sync::Notify::new());
+                let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel();
+                let policy = super::ConnectionIoPolicy {
+                    ws_handoff_receive_gate: Some(receive_gate.clone()),
+                    ws_handoff_queued_tx: Some(queued_tx),
+                    ..Default::default()
+                };
+                let server = tokio::task::spawn_local(async move {
+                    super::start_with_serve_options_access_limit_and_shutdown(
+                        address.port(),
+                        "127.0.0.1",
+                        None,
+                        false,
+                        None,
+                        true,
+                        1,
+                        crate::access::CdpAccessOptions::default(),
+                        obscura_net::EffectivePersona::builtin(
+                            obscura_net::StealthProfile::WindowsChrome145,
+                        ),
+                        server_shutdown,
+                        false,
+                        policy,
+                    )
+                    .await
+                });
+
+                let request = websocket_upgrade_request(address.port());
+                let mut abandoned = connect_tcp_with_retry(address).await;
+                abandoned.write_all(&request).await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        queued_rx.recv(),
+                    )
+                    .await
+                    .expect("abandoned upgrade did not enter the handoff")
+                    .expect("handoff observer closed"),
+                    1,
+                    "abandoned queued upgrade must own the only admission slot",
+                );
+                socket2::SockRef::from(&abandoned)
+                    .set_linger(Some(std::time::Duration::ZERO))
+                    .expect("configure queued client reset");
+                drop(abandoned);
+
+                receive_gate.notify_one();
+                let mut replacement = connect_with_retry(address).await;
+                assert!(websocket_command(
+                    &mut replacement,
+                    1,
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                )
+                .await["result"]
+                    .is_object());
+
+                shutdown.cancel();
+                wait_for_socket_close(&mut replacement).await;
+                tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                    .await
+                    .expect("server did not finish after abandoned queued upgrade")
+                    .expect("server task")
+                    .expect("server shutdown");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_connection_holds_shared_admission_until_processor_cleanup() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = probe.local_addr().unwrap();
+                drop(probe);
+                let shutdown = super::ServerShutdown::new();
+                let server_shutdown = shutdown.clone();
+                let server = tokio::task::spawn_local(async move {
+                    super::start_with_serve_options_access_limit_and_shutdown(
+                        address.port(),
+                        "127.0.0.1",
+                        None,
+                        false,
+                        None,
+                        true,
+                        1,
+                        crate::access::CdpAccessOptions::default(),
+                        obscura_net::EffectivePersona::builtin(
+                            obscura_net::StealthProfile::WindowsChrome145,
+                        ),
+                        server_shutdown,
+                        false,
+                        super::ConnectionIoPolicy::default(),
+                    )
+                    .await
+                });
+
+                let mut active = connect_with_retry(address).await;
+                assert!(websocket_command(
+                    &mut active,
+                    1,
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                )
+                .await["result"]
+                    .is_object());
+
+                let request = websocket_upgrade_request(address.port());
+                let mut refused = connect_tcp_with_retry(address).await;
+                refused.write_all(&request).await.unwrap();
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    refused.read_to_end(&mut response),
+                )
+                .await
+                .expect("active-cap refusal did not close")
+                .expect("read active-cap refusal");
+                assert_eq!(response, super::CONNECTION_LIMIT_RESPONSE.as_bytes());
+                assert!(websocket_command(
+                    &mut active,
+                    2,
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                )
+                .await["result"]
+                    .is_object());
+
+                active.close(None).await.unwrap();
+                drop(active);
+                let mut replacement = connect_with_retry(address).await;
+                assert!(websocket_command(
+                    &mut replacement,
+                    3,
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                )
+                .await["result"]
+                    .is_object());
+
+                shutdown.cancel();
+                wait_for_socket_close(&mut replacement).await;
+                tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                    .await
+                    .expect("server did not finish after active admission shutdown")
+                    .expect("server task")
+                    .expect("server shutdown");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

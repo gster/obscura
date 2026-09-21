@@ -75,7 +75,8 @@ Run the CDP server. The supported client path is official Playwright Python over
                              another authenticated boundary protects it
     --proxy <URL>            HTTP or SOCKS5 proxy
     --workers <N>            Worker processes (default 1)
-    --max-connections <N>    Maximum simultaneous CDP connections per worker
+    --max-connections <N>    Maximum admitted CDP WebSockets per worker,
+                             including authorized handoffs and active connections
                              (default 128); the multi-worker parent admits at
                              most workers * max-connections concurrent relays
     --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)

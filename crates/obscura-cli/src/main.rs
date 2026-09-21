@@ -99,12 +99,13 @@ enum Command {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
         workers: u16,
 
-        /// Maximum live CDP connections. Each connection runs on its own OS
-        /// thread with its own V8 isolates, so this bounds the server's thread
-        /// and memory footprint. This limit is per worker when `--workers` is
-        /// greater than one; the parent admits at most workers times this many
-        /// simultaneous byte-transparent relays. Connections beyond the limit
-        /// are refused with a 503 rather than queued.
+        /// Maximum admitted CDP WebSocket connections, including authorized
+        /// upgrades waiting for processor handoff and active connections. Each
+        /// active connection runs on its own OS thread with its own V8 isolates.
+        /// This limit is per worker when `--workers` is greater than one; the
+        /// parent admits at most workers times this many simultaneous
+        /// byte-transparent relays. Connections beyond the limit are refused
+        /// with a 503 rather than queued outside the allowance.
         #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
         max_connections: usize,
 

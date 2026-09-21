@@ -260,6 +260,37 @@ reaping, parent-only shutdown, kernel listen backlog, total FD/task/RSS/V8 or
 socket-buffer limits, container networking, or any other operating system.
 Those boundaries require separate evidence.
 
+## Single-worker WebSocket admission qualification
+
+`cdp_ws_capacity.py` qualifies `--max-connections` against a real Darwin
+release process. The limit covers authorized WebSocket upgrades waiting for
+processor handoff together with active CDP connections. With the limit set to
+one, the runner holds an upgraded socket, requires the next upgrade to receive
+a complete HTTP 503 with `X-Obscura-Reason: max-connections`, and proves the
+held socket still executes `Browser.getVersion`. It then closes the active
+socket, waits for listener, FD, and thread counts to return to their exact
+baseline, and repeats the reject/recover cycle to detect counter drift. A final
+active socket remains open during SIGTERM; both clean socket EOF and process
+exit status zero are required.
+
+Use a release binary and a new output path outside the repository:
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+python3 tools/unblocked/cdp_ws_capacity.py \
+  --binary target/release/obscura \
+  --output "$RUN_ROOT/cdp-ws-capacity"
+```
+
+Every HTTP request/response, WebSocket payload/frame, host command stdout and
+stderr stream, process/socket snapshot, server byte stream, traceback, binary
+hash, and artifact hash is retained without redaction, truncation, or field
+removal. The runner does not turn a failed graceful shutdown into a passing
+cleanup by sending SIGKILL. This evidence is Darwin-specific and does not
+qualify Linux, Windows, containers, multi-worker relay totals, silent-pending
+connections, the deterministic handoff-saturation test hook, or total resource
+limits.
+
 ## Trace comparison
 
 Each successful mode writes one trace and `result.json` reports the first exact
