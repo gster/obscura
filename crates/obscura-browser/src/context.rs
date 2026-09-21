@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::network_history::NetworkHistory;
 use obscura_net::{CookieJar, EffectivePersona, ObscuraHttpClient, RobotsCache};
 
 #[derive(Clone, Debug, Default)]
@@ -10,6 +11,15 @@ pub struct BrowserContextOptions {
     pub allow_file_access: bool,
     pub allow_private_network: bool,
     pub obey_robots: bool,
+}
+
+impl Drop for BrowserContext {
+    fn drop(&mut self) {
+        // Pages retain an Arc<BrowserContext>, so the final context drop only
+        // runs after every Page writer has closed and flushed its accepted
+        // prefix. Persist the context-close marker for clean recovery.
+        let _ = self.network_history.finalize();
+    }
 }
 
 pub struct BrowserContext {
@@ -24,6 +34,8 @@ pub struct BrowserContext {
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
     pub allow_private_network: bool,
+    network_history: NetworkHistory,
+    network_observation_root: std::sync::Mutex<obscura_js::network_observation::NetworkObservationQueue>,
 }
 
 impl BrowserContext {
@@ -154,6 +166,17 @@ impl BrowserContext {
             *guard = persona.user_agent().to_string();
         }
 
+        let network_history = match storage_dir.as_deref() {
+            Some(directory) => NetworkHistory::persistent(id.clone(), directory)
+                .unwrap_or_else(|error| NetworkHistory::failed(id.clone(), error)),
+            None => NetworkHistory::ephemeral(id.clone()),
+        };
+        let network_observation_root =
+            obscura_js::network_observation::NetworkObservationQueue::default();
+        if let Some(failure) = network_history.terminal_failure() {
+            network_observation_root.fail_history(failure.message);
+        }
+
         Ok(Self {
             id,
             cookie_jar,
@@ -166,11 +189,40 @@ impl BrowserContext {
             allow_file_access,
             storage_dir,
             allow_private_network,
+            network_history,
+            network_observation_root: std::sync::Mutex::new(network_observation_root),
         })
     }
 
     pub fn persona(&self) -> &EffectivePersona {
         &self.persona
+    }
+
+    pub fn network_history(&self) -> NetworkHistory {
+        self.network_history.clone()
+    }
+
+    pub(crate) fn network_observation_queue(
+        &self,
+    ) -> obscura_js::network_observation::NetworkObservationQueue {
+        let root = self.network_observation_root
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(failure) = self.network_history.terminal_failure() {
+            root.fail_history(failure.message);
+        }
+        root.sibling()
+    }
+
+    pub(crate) fn propagate_network_history_terminal(
+        &self,
+    ) -> Option<crate::network_history::NetworkHistoryError> {
+        let failure = self.network_history.terminal_failure()?;
+        self.network_observation_root
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .fail_history(failure.message.clone());
+        Some(failure)
     }
 
     pub fn device_identity(&self) -> obscura_js::ops::DeviceIdentity {
@@ -222,6 +274,18 @@ impl BrowserContext {
             *guard = persona.user_agent().to_string();
         }
 
+        let storage_dir = persistent.then(|| self.storage_dir.clone()).flatten();
+        let network_history = match storage_dir.as_deref() {
+            Some(directory) => NetworkHistory::persistent(id.clone(), directory)
+                .unwrap_or_else(|error| NetworkHistory::failed(id.clone(), error)),
+            None => NetworkHistory::ephemeral(id.clone()),
+        };
+        let network_observation_root =
+            obscura_js::network_observation::NetworkObservationQueue::default();
+        if let Some(failure) = network_history.terminal_failure() {
+            network_observation_root.fail_history(failure.message);
+        }
+
         Ok(Self {
             id,
             cookie_jar,
@@ -232,8 +296,10 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: self.obey_robots,
             allow_file_access: self.allow_file_access,
-            storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
+            storage_dir,
             allow_private_network: self.allow_private_network,
+            network_history,
+            network_observation_root: std::sync::Mutex::new(network_observation_root),
         })
     }
 
@@ -320,5 +386,34 @@ mod tests {
             source.http_client.user_agent.read().await.as_str(),
             source.persona().user_agent()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_registration_failure_stops_an_existing_context_runtime() {
+        let mut context = BrowserContext::new("registration-limit".to_string(), persona());
+        context.network_history = crate::network_history::NetworkHistory::with_limits(
+            "registration-limit",
+            crate::network_history::NetworkHistoryLimits {
+                records: 1,
+                ..Default::default()
+            },
+        );
+        context.network_observation_root = std::sync::Mutex::new(
+            obscura_js::network_observation::NetworkObservationQueue::default(),
+        );
+        let context = Arc::new(context);
+        let mut first = crate::Page::new("first".to_string(), context.clone());
+        first.navigate("data:text/html,first").await.unwrap();
+
+        let second = crate::Page::new("second".to_string(), context.clone());
+
+        assert!(second.network_history_page_instance_id().is_none());
+        assert_eq!(
+            context.network_history().terminal_failure().unwrap().kind,
+            crate::network_history::NetworkHistoryFailureKind::Count,
+        );
+        let failure = first.network_observation_failure()
+            .expect("existing runtime receives registration terminal");
+        assert!(failure.message.contains("pageInstances limit 1"));
     }
 }

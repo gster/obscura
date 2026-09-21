@@ -18,6 +18,7 @@ pub struct Exchange {
     pub body_complete: bool,
     pub body_size: usize,
     pub body_request_id: Option<String>,
+    pub body_capture_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -27,6 +28,7 @@ pub struct RequestTrace {
     request_bodies: Arc<Mutex<crate::request_body::RequestBodyStore>>,
     request_id: String,
     capture_response_bodies: bool,
+    capture_redirect_response_bodies: bool,
 }
 
 impl RequestTrace {
@@ -36,12 +38,14 @@ impl RequestTrace {
         Self {
             exchanges: Arc::new(Mutex::new(Vec::new())), bodies, request_bodies,
             request_id, capture_response_bodies: true,
+            capture_redirect_response_bodies: true,
         }
     }
 
     /// Native navigation owns final-response storage because it must classify
-    /// binary main resources. The trace still retains every hop's metadata and
-    /// exact request bodies, but does not duplicate response-body budget.
+    /// binary main resources. The trace still retains every redirect response
+    /// body, hop metadata, and exact request body without duplicating the final
+    /// response-body budget.
     pub fn new_request_only(bodies: Arc<Mutex<crate::response_body::ResponseBodyStore>>,
         request_bodies: Arc<Mutex<crate::request_body::RequestBodyStore>>, request_id: String,
     ) -> Self {
@@ -78,6 +82,7 @@ impl RequestTrace {
             transport_request_body_present: false, transport_request_body_size: 0,
             transport_request_body_request_id: None,
             response: None, body_complete: false, body_size: 0, body_request_id: None,
+            body_capture_error: None,
         });
         Ok(())
     }
@@ -146,7 +151,14 @@ impl RequestTrace {
         if let Some(exchange) = exchanges.last_mut() {
             // Spool now rather than retaining every redirect body in memory.
             // Header-only captures never register an empty successful body.
-            let body_stored = if body_complete && self.capture_response_bodies {
+            let is_redirect = (300..400).contains(&response.status)
+                && response.raw_headers.as_ref().is_some_and(|headers| {
+                    headers.fields.iter().any(|field| field.name.eq_ignore_ascii_case(b"location"))
+                });
+            let body_stored = if body_complete
+                && (self.capture_response_bodies
+                    || (self.capture_redirect_response_bodies && is_redirect))
+            {
                 let body_id = format!("{}-hop-{}", self.request_id, index);
                 match self.bodies.lock().unwrap_or_else(|e| e.into_inner())
                     .insert(body_id.clone(), &response.body, false)
@@ -155,7 +167,10 @@ impl RequestTrace {
                         exchange.body_request_id = Some(body_id);
                         true
                     }
-                    Err(_) => false,
+                    Err(error) => {
+                        exchange.body_capture_error = Some(error.to_string());
+                        false
+                    }
                 }
             } else { false };
             exchange.response = Some(Response {

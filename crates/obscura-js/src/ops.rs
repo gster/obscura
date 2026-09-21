@@ -181,6 +181,11 @@ pub struct JsNetworkEvent {
     pub request_started: bool,
     pub redirect: bool,
     pub response_body_request_id: Option<String>,
+    pub response_body_capture_error: Option<String>,
+    /// Shared exact body storage carried with the accepted observation so the
+    /// context history does not depend on a later, consumable protocol view.
+    #[serde(skip_serializing)]
+    pub response_body: Option<obscura_net::response_body::ResponseBody>,
     /// Matches the `fetch-{N}` id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
@@ -3852,6 +3857,8 @@ pub(crate) struct NetworkRequest {
     pub interception_id: Option<String>,
     response_interception_id: Option<String>,
     response_status_texts: Vec<String>,
+    retained_response_bodies:
+        HashMap<String, obscura_net::response_body::ResponseBody>,
     pub initiator_request_id: Option<String>,
     resource_type: ResourceType,
     finished: bool,
@@ -3875,7 +3882,7 @@ impl NetworkRequest {
         trace.begin(url, method, headers, body)?;
         let document_generation = state.borrow().network_document_generation;
         let document_url = state.borrow().network_document_url.clone();
-        Ok(Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, response_interception_id: None, response_status_texts: Vec::new(), initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 })
+        Ok(Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, response_interception_id: None, response_status_texts: Vec::new(), retained_response_bodies: HashMap::new(), initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 })
     }
 
     fn set_response_status_text(&mut self, index: usize, status_text: Option<String>) {
@@ -3909,7 +3916,8 @@ impl NetworkRequest {
             transport_request_body_present: exchange.transport_request_body_present,
             transport_request_body_request_id: exchange.transport_request_body_request_id.clone(),
             transport_request_body_size: exchange.transport_request_body_size,
-            request_started: false, redirect: false, response_body_request_id: None, body_size: 0,
+            request_started: false, redirect: false, response_body_request_id: None,
+            response_body_capture_error: None, response_body: None, body_size: 0,
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
         });
         self.state.borrow_mut().js_network_events.try_extend(events)?;
@@ -3953,6 +3961,9 @@ impl NetworkRequest {
         let response = exchange.response;
         let body_captured = exchange.body_complete && response.is_some();
         let body_id = exchange.body_request_id;
+        let retained_response_body = body_id.as_ref().and_then(|body_id| {
+            self.retained_response_bodies.get(body_id).cloned()
+        });
         if !redirect && body_captured {
             let mut store = state.network_response_bodies.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(body_id) = &body_id {
@@ -3965,6 +3976,15 @@ impl NetworkRequest {
                 let _ = state.network_response_bodies.lock().unwrap_or_else(|e| e.into_inner()).alias(body_id, alias);
             }
         }
+        let response_body_request_id = if redirect {
+            body_id
+        } else {
+            body_captured.then(|| self.id.clone())
+        };
+        let response_body = response_body_request_id.as_deref().and_then(|body_id| {
+            state.network_response_bodies.lock().unwrap_or_else(|e| e.into_inner())
+                .get(body_id).and_then(Result::ok).map(|(body, _)| body)
+        }).or(retained_response_body);
         JsNetworkEvent {
             document_generation: self.document_generation, document_url: self.document_url.clone(),
             initiator_request_id: self.initiator_request_id.clone(),
@@ -3988,7 +4008,9 @@ impl NetworkRequest {
             request_started: if index == 0 { self.network_start.swap(2, std::sync::atomic::Ordering::SeqCst) == 1 } else {
                 self.hop_starts.get(index - 1).is_some_and(|start| start.swap(2, std::sync::atomic::Ordering::SeqCst) == 1)
             }, redirect,
-            response_body_request_id: if redirect { body_id } else { body_captured.then(|| self.id.clone()) },
+            response_body_request_id,
+            response_body_capture_error: exchange.body_capture_error,
+            response_body,
         }
     }
 
@@ -4553,7 +4575,7 @@ async fn pause_response_hop(
     };
     let id = shared.borrow().intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let request_id = format!("intercept-{id}");
-    let body_id = exchange.body_request_id.as_ref().ok_or_else(|| {
+    let body_id = exchange.body_request_id.clone().ok_or_else(|| {
         let canonical_id = format!("{}-hop-{exchange_index}", observation.id);
         let error = response_bodies.lock().unwrap_or_else(|e| e.into_inner())
             .get(&canonical_id).and_then(Result::err)
@@ -4561,8 +4583,10 @@ async fn pause_response_hop(
             .unwrap_or_else(|| "response_body_capture_incomplete".to_string());
         deno_error::JsErrorBox::generic(error)
     })?;
+    let retained_response_body = response_bodies.lock().unwrap_or_else(|e| e.into_inner())
+        .get(&body_id).and_then(Result::ok).map(|(body, _)| body);
     response_bodies.lock().unwrap_or_else(|e| e.into_inner())
-        .alias(body_id, &request_id)
+        .alias(&body_id, &request_id)
         .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     let redirected_request_id = observation.response_interception_id.replace(request_id.clone());
     let (resolver, resolution) = tokio::sync::oneshot::channel();
@@ -4589,6 +4613,9 @@ async fn pause_response_hop(
         response_body_request_id: exchange.body_request_id,
         resolver,
     }).map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception channel closed"))?;
+    if let Some(body) = retained_response_body {
+        observation.retained_response_bodies.insert(body_id, body);
+    }
 
     match resolution.await.map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception resolver closed"))? {
         InterceptResolution::ContinueResponse { status, status_text, headers, raw_headers } => {
@@ -4671,7 +4698,7 @@ async fn pause_redirect_hop(
         request_id, url: url.clone(), method: method.clone(), headers: headers.iter().cloned().collect(),
         resource_type: cdp_resource_type(observation.resource_type).into(),
         response_status_code: None, response_headers: None, response_raw_headers: None,
-        response_body_request_id: None, resolver,
+            response_body_request_id: None, resolver,
     }).map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception channel closed"))?;
     let resolution = resolution.await.map_err(|_| deno_error::JsErrorBox::generic("Aborted: interception resolver closed"))?;
     match resolution {

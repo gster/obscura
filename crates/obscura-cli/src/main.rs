@@ -203,6 +203,9 @@ enum Command {
 
     Mcp {
         #[arg(long)]
+        storage_dir: Option<std::path::PathBuf>,
+
+        #[arg(long)]
         http: bool,
 
         #[arg(long, default_value = "127.0.0.1")]
@@ -683,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Some(Command::Mcp {
+            storage_dir,
             http,
             host,
             port,
@@ -690,9 +694,9 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(host, port, mcp_proxy, persona.clone()).await?;
+                obscura_mcp::http::run(host, port, mcp_proxy, persona.clone(), storage_dir).await?;
             } else {
-                obscura_mcp::run(mcp_proxy, persona.clone()).await?;
+                obscura_mcp::run(mcp_proxy, persona.clone(), storage_dir).await?;
             }
         }
         None => {

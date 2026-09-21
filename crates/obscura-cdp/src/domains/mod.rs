@@ -8,6 +8,7 @@ pub mod input;
 pub mod io;
 pub mod lp;
 pub mod network;
+pub mod obscura;
 pub mod page;
 pub mod pdf;
 pub mod runtime;

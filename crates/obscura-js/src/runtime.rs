@@ -6959,6 +6959,26 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Stop every Dedicated Worker owned by this runtime and wait until each
+    /// worker's native state has been dropped. A successful return guarantees
+    /// that accepted worker network observations have reached the page-wide
+    /// teardown queue. The single timeout bounds the whole worker set.
+    pub fn shutdown_workers(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), crate::worker::WorkerShutdownError> {
+        let registry = {
+            let runtime = self.runtime();
+            let op_state = runtime.op_state();
+            let state = op_state.borrow();
+            state
+                .borrow::<std::rc::Rc<std::cell::RefCell<crate::worker::WorkerRegistry>>>()
+                .clone()
+        };
+        let result = registry.borrow_mut().shutdown(timeout);
+        result
+    }
+
     pub fn execution_deadline(&self, deadline: std::time::Instant) -> ExecutionDeadlineGuard {
         let handle = self.isolate_handle();
         let armed = crate::cdp_watchdog::arm_until(handle.clone(), deadline);
@@ -8435,6 +8455,38 @@ mod tests {
             assert!(request.resolver.is_closed());
             assert!(rt.take_js_network_events().is_empty());
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_shutdown_barrier_flushes_pending_interception_observation() {
+        let mut rt = setup_runtime("<html></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ops::InterceptedRequest>();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.execute_script("worker-shutdown-barrier", r#"
+            globalThis.worker = new Worker(URL.createObjectURL(new Blob([
+                "fetch('https://example.test/pending-shutdown').catch(()=>{});"
+            ])));
+        "#).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let request = loop {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                rt.run_autonomous_event_loop_turn(),
+            ).await;
+            if let Ok(request) = rx.try_recv() { break request; }
+            assert!(std::time::Instant::now() < deadline, "worker interception did not arrive");
+        };
+
+        rt.evaluate("worker.terminate()").unwrap();
+        rt.shutdown_workers(std::time::Duration::from_secs(1)).unwrap();
+
+        assert!(request.resolver.is_closed());
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].request_id, request.network_id);
+        assert_eq!(events[0].error.as_deref(), Some("Aborted"));
+        assert!(rt.take_js_network_events().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

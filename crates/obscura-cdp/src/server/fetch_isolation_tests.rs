@@ -271,6 +271,43 @@ async fn response_stage_pause_exposes_complete_body_and_enforces_stage_lifecycle
         assert_eq!(response["params"]["response"]["statusText"], "Created by fixture");
         assert_eq!(response["params"]["response"]["headers"]["x-replaced"], "yes");
 
+        client.start_fetch(&session, &format!("{base}/history-fulfill"), false).await;
+        let fulfilled_pause = client.pause(&session).await;
+        let fulfilled_network_id = fulfilled_pause["params"]["networkId"].clone();
+        let replacement = b"history-response-replacement";
+        client.ok(Some(&session), "Fetch.fulfillRequest", json!({
+            "requestId": fulfilled_pause["params"]["requestId"],
+            "responseCode": 200,
+            "body": base64::engine::general_purpose::STANDARD.encode(replacement),
+        })).await;
+        assert_eq!(client.result(&session).await, "history-response-replacement");
+        while !client.events.iter().any(|event| event["method"] == "Network.loadingFinished"
+            && event["params"]["requestId"] == fulfilled_network_id)
+        {
+            let event = client.recv().await;
+            client.events.push(event);
+        }
+        let histories = client.ok(None, "Obscura.getNetworkHistories", json!({})).await;
+        let history_id = histories["histories"].as_array().unwrap().iter()
+            .find(|history| history["live"] == true).unwrap()["historyId"].clone();
+        let history = client.ok(None, "Obscura.getNetworkHistory", json!({
+            "historyId": history_id,
+            "limit": 1000,
+        })).await;
+        let fulfilled_record = history["records"].as_array().unwrap().iter()
+            .find(|record| record["event"]["requestId"] == fulfilled_network_id
+                && record["responseBody"].is_object())
+            .expect("fulfilled response remains in persistent history");
+        let fulfilled_body = client.ok(None, "Obscura.getNetworkBody", json!({
+            "historyId": history_id,
+            "bodyKey": fulfilled_record["responseBody"]["key"],
+        })).await;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(fulfilled_body["data"].as_str().unwrap()).unwrap(),
+            replacement,
+        );
+
         client.start_fetch(&session, &format!("{base}/redirect/response-stage"), false).await;
         let redirect = client.pause(&session).await;
         assert_eq!(redirect["params"]["responseStatusCode"], 302);
@@ -582,6 +619,26 @@ async fn single_page_sessionless_pause_resolution_and_navigation_disconnect() {
         client.ok(None, "Fetch.disable", json!({})).await;
         assert_eq!(client.result(&session).await, "failed", "disable must abort a sessionless pause after stream transfer");
         client.ok(None, "IO.close", json!({"handle":stream})).await;
+        let histories = client.ok(None, "Obscura.getNetworkHistories", json!({})).await;
+        let history_id = histories["histories"].as_array().unwrap().iter()
+            .find(|history| history["live"] == true).unwrap()["historyId"].clone();
+        let history = client.ok(None, "Obscura.getNetworkHistory", json!({
+            "historyId": history_id,
+            "limit": 1000,
+        })).await;
+        let stream_record = history["records"].as_array().unwrap().iter()
+            .find(|record| record["event"]["url"] == format!("{base}/sessionless-stream"))
+            .expect("response-stage stream observation remains in persistent history");
+        let body_key = stream_record["responseBody"]["key"].clone();
+        let retained = client.ok(None, "Obscura.getNetworkBody", json!({
+            "historyId": history_id,
+            "bodyKey": body_key,
+        })).await;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(retained["data"].as_str().unwrap()).unwrap(),
+            b"/sessionless-stream",
+        );
         client.ok(Some(&session), "Fetch.enable", json!({"patterns":[{"urlPattern":"*","requestStage":"Response"}]})).await;
         // A script pauses while its Page is temporarily removed from ctx.pages
         // by the navigation task. Route using the enable owner, not ctx.pages.

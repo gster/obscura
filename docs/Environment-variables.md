@@ -97,6 +97,39 @@ Request timeout for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads. W
 OBSCURA_FETCH_TIMEOUT_MS=15000 obscura serve
 ```
 
+### Network history limits
+
+Every browser context owns one append-only Network observation history. The
+history keeps complete event metadata, lossless raw headers, and exact request,
+transport-request, and response body bytes. It does not evict, truncate, redact,
+or silently drop an accepted record. The first admission, serialization, I/O,
+or producer-teardown failure is sticky: the accepted prefix remains readable
+and later network work is rejected with that terminal failure.
+
+The following variables set per-context hard limits. Values are unsigned byte
+or entry counts; an absent or invalid value uses the default.
+
+| Variable | Default | Limit |
+| --- | ---: | --- |
+| `OBSCURA_NETWORK_HISTORY_RECORDS` | 4096 | Records, and independently page instances |
+| `OBSCURA_NETWORK_HISTORY_METADATA_BYTES` | 64 MiB | Complete serialized record metadata |
+| `OBSCURA_NETWORK_HISTORY_SINGLE_RECORD_BYTES` | 16 MiB | One complete serialized record |
+| `OBSCURA_NETWORK_HISTORY_BODY_BYTES` | 512 MiB | Unique exact body bytes |
+| `OBSCURA_NETWORK_HISTORY_BODY_ENTRIES` | 32768 | Immutable request/transport/response body references |
+| `OBSCURA_NETWORK_HISTORY_DISK_BYTES` | 640 MiB | Manifest and checksummed journal bytes when persistent |
+
+The existing request- and response-body capture budgets remain producer-side
+limits. Their defaults are 256 MiB each, matching the history's 512 MiB
+combined body budget. If either producer cannot capture an exact body first,
+the history stops with that complete capture error instead of accepting a
+record with a missing body.
+
+Without `--storage-dir`, the bounded history is memory-only and lasts for the
+browser context. With `--storage-dir` on `serve` or `mcp`, each context writes a
+private checksummed archive below `network-history/<history-id>/`; clean close
+records the terminal state and crash recovery exposes the valid committed
+prefix plus an explicit recovery failure for an incomplete or corrupt tail.
+
 ### `OBSCURA_PROXY`
 
 Default proxy URL used by `obscura-worker` for the parallel `scrape` command when no `--proxy` flag is set.

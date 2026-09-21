@@ -21,7 +21,50 @@ pub struct WorkerRegistry {
     pub(crate) execution_cancellation: Option<crate::execution_cancellation::ExecutionCancellation>,
     pub next_id: u32,
     pub workers: HashMap<u32, WorkerInstance>,
+    retiring: Vec<(u32, WorkerInstance)>,
+    shutdown_failures: Vec<WorkerShutdownFailure>,
 }
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum WorkerShutdownFailure {
+    TimedOut { worker_id: u32 },
+    CompletionChannelClosed { worker_id: u32 },
+    WorkerFailed { worker_id: u32, message: String },
+    SelfWait { worker_id: u32 },
+}
+
+/// A complete, deterministic account of workers whose teardown could not be
+/// confirmed. Callers must treat this as a potentially incomplete network
+/// observation flush.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkerShutdownError {
+    failures: Vec<WorkerShutdownFailure>,
+}
+
+impl std::fmt::Display for WorkerShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Worker shutdown incomplete")?;
+        for failure in &self.failures {
+            match failure {
+                WorkerShutdownFailure::TimedOut { worker_id } => {
+                    write!(f, "; worker {worker_id} timed out")?;
+                }
+                WorkerShutdownFailure::CompletionChannelClosed { worker_id } => {
+                    write!(f, "; worker {worker_id} completion channel closed")?;
+                }
+                WorkerShutdownFailure::WorkerFailed { worker_id, message } => {
+                    write!(f, "; worker {worker_id} failed: {message}")?;
+                }
+                WorkerShutdownFailure::SelfWait { worker_id } => {
+                    write!(f, "; worker {worker_id} cannot wait for itself")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for WorkerShutdownError {}
 
 #[derive(Default)]
 struct WorkerPolicy {
@@ -32,6 +75,119 @@ struct WorkerPolicy {
     intercept_response_patterns: Vec<crate::ops::FetchRequestPattern>,
     console_enabled: bool,
     runtime_events_enabled: bool,
+}
+
+impl WorkerShutdownFailure {
+    fn worker_id(&self) -> u32 {
+        match self {
+            Self::TimedOut { worker_id }
+            | Self::CompletionChannelClosed { worker_id }
+            | Self::WorkerFailed { worker_id, .. }
+            | Self::SelfWait { worker_id } => *worker_id,
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            Self::TimedOut { .. } => 0,
+            Self::CompletionChannelClosed { .. } => 1,
+            Self::WorkerFailed { .. } => 2,
+            Self::SelfWait { .. } => 3,
+        }
+    }
+}
+
+impl WorkerRegistry {
+    fn record_completion(
+        failures: &mut Vec<WorkerShutdownFailure>,
+        worker_id: u32,
+        completion: Result<(), String>,
+    ) {
+        if let Err(message) = completion {
+            failures.push(WorkerShutdownFailure::WorkerFailed { worker_id, message });
+        }
+    }
+
+    fn reap_retiring(&mut self) {
+        let mut pending = Vec::new();
+        for (worker_id, worker) in self.retiring.drain(..) {
+            match worker.completion.try_recv() {
+                Ok(completion) => Self::record_completion(
+                    &mut self.shutdown_failures,
+                    worker_id,
+                    completion,
+                ),
+                Err(std::sync::mpsc::TryRecvError::Empty) => pending.push((worker_id, worker)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.shutdown_failures.push(
+                    WorkerShutdownFailure::CompletionChannelClosed { worker_id },
+                ),
+            }
+        }
+        self.retiring = pending;
+    }
+
+    pub(crate) fn shutdown(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), WorkerShutdownError> {
+        self.reap_retiring();
+        let mut workers: Vec<_> = std::mem::take(&mut self.workers).into_iter().collect();
+        workers.append(&mut self.retiring);
+        workers.sort_by_key(|(worker_id, _)| *worker_id);
+
+        // Terminate every isolate before waiting for any one of them. A stuck
+        // worker therefore cannot postpone the stop request for later workers.
+        for (_, worker) in &workers {
+            worker.stop();
+        }
+
+        let now = std::time::Instant::now();
+        let deadline = now.checked_add(timeout).unwrap_or(now);
+        let current_thread = std::thread::current().id();
+        let mut failures = std::mem::take(&mut self.shutdown_failures);
+        for (worker_id, worker) in workers {
+            if worker.thread_id == current_thread {
+                failures.push(WorkerShutdownFailure::SelfWait { worker_id });
+                continue;
+            }
+            let completion = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => {
+                    match worker.completion.recv_timeout(remaining) {
+                        Ok(completion) => Some(completion),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            failures.push(WorkerShutdownFailure::TimedOut { worker_id });
+                            None
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            failures.push(WorkerShutdownFailure::CompletionChannelClosed { worker_id });
+                            None
+                        }
+                    }
+                }
+                _ => match worker.completion.try_recv() {
+                    Ok(completion) => Some(completion),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        failures.push(WorkerShutdownFailure::TimedOut { worker_id });
+                        None
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        failures.push(WorkerShutdownFailure::CompletionChannelClosed { worker_id });
+                        None
+                    }
+                },
+            };
+            if let Some(completion) = completion {
+                Self::record_completion(&mut failures, worker_id, completion);
+            }
+        }
+
+        failures.sort_by_key(|failure| (failure.worker_id(), failure.rank()));
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerShutdownError { failures })
+        }
+    }
 }
 
 pub(crate) fn sync_policy(state: &OpState) {
@@ -65,6 +221,8 @@ pub struct WorkerInstance {
     commands: queue::Sender<WorkerCommand>,
     events: std::sync::Arc<tokio::sync::Mutex<queue::Receiver<WorkerEvent>>>,
     control: std::sync::Arc<WorkerControl>,
+    completion: std::sync::mpsc::Receiver<Result<(), String>>,
+    thread_id: std::thread::ThreadId,
 }
 
 #[derive(Default)]
@@ -83,10 +241,26 @@ impl WorkerControl {
         self.terminated.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
-impl Drop for WorkerInstance {
+
+struct WorkerIsolateRegistration {
+    control: std::sync::Arc<WorkerControl>,
+}
+
+impl Drop for WorkerIsolateRegistration {
     fn drop(&mut self) {
+        *self.control.isolate.lock().unwrap() = None;
+    }
+}
+
+impl WorkerInstance {
+    fn stop(&self) {
         self.control.terminate();
         let _ = self.commands.send(WorkerCommand::Stop);
+    }
+}
+impl Drop for WorkerInstance {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 enum WorkerCommand { Run(String), Message(String), Stop }
@@ -929,24 +1103,44 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
     let control = std::sync::Arc::new(WorkerControl::default());
     let child_control = control.clone();
     let mut registry = registry.borrow_mut();
+    registry.reap_retiring();
     registry.next_id = registry.next_id.saturating_add(1);
     let id = registry.next_id;
-    if std::thread::Builder::new().name(format!("obscura-worker-{id}")).spawn(move || {
-        let _lease = lease;
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-        if let Ok(runtime) = runtime {
-            runtime.block_on(run_worker(id, config, command_rx, events, child_control));
-        }
-    }).is_err() { return 0; }
+    let (completion_tx, completion) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new().name(format!("obscura-worker-{id}")).spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = lease;
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|error| format!("Worker runtime initialization failed: {error}"))?;
+            runtime.block_on(run_worker(id, config, command_rx, events, child_control))
+        }));
+        // `run_worker` owns its ObscuraJsRuntime. Reaching this line proves the
+        // runtime and ObscuraState have dropped, including the final transfer
+        // of accepted network observations into the shared teardown queue.
+        let completion = match outcome {
+            Ok(completion) => completion,
+            Err(payload) => {
+                let message = payload.downcast_ref::<String>().map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                    .unwrap_or("unknown panic");
+                Err(format!("Worker thread panicked: {message}"))
+            }
+        };
+        let _ = completion_tx.send(completion);
+    });
+    let Ok(thread) = thread else { return 0; };
+    let thread_id = thread.thread().id();
+    drop(thread);
     registry.workers.insert(id, WorkerInstance { commands,
-        events: std::sync::Arc::new(tokio::sync::Mutex::new(event_rx)), control });
+        events: std::sync::Arc::new(tokio::sync::Mutex::new(event_rx)), control,
+        completion, thread_id });
     id
 }
 
 async fn run_worker(id: u32, config: WorkerConfig,
     mut commands: queue::Receiver<WorkerCommand>,
-    events: queue::Sender<WorkerEvent>, control: std::sync::Arc<WorkerControl>) {
-    if control.stopped() { return; }
+    events: queue::Sender<WorkerEvent>, control: std::sync::Arc<WorkerControl>) -> Result<(), String> {
+    if control.stopped() { return Ok(()); }
     let execution_cancellation = config.execution_cancellation.clone();
     let mut rt = crate::runtime::ObscuraJsRuntime::with_base_url_and_proxy(
         &config.url,
@@ -957,8 +1151,9 @@ async fn run_worker(id: u32, config: WorkerConfig,
     {
         let mut handle = control.isolate.lock().unwrap();
         *handle = Some(rt.isolate_handle());
-        if control.stopped() { return; }
     }
+    let _isolate_registration = WorkerIsolateRegistration { control: control.clone() };
+    if control.stopped() { return Ok(()); }
     {
         let mut state = rt.state.borrow_mut();
         state.url = config.url.clone();
@@ -999,11 +1194,11 @@ async fn run_worker(id: u32, config: WorkerConfig,
         teardown_events, teardown_notify };
     rt.runtime().op_state().borrow_mut().put(endpoint);
     let setup = format!("Object.assign(globalThis, {});", serde_json::Value::Object(config.globals));
-    if rt.execute_script("worker-identity", &setup).is_err() { return; }
+    if rt.execute_script("worker-identity", &setup).is_err() { return Ok(()); }
     rt.run_page_init();
     if let Err(error) = rt.initialize_worker_scope(id, &config.url) {
         rt.runtime().op_state().borrow().borrow::<WorkerEndpoint>().emit("error", &error);
-        return;
+        return Ok(());
     }
     let mut idle = true;
     loop {
@@ -1046,8 +1241,8 @@ async fn run_worker(id: u32, config: WorkerConfig,
         }
         idle = false;
     }
-    // Clear the cross-thread handle before dropping its owning isolate.
-    *control.isolate.lock().unwrap() = None;
+    rt.shutdown_workers(std::time::Duration::from_secs(5))
+        .map_err(|error| error.to_string())
 }
 
 #[op2]
@@ -1102,7 +1297,13 @@ pub fn op_worker_close(state: &OpState) {
 
 #[op2(fast)]
 pub fn op_worker_terminate(state: &OpState, worker_id: u32) {
-    state.borrow::<Rc<RefCell<WorkerRegistry>>>().borrow_mut().workers.remove(&worker_id);
+    let registry = state.borrow::<Rc<RefCell<WorkerRegistry>>>().clone();
+    let mut registry = registry.borrow_mut();
+    if let Some(worker) = registry.workers.remove(&worker_id) {
+        worker.stop();
+        registry.retiring.push((worker_id, worker));
+    }
+    registry.reap_retiring();
 }
 
 #[op2]
@@ -1236,6 +1437,29 @@ pub fn op_worker_deserialize<'s>(scope: &mut v8::HandleScope<'s>, #[string] data
 mod tests {
     use super::*;
 
+    fn dormant_worker(
+        completion: std::sync::mpsc::Receiver<Result<(), String>>,
+        thread_id: std::thread::ThreadId,
+    ) -> (WorkerInstance, queue::Receiver<WorkerCommand>) {
+        let resources = std::sync::Arc::new(queue::Resources::default());
+        let (commands, command_rx) = queue::channel(resources.clone());
+        let (_events, event_rx) = queue::channel(resources);
+        (
+            WorkerInstance {
+                commands,
+                events: std::sync::Arc::new(tokio::sync::Mutex::new(event_rx)),
+                control: std::sync::Arc::new(WorkerControl::default()),
+                completion,
+                thread_id,
+            },
+            command_rx,
+        )
+    }
+
+    fn finished_thread_id() -> std::thread::ThreadId {
+        std::thread::spawn(|| std::thread::current().id()).join().unwrap()
+    }
+
     fn network_event(request_id: &str) -> crate::ops::JsNetworkEvent {
         crate::ops::JsNetworkEvent {
             document_generation: 0, document_url: String::new(),
@@ -1245,6 +1469,8 @@ mod tests {
             transport_request_body_present: false, transport_request_body_request_id: None,
             transport_request_body_size: 0,
             request_started: false, redirect: false, response_body_request_id: None,
+            response_body_capture_error: None,
+            response_body: None,
             request_id: request_id.into(), url: "http://example.test/".into(), method: "GET".into(),
             resource_type: obscura_net::ResourceType::Fetch, status: 200,
             status_text: String::new(),
@@ -1301,5 +1527,44 @@ mod tests {
         assert_eq!(drained.events[1].error.as_deref(), Some("Aborted"));
         assert_eq!(drained.events[1].raw_headers.as_ref().unwrap().fields[0].value, b"\x80\xff");
         assert_eq!(drained.failure, Some(failure));
+    }
+
+    #[test]
+    fn worker_shutdown_reports_every_timeout_and_receiver_failure() {
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        drop(closed_tx);
+        let (pending, _pending_commands) = dormant_worker(pending_rx, finished_thread_id());
+        let (closed, _closed_commands) = dormant_worker(closed_rx, finished_thread_id());
+        let mut registry = WorkerRegistry::default();
+        registry.retiring.push((2, pending));
+        registry.retiring.push((1, closed));
+
+        let error = registry.shutdown(std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(error.failures, vec![
+            WorkerShutdownFailure::CompletionChannelClosed { worker_id: 1 },
+            WorkerShutdownFailure::TimedOut { worker_id: 2 },
+        ]);
+        assert_eq!(
+            error.to_string(),
+            "Worker shutdown incomplete; worker 1 completion channel closed; worker 2 timed out",
+        );
+        assert!(registry.workers.is_empty());
+        assert!(registry.retiring.is_empty());
+        drop(pending_tx);
+    }
+
+    #[test]
+    fn worker_shutdown_never_waits_for_the_current_thread() {
+        let (_completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let (worker, _commands) = dormant_worker(completion_rx, std::thread::current().id());
+        let mut registry = WorkerRegistry::default();
+        registry.workers.insert(7, worker);
+        let start = std::time::Instant::now();
+
+        let error = registry.shutdown(std::time::Duration::from_secs(1)).unwrap_err();
+
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(error.failures, vec![WorkerShutdownFailure::SelfWait { worker_id: 7 }]);
     }
 }

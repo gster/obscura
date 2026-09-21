@@ -56,6 +56,12 @@ pub struct ResponseBody {
     len: usize,
 }
 
+impl std::fmt::Debug for ResponseBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseBody").field("len", &self.len).finish()
+    }
+}
+
 impl ResponseBody {
     pub fn from_bytes(bytes: &[u8], memory_threshold: usize) -> Result<Self, ResponseBodyError> {
         let storage = if bytes.len() > memory_threshold {

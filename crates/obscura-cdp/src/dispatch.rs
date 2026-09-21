@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{BrowserContext, NetworkHistory, NetworkHistoryLimits, Page};
 use crate::domains::fetch::RoutedInterceptedRequest;
 use serde_json::{json, Value};
 
@@ -46,6 +46,13 @@ pub(crate) struct ExecutionContextRecord {
     pub origin: String,
     pub world_name: String,
     pub is_default: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct CdpNetworkHistory {
+    pub browser_context_id: String,
+    pub history: NetworkHistory,
+    pub live: bool,
 }
 
 pub struct CdpContext {
@@ -108,6 +115,13 @@ pub struct CdpContext {
     next_screencast_session_id: i64,
     pub default_context: Arc<BrowserContext>,
     pub browser_contexts: HashMap<String, Arc<BrowserContext>>,
+    /// Context histories outlive Target disposal for the lifetime of this CDP
+    /// connection. Standard Network.* remains page/session scoped; only the
+    /// browser-level Obscura domain reads this archive registry.
+    pub(crate) network_histories: HashMap<String, CdpNetworkHistory>,
+    /// Archives that could not be recovered remain visible to protocol clients
+    /// instead of being indistinguishable from an empty storage directory.
+    pub(crate) network_history_recovery_failures: Vec<Value>,
     page_counter: u32,
     browser_context_counter: u32,
     target_session_counter: u64,
@@ -206,6 +220,66 @@ impl CdpContext {
     /// and embedders may construct their own.
     pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
         let valid_context_ids = HashSet::new();
+        let default_history = default_context.network_history();
+        let mut network_histories = HashMap::new();
+        let mut network_history_recovery_failures = Vec::new();
+        if let Some(storage_dir) = default_context.storage_dir.as_deref() {
+            let archive_root = storage_dir.join("network-history");
+            match std::fs::read_dir(&archive_root) {
+                Ok(entries) => {
+                    let mut directories = entries.filter_map(Result::ok)
+                        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                        .map(|entry| entry.path())
+                        .collect::<Vec<_>>();
+                    directories.sort();
+                    for directory in directories {
+                        let history = match NetworkHistory::recover_archive(
+                            &directory,
+                            NetworkHistoryLimits::default(),
+                        ) {
+                            Ok(history) => history,
+                            Err(error) => {
+                                tracing::warn!(archive = %directory.display(),
+                                    "could not recover persisted network history: {error}");
+                                network_history_recovery_failures.push(json!({
+                                    "archivePath": directory.display().to_string(),
+                                    "error": error,
+                                }));
+                                continue;
+                            }
+                        };
+                        network_histories.insert(
+                            history.id().0.clone(),
+                            CdpNetworkHistory {
+                                browser_context_id: history.context_id(),
+                                history,
+                                live: false,
+                            },
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(archive_root = %archive_root.display(),
+                        "could not enumerate persisted network histories: {error}");
+                    network_history_recovery_failures.push(json!({
+                        "archivePath": archive_root.display().to_string(),
+                        "error": {
+                            "kind": "io",
+                            "message": error.to_string(),
+                        },
+                    }));
+                }
+            }
+        }
+        network_histories.insert(
+            default_history.id().0.clone(),
+            CdpNetworkHistory {
+                browser_context_id: default_context.id.clone(),
+                history: default_history,
+                live: true,
+            },
+        );
         CdpContext {
             pages: Vec::new(),
             navigating_page_id: None,
@@ -232,6 +306,8 @@ impl CdpContext {
             next_screencast_session_id: 0,
             default_context,
             browser_contexts: HashMap::new(),
+            network_histories,
+            network_history_recovery_failures,
             page_counter: 0,
             browser_context_counter: 0,
             target_session_counter: 0,
@@ -346,6 +422,15 @@ impl CdpContext {
                 .try_isolated_copy_with_persona(id.clone(), false, persona)
                 .map_err(|error| error.to_string())?,
         );
+        let history = context.network_history();
+        self.network_histories.insert(
+            history.id().0.clone(),
+            CdpNetworkHistory {
+                browser_context_id: id.clone(),
+                history,
+                live: true,
+            },
+        );
         self.browser_contexts.insert(id.clone(), context);
         Ok(id)
     }
@@ -364,9 +449,8 @@ impl CdpContext {
         if id == self.default_context.id {
             return Err("The default browser context cannot be disposed".to_string());
         }
-        if self.browser_contexts.remove(id).is_none() {
-            return Err(format!("Browser context not found: {}", id));
-        }
+        let context = self.browser_contexts.get(id).cloned()
+            .ok_or_else(|| format!("Browser context not found: {}", id))?;
 
         let page_ids: Vec<String> = self
             .pages
@@ -377,7 +461,38 @@ impl CdpContext {
         for page_id in &page_ids {
             self.remove_page(page_id);
         }
+        self.finalize_context_history(id, &context);
+        self.browser_contexts.remove(id);
         Ok(page_ids)
+    }
+
+    fn finalize_context_history(&mut self, context_id: &str, context: &BrowserContext) {
+        let history = context.network_history();
+        if let Err(error) = history.finalize() {
+            tracing::warn!(browser_context_id = context_id, history_id = %history.id().0,
+                "could not finalize network history: {error}");
+        }
+        if let Some(entry) = self.network_histories.get_mut(&history.id().0) {
+            entry.live = false;
+        }
+    }
+
+    /// Close every Page producer before sealing its context journal. This is
+    /// idempotent and is called by clean connection shutdown.
+    pub fn finalize_network_histories(&mut self) {
+        let page_ids = self.pages.iter().map(|page| page.id.clone()).collect::<Vec<_>>();
+        for page_id in page_ids {
+            self.remove_page(&page_id);
+        }
+
+        let mut contexts = Vec::with_capacity(self.browser_contexts.len() + 1);
+        contexts.push((self.default_context.id.clone(), self.default_context.clone()));
+        contexts.extend(self.browser_contexts.iter().map(|(id, context)| {
+            (id.clone(), context.clone())
+        }));
+        for (id, context) in contexts {
+            self.finalize_context_history(&id, &context);
+        }
     }
 
     pub fn get_page(&self, id: &str) -> Option<&Page> {
@@ -406,7 +521,12 @@ impl CdpContext {
             .filter(|(_, page_id)| page_id.as_str() == id)
             .map(|(session_id, _)| session_id.clone())
             .collect();
-        self.pages.retain(|p| p.id != id);
+        if let Some(index) = self.pages.iter().position(|page| page.id == id) {
+            let mut page = self.pages.remove(index);
+            if let Err(error) = page.close_network_history() {
+                tracing::warn!(page_id = id, "could not close network history page: {error}");
+            }
+        }
         self.current_loader_ids.remove(id);
         self.document_loaders.retain(|(page_id, _), _| page_id != id);
         self.network_owners.retain(|(page_id, _), _| page_id != id);
@@ -963,6 +1083,9 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Network.clearBrowserCookies"
             | "Network.getResponseBody"
             | "Network.getRequestPostData"
+            | "Obscura.getNetworkHistories"
+            | "Obscura.getNetworkHistory"
+            | "Obscura.getNetworkBody"
             | "Fetch.continueRequest"
             | "Fetch.fulfillRequest"
             | "Fetch.failRequest"
@@ -1072,6 +1195,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         }
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
+        "Obscura" => domains::obscura::handle(method, &req.params, ctx).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
         "IO" => domains::io::handle(method, &req.params, ctx, &req.session_id).await,
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,

@@ -177,6 +177,7 @@ pub struct NetworkEvent {
     pub request_started: bool,
     pub redirect: bool,
     pub response_body_request_id: Option<String>,
+    pub response_body_capture_error: Option<String>,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -334,6 +335,7 @@ pub struct Page {
     session_history: obscura_js::ops::SharedSessionHistory,
     session_storage: obscura_js::ops::SharedWebStorage,
     requested_history: Option<obscura_js::ops::HistoryNavigation>,
+    network_history_writer: Option<crate::network_history::PageHistoryWriter>,
     pub network_events: Vec<NetworkEvent>,
     request_bodies: Arc<std::sync::Mutex<obscura_net::request_body::RequestBodyStore>>,
     response_bodies: Arc<std::sync::Mutex<obscura_net::response_body::ResponseBodyStore>>,
@@ -1159,6 +1161,7 @@ impl Page {
         // Page.getFrameTree return a frame the client cannot match,
         // triggering a Target.closeTarget and "Frame has been detached".
         let frame_id = id.clone();
+        let network_history_writer = context.network_history().register_page(id.clone()).ok();
         // Preserve the explicitly configured proxy scheme and endpoint. Every
         // page uses primp; there is no plain-transport product path.
         let stealth_client = Arc::new(StealthHttpClient::with_policy_persona(
@@ -1166,6 +1169,9 @@ impl Page {
             context.proxy_url.as_deref(),
             context.http_client.clone(),
             context.persona(),
+        ));
+        let network_teardown_events = Arc::new(std::sync::Mutex::new(
+            context.network_observation_queue(),
         ));
 
         Page {
@@ -1195,15 +1201,14 @@ impl Page {
             session_history: std::rc::Rc::new(std::cell::RefCell::new(Default::default())),
             session_storage: Default::default(),
             requested_history: None,
+            network_history_writer,
             network_events: Vec::new(),
             request_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             response_bodies: Arc::new(std::sync::Mutex::new(Default::default())),
             js_response_body_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             network_event_counter: 0,
             network_document_generation: 0, network_retired_generations: Vec::new(),
-            network_teardown_events: Arc::new(std::sync::Mutex::new(
-                obscura_js::network_observation::NetworkObservationQueue::default(),
-            )),
+            network_teardown_events,
             network_observation_failure: None,
             network_teardown_notify: Arc::new(tokio::sync::Notify::new()),
             intercept_enabled: false,
@@ -1794,6 +1799,7 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url, request: ResourceRequest) -> Result<Response, ObscuraNetError> {
+        self.ensure_network_history_writable()?;
         self.stealth_client
             .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
             .await
@@ -1801,9 +1807,30 @@ impl Page {
     async fn do_post_form_traced(&self, url: &Url, body: &str, request: ResourceRequest,
         trace: &obscura_net::observation::RequestTrace,
     ) -> Result<Response, ObscuraNetError> {
+        self.ensure_network_history_writable()?;
         self.stealth_client.post_form_resource_traced(
             url, body, request, Some(&self.callbacks), trace,
         ).await
+    }
+
+    fn ensure_network_history_writable(&self) -> Result<(), ObscuraNetError> {
+        if let Some(failure) = self.context.propagate_network_history_terminal() {
+            return Err(ObscuraNetError::Blocked(failure.message));
+        }
+        if let Some(failure) = self.network_teardown_events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .failure()
+        {
+            return Err(ObscuraNetError::Blocked(failure.message));
+        }
+        if self.network_history_writer.is_none() {
+            let message = self.context.network_history().terminal_failure()
+                .map(|failure| failure.message)
+                .unwrap_or_else(|| "network history page registration failed".to_string());
+            return Err(ObscuraNetError::Blocked(message));
+        }
+        Ok(())
     }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
@@ -1839,6 +1866,10 @@ impl Page {
         rt.set_execution_cancellation(self.execution_cancellation.clone());
         self.network_document_generation += 1;
         rt.set_network_observation_context(self.network_document_generation, self.url_string(), self.network_teardown_events.clone(), self.network_teardown_notify.clone());
+        if let Some(failure) = self.context.network_history().terminal_failure() {
+            self.network_teardown_events.lock().unwrap_or_else(|error| error.into_inner())
+                .fail_history(failure.message);
+        }
         rt.set_network_request_body_store(self.request_bodies.clone());
         rt.set_network_response_body_store(self.response_bodies.clone(), self.js_response_body_counter.clone());
         rt.set_url(&self.url_string());
@@ -1899,6 +1930,10 @@ impl Page {
     }
 
     async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String)> {
+        if let Err(error) = self.ensure_network_history_writable() {
+            tracing::warn!(%error, "Skipping stylesheet fetches after network history failure");
+            return Vec::new();
+        }
         let (all_links, inline_imports) = match &self.js {
             Some(js) => js
                 .with_dom(|dom| {
@@ -1977,6 +2012,7 @@ impl Page {
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
         while !pending.is_empty() {
+            if self.ensure_network_history_writable().is_err() { break; }
             let batch = std::mem::take(&mut pending);
             let stealth_client = self.stealth_client.clone();
             let callbacks = self.callbacks.clone();
@@ -2167,6 +2203,7 @@ impl Page {
         module_budget_override: Option<u64>,
         deadline: Option<std::time::Instant>,
     ) -> Result<(), PageError> {
+        self.ensure_network_history_writable()?;
         check_navigation_deadline(deadline)?;
         #[cfg(feature = "render")]
         let mut fragment = self.js.as_ref().and_then(ObscuraJsRuntime::begin_document_fragment);
@@ -4422,11 +4459,21 @@ impl Page {
     /// is drained, so calling this repeatedly does not duplicate events. The
     /// fetch-{N} request id is preserved so Network.getResponseBody resolves.
     fn retire_js_network_events(&mut self) {
+        let worker_shutdown_error = self.js.as_mut().and_then(|js| {
+            js.shutdown_workers(std::time::Duration::from_secs(5))
+                .err()
+                .map(|error| error.to_string())
+        });
         if let Some(js) = self.js.take() {
             self.network_retired_generations.push(self.network_document_generation);
             let (document_url, observations) = js.retire_network_events();
             self.append_js_network_observations(observations, Some(document_url));
             self.sync_js_network_events();
+        }
+        if let Some(error) = worker_shutdown_error {
+            self.fail_network_history(format!(
+                "network history producer teardown failed: {error}"
+            ));
         }
     }
 
@@ -4452,11 +4499,24 @@ impl Page {
         observations: obscura_js::network_observation::NetworkObservationDrain,
         retired_document_url: Option<String>,
     ) {
+        let observation_failure = observations.failure.clone();
         if self.network_observation_failure.is_none() {
             self.network_observation_failure = observations.failure;
         }
         for ev in observations.events {
-            self.network_events.push(NetworkEvent {
+            let history_response_body = match (
+                ev.response_body_request_id.as_deref(),
+                ev.response_body.clone(),
+            ) {
+                (Some(body_id), Some(body)) => Some(
+                    crate::network_history::HistoryBodyCandidate::from_response_body(
+                        body_id.to_string(),
+                        body,
+                    ),
+                ),
+                _ => None,
+            };
+            let event = NetworkEvent {
                 document_generation: ev.document_generation, document_url: ev.document_url,
                 retired_document_url: retired_document_url.clone(),
                 initiator_request_id: ev.initiator_request_id.clone(),
@@ -4469,6 +4529,7 @@ impl Page {
                 transport_request_body_size: ev.transport_request_body_size,
                 request_started: ev.request_started, redirect: ev.redirect,
                 response_body_request_id: ev.response_body_request_id,
+                response_body_capture_error: ev.response_body_capture_error,
                 request_id: ev.request_id,
                 url: ev.url,
                 method: ev.method,
@@ -4481,7 +4542,151 @@ impl Page {
                 request_raw_headers: ev.request_raw_headers,
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
+            };
+            let _ = self.commit_network_event_with_response(event, history_response_body);
+        }
+        if let Some(failure) = observation_failure {
+            self.fail_network_history(format!(
+                "network observation producer failed ({:?}): {}",
+                failure.kind, failure.message,
+            ));
+        }
+    }
+
+    fn fail_network_history(&mut self, message: String) -> crate::network_history::NetworkHistoryError {
+        self.fail_network_history_request(message, None)
+    }
+
+    fn fail_network_history_request(
+        &mut self,
+        message: String,
+        request_id: Option<String>,
+    ) -> crate::network_history::NetworkHistoryError {
+        let page_instance_id = self.network_history_writer.as_ref()
+            .map(|writer| writer.page_instance_id().clone());
+        let failure = self.context.network_history().fail(
+            crate::network_history::NetworkHistoryFailureKind::Producer,
+            message,
+            page_instance_id,
+            request_id,
+        );
+        self.network_teardown_events.lock().unwrap_or_else(|error| error.into_inner())
+            .fail_history(failure.message.clone());
+        failure
+    }
+
+    fn request_history_body(
+        &self,
+        present: bool,
+        body_id: Option<&str>,
+    ) -> Option<crate::network_history::HistoryBodyCandidate> {
+        if !present { return None; }
+        let body_id = body_id?;
+        let body = self.request_bodies.lock().unwrap_or_else(|error| error.into_inner())
+            .get(body_id)?.ok()?;
+        Some(crate::network_history::HistoryBodyCandidate::from_response_body(
+            body_id.to_string(), body,
+        ))
+    }
+
+    fn response_history_body(
+        &self,
+        body_id: Option<&str>,
+    ) -> Option<crate::network_history::HistoryBodyCandidate> {
+        let body_id = body_id?;
+        let (body, _) = self.response_bodies.lock().unwrap_or_else(|error| error.into_inner())
+            .get(body_id)?.ok()?;
+        Some(crate::network_history::HistoryBodyCandidate::from_response_body(
+            body_id.to_string(), body,
+        ))
+    }
+
+    fn commit_network_event(
+        &mut self,
+        event: NetworkEvent,
+    ) -> Result<u64, crate::network_history::NetworkHistoryError> {
+        self.commit_network_event_with_response(event, None)
+    }
+
+    fn commit_network_event_with_response(
+        &mut self,
+        event: NetworkEvent,
+        history_response_body: Option<crate::network_history::HistoryBodyCandidate>,
+    ) -> Result<u64, crate::network_history::NetworkHistoryError> {
+        if let Some(error) = event.response_body_capture_error.clone() {
+            let failure = self.fail_network_history_request(
+                format!("network history exact response body capture failed: {error}"),
+                Some(event.request_id.clone()),
+            );
+            // Preserve the compatibility Page view of the failed observation,
+            // while the context history remains an explicit accepted prefix.
+            self.network_events.push(event);
+            return Err(failure);
+        }
+        let Some(writer) = self.network_history_writer.clone() else {
+            let failure = self.context.network_history().terminal_failure().unwrap_or_else(|| {
+                self.context.network_history().fail(
+                    crate::network_history::NetworkHistoryFailureKind::Producer,
+                    "network history page registration failed",
+                    None,
+                    Some(event.request_id.clone()),
+                )
             });
+            self.network_teardown_events.lock().unwrap_or_else(|error| error.into_inner())
+                .fail_history(failure.message.clone());
+            return Err(failure);
+        };
+        let request_body = self.request_history_body(
+            event.request_body_present,
+            event.request_body_request_id.as_deref(),
+        );
+        let transport_request_body = self.request_history_body(
+            event.transport_request_body_present,
+            event.transport_request_body_request_id.as_deref(),
+        );
+        let response_body = history_response_body
+            .or_else(|| self.response_history_body(event.response_body_request_id.as_deref()));
+        match writer.append_event(&event, request_body, transport_request_body, response_body) {
+            Ok(sequence) => {
+                self.network_events.push(event);
+                Ok(sequence)
+            }
+            Err(error) => {
+                self.network_teardown_events.lock().unwrap_or_else(|failure| failure.into_inner())
+                    .fail_history(error.message.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn network_history_page_instance_id(&self) -> Option<crate::network_history::PageInstanceId> {
+        self.network_history_writer.as_ref().map(|writer| writer.page_instance_id().clone())
+    }
+
+    /// Flush every accepted producer observation and close this Page's writer.
+    /// The BrowserContext retains the immutable history and bodies afterwards.
+    pub fn close_network_history(&mut self) -> Result<(), crate::network_history::NetworkHistoryError> {
+        // FrameRealm owns handles in the Page isolate. They must be released
+        // before retire_js_network_events takes and drops that runtime.
+        self.pending_frame_work.clear();
+        self.frames.clear();
+        self.retire_js_network_events();
+        self.sync_js_network_events();
+        match self.network_history_writer.as_ref() {
+            Some(writer) => match writer.close() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.network_teardown_events
+                        .lock()
+                        .unwrap_or_else(|failure| failure.into_inner())
+                        .fail_history(error.message.clone());
+                    Err(error)
+                }
+            },
+            None => self.context.network_history().terminal_failure().map_or_else(
+                || Err(self.fail_network_history("network history page writer is unavailable".to_string())),
+                Err,
+            ),
         }
     }
 
@@ -4758,7 +4963,7 @@ impl Page {
         response_headers: &std::collections::HashMap<String, String>,
         body_size: usize,
     ) {
-        self.record_network_event_inner(
+        let (_, event) = self.network_event(
             url,
             method,
             resource_type,
@@ -4769,6 +4974,7 @@ impl Page {
             body_size,
             None,
         );
+        let _ = self.commit_network_event(event);
     }
 
     fn record_network_event_with_body(
@@ -4784,7 +4990,7 @@ impl Page {
         base64_encoded: bool,
         request_body: Option<(String, usize)>,
     ) {
-        let request_id = self.record_network_event_inner(
+        let (request_id, mut event) = self.network_event(
             url,
             method,
             resource_type,
@@ -4795,10 +5001,18 @@ impl Page {
             body.len(),
             request_body,
         );
-        self.store_response_body(request_id, body, base64_encoded);
+        self.store_response_body(request_id.clone(), body, base64_encoded);
+        event.response_body_request_id = Some(request_id);
+        let response_body = event.response_body_request_id.as_ref().map(|body_id| {
+            crate::network_history::HistoryBodyCandidate::from_bytes(
+                body_id.clone(),
+                body.to_vec(),
+            )
+        });
+        let _ = self.commit_network_event_with_response(event, response_body);
     }
 
-    fn record_network_event_inner(
+    fn network_event(
         &mut self,
         url: &str,
         method: &str,
@@ -4809,7 +5023,7 @@ impl Page {
         request_raw_headers: Option<&obscura_net::HeaderCapture>,
         body_size: usize,
         request_body: Option<(String, usize)>,
-    ) -> String {
+    ) -> (String, NetworkEvent) {
         let request_id = request_body.as_ref().map(|(request_id, _)| request_id.clone())
             .unwrap_or_else(|| self.next_network_event_id());
         let timestamp = std::time::SystemTime::now()
@@ -4817,7 +5031,7 @@ impl Page {
             .unwrap_or_default()
             .as_secs_f64();
         let request_body_request_id = request_body.as_ref().map(|(request_id, _)| request_id.clone());
-        self.network_events.push(NetworkEvent {
+        let event = NetworkEvent {
             document_generation: u64::MAX, document_url: String::new(),
             initiator_request_id: None,
             retired_document_url: None,
@@ -4829,6 +5043,7 @@ impl Page {
             transport_request_body_request_id: request_body_request_id,
             transport_request_body_size: request_body.as_ref().map_or(0, |(_, size)| *size),
             request_started: false, redirect: false, response_body_request_id: None,
+            response_body_capture_error: None,
             request_id: request_id.clone(),
             url: url.to_string(),
             method: method.to_string(),
@@ -4841,8 +5056,8 @@ impl Page {
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
-        });
-        request_id
+        };
+        (request_id, event)
     }
 
     fn record_traced_navigation_events(
@@ -4861,7 +5076,12 @@ impl Page {
             let response = exchange.response.clone().unwrap_or_else(|| final_response.clone());
             let request_raw_headers = exchange.request_headers.clone()
                 .or_else(|| response.request_raw_headers.clone());
-            self.network_events.push(NetworkEvent {
+            let response_body_request_id = if redirect {
+                exchange.body_request_id.clone()
+            } else {
+                Some(request_id.to_string())
+            };
+            let event = NetworkEvent {
                 document_generation: u64::MAX,
                 document_url: String::new(),
                 initiator_request_id: None,
@@ -4876,7 +5096,8 @@ impl Page {
                 transport_request_body_size: exchange.transport_request_body_size,
                 request_started: false,
                 redirect,
-                response_body_request_id: (!redirect).then(|| request_id.to_string()),
+                response_body_request_id,
+                response_body_capture_error: exchange.body_capture_error.clone(),
                 request_id: request_id.to_string(),
                 url: exchange.url,
                 method: exchange.method,
@@ -4897,7 +5118,8 @@ impl Page {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs_f64(),
-            });
+            };
+            let _ = self.commit_network_event(event);
         }
     }
 
@@ -5309,6 +5531,7 @@ impl Drop for Page {
     fn drop(&mut self) {
         // A closed target must not keep fetching for a document nobody can
         // observe any more.
+        let _ = self.close_network_history();
         self.retire_render_resources();
     }
 }
@@ -5331,6 +5554,8 @@ mod tests {
             request_started: true,
             redirect: false,
             response_body_request_id: Some(request_id.to_string()),
+            response_body_capture_error: None,
+            response_body: None,
             request_id: request_id.to_string(),
             url: format!("https://example.test/{request_id}"),
             method: "GET".to_string(),
@@ -5356,11 +5581,24 @@ mod tests {
 
     #[test]
     fn page_drains_the_accepted_prefix_and_keeps_shared_failure_sticky() {
+        let root = std::env::temp_dir().join(format!(
+            "obscura-network-observation-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
         let context = std::sync::Arc::new(super::BrowserContext::with_options(
             "network-observation-failure".into(),
             obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
-            crate::BrowserContextOptions::default(),
+            crate::BrowserContextOptions {
+                storage_dir: Some(root.clone()),
+                ..Default::default()
+            },
         ));
+        let history = context.network_history();
+        let archive = history.storage_path().unwrap();
         let mut page = super::Page::new("network-observation-failure".into(), context);
         let mut teardown = obscura_js::network_observation::NetworkObservationQueue::with_limits(
             1,
@@ -5369,6 +5607,7 @@ mod tests {
         );
         let mut runtime = teardown.sibling();
 
+        page.store_response_body("accepted".to_string(), &[0, 0xff, b'='], true);
         teardown.try_push(js_network_event("accepted")).unwrap();
         let failure = runtime.try_push(js_network_event("rejected")).unwrap_err();
         page.network_teardown_events = std::sync::Arc::new(std::sync::Mutex::new(teardown));
@@ -5388,6 +5627,88 @@ mod tests {
         page.sync_js_network_events();
         assert_eq!(page.network_events.len(), 1);
         assert_eq!(page.network_observation_failure(), Some(failure));
+
+        let history_failure = history.terminal_failure().expect("history failure is sticky");
+        assert_eq!(
+            history_failure.kind,
+            crate::network_history::NetworkHistoryFailureKind::Producer,
+        );
+        assert!(history_failure.message.contains("Network observation count exceeded 1"));
+        page.close_network_history().unwrap();
+        drop(page);
+        history.finalize().unwrap();
+        drop(history);
+        let recovered = crate::network_history::NetworkHistory::recover_archive(
+            &archive,
+            crate::network_history::NetworkHistoryLimits::default(),
+        ).unwrap();
+        let recovered_failure = recovered.terminal_failure()
+            .expect("recovered history preserves producer failure");
+        assert_eq!(recovered_failure.kind,
+            crate::network_history::NetworkHistoryFailureKind::Producer);
+        assert!(recovered_failure.message.contains("Network observation count exceeded 1"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn response_body_capture_failure_stops_history_without_hiding_the_page_event() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "network-body-capture-failure".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let history = context.network_history();
+        let mut page = super::Page::new("network-body-capture-failure".into(), context);
+        let mut event = js_network_event("uncaptured");
+        event.response_body_request_id = None;
+        event.response_body_capture_error = Some(
+            "response_body_budget_exhausted: total_bytes limit 2, attempted 3".into(),
+        );
+        page.network_teardown_events.lock().unwrap().try_push(event).unwrap();
+
+        page.sync_js_network_events();
+
+        assert_eq!(page.network_events.len(), 1);
+        assert_eq!(page.network_events[0].request_id, "uncaptured");
+        let failure = history.terminal_failure().expect("history failure is sticky");
+        assert_eq!(failure.kind, crate::network_history::NetworkHistoryFailureKind::Producer);
+        assert!(failure.message.contains("response_body_budget_exhausted"));
+        assert!(history.query(crate::network_history::NetworkHistoryQuery {
+            after_sequence: 0,
+            limit: 10,
+            page_instance_id: None,
+        }).records.is_empty());
+    }
+
+    #[test]
+    fn context_history_failure_stops_an_initialized_sibling_page_runtime() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "shared-network-history-failure".into(),
+            obscura_net::EffectivePersona::builtin(
+                obscura_net::StealthProfile::WindowsChrome145,
+            ),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut left = super::Page::new("left".into(), context.clone());
+        let mut right = super::Page::new("right".into(), context);
+        right.init_js();
+
+        let failure = left.fail_network_history("shared producer failure".to_string());
+
+        assert_eq!(
+            right.network_teardown_events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .failure()
+                .unwrap()
+                .message,
+            failure.message,
+        );
+        assert!(right.ensure_network_history_writable().unwrap_err().to_string()
+            .contains("shared producer failure"));
+        let runtime_failure = right.js.as_ref().unwrap().take_js_network_events()
+            .failure.expect("initialized sibling runtime sees shared terminal");
+        assert_eq!(runtime_failure.message, failure.message);
     }
 
     #[test]
@@ -5536,7 +5857,7 @@ mod tests {
                 let (mut first, _) = listener.accept().unwrap();
                 let first_request = read_request(&mut first);
                 first.write_all(format!(
-                    "HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 13\r\nConnection: close\r\n\r\nredirect-body"
                 ).as_bytes()).unwrap();
                 let (mut second, _) = listener.accept().unwrap();
                 let second_request = read_request(&mut second);
@@ -5550,6 +5871,7 @@ mod tests {
                 obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
                 None, None, true,
             ));
+            let history = context.network_history();
             let mut page = super::Page::new(format!("native-post-{status}"), context);
             page.navigate_with_wait_post(
                 &format!("http://{address}/start"),
@@ -5591,6 +5913,29 @@ mod tests {
             } else {
                 assert!(second_request.ends_with(b"payload"));
             }
+
+            page.close_network_history().unwrap();
+            drop(page);
+            let records = history.query(crate::network_history::NetworkHistoryQuery {
+                after_sequence: 0,
+                limit: 100,
+                page_instance_id: None,
+            }).records.into_iter()
+                .filter(|record| record.event.resource_type == "Document")
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2);
+            let redirect_body = records[0].response_body.as_ref()
+                .expect("redirect response body must survive Page close");
+            assert_eq!(
+                history.read_body(&redirect_body.key, 0, usize::MAX).unwrap().bytes,
+                b"redirect-body",
+            );
+            let final_body = records[1].response_body.as_ref()
+                .expect("final response body must survive Page close");
+            assert_eq!(
+                history.read_body(&final_body.key, 0, usize::MAX).unwrap().bytes,
+                b"<p>done</p>",
+            );
         }
     }
 

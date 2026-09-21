@@ -9,6 +9,7 @@ fn observation() -> NetworkEvent {
         transport_request_body_present: false, transport_request_body_request_id: None,
         transport_request_body_size: 0, request_started: true, redirect: false,
         response_body_request_id: Some("fetch-1-hop-0".into()),
+        response_body_capture_error: None,
         request_id: "fetch-1".into(), url: "https://example.test/api".into(),
         method: "POST".into(), resource_type: "Fetch".into(), status: 200,
         status_text: "OK".into(), headers: Default::default(),

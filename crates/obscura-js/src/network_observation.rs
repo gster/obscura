@@ -23,6 +23,7 @@ pub enum NetworkObservationFailureKind {
     Bytes,
     EventBytes,
     Serialization,
+    History,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -92,8 +93,24 @@ impl Budget {
             NetworkObservationFailureKind::Serialization => {
                 "Network observation serialization failed".to_string()
             }
+            NetworkObservationFailureKind::History => {
+                "Network observation history failed".to_string()
+            }
         };
         let failure = NetworkObservationFailure { kind, message };
+        usage.failure = Some(failure.clone());
+        failure
+    }
+
+    fn fail_external(&self, message: String) -> NetworkObservationFailure {
+        let mut usage = self.usage.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(failure) = &usage.failure {
+            return failure.clone();
+        }
+        let failure = NetworkObservationFailure {
+            kind: NetworkObservationFailureKind::History,
+            message,
+        };
         usage.failure = Some(failure.clone());
         failure
     }
@@ -216,6 +233,13 @@ impl NetworkObservationQueue {
     pub fn len(&self) -> usize { self.records.len() }
     pub fn is_empty(&self) -> bool { self.records.is_empty() }
     pub fn failure(&self) -> Option<NetworkObservationFailure> { self.budget.failure() }
+
+    /// Propagate a terminal failure from the owning Page's persistent history
+    /// into every sibling producer. Already reserved records retain their
+    /// accepted-prefix barrier; later scripted work fails before transport.
+    pub fn fail_history(&self, message: impl Into<String>) -> NetworkObservationFailure {
+        self.budget.fail_external(message.into())
+    }
 
     /// Return the sticky failure only after every previously admitted record
     /// has left all sibling queues. Consumers emit this after the accepted
@@ -344,6 +368,8 @@ mod tests {
             request_started: true,
             redirect: false,
             response_body_request_id: Some(request_id.into()),
+            response_body_capture_error: None,
+            response_body: None,
             body_size: 256,
             timestamp: 123.5,
         }

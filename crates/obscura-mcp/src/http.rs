@@ -183,13 +183,14 @@ pub async fn run(
     port: u16,
     proxy: Option<String>,
     persona: obscura_net::EffectivePersona,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     obscura_net::activate_process_persona(&persona)?;
     let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("MCP HTTP server on http://{}:{}/mcp", host, port);
 
-    let mut state = BrowserState::new(proxy, persona);
+    let mut state = BrowserState::new(proxy, persona, storage_dir);
     let allowed_origins = allowed_origins_env();
 
     loop {

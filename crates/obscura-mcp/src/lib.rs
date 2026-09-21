@@ -1,5 +1,5 @@
 // The tools/list JSON literal expanded by serde_json::json! is large
-// enough now (32 tool definitions) that the default macro recursion
+// enough now (35 tool definitions) that the default macro recursion
 // limit (128) overflows. Bumping for this crate only.
 #![recursion_limit = "512"]
 
@@ -13,8 +13,12 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use obscura_browser::{
-    AutomationWait, AutomationWaitError, BrowserContext, DocumentIdentity, NetworkEvent, NetworkEventPhase, Page,
+    AutomationWait, AutomationWaitError, BrowserContext, DocumentIdentity, HistoryBodyRef,
+    NetworkHistory, NetworkHistoryLimits, NetworkHistoryQuery, NetworkHistoryRecord, Page,
+    PageInstanceId,
 };
+#[cfg(test)]
+use obscura_browser::{NetworkEvent, NetworkEventPhase};
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -72,6 +76,8 @@ pub struct BrowserState {
     active_tab: Option<String>,
     tab_counter: u32,
     context: Arc<BrowserContext>,
+    recovered_network_histories: Vec<NetworkHistory>,
+    network_history_recovery_failures: Vec<Value>,
     console_messages: Vec<String>,
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
     /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
@@ -82,12 +88,16 @@ pub struct BrowserState {
 }
 
 impl BrowserState {
-    pub fn new(proxy: Option<String>, persona: obscura_net::EffectivePersona) -> Self {
+    pub fn new(proxy: Option<String>, persona: obscura_net::EffectivePersona, storage_dir: Option<std::path::PathBuf>) -> Self {
+        let (recovered_network_histories, network_history_recovery_failures) =
+            storage_dir.as_deref().map(recover_network_histories)
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
         let context = Arc::new(BrowserContext::with_options(
             "mcp".to_string(),
             persona,
             obscura_browser::BrowserContextOptions {
                 proxy_url: proxy,
+                storage_dir,
                 ..Default::default()
             },
         ));
@@ -96,6 +106,8 @@ impl BrowserState {
             active_tab: None,
             tab_counter: 0,
             context,
+            recovered_network_histories,
+            network_history_recovery_failures,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
         }
@@ -109,7 +121,7 @@ impl BrowserState {
         if self.active_tab.is_none() {
             self.tab_counter += 1;
             let id = format!("tab-{}", self.tab_counter);
-            let page = Page::new("mcp-page".to_string(), self.context.clone());
+            let page = Page::new(format!("mcp-{id}"), self.context.clone());
             page.set_console_messages_enabled(true);
             self.tabs.insert(id.clone(), page);
             self.active_tab = Some(id);
@@ -233,6 +245,40 @@ impl BrowserState {
     }
 }
 
+fn recover_network_histories(storage_dir: &std::path::Path) -> (Vec<NetworkHistory>, Vec<Value>) {
+    let root = storage_dir.join("network-history");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => {
+            return (Vec::new(), vec![json!({
+                "archive_root": root,
+                "operation": "read_dir",
+                "error": error.to_string(),
+            })]);
+        }
+    };
+    let mut directories = entries.filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    directories.sort();
+    let mut histories = Vec::new();
+    let mut failures = Vec::new();
+    for directory in directories {
+        match NetworkHistory::recover_archive(&directory, NetworkHistoryLimits::default()) {
+            Ok(history) => histories.push(history),
+            Err(error) => failures.push(json!({
+                "archive": directory,
+                "error": error,
+            })),
+        }
+    }
+    (histories, failures)
+}
+
 pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
     match method {
         "initialize" => handle_initialize(id, params),
@@ -248,6 +294,7 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
 pub async fn run(
     proxy: Option<String>,
     persona: obscura_net::EffectivePersona,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     obscura_net::activate_process_persona(&persona)?;
     let stdin = tokio::io::stdin();
@@ -255,7 +302,7 @@ pub async fn run(
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
 
-    let mut state = BrowserState::new(proxy, persona);
+    let mut state = BrowserState::new(proxy, persona, storage_dir);
     let mut runtime_pump_armed = false;
 
     loop {
@@ -444,10 +491,45 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_network_requests",
-                "description": "Return pretty JSON network lifecycle events currently retained by the active page, without consuming them or response bodies. This is a page buffer, not persistent history; upstream JS/Worker queues drop oldest entries beyond 4096.",
+                "description": "Return the active page's complete append-only network history, including exact request, transport-request, and response bodies. Reading does not consume records or bodies.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
+                }
+            },
+            {
+                "name": "browser_network_histories",
+                "description": "List the current live network history and every recovered archive available from --storage-dir.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "browser_network_history",
+                "description": "Query a live or recovered append-only network history with stable sequence pagination. Records retain every observed field and immutable exact body references.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "history_id": { "type": "string", "description": "Optional recovered or live history id; defaults to the current live context" },
+                        "after_sequence": { "type": "number", "minimum": 0, "description": "Return records after this committed sequence" },
+                        "limit": { "type": "number", "minimum": 1, "description": "Maximum complete records to return (default 100)" },
+                        "page_instance_id": { "type": "string", "description": "Optional immutable page-instance filter" }
+                    }
+                }
+            },
+            {
+                "name": "browser_network_body",
+                "description": "Read an exact immutable network-history body chunk without consuming it. Binary chunks are returned as base64.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "history_id": { "type": "string", "description": "Optional recovered or live history id; defaults to the current live context" },
+                        "body_key": { "type": "string" },
+                        "offset": { "type": "number", "minimum": 0 },
+                        "length": { "type": "number", "minimum": 0, "description": "Exact maximum bytes to read; default 1048576" }
+                    },
+                    "required": ["body_key"]
                 }
             },
             {
@@ -782,6 +864,9 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_evaluate" => tool_evaluate(args, state).await,
         "browser_wait_for" => tool_wait_for(args, state).await,
         "browser_network_requests" => tool_network_requests(state),
+        "browser_network_histories" => tool_network_histories(state),
+        "browser_network_history" => tool_network_history(args, state),
+        "browser_network_body" => tool_network_body(args, state),
         "browser_console_messages" => tool_console_messages(state),
         "browser_close" => tool_close(state),
         // Tier 1 agent-UX additions
@@ -1194,19 +1279,208 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
 }
 
 fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
-    let page = state.page_mut();
-    page.sync_js_network_events();
-    let request_bodies = page.request_body_store();
-    let request_bodies = request_bodies.lock().unwrap_or_else(|error| error.into_inner());
-    let events = page.network_events.iter()
-        .map(|event| network_event_projection(event, &request_bodies))
-        .collect::<Result<Vec<_>, _>>()?;
-    let terminal_failure = page.network_observation_failure().map(|failure| {
-        serde_json::to_value(failure)
-            .expect("NetworkObservationFailure serialization is infallible")
+    let page_instance_id = {
+        let page = state.page_mut();
+        page.sync_js_network_events();
+        page.network_history_page_instance_id()
+            .ok_or("active page has no network history writer")?
+    };
+    let history = state.context.network_history();
+    let page = history.query(NetworkHistoryQuery {
+        after_sequence: 0,
+        limit: usize::MAX,
+        page_instance_id: Some(page_instance_id),
     });
+    let events = page.records.iter()
+        .map(|record| history_record_projection(&history, record))
+        .collect::<Result<Vec<_>, _>>()?;
+    let terminal_failure = page.terminal_failure
+        .map(|failure| serde_json::to_value(failure)
+            .expect("NetworkHistoryError serialization is infallible"));
     let payload = network_requests_payload(events, terminal_failure);
     serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())
+}
+
+fn sync_network_histories(state: &mut BrowserState) {
+    for page in state.tabs.values_mut() {
+        page.sync_js_network_events();
+    }
+}
+
+fn network_history_summary(history: &NetworkHistory, live: bool) -> Value {
+    let page = history.query(NetworkHistoryQuery {
+        after_sequence: 0,
+        limit: 1,
+        page_instance_id: None,
+    });
+    json!({
+        "history_id": page.history_id,
+        "context_id": history.context_id(),
+        "live": live,
+        "finalized": page.finalized,
+        "terminal_failure": page.terminal_failure,
+        "pages": page.pages,
+        "closed_pages": page.closed_pages,
+    })
+}
+
+fn tool_network_histories(state: &mut BrowserState) -> Result<String, String> {
+    sync_network_histories(state);
+    let live = state.context.network_history();
+    let mut histories = vec![network_history_summary(&live, true)];
+    histories.extend(
+        state.recovered_network_histories.iter()
+            .map(|history| network_history_summary(history, false)),
+    );
+    serde_json::to_string_pretty(&json!({
+        "histories": histories,
+        "recovery_failures": state.network_history_recovery_failures,
+    })).map_err(|error| error.to_string())
+}
+
+fn select_network_history(args: &Value, state: &BrowserState) -> Result<NetworkHistory, String> {
+    let requested = args.get("history_id").and_then(Value::as_str);
+    let live = state.context.network_history();
+    if requested.is_none_or(|history_id| history_id == live.id().0) {
+        return Ok(live);
+    }
+    state.recovered_network_histories.iter()
+        .find(|history| requested == Some(history.id().0.as_str()))
+        .cloned()
+        .ok_or_else(|| format!("unknown network history id '{}'", requested.unwrap()))
+}
+
+fn json_usize(args: &Value, name: &str, default: usize) -> Result<usize, String> {
+    let Some(value) = args.get(name) else { return Ok(default); };
+    let value = value.as_u64().ok_or_else(|| format!("{name} must be a non-negative integer"))?;
+    usize::try_from(value).map_err(|_| format!("{name} does not fit this platform"))
+}
+
+fn tool_network_history(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    sync_network_histories(state);
+    let history = select_network_history(args, state)?;
+    let after_sequence = args.get("after_sequence").map_or(Ok(0), |value| {
+        value.as_u64().ok_or("after_sequence must be a non-negative integer")
+    })?;
+    let limit = json_usize(args, "limit", 100)?;
+    if limit == 0 { return Err("limit must be at least 1".to_string()); }
+    let page_instance_id = args.get("page_instance_id").and_then(Value::as_str)
+        .map(|value| PageInstanceId(value.to_string()));
+    let page = history.query(NetworkHistoryQuery {
+        after_sequence,
+        limit,
+        page_instance_id,
+    });
+    let payload = json!({
+        "history_id": page.history_id,
+        "records": page.records,
+        "next_sequence": page.next_sequence,
+        "terminal_failure": page.terminal_failure,
+        "finalized": page.finalized,
+        "pages": page.pages,
+        "closed_pages": page.closed_pages,
+        "recovery_failures": state.network_history_recovery_failures,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())
+}
+
+fn tool_network_body(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let history = select_network_history(args, state)?;
+    let body_key = args.get("body_key").and_then(Value::as_str)
+        .ok_or("Missing body_key parameter")?;
+    let offset = json_usize(args, "offset", 0)?;
+    let length = json_usize(args, "length", 1024 * 1024)?;
+    let chunk = history.read_body(
+        &obscura_browser::HistoryBodyKey(body_key.to_string()),
+        offset,
+        length,
+    ).map_err(|error| error.to_string())?;
+    let (body, base64_encoded) = match std::str::from_utf8(&chunk.bytes) {
+        Ok(text) => (text.to_string(), false),
+        Err(_) => (
+            base64::engine::general_purpose::STANDARD.encode(&chunk.bytes),
+            true,
+        ),
+    };
+    serde_json::to_string_pretty(&json!({
+        "history_id": history.id(),
+        "body_key": body_key,
+        "offset": chunk.offset,
+        "total_size": chunk.total_size,
+        "eof": chunk.eof,
+        "body": body,
+        "base64_encoded": base64_encoded,
+    })).map_err(|error| error.to_string())
+}
+
+fn history_body_projection(
+    history: &NetworkHistory,
+    body: Option<&HistoryBodyRef>,
+) -> Result<Value, String> {
+    let Some(body) = body else { return Ok(Value::Null); };
+    let chunk = history.read_body(&body.key, 0, body.size)
+        .map_err(|error| error.to_string())?;
+    let (payload, base64_encoded) = match std::str::from_utf8(&chunk.bytes) {
+        Ok(text) => (text.to_string(), false),
+        Err(_) => (
+            base64::engine::general_purpose::STANDARD.encode(&chunk.bytes),
+            true,
+        ),
+    };
+    Ok(json!({
+        "body": payload,
+        "base64_encoded": base64_encoded,
+        "body_ref": body,
+    }))
+}
+
+fn history_record_projection(
+    history: &NetworkHistory,
+    record: &NetworkHistoryRecord,
+) -> Result<Value, String> {
+    let phase = if record.event.error.is_some() { "failed" }
+        else if record.event.redirect { "redirect" }
+        else if record.event.pending { "started" }
+        else { "completed" };
+    let event = &record.event;
+    Ok(json!({
+        "phase": phase,
+        "sequence": record.sequence,
+        "history_id": record.history_id,
+        "page_instance_id": record.page_instance_id,
+        "display_page_id": record.display_page_id,
+        "document_generation": event.document_generation,
+        "document_url": event.document_url,
+        "retired_document_url": event.retired_document_url,
+        "initiator_request_id": event.initiator_request_id,
+        "pending": event.pending,
+        "error": event.error,
+        "request_started": event.request_started,
+        "redirect": event.redirect,
+        "request_id": event.request_id,
+        "url": event.url,
+        "method": event.method,
+        "resource_type": event.resource_type,
+        "request_body_present": event.request_body_present,
+        "request_body_request_id": event.request_body_request_id,
+        "request_body_size": event.request_body_size,
+        "request_body": history_body_projection(history, record.request_body.as_ref())?,
+        "transport_request_body_present": event.transport_request_body_present,
+        "transport_request_body_request_id": event.transport_request_body_request_id,
+        "transport_request_body_size": event.transport_request_body_size,
+        "transport_request_body": history_body_projection(history, record.transport_request_body.as_ref())?,
+        "headers": event.headers,
+        "request_raw_headers": event.request_raw_headers,
+        "status": event.status,
+        "status_text": event.status_text,
+        "response_headers": event.response_headers,
+        "raw_headers": event.raw_headers,
+        "response_body_request_id": event.response_body_request_id,
+        "response_body_capture_error": event.response_body_capture_error,
+        "response_body": history_body_projection(history, record.response_body.as_ref())?,
+        "body_size": event.body_size,
+        "timestamp": event.timestamp,
+    }))
 }
 
 fn network_requests_payload(
@@ -1221,6 +1495,7 @@ fn network_requests_payload(
     Value::Object(payload)
 }
 
+#[cfg(test)]
 fn request_body_projection(
     store: &obscura_net::request_body::RequestBodyStore,
     present: bool,
@@ -1240,6 +1515,7 @@ fn request_body_projection(
     }).map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn network_event_projection(
     event: &NetworkEvent,
     request_bodies: &obscura_net::request_body::RequestBodyStore,
@@ -1286,6 +1562,7 @@ fn network_event_projection(
         "response_headers": &*event.response_headers,
         "raw_headers": event.raw_headers,
         "response_body_request_id": event.response_body_request_id,
+        "response_body_capture_error": event.response_body_capture_error,
         "body_size": event.body_size,
         "timestamp": event.timestamp,
     }))
@@ -2224,7 +2501,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn render_tool_calls_return_mcp_binary_content_and_reject_bad_options() {
-        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
         state.page_mut().navigate(
             "data:text/html,<html style='margin:0'><body style='margin:0;background:red'><div style='width:64px;height:48px'></div></body></html>",
         ).await.expect("render test page should navigate");
@@ -2275,7 +2552,7 @@ mod tests {
                 console.error('mcp-console-click');\
                 setTimeout(()=>{console.error('mcp-console-async');document.body.id='done'},25)\
             }</script>";
-        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
         state
             .page_mut()
             .navigate(PAGE)
@@ -2351,7 +2628,7 @@ mod tests {
         // --allow-private-network to run their repro.
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
         state
             .page_mut()
             .navigate(&base)
@@ -2398,6 +2675,7 @@ mod tests {
                 transport_request_body_request_id: Some(TRANSPORT_ID.into()), transport_request_body_size: 3,
                 request_started: true, redirect: false,
                 response_body_request_id: Some("fetch-1-hop-0".into()),
+                response_body_capture_error: None,
                 request_id: "fetch-1".into(), url: "https://example.test/api".into(),
                 method: "POST".into(), resource_type: "Fetch".into(), status: 200,
                 status_text: "OK".into(), headers: Default::default(),
@@ -2432,8 +2710,9 @@ mod tests {
         assert_eq!(projected["request_body"]["body"], "AP89");
         assert_eq!(projected["request_body"]["base64_encoded"], true);
         assert_eq!(projected["transport_request_body"], projected["request_body"]);
+        assert_eq!(projected["response_body_capture_error"], Value::Null);
         assert_eq!(projected["timestamp"], 123.5);
-        assert_eq!(projected.as_object().unwrap().len(), 30);
+        assert_eq!(projected.as_object().unwrap().len(), 31);
         event.pending = true;
         let started = network_event_projection(&event, &request_bodies).unwrap();
         assert_eq!(started["phase"], "started");
@@ -2458,7 +2737,7 @@ mod tests {
 
     #[test]
     fn network_tool_empty_history_has_stable_shape() {
-        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
         let first = tool_network_requests(&mut state).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&first).unwrap(), json!({"events": []}));
         assert_eq!(tool_network_requests(&mut state).unwrap(), first);
@@ -2489,10 +2768,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn network_history_survives_navigation_and_page_close() {
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
+        state.page_mut().navigate("data:text/html,first").await.unwrap();
+        state.page_mut().navigate("data:text/html,second").await.unwrap();
+        let history_id = state.context.network_history().id().0;
+        let before_close: Value = serde_json::from_str(&tool_network_history(&json!({}), &mut state).unwrap()).unwrap();
+        assert!(before_close["records"].as_array().unwrap().len() >= 2);
+        let first_page: Value = serde_json::from_str(&tool_network_history(&json!({"limit": 1}), &mut state).unwrap()).unwrap();
+        let second_page: Value = serde_json::from_str(&tool_network_history(&json!({"after_sequence": first_page["next_sequence"], "limit": 100}), &mut state).unwrap()).unwrap();
+        assert_eq!(first_page["records"].as_array().unwrap().len(), 1);
+        assert!(!second_page["records"].as_array().unwrap().is_empty());
+        let sequences = before_close["records"].as_array().unwrap().iter()
+            .map(|event| event["sequence"].as_u64().unwrap()).collect::<Vec<_>>();
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+        tool_close(&mut state).unwrap();
+        let after_close: Value = serde_json::from_str(&tool_network_history(&json!({"history_id": history_id}), &mut state).unwrap()).unwrap();
+        assert_eq!(after_close["records"].as_array().unwrap().len(), sequences.len());
+        assert_eq!(after_close["next_sequence"], sequences.last().copied().unwrap());
+    }
+
+    #[test]
+    fn network_history_empty_and_pagination_have_stable_shapes() {
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
+        let empty: Value = serde_json::from_str(&tool_network_history(&json!({}), &mut state).unwrap()).unwrap();
+        assert_eq!(empty["records"], json!([]));
+        assert!(empty.get("terminal_failure").is_some());
+        assert!(empty.get("next_sequence").is_some());
+        assert!(empty.get("history_id").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_history_storage_dir_recovers_after_state_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "obscura-mcp-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let persona = obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145);
+        let history_id;
+        {
+            let mut state = BrowserState::new(None, persona.clone(), Some(root.clone()));
+            state.page_mut().navigate("data:text/html,recover-me").await.unwrap();
+            history_id = state.context.network_history().id().0;
+        }
+        let corrupt = root.join("network-history/corrupt-archive");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(corrupt.join("manifest.json"), b"not-json").unwrap();
+        let mut recovered = BrowserState::new(None, persona, Some(root.clone()));
+        let listed: Value = serde_json::from_str(&tool_network_histories(&mut recovered).unwrap()).unwrap();
+        assert!(listed["histories"].as_array().unwrap().iter().any(|history| {
+            history["history_id"] == history_id && history["live"] == false
+        }));
+        assert_eq!(listed["recovery_failures"].as_array().unwrap().len(), 1);
+        let output: Value = serde_json::from_str(&tool_network_history(&json!({"history_id": history_id}), &mut recovered).unwrap()).unwrap();
+        assert!(!output["records"].as_array().unwrap().is_empty());
+        assert_eq!(output["recovery_failures"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn network_tool_includes_completed_script_fetches() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
         state
             .page_mut()
             .navigate(&base)
@@ -2535,7 +2877,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_tools_notify_controlled_input_tracker() {
-        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
         state
             .page_mut()
             .navigate("data:text/html,<div id=root><input id=field></div>")
@@ -2610,7 +2952,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_form_check_and_select_use_native_setter_and_trusted_events() {
-        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let mut state = BrowserState::new(None, obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145), None);
         state
             .page_mut()
             .navigate(

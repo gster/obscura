@@ -28,6 +28,12 @@ With a proxy:
 obscura mcp --proxy http://proxy.example.com:8080
 ```
 
+To retain Network observation archives across process restarts:
+
+```bash
+obscura mcp --storage-dir ./obscura-state
+```
+
 ## Security
 
 The HTTP transport has no built-in auth, so anyone who can reach the port can drive the browser. Two guards ship for the HTTP transport:
@@ -72,7 +78,9 @@ values return a tool error.
 
 Diagnostics:
 
-- `browser_network_requests`, `browser_console_messages`
+- `browser_network_requests`, `browser_network_histories`,
+  `browser_network_history`, `browser_network_body`,
+  `browser_console_messages`
 
 Visual output (render-enabled builds):
 
@@ -102,28 +110,37 @@ CDP `Page.startScreencast` for activity-driven screencasting.
 ### Network observations
 
 `browser_network_requests` returns pretty JSON with an `events` array, including
-`{"events": []}` for an empty buffer. This deliberately replaces the previous
-human-readable request lines; callers must parse the JSON object. Each entry is
-one lifecycle observation (`started`, `redirect`, `completed`, or `failed`), not
-one deduplicated request. Use `request_id` and document identity fields to relate
-entries; preflight records retain `initiator_request_id`. A standalone started
-record is not guaranteed: ordinary successful fetches may have only a completed
-record, while preflight paths can publish a separate start.
+`{"events": []}` for an empty active-page history. Each entry is one lifecycle
+observation (`started`, `redirect`, `completed`, or `failed`), not one
+deduplicated request. Records come from the context-owned append-only history,
+so navigation does not replace earlier records and closing a page does not
+delete them. Use `sequence`, `history_id`, immutable `page_instance_id`,
+`request_id`, and document identity fields to relate entries. A standalone
+started record is not guaranteed: ordinary successful fetches may have only a
+completed record, while preflight paths can publish a separate start.
 
 The output preserves every current `NetworkEvent` field, including errors,
 request/response compatibility header maps and lossless raw header captures.
 Raw header fields retain repeated values and arbitrary bytes as base64, including
 Cookie and Authorization. `headers` is the request compatibility map;
 `response_headers` is the response compatibility map; `request_raw_headers` and
-`raw_headers` are their respective lossless captures. `request_body_size` is a
-byte count, not retained request payload; `body_size` describes the response and
-`response_body_request_id` identifies a captured response body where available.
-Capture stages describe their source, not HTTP wire framing.
+`raw_headers` are their respective lossless captures. Exact request,
+transport-request, and response bodies are included as UTF-8 or standard base64,
+with an immutable `body_ref`; explicit empty bodies remain distinct from absent
+bodies. Capture stages describe their source, not HTTP wire framing. Reading
+records or bodies never consumes them.
 
-This is a snapshot of the active Page's current event buffer. Reading it neither
-consumes events nor reads or consumes response bodies. Repeated reads retain the
-same entries until page activity changes the buffer. It is not complete persistent
-history: navigation replaces static resource records while scripted records can
-remain, Page close discards its buffer, and upstream JS/Worker queues currently
-drop oldest entries beyond 4096. Those retention and capacity boundaries remain
-separate OB-021 work.
+For bounded retrieval, first call `browser_network_histories` to discover the
+live history and archives recovered from `--storage-dir`. Then call
+`browser_network_history` with `history_id`, `after_sequence`, `limit`, and an
+optional `page_instance_id`. The result includes the next committed sequence,
+page registration/close state, finalization, and the complete sticky terminal
+failure when present. Use `browser_network_body` with a record's `body_key` for
+repeatable offset/length chunks; binary chunks are standard base64. Recovery
+keeps every checksum-valid committed record before an incomplete, corrupt, or
+over-limit tail and reports the failure explicitly.
+
+History admission is bounded by the `OBSCURA_NETWORK_HISTORY_*` variables. It
+is an accepted-prefix contract, not an eviction policy: a limit or persistence
+failure does not drop old records and does not permit later network work to
+continue unobserved.

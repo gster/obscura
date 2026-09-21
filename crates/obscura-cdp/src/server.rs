@@ -1217,6 +1217,8 @@ async fn cdp_processor(
         let _ = pause.resolver.send(obscura_js::ops::InterceptResolution::Fail { reason: "Aborted".into() });
     }
 
+    ctx.finalize_network_histories();
+
     // The connection thread merges this context's cookie delta into the
     // persistence template after the processor stops.
     let _ = &ctx;
