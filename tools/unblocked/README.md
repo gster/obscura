@@ -460,12 +460,12 @@ platforms. Native coordinate input requires the render build.
 
 ## Native keyboard and text qualification
 
-`native_keyboard_smoke.py` uses Playwright's raw CDP session against nine
+`native_keyboard_smoke.py` uses Playwright's raw CDP session against ten
 isolated local cases. It checks `Input.insertText` selection replacement and
 empty deletion, keyDown/rawKeyDown/char/keyUp phase order, cancellation,
 keyboard metadata, browser-owned dispatch despite poisoned public APIs,
-focus/document reentry, ordinary input/textarea `maxlength` edits, and malformed
-protocol parameters. The maxlength case retains the original requested text in
+focus/document reentry, ordinary input/textarea `maxlength` edits, bounded
+contenteditable text input, and malformed protocol parameters. The maxlength case retains the original requested text in
 `beforeinput`, verifies the actual UTF-16/scalar-aligned inserted prefix in
 `input`, covers zero capacity, selection replacement, dynamic bounds, an
 already-overlong scripted value, textarea newline normalization, key text, and
@@ -479,6 +479,15 @@ suppresses mouse, wheel, and key dispatch while any of its sessions contributes
 true. Navigation preserves contributions, detach clears the detached session,
 and another target remains independent. `Input.insertText` still executes;
 false removes only the calling session's contribution.
+
+The `contenteditable` case contains eight subscenarios: insertText, same-Text
+selection replacement, key text, cancellation, append-only DOM reentry, a
+`contenteditable=false` island, the qualified empty direct-span deletion, and
+focus transfer to an ordinary input. Every snapshot retains complete outerHTML,
+innerHTML, text, active element, event fields, StaticRange paths, live Selection
+paths and ancestor HTML through the document. The comparator projects only the
+qualified DOM/event/selection contract and keeps the untouched raw capture next
+to that decision.
 
 Paired comparison retains every raw event field. For the `ignore=false`
 restoration phase it compares complete actions, state, keyboard/text events,
@@ -510,8 +519,12 @@ result directory without field removal.
 
 This gate qualifies ordinary input/textarea selection edits and maxlength user
 edits, readonly and non-editable beforeinput behavior, the listed event phases
-and metadata, and the measured focus/document reentry. It does not qualify
-contenteditable, IME/composition, grapheme or word editing, arbitrary editor
-commands, platform-shortcut defaults, complex implicit form submission, or
-button/checkbox activation. Keyboard and text native input currently requires
-the render build; no-render reports it as unsupported.
+and metadata, and the measured focus/document reentry. Its contenteditable
+claim is limited to insertText/key text on a same-Text-node range in the focused
+editing host, plus the explicitly checked direct single-Text span deletion and
+adjacent-Text merge. It does not qualify other full-node structural deletion
+shapes, cross-node selection, Backspace/Delete/Enter, paragraph splitting, IME/composition,
+grapheme or word editing, arbitrary editor commands, platform-shortcut defaults,
+complex implicit form submission, or button/checkbox activation. Keyboard and
+text native input currently requires the render build; no-render reports it as
+unsupported.

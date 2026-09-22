@@ -5,12 +5,20 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`17e70390b076aeb30c36fb4f8df81e6a94984991`，`Qualify ignored CDP input events`。
+- 最近完成的实现提交：`195be5537f8da41f7c0235318b6090e57eef4b19`，`Qualify bounded contenteditable text input`。
 - 发布核对要求：`HEAD`、本地 `main`、`origin/main` 与远端 `refs/heads/main` 必须对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 最新切片入口是 [`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 的 session contribution 与 dispatcher fast path、[`input.rs`](../crates/obscura-cdp/src/domains/input.rs) 的参数/抑制入口、[`target.rs`](../crates/obscura-cdp/src/domains/target.rs) 的 detach cleanup，以及 [`native_keyboard_smoke.py`](../tools/unblocked/native_keyboard_smoke.py) 的 Chrome/Obscura 成对资格工具。
+- 最新切片入口是 [`runtime.rs`](../crates/obscura-js/src/runtime.rs) 的 native contenteditable dispatch、[`bootstrap.js`](../crates/obscura-js/js/bootstrap.js) 的受保护 edit/mutation handoff，以及 [`native_keyboard_smoke.py`](../tools/unblocked/native_keyboard_smoke.py) 的 Chrome/Obscura 成对资格工具。
 
 ## 最近完成的阶段
+
+OB-021 contenteditable 有界文本输入切片完成 `Input.insertText` 与带 text 的 `Input.dispatchKeyEvent`：只在 focused editing host 内、同一 Text 节点 range 上执行；保留嵌套 inline DOM，发送带 StaticRange 的 trusted/cancelable `beforeinput` 与 mutation 后 trusted `input`。覆盖取消、append-only handler reentry、false island beforeinput-only、focus transfer，以及 direct single-Text span 全选时删除 wrapper、合并左右 Text 并折叠 caret。跨节点 selection、未满足上述条件的空字符串整节点结构删除，以及 Backspace/Delete/Enter 明确 unsupported；paragraph split、IME/composition 和 grapheme/word editing 保持未资格化。
+
+原生删除同步保护 MutationObserver：同 target 重复 observe 更新 options，registry 去重，disconnect 清 pending records；每 observer 独立 record，oldValue/隐式 characterData 按 options 处理，两次 childList 删除保留精确 sibling，完整原生 ancestor path 支持高层 subtree observer。公开 `parentNode`、`isConnected`、`querySelectorAll`、CharacterData/Node/String primitives 被覆盖时不重入该 edit；回归固定 `beforeinput → input → MutationObserver`。
+
+实现提交为 `195be5537f8da41f7c0235318b6090e57eef4b19`。committed render binary `0.1.0-dev+195be55` SHA-256 `4a72070905f28f52ea58361cadcace9b519e3d28e193db6e1ad7a3e49a5029bc`，120797088 bytes；no-render SHA-256 `c621d4442527048ce191a89e1aa7475f0e90b79a2ae820c5ff473fcf424e1565`，78953296 bytes。Chrome `152.0.7977.85` / Obscura `145.0.0.0` 的 8 个 paired 场景全部通过，目录 `/private/tmp/ob021-contenteditable-committed.o7UtRf/`；结果 JSON SHA-256 `09946246b5ada49037591e7addb00eb7411bbc773817239cedb74fa91ef0ebc5`，2874786 bytes；runner stdout SHA-256 `93f4e209c5923e7f80ca174a39dad4e62918f2a1c7f13bb580812fcd8f18a7f4`，2918125 bytes；stderr 0。
+
+聚焦 **3/3**（run `f33259b6-0e44-4fed-bf6a-11504cda7112`）、完整 obscura-js **627/627**、CDP release/render **393/393** 且 3 skipped、全工作区 release/render **2346/2346** 且 4 skipped、完整工具 unittest **140/140**。固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33**。官方 Playwright Python 1.60.0 smoke、37-method profile 和三项 migration gate 通过；目录 `/private/tmp/ob021-contenteditable-playwright-committed.g8Bnl9/`，smoke SHA-256 `1fb99c574731308dec7fc8b05a1d67c8301d9564b881e8648b7eaf59612450c9`，protocol SHA-256 `1f28c007838f06114b969d05ed509241d063a80ce5c19e7a71a38b66a60b63f3`，migration SHA-256 `0a3258571919a8c3f2255d033199663c996b0c3a2b8fd2525fe26bf0f98e8831`。完整 Cargo 原始日志在 `/private/tmp/ob021-contenteditable-gates.G4zK8W/`。Sol high 审计推动修复 unqualified command、observer queue/options/sibling/depth；Astra light Standards 与 Spec 终审均 0 blocker、0 major、0 minor、0 nit。所有 raw DOM/event/selection path、fixture、协议与进程流保留，不脱敏、不删字段。OB-021 仍未关闭。
 
 OB-021 `Input.setIgnoreInputEvents` 已从静默假成功改为 Chrome 152 实测语义：每个 attached session 持有 contribution，同一 target 取 OR；false 只清调用 session，导航保留，detach/target close 清理，新 attachment 默认 false，跨 target 独立。有效 ignore 抑制 mouse/wheel/key 且不进入 Page/V8、input navigation 或 command-driven screencast sampling，`Input.insertText` 仍执行。缺失/非法 boolean 为 `-32602`，无效 session 为 `-32000`。`dispatchTouchEvent`、完整 mouse parity 与 no-render 实际输入没有因此资格化。
 
@@ -24,7 +32,7 @@ OB-021 ordinary input/textarea `maxlength` 用户编辑切片已覆盖 `Input.in
 
 runtime 聚焦 **3/3**（run `c83b0968-a62d-4b8b-9310-3ce903c48443`），CDP input integration binary **11/11**（run `984906fb-4b82-4bba-802f-f023f87a2d37`），完整 unblocked unittest **135/135**。最终 release/render 全工作区 **2339/2339**、4 skipped（run `7f8d84ee-ff66-41e7-b263-4db63ac83432`）；前面三次完整运行中的既有 MCP loopback/title fixture 偶发失败和各自精确复跑均完整保留，不称为修复。committed no-render/render exact build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33** 均通过。官方 Playwright Python 1.60.0 smoke 通过，完整原始协议日志匹配 **37-method** profile；目录 `/private/tmp/ob021-maxlength-playwright-committed.8DcmOY/`，smoke JSON SHA-256 `2d587fd39c5a15aee475b36cfdc5d16a1eba76bbba5b0a416708b0390f77671d`，protocol log SHA-256 `926deea08a2c449abfcb547ace59497c4d834f894223d99973bd55b84da737c6`。Astra light 初审和加强后的终审均为 0 blocker、0 major、0 minor；终审的 68 次删字段 mutation 全被 comparator 拒绝。
 
-contenteditable、IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作和复杂表单默认动作仍未资格化；no-render 坐标/键盘输入仍明确 unsupported。该切片不关闭 OB-021。
+该 maxlength 切片当时尚未资格化 contenteditable；后续上述有界 contenteditable 切片只补充同一 Text range 的 insertText/key text。IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作和复杂表单默认动作仍未资格化；no-render 坐标/键盘输入仍明确 unsupported。该切片不关闭 OB-021。
 
 OB-034 单 worker WebSocket handoff saturation 发布资格切片新增确定性真实 server gate：测试固定断言 channel capacity 为 128，在 receiver gate 保持关闭时排入精确 128 个 authorized upgrade，第 129 个取得 byte-exact 503/`ws-handoff-saturated`，observer 不得升至 129；随后在 gate 仍关闭时 shutdown，并用同一总 deadline 完成 server 与 128 个 client 的收尾。该测试不增加生产 hook，继续只使用既有 `cfg(test)` policy。
 
