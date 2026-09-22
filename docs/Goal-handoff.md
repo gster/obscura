@@ -5,12 +5,20 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`6968a9d6876c9525912a4fbc1713aa074b697a9a`，`Bound pending CDP request heads`。
+- 最近完成的实现提交：`bb1dbd4cdc769545b43abba77a71dce78b01665e`，`Qualify WebSocket handoff saturation`。
 - 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的 accepted request-head reactor，以及 [`cdp_silent_pending.py`](../tools/unblocked/cdp_silent_pending.py) 的单 worker 真实进程资格工具。
+- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的确定性 receive-gate 回归，以及 [`cdp_ws_handoff_capacity.py`](../tools/unblocked/cdp_ws_handoff_capacity.py) 的单 worker 发布二进制资格工具。
 
 ## 最近完成的阶段
+
+OB-034 单 worker WebSocket handoff saturation 发布资格切片新增确定性真实 server gate：测试固定断言 channel capacity 为 128，在 receiver gate 保持关闭时排入精确 128 个 authorized upgrade，第 129 个取得 byte-exact 503/`ws-handoff-saturated`，observer 不得升至 129；随后在 gate 仍关闭时 shutdown，并用同一总 deadline 完成 server 与 128 个 client 的收尾。该测试不增加生产 hook，继续只使用既有 `cfg(test)` policy。
+
+新增 `tools/unblocked/cdp_ws_handoff_capacity.py`，在 Darwin IPv4 loopback、单 worker、`max-connections=512` 下对指定 release binary 运行 3 轮、每轮 256 个 socket。工具先发送缺少末尾 `\r\n\r\n` 的完整 WebSocket head，以 listener queue 0、ESTABLISHED 精确 256、FD 增量至少 256、进程存活和线程采样形成稳定 barrier；再用 OS 确认的进程组 `SIGSTOP` 固定状态，发送全部 terminator 后 `SIGCONT`。每条连接必须分类为完整 101 或唯一完整 503/`ws-handoff-saturated`，所有 101 都继续发送唯一 masked `Browser.getVersion`、验证 matching result、发送 masked Close 并读到 EOF；恢复必须精确回到 FD 16、threads 12、queue/ESTABLISHED 0，再通过独立 HTTP 与 WebSocket/CDP probe。`SIGSTOP` 仅是外部资格同步，不是产品 hook。
+
+最终提交 `bb1dbd4cdc769545b43abba77a71dce78b01665e` 的 render binary 为 `0.1.0-dev+bb1dbd4`，SHA-256 `f28e503665a900f83ebd929bbb1f98078cf1ca559a5d0f7fb05975952825ec7d`，120799200 bytes。最终目录 `/private/tmp/ob034-ws-handoff-final.tSD284/evidence/` 的 manifest SHA-256 为 `02e6cf97697ba90c570cfc18ac04ce718eed59716e50282fea8eac2bc2e877c1`，6916483 bytes，8638/8638 个登记 artifact 的 bytes/SHA-256 全部独立复核通过。三轮分别得到 167/89、175/81、176/80 个 101/503，全部 518 个 101 均完成匹配 CDP 往返；每轮 barrier/stopped 均为 FD 272、ESTABLISHED 256、listener completed 0，每轮恢复均为 FD 16、threads 12、ESTABLISHED/listener completed 0。stderr 原始 31000 bytes，精确包含 250 条 `WS handoff channel full (128)` warning，与 89+81+80 个 503 一致；SIGTERM 后 returncode 0、group gone、无 forced kill。首次未冻结调度的 `/private/tmp/ob034-ws-handoff-final.CRldKp/evidence/` 三轮全为 256 个 101，诚实保留为 exit 2/`not-qualified`，不冒充通过。
+
+发布工具没有直接读取内部 queue occupancy；唯一响应、精确 warning 数量与完整恢复证明生产拒绝分支，精确 128 容量由上述确定性 Rust gate 证明。工具定向 unittest **19/19**、完整 unblocked unittest **133/133**；聚焦 render/no-render 各 **1/1**；render CDP **385/385**、3 skipped，no-render 有效集合 **322/322**、3 skipped、1 binary skipped；release/render 全工作区 **2332/2332**、4 skipped。两种 exact CLI build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33**、官方 Playwright Python 1.60.0 smoke 与完整 **37-method** profile 均通过。Playwright 原始目录 `/private/tmp/ob034-ws-handoff-playwright.PhtGpC/`；`smoke.json` SHA-256 为 `889ea364acf09e88ce6f10f983ea517846aef88c1e91e7ef302aa34d866f5ccf`，protocol log SHA-256 为 `46b8bbd236e05788ff50afc68f7f343a4a28cc2df3f6b87ce78e4030c4047471`。Astra light 首审 0 blocker、2 major、2 minor，推动修复 stopped 状态清理、发送失败 wire salvage、loopback 参数约束和 exact-128 pin；终审 0 blocker、0 major、0 minor。全部命令、字节、stream、snapshot、结果、traceback 与 hash 原样保留。结论不外推非 Darwin、multi-worker、container、总 process/FD/RSS/V8/socket-buffer 或剩余 input qualification，OB-034 仍开放。
 
 OB-034 单 worker accepted silent/incomplete request-head 切片以 Mio READABLE reactor 和最早 deadline heap 替换每毫秒线性扫描。基础 accepted-incomplete 上限为 256；另有固定 16 条、100ms classification reserve，所以 hard total 为 272。完整 request head 在基础容量饱和时仍可进入 HTTP/WebSocket 分类；reserve 到期或 hard cap 返回完整 503/`max-pending-request-heads`，半包在 10 秒 TTL 返回完整 408/`request-head-timeout`，全静默连接到期只关闭且不伪造 HTTP bytes。读取的原始 prefix 逐字节保留，WebSocket 101 写出后才解锁同一 TCP write 中已随 upgrade head 到达的 frame tail。shutdown 直接释放全部 pending，不等待 TTL；deadline heap 对 stale entry 有固定 compaction 边界。
 
@@ -183,7 +191,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
 1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
-2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_ws_capacity.py`、`tools/unblocked/cdp_silent_pending.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace、发布工具可重复制造的 handoff saturation 证据与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量、CPU/FD 事实或 RSS 采样外推为总容量/总资源上限。
+2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_ws_capacity.py`、`tools/unblocked/cdp_ws_handoff_capacity.py`、`tools/unblocked/cdp_silent_pending.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace 与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量、CPU/FD 事实或 RSS 采样外推为总容量/总资源上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
