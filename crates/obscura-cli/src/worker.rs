@@ -47,6 +47,19 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    let v8_flags = std::env::var("OBSCURA_V8_FLAGS").unwrap_or_else(|_| {
+        eprintln!("OBSCURA_V8_FLAGS is required");
+        std::process::exit(2);
+    });
+    if v8_flags.trim().is_empty() {
+        eprintln!("OBSCURA_V8_FLAGS must not be empty");
+        std::process::exit(2);
+    }
+    obscura_js::try_set_v8_flags(&v8_flags).unwrap_or_else(|error| {
+        eprintln!("Cannot configure OBSCURA_V8_FLAGS: {error}");
+        std::process::exit(2);
+    });
+
     let proxy = std::env::var("OBSCURA_PROXY")
         .ok()
         .map(|value| value.trim().to_string())

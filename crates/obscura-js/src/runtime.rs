@@ -26860,7 +26860,8 @@ return {before,removed,reinsert,moved,cleared};
 
     #[test]
     fn heap_limit_terminates_script_and_runtime_recovers() {
-        crate::v8_flags::set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1");
+        crate::v8_flags::try_set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1")
+            .unwrap();
         let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
 
         for _ in 0..2 {

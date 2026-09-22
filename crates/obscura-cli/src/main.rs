@@ -508,7 +508,7 @@ async fn main() -> anyhow::Result<()> {
 
     let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
     tracing::debug!("V8 flags: {}", v8_flags);
-    obscura_js::set_v8_flags(&v8_flags);
+    obscura_js::try_set_v8_flags(&v8_flags)?;
 
     // The js-side fetch path (op_fetch_url) reads OBSCURA_ALLOW_PRIVATE_NETWORK
     // directly for its SSRF gate. Mirror the CLI flag into the env var so
@@ -726,6 +726,7 @@ async fn main() -> anyhow::Result<()> {
                 global_proxy,
                 obey_robots,
                 persona.clone(),
+                v8_flags.clone(),
             )
             .await?;
         }
@@ -2645,6 +2646,7 @@ async fn run_parallel_scrape(
     proxy: Option<String>,
     obey_robots: bool,
     persona: obscura_net::EffectivePersona,
+    v8_flags: String,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -2684,6 +2686,7 @@ async fn run_parallel_scrape(
     let read_timeout = Duration::from_secs(timeout_secs.min(30));
     let shutdown_timeout = Duration::from_secs(5);
     let persona_json = Arc::new(serde_json::to_string(&persona.to_spec())?);
+    let v8_flags = Arc::new(v8_flags);
 
     let mut handles = Vec::new();
 
@@ -2693,6 +2696,7 @@ async fn run_parallel_scrape(
         let worker_path = worker_path.clone();
         let proxy = proxy.clone();
         let persona_json = persona_json.clone();
+        let v8_flags = v8_flags.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -2705,6 +2709,7 @@ async fn run_parallel_scrape(
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
                 .env("OBSCURA_PERSONA_JSON", persona_json.as_str())
+                .env("OBSCURA_V8_FLAGS", v8_flags.as_str())
                 .spawn()
             {
                 Ok(c) => c,
