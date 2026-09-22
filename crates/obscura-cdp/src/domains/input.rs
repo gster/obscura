@@ -210,6 +210,9 @@ pub async fn handle(
     match method {
         "dispatchMouseEvent" => {
             let input = coordinate_input(params)?;
+            if ctx.mouse_and_key_input_ignored(session_id)? {
+                return Ok(json!({}));
+            }
             let page = ctx.get_session_page_mut(session_id)
                 .ok_or_else(|| "Input requires an attached page session".to_string())?;
             match input {
@@ -236,6 +239,9 @@ pub async fn handle(
         }
         "dispatchKeyEvent" => {
             let input = keyboard_input(params)?;
+            if ctx.mouse_and_key_input_ignored(session_id)? {
+                return Ok(json!({}));
+            }
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or_else(|| "Input requires an attached page session".to_string())?;
@@ -244,7 +250,16 @@ pub async fn handle(
             Ok(json!({}))
         }
         "dispatchTouchEvent" => Ok(json!({})),
-        "setIgnoreInputEvents" => Ok(json!({})),
+        "setIgnoreInputEvents" => {
+            let ignored = params
+                .get("ignore")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    "Invalid setIgnoreInputEvents ignore: expected a boolean".to_string()
+                })?;
+            ctx.set_input_events_ignored(session_id, ignored)?;
+            Ok(json!({}))
+        }
         _ => Err(format!("Unknown Input method: {}", method)),
     }
 }

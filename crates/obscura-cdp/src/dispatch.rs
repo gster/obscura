@@ -103,6 +103,11 @@ pub struct CdpContext {
     pub(crate) pending_fetch_policy_cleanup: HashSet<String>,
     pub(crate) navigating_document_loader: Option<(u64, String)>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
+    /// Each attached CDP session owns an Input.setIgnoreInputEvents
+    /// contribution. Mouse/key input is ignored when any live session for the
+    /// target contributes true. Navigation preserves contributions; detach and
+    /// target teardown discard them. Input.insertText bypasses this gate.
+    input_ignored_sessions: HashSet<String>,
     /// Current document loader per page. Navigation events and later
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
@@ -331,6 +336,7 @@ impl CdpContext {
             pending_fetch_policy_cleanup: HashSet::new(),
             navigating_document_loader: None,
             sessions: HashMap::new(),
+            input_ignored_sessions: HashSet::new(),
             current_loader_ids: HashMap::new(),
             document_loaders: HashMap::new(),
             network_owners: HashMap::new(),
@@ -591,6 +597,7 @@ impl CdpContext {
             }
         }
         for session_id in &removed_sessions {
+            self.input_ignored_sessions.remove(session_id);
             self.runtime_enabled_sessions.remove(session_id);
             self.disable_network_session(session_id);
         }
@@ -911,11 +918,88 @@ impl CdpContext {
         }
         self.get_page_mut(&page_id)
     }
+
+    pub(crate) fn mouse_and_key_input_ignored(
+        &self,
+        session_id: &Option<String>,
+    ) -> Result<bool, String> {
+        let session_id = session_id.as_ref()
+            .ok_or_else(|| "Input requires an attached page session".to_string())?;
+        let page_id = self.sessions.get(session_id)
+            .filter(|page_id| self.has_page(page_id))
+            .ok_or_else(|| "Input requires an attached page session".to_string())?;
+        Ok(self.input_ignored_sessions.iter().any(|ignored_session| {
+            self.sessions.get(ignored_session) == Some(page_id)
+        }))
+    }
+
+    pub(crate) fn set_input_events_ignored(
+        &mut self,
+        session_id: &Option<String>,
+        ignored: bool,
+    ) -> Result<(), String> {
+        let session_id = session_id.as_ref()
+            .ok_or_else(|| "Input requires an attached page session".to_string())?;
+        if !self.sessions.get(session_id).is_some_and(|page_id| self.has_page(page_id)) {
+            return Err("Input requires an attached page session".to_string());
+        }
+        if ignored {
+            self.input_ignored_sessions.insert(session_id.clone());
+        } else {
+            self.input_ignored_sessions.remove(session_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_input_events_ignored(&mut self, session_id: &str) {
+        self.input_ignored_sessions.remove(session_id);
+    }
 }
 
 #[cfg(test)]
 mod context_ownership_tests {
     use super::*;
+
+    #[test]
+    fn ignored_input_contributions_are_session_owned_and_page_aggregated() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let first_page = ctx.create_page();
+        let second_page = ctx.create_page();
+        let owner = Some("input-owner".to_string());
+        let sibling = Some("input-sibling".to_string());
+        let other = Some("input-other".to_string());
+        ctx.sessions.insert(owner.clone().unwrap(), first_page.clone());
+        ctx.sessions.insert(sibling.clone().unwrap(), first_page.clone());
+        ctx.sessions.insert(other.clone().unwrap(), second_page);
+
+        ctx.set_input_events_ignored(&owner, true).unwrap();
+        assert!(ctx.mouse_and_key_input_ignored(&owner).unwrap());
+        assert!(ctx.mouse_and_key_input_ignored(&sibling).unwrap());
+        assert!(!ctx.mouse_and_key_input_ignored(&other).unwrap());
+        ctx.set_input_events_ignored(&sibling, false).unwrap();
+        assert!(ctx.mouse_and_key_input_ignored(&sibling).unwrap());
+
+        ctx.get_page_mut(&first_page).unwrap().navigate_blank();
+        assert!(ctx.mouse_and_key_input_ignored(&owner).unwrap());
+        ctx.set_input_events_ignored(&sibling, true).unwrap();
+        ctx.set_input_events_ignored(&owner, false).unwrap();
+        assert!(ctx.mouse_and_key_input_ignored(&owner).unwrap());
+
+        ctx.clear_input_events_ignored(owner.as_deref().unwrap());
+        ctx.sessions.remove(owner.as_deref().unwrap());
+        assert!(ctx.mouse_and_key_input_ignored(&sibling).unwrap());
+        ctx.clear_input_events_ignored(sibling.as_deref().unwrap());
+        ctx.sessions.remove(sibling.as_deref().unwrap());
+        let replacement = Some("input-replacement".to_string());
+        ctx.sessions.insert(replacement.clone().unwrap(), first_page.clone());
+        assert!(!ctx.mouse_and_key_input_ignored(&replacement).unwrap());
+
+        ctx.set_input_events_ignored(&replacement, true).unwrap();
+        ctx.remove_page(&first_page);
+        assert!(ctx.input_ignored_sessions.is_empty());
+    }
 
     #[test]
     fn repeated_page_teardown_does_not_grow_context_maps() {
@@ -1157,6 +1241,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Storage.setCookies"
             | "Storage.clearCookies"
             | "Storage.deleteCookies"
+            | "Input.setIgnoreInputEvents"
     )
 }
 
@@ -1202,7 +1287,12 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // audited to confirm it never reaches `JsRuntime::execute_script` or DOM
     // mutation that re-enters V8. (`get_session_page_mut` itself no longer
     // enters V8 as of #872, so calling it is not what gates a method here.)
-    let _v8_guard = if is_v8_free_method(&req.method) {
+    let ignored_input_command = matches!(
+        req.method.as_str(),
+        "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent"
+    ) && ctx.mouse_and_key_input_ignored(&req.session_id).unwrap_or(false);
+    let v8_free = is_v8_free_method(&req.method) || ignored_input_command;
+    let _v8_guard = if v8_free {
         None
     } else {
         // Per-connection lock (owned guard, so it does not borrow `ctx`): keeps
@@ -1224,7 +1314,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60_000);
-    let cmd_watchdog = if cmd_budget_ms == 0 || is_v8_free_method(&req.method) {
+    let cmd_watchdog = if cmd_budget_ms == 0 || v8_free {
         None
     } else {
         ctx.get_session_page(&req.session_id)
@@ -1278,7 +1368,9 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     #[cfg(feature = "render")]
-    if result.is_ok() && domains::page::command_can_change_screencast_frame(&req.method) {
+    if result.is_ok() && !ignored_input_command
+        && domains::page::command_can_change_screencast_frame(&req.method)
+    {
         if let Err(error) = domains::page::queue_screencast_frame(ctx, &req.session_id, false) {
             // Frame delivery is an asynchronous side effect in Chromium; it
             // must not rewrite an otherwise successful command response.
@@ -1315,7 +1407,10 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
                 -32602
             } else if matches!(
                 req.method.as_str(),
-                "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" | "Input.insertText"
+                "Input.dispatchMouseEvent"
+                    | "Input.dispatchKeyEvent"
+                    | "Input.insertText"
+                    | "Input.setIgnoreInputEvents"
             ) {
                 if msg.starts_with("Invalid ") { -32602 } else { -32000 }
             } else {
@@ -1664,6 +1759,47 @@ mod tests {
             params: json!({}),
             session_id: None,
         }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn ignored_mouse_and_key_do_not_advance_screencast_sampling() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let owner = Some("ignored-input-owner".to_string());
+        let sibling = "ignored-input-sibling".to_string();
+        let attached_sibling = Some(sibling.clone());
+        ctx.sessions.insert(owner.clone().unwrap(), page_id.clone());
+        ctx.sessions.insert(sibling.clone(), page_id);
+        ctx.set_input_events_ignored(&owner, true).unwrap();
+        ctx.set_input_events_ignored(&attached_sibling, false).unwrap();
+        ctx.screencasts.insert(sibling.clone(), ScreencastState {
+            format: ScreencastFormat::Png,
+            quality: 100,
+            max_width: None,
+            max_height: None,
+            every_nth_frame: 2,
+            command_frame_counter: 0,
+            session_id: 1,
+            frames_in_flight: 0,
+            observed_activity_generation: 0,
+            autonomous_frame_pending: false,
+        });
+
+        for (id, method, params) in [
+            (1, "Input.dispatchMouseEvent", json!({"type":"mouseMoved","x":1,"y":1})),
+            (2, "Input.dispatchKeyEvent", json!({"type":"keyDown","text":"x"})),
+        ] {
+            let response = dispatch(&CdpRequest {
+                id, method: method.into(), params, session_id: attached_sibling.clone(),
+            }, &mut ctx).await;
+            assert!(response.error.is_none(), "{method}: {:?}", response.error);
+        }
+        assert_eq!(ctx.screencasts[&sibling].command_frame_counter, 0);
+        assert!(!ctx.pending_events.iter()
+            .any(|event| event.method == "Page.screencastFrame"));
     }
 
     #[test]

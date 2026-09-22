@@ -39,6 +39,7 @@ CASES = (
     "poison",
     "reentrancy",
     "maxlength",
+    "ignore-input",
     "protocol-negative",
 )
 
@@ -46,11 +47,13 @@ HTML = r'''<!doctype html>
 <meta charset="utf-8"><title>OB-027 native keyboard fixture</title>
 <style>input,textarea{font:16px sans-serif} #edit{position:absolute;left:20px;top:20px}
 #other{position:absolute;left:20px;top:80px} #ro{position:absolute;left:20px;top:140px}</style>
+<style>#scrollbox{position:absolute;left:300px;top:20px;width:120px;height:60px;overflow:auto}#scrollpad{height:500px;width:20px}</style>
 <input id="edit" value="abcd"><textarea id="other">new</textarea>
 <input id="ro" value="readonly" readonly><button id="button">button</button>
+<div id="scrollbox"><div id="scrollpad"></div></div>
 <script>
 (() => {
-  const nodes = ['edit', 'other', 'ro', 'button'].map(id => document.getElementById(id))
+    const nodes = ['edit', 'other', 'ro', 'button', 'scrollbox'].map(id => document.getElementById(id))
     .concat([document, window]);
   const name = n => n === document ? 'document' : n === window ? 'window' : n && n.id;
   const read = e => ({type:e.type, target:name(e.target), currentTarget:name(e.currentTarget),
@@ -70,9 +73,10 @@ HTML = r'''<!doctype html>
     globalThis.__poisonCalls={KeyboardEvent:0,InputEvent:0,Event:0,dispatchEvent:0}; };
   globalThis.__snapshotKeyProbe = () => ({events:globalThis.__keyEvents,
     poisonCalls:globalThis.__poisonCalls, active:document.activeElement && document.activeElement.id,
+    scrollTop:document.getElementById('scrollbox').scrollTop,
     values:Object.fromEntries(['edit','other','ro'].map(id => { const n=document.getElementById(id);
       return [id,{value:n.value,start:n.selectionStart,end:n.selectionEnd}]; }))});
-  for (const node of nodes) for (const type of ['keydown','keypress','beforeinput','input','keyup','change'])
+  for (const node of nodes) for (const type of ['keydown','keypress','beforeinput','input','keyup','change','pointermove','pointerdown','mousedown','pointerup','mouseup','click','wheel'])
     node.addEventListener(type, e => globalThis.__keyEvents.push(read(e)), true);
   globalThis.__resetKeyProbe();
   globalThis.__keyProbeReady = true;
@@ -216,16 +220,46 @@ def _dispatch(
 ) -> dict[str, Any]:
     session = page.context.new_cdp_session(page)
     try:
-        response: Any = None; action_error: dict[str, Any] | None = None
-        try: response = session.send(method, params)
-        except Exception as error: action_error = error_record(error)
-        return {"method": method, "params": params, "response": response, "actionError": action_error}
+        return _session_dispatch(session, params, method)
     finally:
         session.detach()
 
 
+def _session_dispatch(
+    session: Any,
+    params: dict[str, Any],
+    method: str = "Input.dispatchKeyEvent",
+) -> dict[str, Any]:
+    response: Any = None
+    action_error: dict[str, Any] | None = None
+    try:
+        response = session.send(method, params)
+    except Exception as error:
+        action_error = error_record(error)
+    return {"method": method, "params": params, "response": response, "actionError": action_error}
+
+
 def _snapshot(page: Any) -> dict[str, Any]:
     return page.evaluate("globalThis.__snapshotKeyProbe()")
+
+
+def _settle_ignore_scroll(page: Any) -> dict[str, Any]:
+    return page.evaluate("""() => new Promise(resolve => {
+      const samples = [];
+      let previous = null, stable = 0;
+      const frame = () => {
+        const value = document.getElementById('scrollbox').scrollTop;
+        samples.push(value);
+        stable = value === previous ? stable + 1 : 0;
+        previous = value;
+        if (stable >= 2 || samples.length >= 30) {
+          resolve({samples, stable, finalValue:value});
+          return;
+        }
+        requestAnimationFrame(frame);
+      };
+      requestAnimationFrame(frame);
+    })""")
 
 
 def _insert_text(page: Any) -> dict[str, Any]:
@@ -542,9 +576,148 @@ def _protocol_negative(page: Any) -> dict[str, Any]:
         ("Input.insertText", {"text":None}),
         ("Input.insertText", {"text":3}),
         ("Input.dispatchKeyEvent", {"type":"notAKeyEvent"}),
+        ("Input.setIgnoreInputEvents", {}),
+        ("Input.setIgnoreInputEvents", {"ignore":"true"}),
+        ("Input.setIgnoreInputEvents", {"ignore":1}),
+        ("Input.setIgnoreInputEvents", {"ignore":None}),
     ]
     return {"actions":[_dispatch(page, params, method) for method, params in cases],
             "snapshot":_snapshot(page)}
+
+
+def _ignore_input(page: Any) -> dict[str, Any]:
+    def select_end(target: Any) -> None:
+        target.locator("#edit").focus()
+        target.evaluate("""() => { const n=document.querySelector('#edit');
+          n.setSelectionRange(n.value.length, n.value.length); }""")
+
+    def active_phase(session: Any, ignore: bool) -> dict[str, Any]:
+        select_end(page)
+        page.evaluate("globalThis.__resetKeyProbe()")
+        before = _snapshot(page)
+        actions = [
+            _session_dispatch(session, {"ignore": ignore}, "Input.setIgnoreInputEvents"),
+            _session_dispatch(session, {"type":"mouseMoved", "x":25, "y":25}, "Input.dispatchMouseEvent"),
+            _session_dispatch(session, {"type":"mousePressed", "x":25, "y":25, "button":"left"}, "Input.dispatchMouseEvent"),
+            _session_dispatch(session, {"type":"mouseReleased", "x":25, "y":25, "button":"left"}, "Input.dispatchMouseEvent"),
+            _session_dispatch(session, {"type":"mouseWheel", "x":330, "y":35, "deltaX":0, "deltaY":40}, "Input.dispatchMouseEvent"),
+        ]
+        # A successful mouse press can change the caret.  Pin it again before
+        # keyboard editing so layout differences cannot masquerade as an
+        # ignore-state difference.
+        select_end(page)
+        actions += [
+            _session_dispatch(session, {"type":"keyDown", "key":"a", "code":"KeyA", "text":"a"}),
+            _session_dispatch(session, {"type":"keyUp", "key":"a", "code":"KeyA"}),
+            _session_dispatch(session, {"text":"x"}, "Input.insertText"),
+        ]
+        settle = _settle_ignore_scroll(page)
+        if settle.get("stable", 0) < 2:
+            raise AssertionError(f"ignore-input wheel did not settle: {settle!r}")
+        return {"before": before, "actions": actions, "settle":settle,
+                "after": _snapshot(page)}
+
+    def key_action(session: Any, text: str) -> dict[str, Any]:
+        return _session_dispatch(
+            session,
+            {"type":"keyDown", "key":text, "code":f"Key{text.upper()}", "text":text},
+        )
+
+    page.reload()
+    owner = page.context.new_cdp_session(page)
+    try:
+        true_phase = active_phase(owner, True)
+        false_phase = active_phase(owner, False)
+
+        # Each CDP session owns one contribution to the target switch.  The
+        # target ignores browser input while any attached session contributes
+        # true; false removes only the calling session's contribution.
+        page.reload(); select_end(page); page.evaluate("globalThis.__resetKeyProbe()")
+        sibling = page.context.new_cdp_session(page)
+        try:
+            sibling_actions = [
+                _session_dispatch(owner, {"ignore": True}, "Input.setIgnoreInputEvents"),
+                _session_dispatch(sibling, {"ignore": False}, "Input.setIgnoreInputEvents"),
+                key_action(sibling, "b"),
+                key_action(owner, "c"),
+                _session_dispatch(sibling, {"ignore": True}, "Input.setIgnoreInputEvents"),
+                key_action(sibling, "d"),
+                _session_dispatch(owner, {"ignore": False}, "Input.setIgnoreInputEvents"),
+                key_action(owner, "e"),
+            ]
+            sibling_snapshot = _snapshot(page)
+
+            # Navigation replaces the document but keeps the attached session,
+            # so that session's ignore state remains set.  insertText is
+            # deliberately exempt in Chrome.
+            page.reload(); select_end(page); page.evaluate("globalThis.__resetKeyProbe()")
+            navigation_actions = [
+                key_action(sibling, "f"),
+                _session_dispatch(sibling, {"text":"n"}, "Input.insertText"),
+            ]
+            navigation_snapshot = _snapshot(page)
+        finally:
+            # Detach discards the session-local state.  A replacement session
+            # begins enabled even though the old session was ignored.
+            sibling.detach()
+
+        replacement = page.context.new_cdp_session(page)
+        try:
+            page.reload(); select_end(page); page.evaluate("globalThis.__resetKeyProbe()")
+            reattach_actions = [
+                key_action(replacement, "g"),
+                _session_dispatch(replacement, {"text":"r"}, "Input.insertText"),
+            ]
+            reattach_snapshot = _snapshot(page)
+
+            # A different target is independent and continues accepting key
+            # input while the first target remains ignored.
+            select_end(page); page.evaluate("globalThis.__resetKeyProbe()")
+            other_actions = [
+                _session_dispatch(
+                    replacement, {"ignore": True}, "Input.setIgnoreInputEvents"
+                ),
+                key_action(replacement, "i"),
+            ]
+            first_target_snapshot = _snapshot(page)
+            other = page.context.new_page()
+            try:
+                other.goto(page.url, wait_until="load")
+                if other.evaluate("globalThis.__keyProbeReady") is not True:
+                    raise AssertionError("secondary ignore-input fixture did not initialize")
+                select_end(other); other.evaluate("globalThis.__resetKeyProbe()")
+                other_session = page.context.new_cdp_session(other)
+                try:
+                    other_actions.append(key_action(other_session, "h"))
+                    other_snapshot = _snapshot(other)
+                finally:
+                    other_session.detach()
+            finally:
+                other.close()
+            cleanup_action = _session_dispatch(
+                replacement, {"ignore": False}, "Input.setIgnoreInputEvents"
+            )
+        finally:
+            replacement.detach()
+    finally:
+        if owner is not None:
+            try:
+                _session_dispatch(owner, {"ignore": False}, "Input.setIgnoreInputEvents")
+            finally:
+                owner.detach()
+    return {
+        "true": true_phase,
+        "false": false_phase,
+        "sibling": {"actions": sibling_actions, "snapshot": sibling_snapshot},
+        "navigation": {"actions": navigation_actions, "snapshot": navigation_snapshot},
+        "reattach": {"actions": reattach_actions, "snapshot": reattach_snapshot},
+        "otherTarget": {
+            "actions": other_actions,
+            "firstSnapshot": first_target_snapshot,
+            "snapshot": other_snapshot,
+        },
+        "cleanupAction": cleanup_action,
+    }
 
 
 def run_case(page: Any, case: str) -> dict[str, Any]:
@@ -555,6 +728,7 @@ def run_case(page: Any, case: str) -> dict[str, Any]:
     if case == "poison": return _poison(page)
     if case == "reentrancy": return _reentrancy(page)
     if case == "maxlength": return _maxlength(page)
+    if case == "ignore-input": return _ignore_input(page)
     if case == "protocol-negative": return _protocol_negative(page)
     raise ValueError(case)
 
@@ -763,7 +937,7 @@ def assert_contract(case: str, observation: dict[str, Any], *, label: str) -> No
             if actual != expected:
                 raise AssertionError(f"{label}: maxlength {name} event states differ: {actual!r}")
     elif case == "protocol-negative":
-        expected_errors = [False, True, True, True, True, True, True]
+        expected_errors = [False, True, True, True, True, True, True, True, True, True, True]
         actual_errors = [bool(item.get("actionError")) for item in observation["actions"]]
         if actual_errors != expected_errors:
             raise AssertionError(f"{label}: protocol validation differs: {actual_errors!r}")
@@ -772,12 +946,157 @@ def assert_contract(case: str, observation: dict[str, Any], *, label: str) -> No
             marker = f"Protocol error ({item['method']}):"
             if error.get("type") != "Error" or marker not in error.get("message", ""):
                 raise AssertionError(f"{label}: non-protocol failure accepted: {item!r}")
+    elif case == "ignore-input":
+        def successful(actions: list[dict[str, Any]], name: str) -> None:
+            if not actions or any(
+                not isinstance(item.get("params"), dict)
+                or item.get("response") != {}
+                or item.get("actionError") is not None
+                for item in actions
+            ):
+                raise AssertionError(f"{label}: ignore-input {name} action failed: {actions!r}")
+
+        for name in ("true", "false"):
+            record = observation.get(name, {})
+            actions = record.get("actions", [])
+            if len(actions) != 8:
+                raise AssertionError(f"{label}: ignore-input {name} action count differs: {record!r}")
+            successful(actions, name)
+            if actions[0].get("method") != "Input.setIgnoreInputEvents":
+                raise AssertionError(f"{label}: ignore-input state action missing")
+            if record.get("before", {}).get("scrollTop") != 0:
+                raise AssertionError(f"{label}: ignore-input initial scroll differs")
+        true_after = observation["true"]["after"]
+        false_after = observation["false"]["after"]
+        true_types = [event.get("type") for event in true_after.get("events", [])
+                      if event.get("currentTarget") == "edit"]
+        if true_after.get("values", {}).get("edit") != {"value":"abcdx","start":5,"end":5} \
+                or true_after.get("scrollTop") != 0 \
+                or true_types != ["beforeinput", "input"]:
+            raise AssertionError(f"{label}: ignore=true did not suppress browser input: {true_after!r}")
+        false_types = [event.get("type") for event in false_after.get("events", [])
+                       if event.get("currentTarget") == "edit"]
+        for event_type in ("pointermove", "pointerdown", "mousedown", "pointerup", "mouseup", "keydown", "keyup", "beforeinput", "input"):
+            if event_type not in false_types:
+                raise AssertionError(f"{label}: ignore=false missing {event_type}: {false_types!r}")
+        wheel_types = [event.get("type") for event in false_after.get("events", [])
+                       if event.get("currentTarget") == "scrollbox"]
+        if false_after.get("values", {}).get("edit") != {"value":"abcdxax","start":7,"end":7} \
+                or false_after.get("scrollTop") != 40 \
+                or wheel_types != ["wheel"]:
+            raise AssertionError(f"{label}: ignore=false state differs: {false_after!r}")
+
+        sibling = observation.get("sibling", {})
+        successful(sibling.get("actions", []), "sibling")
+        sibling_types = [event.get("type") for event in sibling.get("snapshot", {}).get("events", [])
+                         if event.get("currentTarget") == "edit"]
+        if sibling.get("snapshot", {}).get("values", {}).get("edit") != {"value":"abcd","start":4,"end":4} \
+                or sibling_types:
+            raise AssertionError(f"{label}: sibling session state differs: {sibling!r}")
+
+        expected_lifecycle = {
+            "navigation": (
+                {"value":"abcdn","start":5,"end":5}, "n", ["beforeinput", "input"]
+            ),
+            "reattach": (
+                {"value":"abcdgr","start":6,"end":6}, "r",
+                ["keydown", "keypress", "beforeinput", "input", "beforeinput", "input"],
+            ),
+            "otherTarget": (
+                {"value":"abcdh","start":5,"end":5}, "h",
+                ["keydown", "keypress", "beforeinput", "input"],
+            ),
+        }
+        for name, (field, accepted, expected_types) in expected_lifecycle.items():
+            record = observation.get(name, {})
+            successful(record.get("actions", []), name)
+            snapshot = record.get("snapshot", {})
+            types = [event.get("type") for event in snapshot.get("events", [])
+                     if event.get("currentTarget") == "edit"]
+            if snapshot.get("values", {}).get("edit") != field \
+                    or types != expected_types \
+                    or not any(event.get("data") == accepted for event in snapshot.get("events", [])):
+                raise AssertionError(f"{label}: ignore-input {name} lifecycle differs: {record!r}")
+        first_target = observation.get("otherTarget", {}).get("firstSnapshot", {})
+        first_types = [event.get("type") for event in first_target.get("events", [])
+                       if event.get("currentTarget") == "edit"]
+        if first_target.get("values", {}).get("edit") != {
+            "value":"abcdgr", "start":6, "end":6
+        } or first_types:
+            raise AssertionError(
+                f"{label}: ignore-input first target was not isolated: {first_target!r}"
+            )
+        successful([observation.get("cleanupAction", {})], "cleanup")
 
 
 def compare_case(case: str, reference: dict[str, Any], candidate: dict[str, Any], *, label: str) -> None:
     if case == "protocol-negative":
-        if [bool(x.get("actionError")) for x in reference["actions"]] != [bool(x.get("actionError")) for x in candidate["actions"]]:
+        def contract(action: dict[str, Any]) -> tuple[Any, ...]:
+            error = action.get("actionError") or {}
+            method = action.get("method")
+            message = str(error.get("message", ""))
+            marker = f"Protocol error ({method}):"
+            return (method, action.get("params"), action.get("response"),
+                    error.get("type"), bool(error), marker in message)
+        if [contract(x) for x in reference["actions"]] != [contract(x) for x in candidate["actions"]]:
             raise AssertionError(f"{label}: protocol negative result differs")
+        return
+    if case == "ignore-input":
+        def restored_snapshot_contract(snapshot: dict[str, Any]) -> dict[str, Any]:
+            # setIgnoreInputEvents only qualifies whether coordinate input is
+            # admitted again.  Preserve every raw event in the result, but do
+            # not make this case re-qualify the independent mouse parity
+            # matrix: click synthesis, legacy `which`, non-control value
+            # projection, and caret timing during a coordinate event remain
+            # independent mouse-parity work outside this gate.  Their complete
+            # raw records stay in the result.  All other fields, including the
+            # complete keyboard/text events, remain exact.
+            coordinate_types = {
+                "pointermove", "pointerdown", "pointerup",
+                "mousedown", "mouseup", "wheel",
+            }
+            events = []
+            for raw in snapshot.get("events", []):
+                if raw.get("type") == "click":
+                    continue
+                event = dict(raw)
+                if event.get("type") in coordinate_types:
+                    for key in (
+                        "which", "targetValue",
+                        "targetSelectionStart", "targetSelectionEnd",
+                    ):
+                        event.pop(key, None)
+                events.append(event)
+            return {
+                "events": events,
+                "poisonCalls": snapshot.get("poisonCalls"),
+                "active": snapshot.get("active"),
+                "scrollTop": snapshot.get("scrollTop"),
+                "values": snapshot.get("values"),
+            }
+
+        for name in ("true", "false", "sibling", "navigation", "reattach", "otherTarget"):
+            ref = reference.get(name, {}); got = candidate.get(name, {})
+            ref_after = ref.get("after")
+            got_after = got.get("after")
+            after_differs = (
+                restored_snapshot_contract(ref_after or {})
+                != restored_snapshot_contract(got_after or {})
+                if name == "false" else ref_after != got_after
+            )
+            if ref.get("before") != got.get("before") or after_differs \
+                    or ref.get("snapshot") != got.get("snapshot") \
+                    or ref.get("firstSnapshot") != got.get("firstSnapshot"):
+                raise AssertionError(f"{label}: ignore-input {name} snapshot differs")
+            if ref.get("settle", {}).get("finalValue") != got.get("settle", {}).get("finalValue") \
+                    or bool(ref.get("settle", {}).get("stable", 0) >= 2) != bool(
+                        got.get("settle", {}).get("stable", 0) >= 2
+                    ):
+                raise AssertionError(f"{label}: ignore-input {name} settle differs")
+            if ref.get("actions") != got.get("actions"):
+                raise AssertionError(f"{label}: ignore-input {name} action result differs")
+        if reference.get("cleanupAction") != candidate.get("cleanupAction"):
+            raise AssertionError(f"{label}: ignore-input cleanup action differs")
         return
     if case == "reentrancy":
         for key in ("focusSnapshot", "documentSnapshot"):

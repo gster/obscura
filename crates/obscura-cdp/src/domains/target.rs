@@ -319,6 +319,7 @@ pub async fn handle(
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 let page_id = ctx.sessions.get(session_id).cloned();
                 ctx.sessions.remove(session_id);
+                ctx.clear_input_events_ignored(session_id);
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.disable_network_session(session_id);
                 if let Some(page_id) = page_id {
@@ -663,6 +664,8 @@ mod tests {
             ).await.unwrap();
             ctx.network_body_sessions.get_mut(session).unwrap().insert("body-id".into());
         }
+        ctx.set_input_events_ignored(&Some(session_id.clone()), true).unwrap();
+        assert!(ctx.mouse_and_key_input_ignored(&Some(sibling.clone())).unwrap());
         ctx.network_request_sessions.insert(
             (page_id.clone(), "request-id".into()),
             vec![session_id.clone(), sibling.clone()],
@@ -685,6 +688,12 @@ mod tests {
         assert!(!ctx.network_enabled_sessions.contains(&session_id));
         assert!(!ctx.network_agent_limits.contains_key(&session_id));
         assert!(!ctx.network_body_sessions.contains_key(&session_id));
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+        assert!(
+            !ctx.mouse_and_key_input_ignored(&Some(session_id.clone())).unwrap(),
+            "detaching must remove the session's ignore contribution before an id can be reused"
+        );
+        ctx.sessions.remove(&session_id);
         assert_eq!(
             ctx.network_request_sessions[&(page_id.clone(), "request-id".into())],
             vec![sibling.clone()]

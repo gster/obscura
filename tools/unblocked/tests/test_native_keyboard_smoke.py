@@ -89,6 +89,10 @@ class NativeKeyboardSmokeTests(unittest.TestCase):
                 }
                 for _ in range(6)
             ],
+            *[
+                {"method": "Input.setIgnoreInputEvents", "actionError": {"type": "Error", "message": "Protocol error (Input.setIgnoreInputEvents): Invalid parameters"}}
+                for _ in range(4)
+            ],
         ]
         with self.assertRaisesRegex(AssertionError, "non-protocol failure accepted"):
             assert_contract(
@@ -96,6 +100,169 @@ class NativeKeyboardSmokeTests(unittest.TestCase):
                 {"actions": actions, "snapshot": {"events": []}},
                 label="candidate",
             )
+
+    def test_ignore_input_contract_requires_all_active_cdp_input_phases(self):
+        def action(method, params):
+            return {"method": method, "params": params, "response": {}, "actionError": None}
+
+        def field(value):
+            return {"value": value, "start": len(value), "end": len(value)}
+
+        def phase(value, ignored):
+            target_types = ["beforeinput", "input"] if ignored else [
+                "pointermove", "pointerdown", "mousedown", "pointerup", "mouseup",
+                "keydown", "keypress", "beforeinput", "input", "keyup",
+                "beforeinput", "input",
+            ]
+            events = [{"type": item, "currentTarget": "edit"} for item in target_types]
+            if not ignored:
+                events.append({"type": "wheel", "currentTarget": "scrollbox"})
+            return {
+                "before": {"scrollTop": 0},
+                "actions": [
+                    action("Input.setIgnoreInputEvents", {"ignore": ignored}),
+                    action("Input.dispatchMouseEvent", {"type": "mouseMoved"}),
+                    action("Input.dispatchMouseEvent", {"type": "mousePressed"}),
+                    action("Input.dispatchMouseEvent", {"type": "mouseReleased"}),
+                    action("Input.dispatchMouseEvent", {"type": "mouseWheel"}),
+                    action("Input.dispatchKeyEvent", {"type": "keyDown"}),
+                    action("Input.dispatchKeyEvent", {"type": "keyUp"}),
+                    action("Input.insertText", {"text": "x"}),
+                ],
+                "after": {
+                    "scrollTop": 0 if ignored else 40,
+                    "events": events,
+                    "values": {"edit": field(value)},
+                },
+            }
+
+        def lifecycle(value, text, key_suppressed, explicit_insert):
+            event_types = ["beforeinput", "input"] if key_suppressed else [
+                "keydown", "keypress", "beforeinput", "input"
+            ]
+            if explicit_insert and not key_suppressed:
+                event_types += ["beforeinput", "input"]
+            actions = [action("Input.dispatchKeyEvent", {"type": "keyDown"})]
+            if explicit_insert:
+                actions.append(action("Input.insertText", {"text": text}))
+            return {
+                "actions": actions,
+                "snapshot": {
+                    "events": [
+                        {"type": event_type, "currentTarget": "edit", "data": (
+                            text if event_type in ("beforeinput", "input") else None
+                        )}
+                        for event_type in event_types
+                    ],
+                    "values": {"edit": field(value)},
+                },
+            }
+
+        observation = {
+            "true": phase("abcdx", True),
+            "false": phase("abcdxax", False),
+            "sibling": {
+                "actions": [action("Input.setIgnoreInputEvents", {"ignore": True}),
+                            action("Input.setIgnoreInputEvents", {"ignore": False}),
+                            action("Input.dispatchKeyEvent", {"type": "keyDown"}),
+                            action("Input.dispatchKeyEvent", {"type": "keyDown"}),
+                            action("Input.setIgnoreInputEvents", {"ignore": True}),
+                            action("Input.dispatchKeyEvent", {"type": "keyDown"}),
+                            action("Input.setIgnoreInputEvents", {"ignore": False}),
+                            action("Input.dispatchKeyEvent", {"type": "keyDown"})],
+                "snapshot": {
+                    "events": [],
+                    "values": {"edit": field("abcd")},
+                },
+            },
+            "navigation": lifecycle("abcdn", "n", True, True),
+            "reattach": lifecycle("abcdgr", "r", False, True),
+            "otherTarget": {
+                "actions": [
+                    action("Input.setIgnoreInputEvents", {"ignore": True}),
+                    action("Input.dispatchKeyEvent", {"type": "keyDown"}),
+                    action("Input.dispatchKeyEvent", {"type": "keyDown"}),
+                ],
+                "firstSnapshot": {
+                    "events": [],
+                    "values": {"edit": field("abcdgr")},
+                },
+                "snapshot": lifecycle("abcdh", "h", False, False)["snapshot"],
+            },
+            "cleanupAction": action("Input.setIgnoreInputEvents", {"ignore": False}),
+        }
+        assert_contract("ignore-input", observation, label="candidate")
+        observation["otherTarget"]["firstSnapshot"]["events"] = [
+            {"type": "keydown", "currentTarget": "edit"}
+        ]
+        with self.assertRaisesRegex(AssertionError, "first target was not isolated"):
+            assert_contract("ignore-input", observation, label="candidate")
+        observation["otherTarget"]["firstSnapshot"]["events"] = []
+        observation["true"]["after"]["events"] = []
+        with self.assertRaisesRegex(AssertionError, "ignore=true did not suppress"):
+            assert_contract("ignore-input", observation, label="candidate")
+
+    def test_ignore_input_comparator_detects_snapshot_mutation(self):
+        action = {"method": "Input.insertText", "params": {"text": "x"}, "response": {}, "actionError": None}
+        reference = {"true": {"before": {}, "after": {"events": [1]}, "actions": [action]},
+                     "false": {"before": {}, "after": {"events": [2]}, "actions": [action]}}
+        candidate = {"true": {"before": {}, "after": {"events": [1]}, "actions": [{**action, "params": {"text": "y"}}]},
+                     "false": {"before": {}, "after": {"events": [2]}, "actions": [action]}}
+        with self.assertRaisesRegex(AssertionError, "ignore-input true action result differs"):
+            compare_case("ignore-input", reference, candidate, label="candidate")
+
+    def test_ignore_input_comparator_scopes_independent_mouse_parity(self):
+        action = {
+            "method": "Input.dispatchMouseEvent",
+            "params": {"type": "mousePressed", "x": 25, "y": 25},
+            "response": {},
+            "actionError": None,
+        }
+        state = {
+            "poisonCalls": {"KeyboardEvent": 0},
+            "active": "edit",
+            "scrollTop": 40,
+            "values": {"edit": {"value": "abcdxax", "start": 7, "end": 7}},
+        }
+        reference = {
+            "false": {
+                "before": {"scrollTop": 0},
+                "actions": [action],
+                "after": {
+                    **state,
+                    "events": [
+                        {
+                            "type": "mousedown", "target": "edit",
+                            "currentTarget": "edit", "constructor": "MouseEvent",
+                            "which": 1, "targetValue": "abcdx",
+                            "targetSelectionStart": 0, "targetSelectionEnd": 0,
+                        },
+                        {"type": "click", "target": "edit", "which": 1},
+                    ],
+                },
+            },
+            "cleanupAction": action,
+        }
+        candidate = {
+            "false": {
+                "before": {"scrollTop": 0},
+                "actions": [dict(action)],
+                "after": {
+                    **state,
+                    "events": [{
+                        "type": "mousedown", "target": "edit",
+                        "currentTarget": "edit", "constructor": "MouseEvent",
+                        "which": None, "targetValue": None,
+                        "targetSelectionStart": 5, "targetSelectionEnd": 5,
+                    }],
+                },
+            },
+            "cleanupAction": action,
+        }
+        compare_case("ignore-input", reference, candidate, label="candidate")
+        candidate["false"]["after"]["events"][0]["target"] = "other"
+        with self.assertRaisesRegex(AssertionError, "ignore-input false snapshot differs"):
+            compare_case("ignore-input", reference, candidate, label="candidate")
 
     def test_maxlength_contract_requires_utf16_truncation_and_actual_event_data(self):
         def record(node, value, caret, events, states=None):

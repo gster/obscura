@@ -460,7 +460,7 @@ platforms. Native coordinate input requires the render build.
 
 ## Native keyboard and text qualification
 
-`native_keyboard_smoke.py` uses Playwright's raw CDP session against eight
+`native_keyboard_smoke.py` uses Playwright's raw CDP session against nine
 isolated local cases. It checks `Input.insertText` selection replacement and
 empty deletion, keyDown/rawKeyDown/char/keyUp phase order, cancellation,
 keyboard metadata, browser-owned dispatch despite poisoned public APIs,
@@ -472,6 +472,20 @@ already-overlong scripted value, textarea newline normalization, key text, and
 the official `Locator.fill()` path. Each event also records the target value,
 selection and maxlength at dispatch time; paired comparison retains and checks
 the complete snapshot rather than projecting only the final control value.
+The `ignore-input` case records `Input.setIgnoreInputEvents` validation and
+paired `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, and
+`Input.insertText` actions. Each attached session owns a contribution; a target
+suppresses mouse, wheel, and key dispatch while any of its sessions contributes
+true. Navigation preserves contributions, detach clears the detached session,
+and another target remains independent. `Input.insertText` still executes;
+false removes only the calling session's contribution.
+
+Paired comparison retains every raw event field. For the `ignore=false`
+restoration phase it compares complete actions, state, keyboard/text events,
+and coordinate-event type/target/constructor metadata, but does not use click
+synthesis, legacy `which`, non-control target value, or coordinate-event caret
+timing as this gate's pass condition. Those remain independent mouse-parity
+work; they are recorded here without being claimed as qualified.
 
 ```bash
 RUN_ROOT="$(mktemp -d)"
