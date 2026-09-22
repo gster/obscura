@@ -336,6 +336,51 @@ the named release binary. It does not qualify Linux, Windows, containers,
 multi-worker relay totals, kernel listen backlog, total RSS, or other resource
 limits.
 
+## Single-worker WebSocket handoff saturation qualification
+
+`cdp_ws_handoff_capacity.py` is the stronger release-process runner for the
+handoff channel. It requires Darwin IPv4 loopback, one worker, exactly
+`--max-connections 512`, exactly 256 accepted sockets, and exactly three
+waves. Each wave connects 256 sockets concurrently and immediately sends
+`websocket_request(...)[:-4]`. Only a stable snapshot with listener
+`completed=0`, exactly 256 target `ESTABLISHED` rows, an FD delta of at least
+256, and a live process permits the server process group to be confirmed in a
+SIGSTOP state. All final `\r\n\r\n` bytes are then sent while every server
+thread is stopped and SIGCONT releases the accept thread and handoff receiver
+together. This makes the already accepted sockets readable in one observable
+burst without a product flag or test hook. The terminator is not pipelined
+with a CDP command.
+
+Every wave must classify all 256 sockets exactly. A complete HTTP 503 with the
+unique `X-Obscura-Reason: ws-handoff-saturated` is the only saturation result;
+`max-connections`, another status, timeout, reset, empty wire, or an incomplete
+response is an explicit failure. At least one 101 and one saturation 503 are
+required per wave. Each 101 socket receives a unique `Browser.getVersion`,
+retains the complete masked frame/payload/result, then sends a masked Close and
+reads EOF. Recovery predicate polling requires listener queue, target
+`ESTABLISHED`, FD count, and thread count to return to baseline before an
+independent HTTP 200 and WebSocket/CDP probe.
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+python3 tools/unblocked/cdp_ws_handoff_capacity.py \
+  --binary target/release/obscura \
+  --output "$RUN_ROOT/cdp-ws-handoff-capacity"
+```
+
+The manifest and evidence preserve every request/response/socket/address and
+monotonic timestamp, all host command stdout/stderr, server streams,
+tracebacks, and hashes without redaction, truncation, or field removal. An
+owned-socket salvage record is written before close on failure. Shutdown sends
+SIGTERM and records return code, forced-kill state, and process-group state;
+the runner never escalates to forced kill. If a real wave does not observe
+both outcomes, the status is `not-qualified` with a nonzero exit rather than a
+claim about handoff saturation. The real runner qualifies the Darwin
+single-worker production branch identified by its unique reason. The
+deterministic Rust receive-gate test separately proves the exact 128-entry
+channel capacity. Neither result qualifies non-Darwin or multi-worker totals,
+nor portable process, FD, RSS, V8, or socket-buffer limits.
+
 ## Trace comparison
 
 Each successful mode writes one trace and `result.json` reports the first exact

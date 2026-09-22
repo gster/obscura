@@ -5618,6 +5618,125 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn receive_gate_saturates_actual_128_handoff_before_shared_admission() {
+        use futures_util::future::join_all;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        assert_eq!(super::MAX_PENDING_WS_HANDOFFS, 128);
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = probe.local_addr().unwrap();
+                drop(probe);
+
+                let shutdown = super::ServerShutdown::new();
+                let server_shutdown = shutdown.clone();
+                let receive_gate = Arc::new(tokio::sync::Notify::new());
+                let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel();
+                let policy = super::ConnectionIoPolicy {
+                    ws_handoff_receive_gate: Some(receive_gate),
+                    ws_handoff_queued_tx: Some(queued_tx),
+                    ..Default::default()
+                };
+                let server = tokio::task::spawn_local(async move {
+                    super::start_with_serve_options_access_limit_and_shutdown(
+                        address.port(),
+                        "127.0.0.1",
+                        None,
+                        false,
+                        None,
+                        true,
+                        super::MAX_PENDING_WS_HANDOFFS + 1,
+                        crate::access::CdpAccessOptions::default(),
+                        obscura_net::EffectivePersona::builtin(
+                            obscura_net::StealthProfile::WindowsChrome145,
+                        ),
+                        server_shutdown,
+                        false,
+                        policy,
+                    )
+                    .await
+                });
+
+                let request = websocket_upgrade_request(address.port());
+                let queued_clients = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        let mut clients = Vec::with_capacity(super::MAX_PENDING_WS_HANDOFFS);
+                        for expected in 1..=super::MAX_PENDING_WS_HANDOFFS {
+                            let mut client = connect_tcp_with_retry(address).await;
+                            client.write_all(&request).await.unwrap();
+                            assert_eq!(
+                                queued_rx.recv().await,
+                                Some(expected),
+                                "authorized handoff {expected} did not own the exact shared-admission count",
+                            );
+                            clients.push(client);
+                        }
+                        clients
+                    },
+                )
+                .await
+                .expect("actual 128-entry WebSocket handoff did not fill");
+
+                let mut saturated = connect_tcp_with_retry(address).await;
+                saturated.write_all(&request).await.unwrap();
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    saturated.read_to_end(&mut response),
+                )
+                .await
+                .expect("129th upgrade did not reach a terminal response")
+                .expect("read 129th upgrade response");
+                assert_eq!(response, super::WS_HANDOFF_LIMIT_RESPONSE.as_bytes());
+                assert!(
+                    queued_rx.try_recv().is_err(),
+                    "the rejected 129th upgrade was reported as admitted",
+                );
+
+                shutdown.cancel();
+                let close_futures = queued_clients.into_iter().map(|mut client| async move {
+                    let mut byte = [0u8; 1];
+                    client.read(&mut byte).await
+                });
+                let (server_result, closes) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    async { tokio::join!(server, join_all(close_futures)) },
+                )
+                .await
+                .expect("shutdown did not drain the full handoff within one total deadline");
+                server_result
+                    .expect("server task")
+                    .expect("server clean shutdown with full handoff");
+                for (index, closed) in closes.into_iter().enumerate() {
+                    match closed {
+                        Ok(0) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::NotConnected
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ) => {}
+                        Ok(bytes) => panic!(
+                            "queued upgrade {} received {bytes} byte(s) after shutdown",
+                            index + 1,
+                        ),
+                        Err(error) => panic!(
+                            "queued upgrade {} failed with non-close error after shutdown: {error}",
+                            index + 1,
+                        ),
+                    }
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn queued_client_reset_before_receive_releases_admission_after_gate_opens() {
         tokio::task::LocalSet::new()
             .run_until(async {
