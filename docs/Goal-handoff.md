@@ -5,12 +5,20 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`bb1dbd4cdc769545b43abba77a71dce78b01665e`，`Qualify WebSocket handoff saturation`。
+- 最近完成的实现提交：`2fbcc0cc84464aa70b3576660bd6a3436a0f3a2f`，`Qualify maxlength text editing`。
 - 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的确定性 receive-gate 回归，以及 [`cdp_ws_handoff_capacity.py`](../tools/unblocked/cdp_ws_handoff_capacity.py) 的单 worker 发布二进制资格工具。
+- 本切片的实现入口是 [`runtime.rs`](../crates/obscura-js/src/runtime.rs) 的共享 native edit 路径、[`bootstrap.js`](../crates/obscura-js/js/bootstrap.js) 的 textarea line-break edit kind，以及 [`native_keyboard_smoke.py`](../tools/unblocked/native_keyboard_smoke.py) 的 Chrome/Obscura 成对资格工具。
 
 ## 最近完成的阶段
+
+OB-021 ordinary input/textarea `maxlength` 用户编辑切片已覆盖 `Input.insertText`、带 `text` 的 `Input.dispatchKeyEvent`、textarea Enter 和官方 `Locator.fill()`。容量按 UTF-16 code unit 计算且不拆 Unicode scalar；`Input.insertText`（包括 Locator.fill）的单行换行归一为空格，textarea 归一为 LF。native edit 在 `beforeinput` 后重新读取目标、value、selection、readonly 与 maxlength，因此 handler 动态 grow/shrink、value/selection 重入和脚本已有超长值的 selection 删除都按最终状态执行。`beforeinput.data` 保留请求，`input.data` 只含实际接纳前缀；无选区且无可接纳文本时不修改值、不发送 `input`，有选区时即使没有插入容量仍删除选区并发送 `input(data="")`。Chrome 152 实测的 `insertText` 与 key-text caret 差异原样保留。
+
+最终 committed binary 来自 `2fbcc0cc84464aa70b3576660bd6a3436a0f3a2f`，版本 `0.1.0-dev+2fbcc0c`，SHA-256 `a075816cd6858613fbf3e8524612d51c011971de922f6f768e96b203a4e9ad3b`，120798960 bytes。Chrome `152.0.7977.85` 与 Obscura `145.0.0.0` 的 8 组场景 exact 对照全部通过；maxlength 的 17 个子场景同时比较最终状态、完整事件序列与事件发生时的 target value/selection/maxlength。最终原始目录 `/private/tmp/ob021-maxlength-committed-final.ITi5Kb/` 有 621 个 artifact；`artifact-sha256.txt` SHA-256 为 `7ab2308eaa4da2e3808450d48831d7687ebfd2fbbfddf92fa404412e1bc04320`，结果 JSON SHA-256 为 `39512e97809b22fb61628c39f45431b708fbc43bdcaf04bda2d0d1021d16d750`，runner stderr 为 0 bytes。
+
+runtime 聚焦 **3/3**（run `c83b0968-a62d-4b8b-9310-3ce903c48443`），CDP input integration binary **11/11**（run `984906fb-4b82-4bba-802f-f023f87a2d37`），完整 unblocked unittest **135/135**。最终 release/render 全工作区 **2339/2339**、4 skipped（run `7f8d84ee-ff66-41e7-b263-4db63ac83432`）；前面三次完整运行中的既有 MCP loopback/title fixture 偶发失败和各自精确复跑均完整保留，不称为修复。committed no-render/render exact build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33** 均通过。官方 Playwright Python 1.60.0 smoke 通过，完整原始协议日志匹配 **37-method** profile；目录 `/private/tmp/ob021-maxlength-playwright-committed.8DcmOY/`，smoke JSON SHA-256 `2d587fd39c5a15aee475b36cfdc5d16a1eba76bbba5b0a416708b0390f77671d`，protocol log SHA-256 `926deea08a2c449abfcb547ace59497c4d834f894223d99973bd55b84da737c6`。Astra light 初审和加强后的终审均为 0 blocker、0 major、0 minor；终审的 68 次删字段 mutation 全被 comparator 拒绝。
+
+contenteditable、IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作和复杂表单默认动作仍未资格化；no-render 坐标/键盘输入仍明确 unsupported。该切片不关闭 OB-021。
 
 OB-034 单 worker WebSocket handoff saturation 发布资格切片新增确定性真实 server gate：测试固定断言 channel capacity 为 128，在 receiver gate 保持关闭时排入精确 128 个 authorized upgrade，第 129 个取得 byte-exact 503/`ws-handoff-saturated`，observer 不得升至 129；随后在 gate 仍关闭时 shutdown，并用同一总 deadline 完成 server 与 128 个 client 的收尾。该测试不增加生产 hook，继续只使用既有 `cfg(test)` policy。
 
@@ -191,7 +199,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
 1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
-2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_ws_capacity.py`、`tools/unblocked/cdp_ws_handoff_capacity.py`、`tools/unblocked/cdp_silent_pending.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace 与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量、CPU/FD 事实或 RSS 采样外推为总容量/总资源上限。
+2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_ws_capacity.py`、`tools/unblocked/cdp_ws_handoff_capacity.py`、`tools/unblocked/cdp_silent_pending.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace，以及 contenteditable、IME/composition、grapheme/word 编辑和复杂默认动作等剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量、CPU/FD 事实或 RSS 采样外推为总容量/总资源上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
@@ -207,6 +215,27 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 ## 原始证据位置
 
 生成本交接的主机上曾保留以下完整临时证据：
+
+- `/private/tmp/ob021-maxlength-committed-final.ITi5Kb/`
+- `/private/tmp/ob021-maxlength-playwright-committed.8DcmOY/`
+- `/private/tmp/ob021-maxlength-full-nextest-final-2.log`
+- `/private/tmp/ob021-maxlength-full-nextest.log`
+- `/private/tmp/ob021-maxlength-full-nextest-rerun.log`
+- `/private/tmp/ob021-maxlength-full-nextest-final.log`
+- `/private/tmp/ob021-maxlength-mcp-rerun.log`
+- `/private/tmp/ob021-maxlength-mcp-rerun-2.log`
+- `/private/tmp/ob021-maxlength-mcp-rerun-3.log`
+- `/private/tmp/ob021-maxlength-build-no-render-committed-final.log`
+- `/private/tmp/ob021-maxlength-build-render-committed-final.log`
+- `/private/tmp/ob021-maxlength-obstacle-committed-final.log`
+- `/private/tmp/ob021-maxlength-final-v2.hCPTL4/`
+- `/private/tmp/ob021-maxlength-final-v3.ItGthv/`
+- `/private/tmp/ob034-input-maxlength-chrome.FBGL1c/`
+- `/private/tmp/ob034-input-maxlength-chrome.VXPwD0/`
+- `/private/tmp/ob034-input-maxlength-chrome.kYCiDP/`
+- `/private/tmp/ob034-input-maxlength-chrome.VqFLGK/`
+- `/private/tmp/ob034-input-maxlength-chrome.Fh6qry/`（缺少 `PYTHONPATH` 的失败证据）
+- `/private/tmp/ob034-input-maxlength-chrome.qbPFsF/`（缺少 bundled Chromium 的失败证据）
 
 - `/private/tmp/ob034-capacity-final-reviewed.IlqITE/evidence/`
 - `/private/tmp/ob034-capacity-close.SfPdJq/evidence/`（要求 server Close echo 的被拒绝门禁，完整失败证据）
