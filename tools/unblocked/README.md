@@ -291,6 +291,51 @@ qualify Linux, Windows, containers, multi-worker relay totals, silent-pending
 connections, the deterministic handoff-saturation test hook, or total resource
 limits.
 
+## Single-worker accepted silent request-head qualification
+
+`cdp_silent_pending.py` observes the Darwin single-worker request-head
+admission behavior. It fills the 256-entry accepted silent-head budget with
+IPv4 loopback sockets and proves application acceptance with an empty listener
+queue, an exact target-listener `ESTABLISHED` count, an FD delta, and stable
+process/thread snapshots. It then sends complete HTTP and WebSocket heads while
+the 256 silent peers remain open and records the observed capacity responses.
+The WebSocket cases must complete 101 and a raw `Browser.getVersion` response;
+the HTTP cases must complete 200 and a matching body length. The 100 ms value
+is the classification grace; this runner does not prove simultaneous occupancy
+of all 16 classification-reserve entries or the 272-slot hard-total state.
+Those hard-bound facts belong to the Rust observer test.
+
+The tool separately fills the observed classification capacity with incomplete
+heads. Those entries must receive complete HTTP 503 responses with
+`X-Obscura-Reason: max-pending-request-heads`; an additional entry while the
+reserve is full must not remain pending. A base partial head is held for the
+production 10-second TTL and must receive a complete HTTP 408 with
+`X-Obscura-Reason: request-head-timeout`. Zero-byte silent sockets must close
+after the same TTL, and server FD count, target TCP rows, threads, and listener
+queue must return to the baseline. The runner records process CPU-time samples
+before and after recovery as host facts only; they are not a portable CPU or
+RSS limit.
+
+Use a release binary and a new output path outside the repository:
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+python3 tools/unblocked/cdp_silent_pending.py \
+  --binary target/release/obscura \
+  --output "$RUN_ROOT/cdp-silent-pending"
+```
+
+Every request and response wire, client address and socket lifecycle, host
+command stdout/stderr, `lsof`/`netstat`/`ps` output, server stdout/stderr,
+signal, exception traceback, binary hash, and artifact hash is retained as raw
+data without redaction, truncation, or field removal. Failed runs still write
+the manifest and preserve owned sockets' final wire and errors. Cleanup sends
+SIGTERM only and never escalates to SIGKILL; a SIGTERM timeout is a failed
+qualification. This result is limited to Darwin IPv4 loopback, one worker, and
+the named release binary. It does not qualify Linux, Windows, containers,
+multi-worker relay totals, kernel listen backlog, total RSS, or other resource
+limits.
+
 ## Trace comparison
 
 Each successful mode writes one trace and `result.json` reports the first exact

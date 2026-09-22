@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use futures_util::{Sink, SinkExt, StreamExt};
 use base64::Engine as _;
@@ -67,6 +71,12 @@ struct ConnectionIoPolicy {
     execution_cancellation_tx: Option<tokio::sync::mpsc::UnboundedSender<
         obscura_js::execution_cancellation::ExecutionCancellation,
     >>,
+    #[cfg(test)]
+    accept_head_policy: Option<AcceptHeadPolicy>,
+    #[cfg(test)]
+    accept_poll_tx: Option<tokio::sync::mpsc::UnboundedSender<std::time::Duration>>,
+    #[cfg(test)]
+    pending_head_count_tx: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
 }
 
 impl Default for ConnectionIoPolicy {
@@ -85,6 +95,12 @@ impl Default for ConnectionIoPolicy {
             admitted_request_tx: None,
             #[cfg(test)]
             execution_cancellation_tx: None,
+            #[cfg(test)]
+            accept_head_policy: None,
+            #[cfg(test)]
+            accept_poll_tx: None,
+            #[cfg(test)]
+            pending_head_count_tx: None,
         }
     }
 }
@@ -132,6 +148,12 @@ const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
 const WS_HANDOFF_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
     X-Obscura-Reason: ws-handoff-saturated\r\n\r\n";
+const PENDING_HEAD_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+    Content-Length: 0\r\nConnection: close\r\n\
+    X-Obscura-Reason: max-pending-request-heads\r\n\r\n";
+const PENDING_HEAD_TIMEOUT_RESPONSE: &str = "HTTP/1.1 408 Request Timeout\r\n\
+    Content-Length: 0\r\nConnection: close\r\n\
+    X-Obscura-Reason: request-head-timeout\r\n\r\n";
 use crate::types::CdpRequest;
 use crate::types::CdpResponse;
 
@@ -221,6 +243,7 @@ impl Drop for WebSocketAdmissionPermit {
 
 struct PendingWebSocket {
     stream: std::net::TcpStream,
+    buffered_head: Vec<u8>,
     admission: WebSocketAdmissionPermit,
 }
 
@@ -712,9 +735,10 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
     // later connection, including CDP clients like Playwright's
     // connectOverCDP, would then sit in the kernel backlog unanswered until
     // its own connect timeout (issue #715). The thread therefore never
-    // blocks on a *stream* — undecided connections are parked and re-polled
-    // every ACCEPT_POLL_INTERVAL, and dropped once they outlive
-    // SILENT_CONNECTION_TTL without sending a request head.
+    // blocks on a *stream*. Each undecided connection is registered with Mio;
+    // readable bytes are consumed into a lossless prefix buffer, and the poll
+    // timeout is the earliest TTL deadline. This avoids the former 1ms linear
+    // scan across every parked socket.
     //
     // The listener remains non-blocking so shutdown never depends on making a
     // self-connection to interrupt accept(). Mio wakes immediately for either
@@ -724,32 +748,169 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
     let accept_persona = persona.clone();
     let accept_access_policy = access_policy.clone();
     let accept_websocket_admission = websocket_admission.clone();
+    #[cfg(test)]
+    let accept_head_policy = connection_io_policy.accept_head_policy.unwrap_or_default();
+    #[cfg(not(test))]
+    let accept_head_policy = AcceptHeadPolicy::default();
+    #[cfg(test)]
+    let accept_poll_tx = connection_io_policy.accept_poll_tx.clone();
+    #[cfg(test)]
+    let pending_head_count_tx = connection_io_policy.pending_head_count_tx.clone();
     let accept_thread = std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
-            let mut accept_events = mio::Events::with_capacity(8);
-            let mut pending: Vec<(std::net::TcpStream, std::time::Instant)> = Vec::new();
+            let mut accept_events = mio::Events::with_capacity(
+                accept_head_policy.limit
+                    + accept_head_policy.classification_reserve
+                    + FIRST_PENDING_HEAD_TOKEN,
+            );
+            let mut pending: HashMap<usize, PendingHttpHead> = HashMap::new();
+            let mut deadlines: BinaryHeap<Reverse<(std::time::Instant, usize)>> =
+                BinaryHeap::new();
+            let mut next_pending_token = FIRST_PENDING_HEAD_TOKEN;
             let mut accept_drain = AcceptDrainState::default();
-            'accept: while !accept_shutdown.is_cancelled() {
-                if accept_drain.should_poll() {
-                    let poll_timeout = if pending.is_empty() {
-                        ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL
-                    } else {
-                        ACCEPT_POLL_INTERVAL
-                    };
-                    match accept_poll.poll(&mut accept_events, Some(poll_timeout)) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            error!("CDP accept poll error: {error}");
-                            accept_shutdown.cancel();
-                            break 'accept;
+            let max_pending = accept_head_policy
+                .limit
+                .saturating_add(accept_head_policy.classification_reserve);
+
+            let finish_pending = |pending: PendingHttpHead, status: RequestHeadStatus| {
+                let buffered = pending.buffered;
+                let stream: std::net::TcpStream = pending.stream.into();
+                match status {
+                    RequestHeadStatus::Head => {
+                        if let Err(error) = accept_dispatch(
+                            stream,
+                            &ws_tx,
+                            buffered,
+                            &accept_access_policy,
+                            &accept_persona,
+                            &accept_websocket_admission,
+                        ) {
+                            if !format!("{error}").contains("close") {
+                                error!("Accept dispatch error: {error}");
+                            }
                         }
+                    }
+                    RequestHeadStatus::TooLarge => reject_buffered_http(
+                        stream,
+                        &AccessFailure::request_header_fields_too_large().response(),
+                    ),
+                    RequestHeadStatus::Closed => {}
+                    RequestHeadStatus::Pending => unreachable!("pending head is not terminal"),
+                }
+            };
+
+            'accept: while !accept_shutdown.is_cancelled() {
+                compact_pending_deadline_heap(
+                    &mut deadlines,
+                    pending
+                        .iter()
+                        .map(|(token, entry)| (entry.deadline, *token)),
+                    max_pending,
+                );
+                while let Some(Reverse((deadline, token))) = deadlines.peek().copied() {
+                    if pending
+                        .get(&token)
+                        .is_some_and(|entry| entry.deadline == deadline)
+                    {
+                        break;
+                    }
+                    deadlines.pop();
+                }
+                let now = std::time::Instant::now();
+                let poll_timeout = accept_poll_timeout(
+                    !accept_drain.should_poll(),
+                    deadlines.peek().map(|Reverse((deadline, _))| *deadline),
+                    now,
+                );
+                #[cfg(test)]
+                if let Some(observer) = &accept_poll_tx {
+                    let _ = observer.send(poll_timeout);
+                }
+                match accept_poll.poll(&mut accept_events, Some(poll_timeout)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        error!("CDP accept poll error: {error}");
+                        accept_shutdown.cancel();
+                        break 'accept;
                     }
                 }
                 if accept_shutdown.is_cancelled() {
                     break;
                 }
+
+                // Process only sockets Mio identified as readable. Bytes are
+                // consumed, so a partial head becomes non-readable and cannot
+                // spin the reactor until another byte actually arrives.
+                let ready_tokens: Vec<usize> = accept_events
+                    .iter()
+                    .filter_map(|event| {
+                        (event.token().0 >= FIRST_PENDING_HEAD_TOKEN)
+                            .then_some(event.token().0)
+                    })
+                    .collect();
+                for token in ready_tokens {
+                    let status = match pending.get_mut(&token) {
+                        Some(entry) => read_request_head(entry),
+                        None => continue,
+                    };
+                    if matches!(status, RequestHeadStatus::Pending) {
+                        continue;
+                    }
+                    let mut entry = pending.remove(&token).expect("ready pending head");
+                    let _ = accept_poll.registry().deregister(&mut entry.stream);
+                    #[cfg(test)]
+                    if let Some(observer) = &pending_head_count_tx {
+                        let _ = observer.send(pending.len());
+                    }
+                    finish_pending(entry, status);
+                }
+
+                // Expire by the earliest deadline rather than scanning the
+                // whole pending set. A partial HTTP request receives 408. A
+                // completely silent socket has not spoken HTTP, so close it
+                // without inventing a response; the server log records why.
+                let now = std::time::Instant::now();
+                while let Some(Reverse((deadline, token))) = deadlines.peek().copied() {
+                    if deadline > now {
+                        break;
+                    }
+                    deadlines.pop();
+                    let Some(mut entry) = pending.remove(&token) else {
+                        continue;
+                    };
+                    if entry.deadline != deadline {
+                        pending.insert(token, entry);
+                        continue;
+                    }
+                    let _ = accept_poll.registry().deregister(&mut entry.stream);
+                    #[cfg(test)]
+                    if let Some(observer) = &pending_head_count_tx {
+                        let _ = observer.send(pending.len());
+                    }
+                    let stream: std::net::TcpStream = entry.stream.into();
+                    if entry.classification_reserve {
+                        warn!(
+                            "refusing request-head classification after {}ms reserve grace",
+                            accept_head_policy.classification_grace.as_millis(),
+                        );
+                        reject_buffered_http(stream, PENDING_HEAD_LIMIT_RESPONSE.as_bytes());
+                    } else if entry.buffered.is_empty() {
+                        warn!(
+                            "closing silent connection after {}ms request-head TTL",
+                            accept_head_policy.ttl.as_millis(),
+                        );
+                    } else {
+                        warn!(
+                            "rejecting incomplete request head after {}ms TTL ({} byte(s))",
+                            accept_head_policy.ttl.as_millis(),
+                            entry.buffered.len(),
+                        );
+                        reject_buffered_http(stream, PENDING_HEAD_TIMEOUT_RESPONSE.as_bytes());
+                    }
+                }
+
                 // Drain a bounded batch from the kernel backlog. A continuous
                 // connection flood must not keep this loop away from the
                 // shutdown check forever. Mio readiness is edge-triggered, so
@@ -758,64 +919,87 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
                 // proves that the readiness edge has been fully drained.
                 let batch = drain_accept_batch(|| {
                     let (stream, _) = accept_listener.accept()?;
-                    let stream: std::net::TcpStream = stream.into();
-                    let _ = stream.set_nonblocking(true);
-                    if pending.len() < MAX_SILENT_PENDING {
-                        pending.push((stream, std::time::Instant::now()));
+                    let now = std::time::Instant::now();
+                    let reserve = pending.len() >= accept_head_policy.limit;
+                    let deadline = now + if reserve {
+                        accept_head_policy.classification_grace
                     } else {
-                        warn!(
-                            "dropping connection: {} connections parked without a request head",
-                            MAX_SILENT_PENDING
-                        );
+                        accept_head_policy.ttl
+                    };
+                    let mut entry = PendingHttpHead {
+                        stream,
+                        buffered: Vec::with_capacity(HTTP_PEEK_BUF),
+                        deadline,
+                        classification_reserve: reserve,
+                    };
+
+                    if pending.len() >= max_pending {
+                        // Preserve fairness at the hard bound: an already
+                        // readable complete head still bypasses silent peers.
+                        // Anything incomplete receives an explicit capacity
+                        // response instead of being parked without a bound.
+                        match read_request_head(&mut entry) {
+                            RequestHeadStatus::Head => {
+                                finish_pending(entry, RequestHeadStatus::Head)
+                            }
+                            RequestHeadStatus::TooLarge => {
+                                finish_pending(entry, RequestHeadStatus::TooLarge)
+                            }
+                            RequestHeadStatus::Closed => {}
+                            RequestHeadStatus::Pending => {
+                                warn!(
+                                    "refusing connection: {} pending request heads plus {} classification reserve slots",
+                                    accept_head_policy.limit,
+                                    accept_head_policy.classification_reserve,
+                                );
+                                let stream: std::net::TcpStream = entry.stream.into();
+                                reject_buffered_http(
+                                    stream,
+                                    PENDING_HEAD_LIMIT_RESPONSE.as_bytes(),
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    while pending.contains_key(&next_pending_token) {
+                        next_pending_token = next_pending_token
+                            .checked_add(1)
+                            .filter(|token| *token >= FIRST_PENDING_HEAD_TOKEN)
+                            .unwrap_or(FIRST_PENDING_HEAD_TOKEN);
+                    }
+                    let token = next_pending_token;
+                    next_pending_token = next_pending_token
+                        .checked_add(1)
+                        .filter(|token| *token >= FIRST_PENDING_HEAD_TOKEN)
+                        .unwrap_or(FIRST_PENDING_HEAD_TOKEN);
+                    accept_poll.registry().register(
+                        &mut entry.stream,
+                        mio::Token(token),
+                        mio::Interest::READABLE,
+                    )?;
+                    deadlines.push(Reverse((entry.deadline, token)));
+                    pending.insert(token, entry);
+                    #[cfg(test)]
+                    if let Some(observer) = &pending_head_count_tx {
+                        let _ = observer.send(pending.len());
                     }
                     Ok(())
                 });
                 if let AcceptBatchStop::Error(error) = &batch.stop {
                     error!("Accept error: {}", error);
-                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                    std::thread::sleep(ACCEPT_ERROR_RETRY_DELAY);
                 }
                 accept_drain.observe(&batch);
                 if accept_shutdown.is_cancelled() {
                     break;
                 }
-                // Give every parked connection a chance to speak; keep the
-                // ones still silent and inside the TTL, dispatch the ones
-                // with a request head. Dropping a stream closes its socket.
-                for (stream, since) in std::mem::take(&mut pending) {
-                    if accept_shutdown.is_cancelled() {
-                        break;
-                    }
-                    if since.elapsed() >= SILENT_CONNECTION_TTL {
-                        continue;
-                    }
-                    match peek_request_head(&stream) {
-                        PeekStatus::NotReady => pending.push((stream, since)),
-                        PeekStatus::Closed => {}
-                        PeekStatus::TooLarge => {
-                            reject_http(
-                                stream,
-                                &AccessFailure::request_header_fields_too_large().response(),
-                            );
-                        }
-                        PeekStatus::Head(head) => {
-                            if let Err(e) = accept_dispatch(
-                                stream,
-                                &ws_tx,
-                                &head,
-                                &accept_access_policy,
-                                &accept_persona,
-                                &accept_websocket_admission,
-                            ) {
-                                if !format!("{}", e).contains("close") {
-                                    error!("Accept dispatch error: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-                if accept_shutdown.is_cancelled() {
-                    break;
-                }
+            }
+            if !pending.is_empty() {
+                info!(
+                    "closing {} pending request head(s) during shutdown",
+                    pending.len(),
+                );
             }
         })?;
 
@@ -937,7 +1121,11 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
             drop(pending);
             break;
         }
-        let PendingWebSocket { stream, admission } = pending;
+        let PendingWebSocket {
+            stream,
+            buffered_head,
+            admission,
+        } = pending;
         // Nagle off + nonblocking on the std socket before it moves to the
         // connection thread. CDP exchanges many small (~100-byte) frames during
         // newPage()/navigate; with Nagle on, each small write waits on an ACK or
@@ -953,6 +1141,7 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
         live_connections.fetch_add(1, Ordering::AcqRel);
         let _ = run_connection_with_io_policy(
             stream,
+            buffered_head,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
@@ -1067,6 +1256,88 @@ fn release_idle_connection_memory() {
     }
 }
 
+/// Async transport which replays bytes consumed by the Mio accept reactor
+/// before reading the live socket. This keeps admission event-driven without
+/// changing the byte stream seen by the WebSocket handshake parser.
+struct PrefixedTcpStream {
+    stream: TcpStream,
+    prefix: std::io::Cursor<Vec<u8>>,
+    handshake_head_end: usize,
+    tail_unlocked: bool,
+}
+
+impl PrefixedTcpStream {
+    fn new(stream: TcpStream, prefix: Vec<u8>) -> Self {
+        let handshake_head_end = prefix
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+            .unwrap_or(prefix.len());
+        let tail_unlocked = prefix.is_empty();
+        Self {
+            stream,
+            prefix: std::io::Cursor::new(prefix),
+            handshake_head_end,
+            tail_unlocked,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for PrefixedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let position = self.prefix.position() as usize;
+        let prefix = self.prefix.get_ref();
+        if position < prefix.len() {
+            // Tungstenite deliberately rejects bytes following an HTTP upgrade
+            // in the same handshake read. Expose exactly the HTTP head first;
+            // its 101 write unlocks any already-consumed WebSocket frame tail.
+            // No byte is discarded or synthesized.
+            if position >= self.handshake_head_end && !self.tail_unlocked {
+                return Poll::Pending;
+            }
+            let readable_end = if position < self.handshake_head_end {
+                self.handshake_head_end
+            } else {
+                prefix.len()
+            };
+            let count = (readable_end - position).min(buf.remaining());
+            buf.put_slice(&prefix[position..position + count]);
+            self.prefix.set_position((position + count) as u64);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PrefixedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.tail_unlocked = true;
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 /// Run one connection with WebSocket I/O on the server runtime and all V8 work
 /// on a dedicated OS thread. The separation is required for disconnect
 /// cancellation: a synchronous V8 loop may pin the processor thread, but it can
@@ -1074,6 +1345,7 @@ fn release_idle_connection_memory() {
 /// connection's active isolate through its thread-safe handle.
 fn run_connection_with_io_policy(
     std_stream: std::net::TcpStream,
+    buffered_head: Vec<u8>,
     context_template: Arc<obscura_browser::BrowserContext>,
     persistence_context: Arc<obscura_browser::BrowserContext>,
     persistence_lock: Arc<std::sync::Mutex<()>>,
@@ -1236,6 +1508,7 @@ fn run_connection_with_io_policy(
                 return;
             }
         };
+        let tokio_stream = PrefixedTcpStream::new(tokio_stream, buffered_head);
         let handler_tx = msg_tx.clone();
         let handler_cancellation = teardown.cancellation.clone();
         tokio::select! {
@@ -1269,40 +1542,22 @@ fn run_connection_with_io_policy(
     Some(io_task.abort_handle())
 }
 
-/// Turn away a connection that arrived while the server was at its limit.
+/// Turn away a connection after the accept reactor consumed its request head.
 ///
 /// Best-effort: the socket is going away either way, so a failed write just
 /// means the client sees a reset instead of the 503.
 fn refuse_connection(stream: std::net::TcpStream) {
-    reject_http(stream, CONNECTION_LIMIT_RESPONSE.as_bytes());
+    reject_buffered_http(stream, CONNECTION_LIMIT_RESPONSE.as_bytes());
 }
 
-/// Consume the bounded request head and return a fixed, non-reflective HTTP
-/// response before closing the socket.
-fn reject_http(stream: std::net::TcpStream, response: &[u8]) {
-    use std::io::{Read, Write};
+/// Return a fixed response after the accept reactor has already consumed all
+/// bytes that were readable from the request. This must not wait for another
+/// read: a silent capacity overflow has no more bytes to consume and the
+/// accept thread must remain available to discovery and WebSocket traffic.
+fn reject_buffered_http(stream: std::net::TcpStream, response: &[u8]) {
     let mut stream = stream;
     let _ = stream.set_nonblocking(false);
-
-    // The accept thread only peeked at the WebSocket handshake. Consume its
-    // bounded HTTP header before closing: Windows resets a socket closed with
-    // unread receive data, which can discard the queued 503 response.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
-    let mut request = [0u8; HTTP_PEEK_BUF];
-    let mut received = 0;
-    while received < request.len() {
-        match stream.read(&mut request[received..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                received += n;
-                if request[..received].windows(4).any(|end| end == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
     let _ = stream.write_all(response);
     let _ = stream.flush();
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -1311,16 +1566,35 @@ fn reject_http(stream: std::net::TcpStream, response: &[u8]) {
 const HTTP_PEEK_BUF: usize = 4096;
 const ACCEPT_LISTENER_TOKEN: mio::Token = mio::Token(0);
 const ACCEPT_SHUTDOWN_TOKEN: mio::Token = mio::Token(1);
+const FIRST_PENDING_HEAD_TOKEN: usize = 2;
 
 /// How long a freshly accepted connection may sit without sending a request
 /// head before the accept thread drops it. Real clients send their handshake
 /// immediately after connecting; only probes and preconnects linger.
 const SILENT_CONNECTION_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How often the accept thread re-polls parked connections that have not sent
-/// a request head yet. Also the retry delay on a persistent accept error, so
-/// it cannot become a log flood.
-const ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+/// Slots reserved for classifying a request while the ordinary silent-head
+/// budget is full. A normal client can therefore send a complete discovery or
+/// WebSocket head through a pool occupied by silent peers instead of being
+/// unconditionally rejected as connection number 257.
+const PENDING_HEAD_CLASSIFICATION_RESERVE: usize = 16;
+
+/// The reserve is deliberately brief: it covers TCP scheduling between
+/// connect/accept and the request write, without becoming a second slow-loris
+/// pool. Entries still incomplete at this deadline receive the capacity 503.
+const PENDING_HEAD_CLASSIFICATION_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Stale deadline entries are cheap to skip when they reach the heap root, but
+/// one long-lived early deadline can otherwise retain every later completed
+/// connection's entry. Rebuild before the heap exceeds this fixed multiple of
+/// the accepted-incomplete socket bound. One accept batch can add at most one
+/// further bound's worth before the next loop, so production remains at most 5x
+/// (1360 entries for the 256 + 16 socket policy) independent of throughput.
+const PENDING_DEADLINE_HEAP_COMPACT_MULTIPLIER: usize = 4;
+
+/// Retry delay on a persistent accept error, so it cannot become a log flood.
+const ACCEPT_ERROR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Upper bound for an idle accept thread to notice shutdown if the explicit
 /// Mio wake fails. Listener readiness still wakes the poll immediately, so
@@ -1357,6 +1631,22 @@ impl AcceptDrainState {
     }
 }
 
+fn accept_poll_timeout(
+    backlog_may_remain: bool,
+    earliest_deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    if backlog_may_remain {
+        std::time::Duration::ZERO
+    } else if let Some(deadline) = earliest_deadline {
+        deadline
+            .saturating_duration_since(now)
+            .min(ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL)
+    } else {
+        ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL
+    }
+}
+
 fn drain_accept_batch<F>(mut accept_one: F) -> AcceptBatchResult
 where
     F: FnMut() -> std::io::Result<()>,
@@ -1384,66 +1674,130 @@ const HTTP_CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// thread's polling work and the server's fd usage under probe floods.
 const MAX_SILENT_PENDING: usize = 256;
 
+#[derive(Clone, Copy)]
+struct AcceptHeadPolicy {
+    limit: usize,
+    ttl: std::time::Duration,
+    classification_reserve: usize,
+    classification_grace: std::time::Duration,
+}
+
+impl Default for AcceptHeadPolicy {
+    fn default() -> Self {
+        Self {
+            limit: MAX_SILENT_PENDING,
+            ttl: SILENT_CONNECTION_TTL,
+            classification_reserve: PENDING_HEAD_CLASSIFICATION_RESERVE,
+            classification_grace: PENDING_HEAD_CLASSIFICATION_GRACE,
+        }
+    }
+}
+
+struct PendingHttpHead {
+    stream: mio::net::TcpStream,
+    buffered: Vec<u8>,
+    deadline: std::time::Instant,
+    classification_reserve: bool,
+}
+
+fn compact_pending_deadline_heap<I>(
+    deadlines: &mut BinaryHeap<Reverse<(std::time::Instant, usize)>>,
+    live_deadlines: I,
+    max_pending: usize,
+) -> bool
+where
+    I: IntoIterator<Item = (std::time::Instant, usize)>,
+{
+    let threshold = max_pending
+        .saturating_mul(PENDING_DEADLINE_HEAP_COMPACT_MULTIPLIER);
+    if deadlines.len() <= threshold {
+        return false;
+    }
+    deadlines.clear();
+    deadlines.extend(live_deadlines.into_iter().map(Reverse));
+    true
+}
+
 /// Result of polling a freshly accepted connection for its request head.
-enum PeekStatus {
-    /// No classifiable request head yet; poll again next accept round.
-    NotReady,
+enum RequestHeadStatus {
+    /// No classifiable request head yet. Because bytes already observed were
+    /// consumed into `PendingHttpHead::buffered`, Mio can sleep until the next
+    /// socket-readiness edge rather than polling this socket on a timer.
+    Pending,
     /// Peer went away without sending a full head.
     Closed,
-    /// A classifiable request head.
-    Head(Vec<u8>),
+    /// A complete request head plus any bytes that arrived in the same read.
+    Head,
     /// The request head filled the admission buffer before its terminator.
     TooLarge,
 }
 
-/// Peek — without consuming — at a freshly accepted connection's request
-/// head. Every request is classified only after the terminating blank line
-/// arrives, so admission never parses a truncated or lossy request.
-fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
-    let mut buf = [0u8; HTTP_PEEK_BUF];
-    let n = match stream.peek(&mut buf) {
-        Ok(0) => return PeekStatus::Closed,
-        Ok(n) => n,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return PeekStatus::NotReady,
-        Err(_) => return PeekStatus::Closed,
-    };
-    let head = &buf[..n];
-    if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
-        return PeekStatus::Head(head[..end + 4].to_vec());
+/// Consume every currently readable byte from a pending request head.
+///
+/// Consuming is essential for an edge-triggered reactor: peeking a partial
+/// head leaves the socket readable forever and may never produce another Mio
+/// edge when the terminating bytes arrive. The bytes are retained verbatim and
+/// replayed into the WebSocket handshake if this becomes an upgrade request.
+fn read_request_head(pending: &mut PendingHttpHead) -> RequestHeadStatus {
+    loop {
+        if pending
+            .buffered
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
+            return RequestHeadStatus::Head;
+        }
+        if pending.buffered.len() == HTTP_PEEK_BUF {
+            return RequestHeadStatus::TooLarge;
+        }
+
+        let remaining = HTTP_PEEK_BUF - pending.buffered.len();
+        let mut chunk = [0u8; 1024];
+        let read_limit = remaining.min(chunk.len());
+        match pending.stream.read(&mut chunk[..read_limit]) {
+            Ok(0) => return RequestHeadStatus::Closed,
+            Ok(read) => pending.buffered.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return RequestHeadStatus::Pending;
+            }
+            Err(_) => return RequestHeadStatus::Closed,
+        }
     }
-    if n == HTTP_PEEK_BUF {
-        return PeekStatus::TooLarge;
-    }
-    PeekStatus::NotReady
 }
 
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
-/// The connection's request head has already been peeked by the accept loop
-/// (`peek_request_head`) and is passed in as `head`:
+/// The connection's request head has already been consumed by the accept
+/// reactor and retained byte-for-byte in `buffered_head`:
 /// - HTTP (`GET /json/*`): serve synchronously via blocking I/O so the
 ///   response is never stalled by the LocalSet.
-/// - WebSocket: forward to the LocalSet for CDP processing.
+/// - WebSocket: forward both the socket and its complete prefix to the LocalSet
+///   so tungstenite observes the original handshake and any pipelined bytes.
 fn accept_dispatch(
     stream: std::net::TcpStream,
     ws_tx: &mpsc::Sender<PendingWebSocket>,
-    head: &[u8],
+    buffered_head: Vec<u8>,
     access_policy: &CdpAccessPolicy,
     persona: &obscura_net::EffectivePersona,
     websocket_admission: &WebSocketAdmissionBudget,
 ) -> anyhow::Result<()> {
-    let authorized = match access_policy.authorize(head) {
+    let head_end = buffered_head
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .ok_or_else(|| anyhow::anyhow!("dispatch received an incomplete request head"))?;
+    let authorized = match access_policy.authorize(&buffered_head[..head_end]) {
         Ok(authorized) => authorized,
         Err(rejection) => {
             warn!("rejecting CDP admission: {}", rejection.reason);
-            reject_http(stream, &rejection.response());
+            reject_buffered_http(stream, &rejection.response());
             return Ok(());
         }
     };
 
     if authorized.route != RequestRoute::WebSocket {
-        // The request head is already sitting in the kernel receive buffer;
-        // switch back to blocking mode for the synchronous /json serve.
+        // The request head has already been consumed, so HTTP serving writes
+        // only the response and never waits on another client read.
         let _ = stream.set_nonblocking(false);
         return handle_http_json_blocking(
             stream,
@@ -1458,10 +1812,14 @@ fn accept_dispatch(
             "refusing authorized WebSocket upgrade: at --max-connections ({})",
             websocket_admission.inner.limit
         );
-        reject_http(stream, CONNECTION_LIMIT_RESPONSE.as_bytes());
+        reject_buffered_http(stream, CONNECTION_LIMIT_RESPONSE.as_bytes());
         return Ok(());
     };
-    let pending = PendingWebSocket { stream, admission };
+    let pending = PendingWebSocket {
+        stream,
+        buffered_head,
+        admission,
+    };
 
     // The admission permit covers both this bounded handoff and the active
     // processor. A saturated/closed receiver returns ownership of the
@@ -1478,12 +1836,18 @@ fn accept_dispatch(
                 "WS handoff channel full ({}); refusing authorized WebSocket upgrade",
                 MAX_PENDING_WS_HANDOFFS
             );
-            reject_http(pending.stream, WS_HANDOFF_LIMIT_RESPONSE.as_bytes());
+            reject_buffered_http(
+                pending.stream,
+                WS_HANDOFF_LIMIT_RESPONSE.as_bytes(),
+            );
             Ok(())
         }
         Err(mpsc::error::TrySendError::Closed(pending)) => {
             warn!("WS handoff receiver closed; refusing authorized WebSocket upgrade");
-            reject_http(pending.stream, WS_HANDOFF_LIMIT_RESPONSE.as_bytes());
+            reject_buffered_http(
+                pending.stream,
+                WS_HANDOFF_LIMIT_RESPONSE.as_bytes(),
+            );
             Ok(())
         }
     }
@@ -1496,12 +1860,7 @@ fn handle_http_json_blocking(
     access_policy: &CdpAccessPolicy,
     persona: &obscura_net::EffectivePersona,
 ) -> anyhow::Result<()> {
-    use std::io::{Read, Write};
-
-    stream.set_read_timeout(Some(HTTP_CONTROL_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(HTTP_CONTROL_IO_TIMEOUT))?;
-    let mut buf = vec![0u8; 4096];
-    let _ = stream.read(&mut buf)?;
 
     let body = match request.route {
         RequestRoute::Version => serde_json::to_string_pretty(&json!({
@@ -3112,7 +3471,7 @@ async fn handle_connection_ws(
     execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
 ) -> anyhow::Result<()> {
     handle_connection_ws_with_io_policy(
-        stream,
+        PrefixedTcpStream::new(stream, Vec::new()),
         msg_tx,
         execution_cancellation,
         ConnectionIoPolicy::default(),
@@ -3120,12 +3479,15 @@ async fn handle_connection_ws(
     .await
 }
 
-async fn handle_connection_ws_with_io_policy(
-    stream: TcpStream,
+async fn handle_connection_ws_with_io_policy<S>(
+    stream: S,
     msg_tx: ServerMessageSender,
     execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
     io_policy: ConnectionIoPolicy,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
     // adds extra latency per frame. write_buffer_size=0 makes every WS write
@@ -3399,6 +3761,7 @@ pub(crate) mod tests {
         ws_tx: &tokio::sync::mpsc::Sender<super::PendingWebSocket>,
         budget: &super::WebSocketAdmissionBudget,
     ) -> tokio::net::TcpStream {
+        use std::io::Read as _;
         use tokio::io::AsyncWriteExt as _;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3409,7 +3772,11 @@ pub(crate) mod tests {
         let request = websocket_upgrade_request(address.port());
         client.write_all(&request).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let server = server.into_std().unwrap();
+        let mut server = server.into_std().unwrap();
+        server.set_nonblocking(false).unwrap();
+        let mut consumed = vec![0u8; request.len()];
+        server.read_exact(&mut consumed).unwrap();
+        assert_eq!(consumed, request);
         server.set_nonblocking(true).unwrap();
         let policy = crate::access::CdpAccessOptions::default()
             .compile(address.ip(), address.port())
@@ -3420,7 +3787,7 @@ pub(crate) mod tests {
         super::accept_dispatch(
             server,
             ws_tx,
-            &request,
+            consumed,
             &policy,
             &persona,
             budget,
@@ -3746,6 +4113,7 @@ pub(crate) mod tests {
         };
         let io_abort = super::run_connection_with_io_policy(
             std_stream,
+            Vec::new(),
             context,
             persistence,
             Arc::new(std::sync::Mutex::new(())),
@@ -3967,6 +4335,495 @@ pub(crate) mod tests {
         assert!(matches!(batch.stop, super::AcceptBatchStop::WouldBlock));
         state.observe(&batch);
         assert!(state.should_poll());
+    }
+
+    #[test]
+    fn pending_head_poll_timeout_is_deadline_driven_not_a_fixed_scan_tick() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            super::accept_poll_timeout(false, None, now),
+            super::ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL,
+        );
+        assert_eq!(
+            super::accept_poll_timeout(
+                false,
+                Some(now + std::time::Duration::from_millis(275)),
+                now,
+            ),
+            std::time::Duration::from_millis(275),
+        );
+        assert_eq!(
+            super::accept_poll_timeout(
+                false,
+                Some(now + std::time::Duration::from_secs(10)),
+                now,
+            ),
+            super::ACCEPT_IDLE_SHUTDOWN_POLL_INTERVAL,
+        );
+        assert_eq!(
+            super::accept_poll_timeout(
+                true,
+                Some(now + std::time::Duration::from_secs(10)),
+                now,
+            ),
+            std::time::Duration::ZERO,
+            "only a known undrained listener backlog may bypass blocking poll",
+        );
+    }
+
+    #[test]
+    fn production_pending_head_budget_has_bounded_classification_reserve() {
+        let policy = super::AcceptHeadPolicy::default();
+        assert_eq!(policy.limit, 256);
+        assert_eq!(policy.classification_reserve, 16);
+        assert_eq!(policy.ttl, std::time::Duration::from_secs(10));
+        assert_eq!(
+            policy.classification_grace,
+            std::time::Duration::from_millis(100),
+        );
+        assert_eq!(
+            policy.limit + policy.classification_reserve,
+            272,
+            "accepted-but-incomplete request heads must have a fixed total bound",
+        );
+    }
+
+    #[test]
+    fn pending_deadline_heap_compacts_stale_tail_behind_live_deadline() {
+        let now = std::time::Instant::now();
+        let max_pending = 272;
+        let threshold = max_pending * super::PENDING_DEADLINE_HEAP_COMPACT_MULTIPLIER;
+        let first_live = (now + std::time::Duration::from_secs(10), 7usize);
+        let second_live = (now + std::time::Duration::from_secs(20), 11usize);
+        let mut deadlines = std::collections::BinaryHeap::new();
+        deadlines.push(std::cmp::Reverse(first_live));
+        for token in 0..=threshold {
+            deadlines.push(std::cmp::Reverse((
+                now + std::time::Duration::from_secs(30 + token as u64),
+                1_000 + token,
+            )));
+        }
+        assert_eq!(
+            deadlines.peek().copied(),
+            Some(std::cmp::Reverse(first_live)),
+            "the live early deadline must hide every stale tail entry from root pruning",
+        );
+
+        assert!(super::compact_pending_deadline_heap(
+            &mut deadlines,
+            [first_live, second_live],
+            max_pending,
+        ));
+        assert_eq!(deadlines.len(), 2);
+        assert_eq!(deadlines.pop(), Some(std::cmp::Reverse(first_live)));
+        assert_eq!(deadlines.pop(), Some(std::cmp::Reverse(second_live)));
+
+        let mut below_threshold = std::collections::BinaryHeap::new();
+        below_threshold.push(std::cmp::Reverse(first_live));
+        assert!(!super::compact_pending_deadline_heap(
+            &mut below_threshold,
+            [second_live],
+            max_pending,
+        ));
+        assert_eq!(below_threshold.pop(), Some(std::cmp::Reverse(first_live)));
+    }
+
+    async fn start_pending_head_test_server(
+        accept_head_policy: super::AcceptHeadPolicy,
+    ) -> (
+        std::net::SocketAddr,
+        super::ServerShutdown,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        tokio::sync::mpsc::UnboundedReceiver<std::time::Duration>,
+        tokio::sync::mpsc::UnboundedReceiver<usize>,
+    ) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let shutdown = super::ServerShutdown::new();
+        let server_shutdown = shutdown.clone();
+        let (poll_tx, poll_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (count_tx, count_rx) = tokio::sync::mpsc::unbounded_channel();
+        let policy = super::ConnectionIoPolicy {
+            accept_head_policy: Some(accept_head_policy),
+            accept_poll_tx: Some(poll_tx),
+            pending_head_count_tx: Some(count_tx),
+            ..Default::default()
+        };
+        let server = tokio::task::spawn_local(async move {
+            super::start_with_serve_options_access_limit_and_shutdown(
+                address.port(),
+                "127.0.0.1",
+                None,
+                false,
+                None,
+                true,
+                2,
+                crate::access::CdpAccessOptions::default(),
+                obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
+                server_shutdown,
+                false,
+                policy,
+            )
+            .await
+        });
+        (address, shutdown, server, poll_rx, count_rx)
+    }
+
+    async fn wait_for_pending_head_count(
+        counts: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+        expected: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match counts.recv().await {
+                    Some(observed) if observed == expected => break,
+                    Some(_) => {}
+                    None => panic!("pending-head observer closed before {expected}"),
+                }
+            }
+        })
+        .await
+        .expect("pending-head count did not converge");
+    }
+
+    fn version_request(port: u16) -> Vec<u8> {
+        format!(
+            "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 126, "test frame must use the short length form");
+        let mask = [0x13, 0x57, 0x9b, 0xdf];
+        let mut frame = Vec::with_capacity(2 + mask.len() + payload.len());
+        frame.push(0x81);
+        frame.push(0x80 | payload.len() as u8);
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        frame
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_request_heads_are_event_driven_lossless_and_bounded() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let policy = super::AcceptHeadPolicy {
+                    limit: 8,
+                    ttl: std::time::Duration::from_millis(400),
+                    classification_reserve: 2,
+                    classification_grace: std::time::Duration::from_millis(100),
+                };
+                let (address, shutdown, server, mut polls, mut counts) =
+                    start_pending_head_test_server(policy).await;
+
+                let request = version_request(address.port());
+                let split = request.len() / 2;
+                let mut partial = connect_tcp_with_retry(address).await;
+                partial.write_all(&request[..split]).await.unwrap();
+                wait_for_pending_head_count(&mut counts, 1).await;
+
+                // Once the listener edge is drained, the reactor must request
+                // a deadline-sized sleep rather than a 1ms scan tick.
+                let long_poll = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    async {
+                        loop {
+                            let timeout = polls.recv().await.expect("poll observer closed");
+                            if timeout >= std::time::Duration::from_millis(100) {
+                                break timeout;
+                            }
+                        }
+                    },
+                )
+                .await
+                .expect("reactor never entered a deadline-driven poll");
+                assert!(long_poll >= std::time::Duration::from_millis(100));
+                let mut byte = [0u8; 1];
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(25),
+                        partial.read(&mut byte),
+                    )
+                    .await
+                    .is_err(),
+                    "partial request was classified before its terminating blank line",
+                );
+                partial.write_all(&request[split..]).await.unwrap();
+                let mut response = Vec::new();
+                partial.read_to_end(&mut response).await.unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                assert!(response
+                    .windows(b"Protocol-Version".len())
+                    .any(|window| window == b"Protocol-Version"));
+                wait_for_pending_head_count(&mut counts, 0).await;
+
+                let mut oversized = connect_tcp_with_retry(address).await;
+                oversized
+                    .write_all(&vec![b'A'; super::HTTP_PEEK_BUF])
+                    .await
+                    .unwrap();
+                wait_for_pending_head_count(&mut counts, 1).await;
+                let oversized_response = read_complete_http_response(oversized).await;
+                assert_eq!(
+                    oversized_response,
+                    crate::access::AccessFailure::request_header_fields_too_large()
+                        .response(),
+                );
+                wait_for_pending_head_count(&mut counts, 0).await;
+
+                let mut closed = connect_tcp_with_retry(address).await;
+                closed.write_all(b"GET /json/ver").await.unwrap();
+                wait_for_pending_head_count(&mut counts, 1).await;
+                socket2::SockRef::from(&closed)
+                    .set_linger(Some(std::time::Duration::ZERO))
+                    .unwrap();
+                drop(closed);
+                wait_for_pending_head_count(&mut counts, 0).await;
+
+                shutdown.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                    .await
+                    .expect("event-driven pending-head server did not stop")
+                    .expect("server task")
+                    .expect("server shutdown");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_head_capacity_reserve_preserves_http_and_websocket_fairness() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let policy = super::AcceptHeadPolicy {
+                    limit: 2,
+                    ttl: std::time::Duration::from_secs(10),
+                    classification_reserve: 2,
+                    classification_grace: std::time::Duration::from_millis(150),
+                };
+                let (address, shutdown, server, _polls, mut counts) =
+                    start_pending_head_test_server(policy).await;
+
+                let mut first = connect_tcp_with_retry(address).await;
+                wait_for_pending_head_count(&mut counts, 1).await;
+                let mut second = connect_tcp_with_retry(address).await;
+                wait_for_pending_head_count(&mut counts, 2).await;
+
+                let overflow = connect_tcp_with_retry(address).await;
+                wait_for_pending_head_count(&mut counts, 3).await;
+                assert_eq!(
+                    read_complete_http_response(overflow).await,
+                    super::PENDING_HEAD_LIMIT_RESPONSE.as_bytes(),
+                    "the first socket above the base cap must reach a finite observable terminal state",
+                );
+                wait_for_pending_head_count(&mut counts, 2).await;
+
+                // A complete discovery request uses the short classification
+                // reserve and is served even though both base slots are silent.
+                let mut http = connect_tcp_with_retry(address).await;
+                http.write_all(&version_request(address.port())).await.unwrap();
+                let http_response = read_complete_http_response(http).await;
+                assert!(http_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+                // The same property holds for a real tungstenite handshake and
+                // CDP command, proving prefix replay reaches production WS I/O.
+                let (mut websocket, _) = tokio_tungstenite::connect_async(
+                    format!("ws://{address}/devtools/browser"),
+                )
+                .await
+                .expect("complete WebSocket head starved behind silent clients");
+                assert!(websocket_command(
+                    &mut websocket,
+                    1,
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                )
+                .await["result"]
+                    .is_object());
+
+                // Fill both reserve slots, then prove the fixed total bound and
+                // complete immediate 503 for the next incomplete socket.
+                while counts.try_recv().is_ok() {}
+                let reserve_one = connect_tcp_with_retry(address).await;
+                wait_for_pending_head_count(&mut counts, 3).await;
+                let reserve_two = connect_tcp_with_retry(address).await;
+                wait_for_pending_head_count(&mut counts, 4).await;
+                let hard_overflow = connect_tcp_with_retry(address).await;
+                let hard_response = read_complete_http_response(hard_overflow).await;
+                assert_eq!(hard_response, super::PENDING_HEAD_LIMIT_RESPONSE.as_bytes());
+                assert_eq!(
+                    read_complete_http_response(reserve_one).await,
+                    super::PENDING_HEAD_LIMIT_RESPONSE.as_bytes(),
+                );
+                assert_eq!(
+                    read_complete_http_response(reserve_two).await,
+                    super::PENDING_HEAD_LIMIT_RESPONSE.as_bytes(),
+                );
+
+                websocket.close(None).await.unwrap();
+                shutdown.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                    .await
+                    .expect("pending-head shutdown waited for TTL")
+                    .expect("server task")
+                    .expect("server shutdown");
+
+                let mut bytes = Vec::new();
+                first.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.is_empty(), "fully silent client received invented HTTP bytes");
+                bytes.clear();
+                second.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.is_empty(), "fully silent client received invented HTTP bytes");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipelined_websocket_prefix_preserves_first_masked_cdp_frame() {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let policy = super::AcceptHeadPolicy {
+                    limit: 4,
+                    ttl: std::time::Duration::from_secs(2),
+                    classification_reserve: 1,
+                    classification_grace: std::time::Duration::from_millis(100),
+                };
+                let (address, shutdown, server, _polls, _counts) =
+                    start_pending_head_test_server(policy).await;
+                let command = json!({
+                    "id": 91,
+                    "method": "Browser.getVersion",
+                    "params": {},
+                })
+                .to_string();
+                let mut outbound = websocket_upgrade_request(address.port());
+                outbound.extend_from_slice(&masked_text_frame(command.as_bytes()));
+
+                let mut client = connect_tcp_with_retry(address).await;
+                client.writable().await.unwrap();
+                assert_eq!(
+                    client.try_write(&outbound).unwrap(),
+                    outbound.len(),
+                    "upgrade head and first masked frame must use one TCP write",
+                );
+
+                let mut received = Vec::new();
+                let response_end = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    async {
+                        loop {
+                            if let Some(position) = received
+                                .windows(4)
+                                .position(|window| window == b"\r\n\r\n")
+                            {
+                                break position + 4;
+                            }
+                            let mut chunk = [0u8; 1024];
+                            let read = client.read(&mut chunk).await.unwrap();
+                            assert!(read > 0, "server closed before WebSocket upgrade response");
+                            received.extend_from_slice(&chunk[..read]);
+                        }
+                    },
+                )
+                .await
+                .expect("WebSocket upgrade response timed out");
+                let websocket_bytes = received.split_off(response_end);
+                assert!(received.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+
+                let mut websocket = tokio_tungstenite::WebSocketStream::from_partially_read(
+                    client,
+                    websocket_bytes,
+                    tokio_tungstenite::tungstenite::protocol::Role::Client,
+                    None,
+                )
+                .await;
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    async {
+                        loop {
+                            let message = websocket
+                                .next()
+                                .await
+                                .expect("WebSocket closed before pipelined command response")
+                                .expect("read pipelined command response");
+                            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                                let response: serde_json::Value =
+                                    serde_json::from_str(&text).unwrap();
+                                if response["id"] == 91 {
+                                    break response;
+                                }
+                            }
+                        }
+                    },
+                )
+                .await
+                .expect("pipelined Browser.getVersion response timed out");
+                assert!(response["result"].is_object(), "unexpected response: {response}");
+
+                websocket.close(None).await.unwrap();
+                shutdown.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                    .await
+                    .expect("pipelined-prefix server did not stop")
+                    .expect("server task")
+                    .expect("server shutdown");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_head_ttl_returns_408_for_partial_and_closes_silent() {
+        use tokio::io::AsyncWriteExt as _;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let policy = super::AcceptHeadPolicy {
+                    limit: 4,
+                    ttl: std::time::Duration::from_millis(80),
+                    classification_reserve: 1,
+                    classification_grace: std::time::Duration::from_millis(40),
+                };
+                let (address, shutdown, server, _polls, mut counts) =
+                    start_pending_head_test_server(policy).await;
+
+                let mut partial = connect_tcp_with_retry(address).await;
+                partial.write_all(b"GET /json/ver").await.unwrap();
+                wait_for_pending_head_count(&mut counts, 1).await;
+                assert_eq!(
+                    read_complete_http_response(partial).await,
+                    super::PENDING_HEAD_TIMEOUT_RESPONSE.as_bytes(),
+                );
+                wait_for_pending_head_count(&mut counts, 0).await;
+
+                let silent = connect_tcp_with_retry(address).await;
+                wait_for_pending_head_count(&mut counts, 1).await;
+                assert!(read_complete_http_response(silent).await.is_empty());
+                wait_for_pending_head_count(&mut counts, 0).await;
+
+                shutdown.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                    .await
+                    .expect("TTL server did not stop")
+                    .expect("server task")
+                    .expect("server shutdown");
+            })
+            .await;
     }
 
     fn request_pause(resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>) -> InterceptedPause {
