@@ -322,6 +322,10 @@ Astra light 首审为 0 blocker、6 major、2 minor，推动修复缺失导入�
 依赖：OB-001、OB-025。入口：CLI/runtime 的配置、初始化、信号与清理代码。
 完成：网络/存储/persona/预算在首个页面和首个请求前生效；审计 V8、TZ、日志等进程级初始化的一次性与冲突行为；就绪、错误、退出码、信号与资源回收有结构化契约；不引入业务状态机。
 
+进展（2026-09-22，V8 进程级启动契约，实施 `9a8b6dfd2c0abd12b18aae642f31bf3c39b620c6`）：`obscura-js` 新增严格 `try_set_v8_flags`，首个非空 trimmed flags 在同一进程级 mutex 内完成 V8 应用；完全相同的重复值幂等，冲突值、首个 runtime 已开始后的 late 值、未完成应用和 poisoned state 均结构化失败，不再静默把未生效配置当作成功。runtime construction 用同一 mutex 取得 platform claim，关闭 check/apply/initialize 竞态；poison 时 runtime fail closed。旧 `set_v8_flags` 保留为 warning-only 源兼容 wrapper，产品入口均使用严格 API。
+
+CLI 在任何 Page/V8 前严格应用 effective defaults + user flags；`scrape` 把同一 effective string 通过保留的内部 `OBSCURA_V8_FLAGS` 传给每个 worker，worker 缺失或空值在 Page 创建前以 exit 2 拒绝。真实本地 fixture 以 `--expose-gc` 经 `obscura scrape -> obscura-worker -> first Page` 验证 `typeof gc == "function"`，并给全部子进程回归设置总期限、超时 kill/reap。聚焦 V8 **9/9**（run `9fff3bf6-165b-460c-93aa-1045d4de203f`），worker/父子启动 **3/3**（run `b1b2e340-607a-4792-810f-5468257861e7`），no-render CLI 最终 **91/91**（run `31cba9d4-7e1f-4db5-98b3-bcd8bc79f7bc`），release/render 全工作区 **2356/2356**、4 skipped（run `ef84fb3d-08a2-409d-93cc-e793a4503a51`）。两种 exact CLI build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33**、官方 Playwright Python 1.60.0 smoke 与完整 **37-method** profile 通过。完整 Cargo/obstacle 原始日志在 `/private/tmp/ob005-v8-gates.fl7dAO/`，最终 Playwright 原始目录为 `/private/tmp/ob005-v8-playwright-final.aGypms/`；配置错误、fixture 错误、既有 MCP loopback 失败、精确重放和旧 binary 误复用证据均保留，不冒充通过或修复。Sol high 审计推动真实 runtime 竞态与端到端可观察测试；Astra light 终审 0 blocker、0 major、0 minor。该切片只收口 V8 flags 的一次性、冲突、父子传播和启动前生效；网络/存储/预算顺序、TZ、日志、ready/error、信号与完整资源回收契约仍待逐项资格，OB-005 保持未关闭。
+
 ### OB-008 · P0 · 最小 Unblocked 开发工程
 
 状态：未关闭。固定 fixture、首批记录/差分、结果清单和独立依赖锁已由 `741f40a`、`fc65daa` 分步交付；跨平台执行与后续资格入口仍未完成。

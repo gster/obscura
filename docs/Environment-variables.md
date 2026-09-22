@@ -185,13 +185,17 @@ OPENSSL_NO_VENDOR=1 cargo build --release --features render
 
 ## V8
 
-V8 flags are passed via `--v8-flags`, not environment variables:
+User V8 flags are passed via `--v8-flags`, not environment variables:
 
 ```bash
 obscura serve --v8-flags "--max-old-space-size=2048 --expose-gc"
 ```
 
 Defaults are `--max-old-space-size=4096 --max-semi-space-size=4 --optimize-for-size` on 64-bit systems (a 4 GB old-space ceiling, a capped young generation, and codegen tuned for a smaller footprint to cut RSS). Anything you pass with `--v8-flags` is appended after these, and V8 uses the last value for a repeated flag, so your value wins for that flag while the other defaults stay in effect.
+
+`OBSCURA_V8_FLAGS` is reserved for the internal `obscura scrape` parent-to-`obscura-worker` startup protocol. It carries the already-computed effective flag string so every worker configures V8 before its first Page. It is not a user configuration surface; invoke `obscura` with `--v8-flags` instead. A directly launched worker rejects a missing or whitespace-only value with exit code 2.
+
+Within one process, the first non-empty trimmed flag string is authoritative. Repeating that exact string is idempotent. A different string, a first configuration after runtime construction starts, or a poisoned/incomplete application is an explicit startup error; product entry points do not silently continue with unknown V8 state.
 
 ## HTTP proxy environment
 

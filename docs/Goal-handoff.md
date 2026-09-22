@@ -5,12 +5,18 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`195be5537f8da41f7c0235318b6090e57eef4b19`，`Qualify bounded contenteditable text input`。
+- 最近完成的实现提交：`9a8b6dfd2c0abd12b18aae642f31bf3c39b620c6`，`Make V8 startup flags fail closed`。
 - 发布核对要求：`HEAD`、本地 `main`、`origin/main` 与远端 `refs/heads/main` 必须对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 最新切片入口是 [`runtime.rs`](../crates/obscura-js/src/runtime.rs) 的 native contenteditable dispatch、[`bootstrap.js`](../crates/obscura-js/js/bootstrap.js) 的受保护 edit/mutation handoff，以及 [`native_keyboard_smoke.py`](../tools/unblocked/native_keyboard_smoke.py) 的 Chrome/Obscura 成对资格工具。
+- 最新切片入口是 [`v8_flags.rs`](../crates/obscura-js/src/v8_flags.rs) 的 process-wide flag state、[`runtime.rs`](../crates/obscura-js/src/runtime.rs) 的 platform claim、[`main.rs`](../crates/obscura-cli/src/main.rs) 与 [`worker.rs`](../crates/obscura-cli/src/worker.rs) 的父子启动传播，以及 [`v8_startup.rs`](../crates/obscura-cli/tests/v8_startup.rs) 的产品路径回归。
 
 ## 最近完成的阶段
+
+OB-005 的 V8 启动子切片已完成。严格 `try_set_v8_flags` 与首个 runtime construction 共用一个 process mutex：首个非空 trimmed 值应用后，同值重复幂等；冲突、首次 late、未完成应用和 poison 都 fail closed，poison 也阻止 runtime 启动。旧 `set_v8_flags` 只保留 warning-only 源兼容。CLI 在 Page/V8 前应用 effective flags；scrape 通过保留的内部 `OBSCURA_V8_FLAGS` 传给每个 worker，缺失/空值在 Page 前 exit 2。真实本地 fixture 以 `--expose-gc` 验证父进程、worker 和首个 Page 的完整路径。
+
+实现提交 `9a8b6dfd2c0abd12b18aae642f31bf3c39b620c6`。聚焦 V8 **9/9**（run `9fff3bf6-165b-460c-93aa-1045d4de203f`），启动集成 **3/3**（run `b1b2e340-607a-4792-810f-5468257861e7`），no-render CLI 最终 **91/91**（run `31cba9d4-7e1f-4db5-98b3-bcd8bc79f7bc`），release/render 全工作区 **2356/2356**、4 skipped（run `ef84fb3d-08a2-409d-93cc-e793a4503a51`）。最终 no-render binary `0.1.0-dev+9a8b6df` SHA-256 `ba9bed2dae9da6886798a0a88750925dd0da98f0244f0f876585bf4737bf2111`，78973920 bytes；render SHA-256 `484b6b3d678591e0560496f957249d18ee63a382bcee030b9fee7a704c485e8a`，120801888 bytes。固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 为 33/33；最终 render binary 通过 Playwright Python 1.60.0 smoke 与 37-method profile，原始目录 `/private/tmp/ob005-v8-playwright-final.aGypms/`。完整 Cargo/obstacle 记录在 `/private/tmp/ob005-v8-gates.fl7dAO/`，包括端到端 fixture 首轮失败、两个既有 MCP loopback 全量失败及精确重放、漏 persona 的 obstacle 0/33、以及 Cargo 误复用旧版本 binary 的 superseded 证据；均保留且不称为产品修复。Sol high 审计和 Astra light 终审已完成，最终 0 blocker、0 major、0 minor。
+
+OB-005 整体仍未关闭。下一步不能把这一 V8 子切片外推为完整启动合同；网络/存储/persona/预算顺序、TZ、日志、ready/error、信号和完整资源回收仍需分别审计与资格。另一个已定位、可独立推进的真实缺口是 network-idle 的 truthfulness：`obscura-browser` 在 deadline 后仍可能把 NetworkIdle 标为成功，CDP 也会把 Load/DOMContentLoaded 投影成 `networkIdle`；进入该复杂切片前先做 Chrome 对照和共享 outcome 设计。
 
 OB-021 contenteditable 有界文本输入切片完成 `Input.insertText` 与带 text 的 `Input.dispatchKeyEvent`：只在 focused editing host 内、同一 Text 节点 range 上执行；保留嵌套 inline DOM，发送带 StaticRange 的 trusted/cancelable `beforeinput` 与 mutation 后 trusted `input`。覆盖取消、append-only handler reentry、false island beforeinput-only、focus transfer，以及 direct single-Text span 全选时删除 wrapper、合并左右 Text 并折叠 caret。跨节点 selection、未满足上述条件的空字符串整节点结构删除，以及 Backspace/Delete/Enter 明确 unsupported；paragraph split、IME/composition 和 grapheme/word editing 保持未资格化。
 

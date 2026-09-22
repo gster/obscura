@@ -115,7 +115,7 @@ Run a JS expression across many URLs in parallel.
 -v, --verbose                Enable verbose logging
 ```
 
-`--proxy` and `--allow-private-network` are global flags: they work before or after any subcommand, and each `scrape` worker inherits them.
+`--proxy`, `--allow-private-network`, and `--v8-flags` are global flags: they work before or after any subcommand, and each `scrape` worker inherits the same effective values. V8 flags are applied in each worker before its first Page is created.
 
 Read URLs from stdin with `-`:
 
