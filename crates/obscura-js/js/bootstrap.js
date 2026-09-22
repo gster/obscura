@@ -9773,6 +9773,7 @@ Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
 });
 
 globalThis.__mutationObservers = [];
+const _mutationArraySplice = Function.call.bind(Array.prototype.splice);
 globalThis.MutationObserver = class MutationObserver {
   constructor(callback) {
     this._callback = callback;
@@ -9780,13 +9781,45 @@ globalThis.MutationObserver = class MutationObserver {
     this._records = [];
   }
   observe(target, options) {
-    this._targets.push({ target, options: options || {} });
-    globalThis.__mutationObservers.push(this);
+    const source = options || {};
+    const normalized = {
+      childList: !!source.childList,
+      attributes: source.attributes,
+      characterData: source.characterData,
+      subtree: !!source.subtree,
+      attributeOldValue: !!source.attributeOldValue,
+      characterDataOldValue: !!source.characterDataOldValue,
+      attributeFilter: source.attributeFilter,
+    };
+    if (normalized.attributes === undefined) {
+      normalized.attributes = normalized.attributeOldValue || normalized.attributeFilter !== undefined;
+    } else normalized.attributes = !!normalized.attributes;
+    if (normalized.characterData === undefined) {
+      normalized.characterData = normalized.characterDataOldValue;
+    } else normalized.characterData = !!normalized.characterData;
+    const registration = { target, options: normalized };
+    let replaced = false;
+    for (let i = 0; i < this._targets.length; i++) {
+      if (this._targets[i].target === target) {
+        this._targets[i] = registration;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) this._targets[this._targets.length] = registration;
+    const observers = globalThis.__mutationObservers;
+    for (let i = 0; i < observers.length; i++) {
+      if (observers[i] === this) return;
+    }
+    observers[observers.length] = this;
   }
   disconnect() {
     this._targets = [];
-    const idx = globalThis.__mutationObservers.indexOf(this);
-    if (idx >= 0) globalThis.__mutationObservers.splice(idx, 1);
+    this._records = [];
+    const observers = globalThis.__mutationObservers;
+    for (let i = observers.length - 1; i >= 0; i--) {
+      if (observers[i] === this) _mutationArraySplice(observers, i, 1);
+    }
   }
   takeRecords() {
     const r = this._records.slice();
@@ -18739,15 +18772,118 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   const NativeFocusEvent = FocusEvent;
   const NativeInputEvent = InputEvent;
   const NativeKeyboardEvent = KeyboardEvent;
+  const NativeRange = Range;
+  const NativeStaticRange = StaticRange;
   const NativeEvent = Event;
   const NativeSubmitEvent = SubmitEvent;
   const NativePopStateEvent = PopStateEvent, NativeHashChangeEvent = HashChangeEvent;
   const NativePageTransitionEvent = PageTransitionEvent;
   const NativeNumber = Number;
   const nativeDocumentQuerySelector = Document.prototype.querySelector;
+  const nativeCreate = Object.create;
+  const nativeCharacterData = Object.getOwnPropertyDescriptor(CharacterData.prototype, 'data');
+  const nativeCharacterDataGetter = nativeCharacterData.get;
+  const nativeSelectionSetRange = Selection.prototype._setRange;
+  const nativeStringSlice = String.prototype.slice;
+  const nativeStringToLowerCase = String.prototype.toLowerCase;
   const enqueueMicrotask = queueMicrotask;
   const resolveInline = Element.prototype._resolveInlineHandler;
   const listeners = new WeakMap();
+  const nativeMutationObservers = globalThis.__mutationObservers;
+  const nativeMutationScheduled = new WeakSet();
+  const nativeMutationScheduledHas = Function.call.bind(WeakSet.prototype.has, nativeMutationScheduled);
+  const nativeMutationScheduledAdd = Function.call.bind(WeakSet.prototype.add, nativeMutationScheduled);
+  const nativeMutationScheduledDelete = Function.call.bind(WeakSet.prototype.delete, nativeMutationScheduled);
+  const nativeSetDelete = Function.call.bind(Set.prototype.delete);
+
+  function nativeMutation(type, target, added, removed, oldValue = null,
+      previousSibling = null, nextSibling = null) {
+    const targetNode=_wrap(target);
+    if (!targetNode) return;
+    const wrapNodes = ids => {
+      const result=[];
+      for (const id of ids || []) { const node=_wrap(id); if (node) result[result.length]=node; }
+      return result;
+    };
+    const addedNodes=wrapNodes(added), removedNodes=wrapNodes(removed);
+    const ancestorPath=_domParse('ancestor_path',target) || [];
+    const processed=[];
+    for (const observer of slice(nativeMutationObservers)) {
+      let duplicate=false;
+      for (const prior of processed) {
+        if (prior === observer) { duplicate=true; break; }
+      }
+      if (duplicate) continue;
+      processed[processed.length]=observer;
+      let matched=false, includeOldValue=false;
+      for (const watched of slice(observer._targets || [])) {
+        const options=watched.options || {};
+        const wantsType=(type === 'attributes' && options.attributes)
+          || (type === 'characterData' && options.characterData)
+          || (type === 'childList' && options.childList);
+        if (!wantsType) continue;
+        const rootId=watched.target?._nid;
+        let matchesRegistration=false;
+        if (rootId !== undefined && rootId !== null) {
+          if (rootId === target) matchesRegistration=true;
+          else if (options.subtree) {
+            for (const ancestor of ancestorPath) {
+              if (ancestor === rootId) { matchesRegistration=true; break; }
+            }
+          }
+        }
+        if (!matchesRegistration) continue;
+        matched=true;
+        if ((type === 'characterData' && options.characterDataOldValue)
+            || (type === 'attributes' && options.attributeOldValue)) includeOldValue=true;
+      }
+      if (!matched || !observer._records) continue;
+      const record={type,target:targetNode,addedNodes,removedNodes,
+        attributeName:null,oldValue:includeOldValue?oldValue:null,
+        attributeNamespace:null,
+        previousSibling:_wrap(previousSibling),nextSibling:_wrap(nextSibling)};
+      observer._records[observer._records.length]=record;
+      if (nativeMutationScheduledHas(observer)) continue;
+      nativeMutationScheduledAdd(observer);
+      enqueueMicrotask(() => {
+        nativeMutationScheduledDelete(observer);
+        const records=splice(observer._records,0,observer._records.length);
+        if (!records.length) return;
+        try { apply(observer._callback,observer,[records,observer]); }
+        catch (_error) {}
+      });
+    }
+  }
+  function nativeSetCharacterData(node, value, oldValue) {
+    _dom('set_text_content',node._nid,value);
+    nativeMutation('characterData',node._nid,[],[],oldValue);
+  }
+  function nativeRemoveQualifiedChild(parent, child) {
+    const removedId=_domParse('get_attribute',child._nid,'id');
+    const previousSibling=_domParse('prev_sibling',child._nid);
+    const nextSibling=_domParse('next_sibling',child._nid);
+    if (_dom('remove_child',child._nid) !== 'true') return false;
+    nativeMutation('childList',parent._nid,[],[child._nid],null,
+      previousSibling,nextSibling);
+    if (removedId && _domSetHas(_windowNamedPropertyNames,removedId)) {
+      const candidates=_domParse('query_selector_all',
+        '[id],embed[name],form[name],iframe[name],img[name],object[name]') || [];
+      let present=false;
+      for (const id of candidates) {
+        if (_domParse('get_attribute',id,'id') === removedId) { present=true; break; }
+        const name=apply(nativeStringToLowerCase,_domString(_domParse('node_name',id)),[]);
+        if ((name === 'embed' || name === 'form' || name === 'iframe'
+            || name === 'img' || name === 'object')
+            && _domParse('get_attribute',id,'name') === removedId) { present=true; break; }
+      }
+      if (!present) {
+        try { delete globalThis[removedId]; }
+        catch (_error) {}
+        nativeSetDelete(_windowNamedPropertyNames,removedId);
+      }
+    }
+    return true;
+  }
 
   function remove(record) {
     if (record.removed) return;
@@ -19316,6 +19452,112 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       altKey:!!(modifiers&1),ctrlKey:!!(modifiers&2),metaKey:!!(modifiers&4),shiftKey:!!(modifiers&8)},NativeKeyboardEvent);
   }});
   define(globalThis,'__obscura_native_text_handoff',{configurable:true,value(kind,nodes,value) {
+    if (kind === 21 || kind === 22) {
+      const focused = nodes[0];
+      if (focused === undefined || _domParse('focus_state')?.[0] !== focused) return 0;
+      const selection = _selectionFor(globalThis.document);
+      const context = node => {
+        let id = node?._nid;
+        let blocked = false;
+        let depth = 0;
+        while (id !== null && id !== undefined && id >= 0 && depth++ < 512) {
+          if (_domParse('node_type',id) === 1) {
+            const raw = _domParse('get_attribute',id,'contenteditable');
+            if (raw !== null) {
+              const keyword = apply(nativeStringToLowerCase,_domString(raw),[]);
+              if (keyword === 'false') blocked = true;
+              if (keyword === '' || keyword === 'true' || keyword === 'plaintext-only') {
+                return {host:id,blocked};
+              }
+            }
+          }
+          id = _domParse('parent_node',id);
+        }
+        return null;
+      };
+      const focusedContext = context(_wrap(focused));
+      if (!focusedContext || focusedContext.blocked || focusedContext.host !== focused) return 0;
+      const range = selection?._range;
+      if (!range) return -1;
+      const startContext = context(range._sc);
+      const endContext = context(range._ec);
+      if (!startContext || !endContext || startContext.host !== endContext.host) return -1;
+      if (startContext.host !== focused) return -1;
+      const blocked = startContext.blocked || endContext.blocked;
+      if (kind === 22) return -1;
+      if (!blocked && (range._sc !== range._ec
+          || _domParse('node_type',range._sc?._nid) !== 3)) return -1;
+      const start = range._so, end = range._eo;
+      const current = apply(nativeCharacterDataGetter,range._sc,[]);
+      if (start > end || end > current.length) return -1;
+      const host = startContext.host;
+      const emptyWrapper = (textNode, rangeStart, rangeEnd, text) => {
+        const textId=textNode._nid;
+        const parentId=_domParse('parent_node',textId);
+        if (value !== '' || rangeStart !== 0 || rangeEnd !== text.length || parentId === host) return null;
+        const children=_domParse('child_nodes',parentId) || [];
+        const grandId=_domParse('parent_node',parentId);
+        const previousId=_domParse('prev_sibling',parentId);
+        const nextId=_domParse('next_sibling',parentId);
+        const parentName=apply(nativeStringToLowerCase,_domString(_domParse('node_name',parentId)),[]);
+        if (parentName !== 'span' || grandId !== host || children.length !== 1
+            || children[0] !== textId || _domParse('node_type',previousId) !== 3
+            || _domParse('node_type',nextId) !== 3) return false;
+        return {parentId,previousId,nextId};
+      };
+      if (emptyWrapper(range._sc,start,end,current) === false) return -1;
+      const targetRange = nativeCreate(NativeStaticRange.prototype);
+      targetRange._sc=range._sc; targetRange._so=start;
+      targetRange._ec=range._ec; targetRange._eo=end;
+      const path = pathFor(host);
+      if (!path.length) return 1;
+      const allowed = dispatch('beforeinput',path,{bubbles:true,cancelable:true,composed:true,
+        data:value,inputType:'insertText',isComposing:false,dataTransfer:null,
+        getTargetRanges(){return [targetRange]}},NativeInputEvent);
+      if (!allowed || blocked) return 1;
+
+      // A handler can alter DOM and Selection synchronously. Re-read both and
+      // edit only another same-Text-node range in the original editing host.
+      if (_domParse('focus_state')?.[0] !== focused) return 1;
+      const nextRange = selection._range;
+      if (!nextRange) return 1;
+      const nextStartContext = context(nextRange._sc);
+      const nextEndContext = context(nextRange._ec);
+      if (!nextStartContext || !nextEndContext
+          || nextStartContext.host !== host || nextEndContext.host !== host
+          || nextStartContext.blocked || nextEndContext.blocked
+          || nextRange._sc !== nextRange._ec
+          || _domParse('node_type',nextRange._sc?._nid) !== 3) return 1;
+      const nextStart = nextRange._so, nextEnd = nextRange._eo;
+      const nextCurrent = apply(nativeCharacterDataGetter,nextRange._sc,[]);
+      if (nextStart > nextEnd || nextEnd > nextCurrent.length) return 1;
+      let caretNode=nextRange._sc, caret=nextStart+value.length;
+      const removeEmptyWrapper=emptyWrapper(nextRange._sc,nextStart,nextEnd,nextCurrent);
+      if (removeEmptyWrapper === false) return 1;
+      if (removeEmptyWrapper) {
+        const previous=_wrap(removeEmptyWrapper.previousId);
+        const following=_wrap(removeEmptyWrapper.nextId);
+        const previousText=apply(nativeCharacterDataGetter,previous,[]);
+        const followingText=apply(nativeCharacterDataGetter,following,[]);
+        nativeSetCharacterData(previous,previousText+followingText,previousText);
+        const hostNode=_wrap(host);
+        if (!nativeRemoveQualifiedChild(hostNode,_wrap(removeEmptyWrapper.parentId))
+            || !nativeRemoveQualifiedChild(hostNode,following)) return 1;
+        caretNode=previous; caret=previousText.length;
+      } else {
+        const prefix=apply(nativeStringSlice,nextCurrent,[0,nextStart]);
+        const suffix=apply(nativeStringSlice,nextCurrent,[nextEnd]);
+        nativeSetCharacterData(nextRange._sc,prefix+value+suffix,nextCurrent);
+      }
+      const collapsed = new NativeRange();
+      collapsed._sc = caretNode; collapsed._so = caret;
+      collapsed._ec = caretNode; collapsed._eo = caret;
+      apply(nativeSelectionSetRange,selection,[collapsed,'forwards']);
+      dispatch('input',pathFor(host),{bubbles:true,cancelable:false,composed:true,
+        data:value,inputType:'insertText',isComposing:false,dataTransfer:null,
+        getTargetRanges(){return []}},NativeInputEvent);
+      return 1;
+    }
     const path=[];for(const node of nodes) path.push(_wrap(node));
     if (nodes.length && _domParse('node_type',nodes[nodes.length-1]) === 9) path.push(globalThis);
     if (kind === 17) {

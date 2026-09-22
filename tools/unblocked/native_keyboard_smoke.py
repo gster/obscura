@@ -39,6 +39,7 @@ CASES = (
     "poison",
     "reentrancy",
     "maxlength",
+    "contenteditable",
     "ignore-input",
     "protocol-negative",
 )
@@ -50,6 +51,7 @@ HTML = r'''<!doctype html>
 <style>#scrollbox{position:absolute;left:300px;top:20px;width:120px;height:60px;overflow:auto}#scrollpad{height:500px;width:20px}</style>
 <input id="edit" value="abcd"><textarea id="other">new</textarea>
 <input id="ro" value="readonly" readonly><button id="button">button</button>
+<div id="ce" contenteditable="true">ab<span id="ce-span">CD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh</div>
 <div id="scrollbox"><div id="scrollpad"></div></div>
 <script>
 (() => {
@@ -76,6 +78,51 @@ HTML = r'''<!doctype html>
     scrollTop:document.getElementById('scrollbox').scrollTop,
     values:Object.fromEntries(['edit','other','ro'].map(id => { const n=document.getElementById(id);
       return [id,{value:n.value,start:n.selectionStart,end:n.selectionEnd}]; }))});
+  const cePath = node => { const result=[];
+    for (let current=node; current && current.nodeType; current=current.parentNode) {
+      let siblingIndex=0;
+      for (let sibling=current.previousSibling; sibling; sibling=sibling.previousSibling) siblingIndex++;
+      result.push({nodeName:current.nodeName,id:current.id||null,siblingIndex,
+        parentId:current.parentNode&&current.parentNode.id||null,
+        parentHTML:current.parentNode&&current.parentNode.outerHTML||null});
+    }
+    return result;
+  };
+  const ceSelection = () => { const selection=getSelection();
+    const range=selection&&selection.rangeCount?selection.getRangeAt(0):null;
+    return {anchorNode:selection.anchorNode&&selection.anchorNode.nodeName,
+      anchorOffset:selection.anchorOffset,focusNode:selection.focusNode&&selection.focusNode.nodeName,
+      focusOffset:selection.focusOffset,anchorPath:cePath(selection.anchorNode),
+      focusPath:cePath(selection.focusNode),range:range?{
+        startPath:cePath(range.startContainer),startOffset:range.startOffset,
+        endPath:cePath(range.endContainer),endOffset:range.endOffset}:null};
+  };
+  const ceRead = event => ({type:event.type,target:name(event.target),
+    currentTarget:name(event.currentTarget),constructor:event.constructor&&event.constructor.name,
+    isTrusted:event.isTrusted,bubbles:event.bubbles,cancelable:event.cancelable,
+    composed:event.composed,defaultPrevented:event.defaultPrevented,key:event.key,
+    code:event.code,location:event.location,repeat:event.repeat,isComposing:event.isComposing,
+    altKey:event.altKey,ctrlKey:event.ctrlKey,metaKey:event.metaKey,shiftKey:event.shiftKey,
+    keyCode:event.keyCode,charCode:event.charCode,which:event.which,
+    data:event.data===undefined?null:event.data,
+    inputType:event.inputType===undefined?null:event.inputType,
+    targetOuterHTML:event.target&&event.target.outerHTML||null,
+    targetTextContent:event.target&&event.target.textContent,
+    selection:ceSelection(),targetRanges:typeof event.getTargetRanges==='function'
+      ? Array.from(event.getTargetRanges(), range => ({
+          startPath:cePath(range.startContainer),startOffset:range.startOffset,
+          endPath:cePath(range.endContainer),endOffset:range.endOffset})) : null});
+  globalThis.__resetContenteditableProbe = () => { globalThis.__ceEvents=[]; };
+  globalThis.__snapshotContenteditableProbe = () => { const root=document.getElementById('ce');
+    return {outerHTML:root.outerHTML,innerHTML:root.innerHTML,textContent:root.textContent,
+      active:document.activeElement&&document.activeElement.id,events:globalThis.__ceEvents,
+      selection:ceSelection(),controls:Object.fromEntries(['edit','other'].map(id=>{const n=document.getElementById(id);
+        return [id,{value:n.value,start:n.selectionStart,end:n.selectionEnd}]}))};
+  };
+  const ce=document.getElementById('ce');
+  for (const type of ['keydown','keypress','beforeinput','input','keyup'])
+    ce.addEventListener(type,event=>globalThis.__ceEvents.push(ceRead(event)),true);
+  globalThis.__resetContenteditableProbe();
   for (const node of nodes) for (const type of ['keydown','keypress','beforeinput','input','keyup','change','pointermove','pointerdown','mousedown','pointerup','mouseup','click','wheel'])
     node.addEventListener(type, e => globalThis.__keyEvents.push(read(e)), true);
   globalThis.__resetKeyProbe();
@@ -567,6 +614,75 @@ def _maxlength(page: Any) -> dict[str, Any]:
     return records
 
 
+def _prepare_contenteditable(
+    page: Any,
+    *,
+    node: str,
+    start: int,
+    end: int,
+    beforeinput_hook: str | None = None,
+) -> None:
+    page.reload()
+    page.evaluate(
+        """args => {
+          const root=document.getElementById('ce');
+          const text=document.querySelector(args.node).firstChild;
+          root.focus();
+          const range=document.createRange();
+          range.setStart(text,args.start);range.setEnd(text,args.end);
+          const selection=getSelection();selection.removeAllRanges();selection.addRange(range);
+          globalThis.__resetContenteditableProbe();
+          if (args.beforeinputHook) {
+            root.addEventListener('beforeinput',Function('event',args.beforeinputHook),{once:true});
+          }
+        }""",
+        {"node":node,"start":start,"end":end,"beforeinputHook":beforeinput_hook},
+    )
+
+
+def _contenteditable(page: Any) -> dict[str, Any]:
+    records: dict[str, Any] = {}
+
+    _prepare_contenteditable(page,node="#ce-span",start=1,end=1)
+    records["insertText"] = {"action":_dispatch(page,{"text":"X"},"Input.insertText"),
+                               "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+
+    _prepare_contenteditable(page,node="#ce-span",start=0,end=2)
+    records["selectionReplacement"] = {
+        "action":_dispatch(page,{"text":"Y"},"Input.insertText"),
+        "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+
+    _prepare_contenteditable(page,node="#ce-span",start=1,end=1)
+    records["keyText"] = {"action":_dispatch(page,{"type":"keyDown","key":"x","code":"KeyX",
+                                                 "text":"x","unmodifiedText":"x","windowsVirtualKeyCode":88}),
+                           "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+
+    _prepare_contenteditable(page,node="#ce-span",start=1,end=1,
+                             beforeinput_hook="event.preventDefault()")
+    records["cancel"] = {"action":_dispatch(page,{"text":"Q"},"Input.insertText"),
+                          "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+
+    _prepare_contenteditable(page,node="#ce-span",start=1,end=1,
+                             beforeinput_hook="document.getElementById('ce').append('M')")
+    records["domReentry"] = {"action":_dispatch(page,{"text":"Q"},"Input.insertText"),
+                              "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+
+    _prepare_contenteditable(page,node="#ce-island",start=2,end=2)
+    records["falseIsland"] = {"action":_dispatch(page,{"text":"Z"},"Input.insertText"),
+                               "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+
+    _prepare_contenteditable(page,node="#ce-span",start=0,end=2)
+    records["emptySelection"] = {"action":_dispatch(page,{"text":""},"Input.insertText"),
+                                  "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+
+    _prepare_contenteditable(page,node="#ce-span",start=1,end=1)
+    page.evaluate("""() => { const edit=document.getElementById('edit');
+      edit.focus(); edit.setSelectionRange(1,1); globalThis.__resetContenteditableProbe(); }""")
+    records["focusTransfer"] = {"action":_dispatch(page,{"text":"X"},"Input.insertText"),
+                                  "snapshot":page.evaluate("globalThis.__snapshotContenteditableProbe()")}
+    return records
+
+
 def _protocol_negative(page: Any) -> dict[str, Any]:
     cases = [
         ("Input.dispatchKeyEvent", {"type":"keyDown"}),
@@ -728,9 +844,96 @@ def run_case(page: Any, case: str) -> dict[str, Any]:
     if case == "poison": return _poison(page)
     if case == "reentrancy": return _reentrancy(page)
     if case == "maxlength": return _maxlength(page)
+    if case == "contenteditable": return _contenteditable(page)
     if case == "ignore-input": return _ignore_input(page)
     if case == "protocol-negative": return _protocol_negative(page)
     raise ValueError(case)
+
+
+def _contenteditable_path_contract(path: Any) -> list[dict[str, Any]]:
+    projected: list[dict[str, Any]] = []
+    if not isinstance(path, list):
+        return projected
+    for item in path:
+        if not isinstance(item, dict):
+            projected.append({"invalid": repr(item)})
+            break
+        projected.append({key:item.get(key) for key in (
+            "nodeName","id","siblingIndex","parentId",
+        )})
+        if item.get("id") == "ce":
+            break
+    return projected
+
+
+def _contenteditable_selection_contract(selection: Any) -> dict[str, Any] | None:
+    if not isinstance(selection, dict):
+        return None
+    range_value = selection.get("range")
+    range_contract = None
+    if isinstance(range_value, dict):
+        range_contract = {
+            "startPath":_contenteditable_path_contract(range_value.get("startPath")),
+            "startOffset":range_value.get("startOffset"),
+            "endPath":_contenteditable_path_contract(range_value.get("endPath")),
+            "endOffset":range_value.get("endOffset"),
+        }
+    return {
+        "anchorNode":selection.get("anchorNode"),
+        "anchorOffset":selection.get("anchorOffset"),
+        "focusNode":selection.get("focusNode"),
+        "focusOffset":selection.get("focusOffset"),
+        "anchorPath":_contenteditable_path_contract(selection.get("anchorPath")),
+        "focusPath":_contenteditable_path_contract(selection.get("focusPath")),
+        "range":range_contract,
+    }
+
+
+def _contenteditable_event_contract(event: Any) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        return {"invalid":repr(event)}
+    target_ranges = event.get("targetRanges")
+    projected_ranges = None
+    if isinstance(target_ranges, list):
+        projected_ranges = [{
+            "startPath":_contenteditable_path_contract(item.get("startPath")),
+            "startOffset":item.get("startOffset"),
+            "endPath":_contenteditable_path_contract(item.get("endPath")),
+            "endOffset":item.get("endOffset"),
+        } if isinstance(item, dict) else {"invalid":repr(item)} for item in target_ranges]
+    return {
+        key:event.get(key) for key in (
+            "type","target","currentTarget","constructor","isTrusted","bubbles",
+            "cancelable","composed","defaultPrevented","data","inputType","isComposing",
+            "targetOuterHTML","targetTextContent",
+        )
+    } | {
+        "selection":_contenteditable_selection_contract(event.get("selection")),
+        "targetRanges":projected_ranges,
+    }
+
+
+def _contenteditable_snapshot_contract(snapshot: Any) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    return {
+        "outerHTML":snapshot.get("outerHTML"),
+        "innerHTML":snapshot.get("innerHTML"),
+        "textContent":snapshot.get("textContent"),
+        "active":snapshot.get("active"),
+        "controls":snapshot.get("controls"),
+        "events":[_contenteditable_event_contract(event) for event in snapshot.get("events", [])],
+        "selection":_contenteditable_selection_contract(snapshot.get("selection")),
+    }
+
+
+def _contenteditable_selection_point(selection: Any) -> tuple[Any, Any, Any, Any]:
+    contract = _contenteditable_selection_contract(selection) or {}
+    anchor_path = contract.get("anchorPath") or []
+    focus_path = contract.get("focusPath") or []
+    anchor_parent = anchor_path[0].get("parentId") if anchor_path else None
+    focus_parent = focus_path[0].get("parentId") if focus_path else None
+    return (anchor_parent,contract.get("anchorOffset"),focus_parent,contract.get("focusOffset"))
 
 
 def assert_contract(case: str, observation: dict[str, Any], *, label: str) -> None:
@@ -936,6 +1139,132 @@ def assert_contract(case: str, observation: dict[str, Any], *, label: str) -> No
             ]
             if actual != expected:
                 raise AssertionError(f"{label}: maxlength {name} event states differ: {actual!r}")
+    elif case == "contenteditable":
+        expected = {
+            "insertText": {
+                "html":"ab<span id=\"ce-span\">CXD</span>ef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> gh",
+                "text":"abCXDef LOCK gh","events":["beforeinput","input"],
+                "initial":("ce-span",1,1),"final":("ce-span",2,2),"data":"X",
+            },
+            "selectionReplacement": {
+                "html":"ab<span id=\"ce-span\">Y</span>ef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> gh",
+                "text":"abYef LOCK gh","events":["beforeinput","input"],
+                "initial":("ce-span",0,2),"final":("ce-span",1,1),"data":"Y",
+            },
+            "keyText": {
+                "html":"ab<span id=\"ce-span\">CxD</span>ef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> gh",
+                "text":"abCxDef LOCK gh","events":["keydown","keypress","beforeinput","input"],
+                "initial":("ce-span",1,1),"final":("ce-span",2,2),"data":"x",
+            },
+            "cancel": {
+                "html":"ab<span id=\"ce-span\">CD</span>ef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> gh",
+                "text":"abCDef LOCK gh","events":["beforeinput"],
+                "initial":("ce-span",1,1),"final":("ce-span",1,1),"data":"Q",
+            },
+            "domReentry": {
+                "html":"ab<span id=\"ce-span\">CQD</span>ef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> ghM",
+                "text":"abCQDef LOCK ghM","events":["beforeinput","input"],
+                "initial":("ce-span",1,1),"final":("ce-span",2,2),"data":"Q",
+            },
+            "falseIsland": {
+                "html":"ab<span id=\"ce-span\">CD</span>ef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> gh",
+                "text":"abCDef LOCK gh","events":["beforeinput"],
+                "initial":("ce-island",2,2),"final":("ce-island",2,2),"data":"Z",
+            },
+            "emptySelection": {
+                "html":"abef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> gh",
+                "text":"abef LOCK gh","events":["beforeinput","input"],
+                "initial":("ce-span",0,2),"final":("ce",2,2),"data":"",
+            },
+            "focusTransfer": {
+                "html":"ab<span id=\"ce-span\">CD</span>ef <span id=\"ce-island\" contenteditable=\"false\">LOCK</span> gh",
+                "text":"abCDef LOCK gh","events":[],"initial":None,"final":None,"data":None,
+            },
+        }
+
+        def selection_matches(selection: Any, point: tuple[str, int, int]) -> bool:
+            parent, start, end = point
+            contract = _contenteditable_selection_contract(selection) or {}
+            anchor = contract.get("anchorPath") or []
+            focus = contract.get("focusPath") or []
+            range_value = contract.get("range") or {}
+            range_start = range_value.get("startPath") or []
+            range_end = range_value.get("endPath") or []
+            return (
+                contract.get("anchorNode") == "#text"
+                and contract.get("focusNode") == "#text"
+                and contract.get("anchorOffset") == start
+                and contract.get("focusOffset") == end
+                and anchor and anchor[0].get("parentId") == parent
+                and focus and focus[0].get("parentId") == parent
+                and range_value.get("startOffset") == start
+                and range_value.get("endOffset") == end
+                and range_start and range_start[0].get("parentId") == parent
+                and range_end and range_end[0].get("parentId") == parent
+            )
+
+        for name, expectation in expected.items():
+            record = observation.get(name, {})
+            action = record.get("action", {})
+            if action.get("response") != {} or action.get("actionError") is not None:
+                raise AssertionError(f"{label}: contenteditable {name} action failed: {action!r}")
+            snapshot = record.get("snapshot", {})
+            actual_types = [event.get("type") for event in snapshot.get("events", [])]
+            if snapshot.get("innerHTML") != expectation["html"] \
+                    or snapshot.get("textContent") != expectation["text"] \
+                    or actual_types != expectation["events"]:
+                raise AssertionError(f"{label}: contenteditable {name} differs: {record!r}")
+            active = "edit" if name == "focusTransfer" else "ce"
+            if snapshot.get("active") != active:
+                raise AssertionError(f"{label}: contenteditable {name} active target differs")
+            if name == "focusTransfer":
+                control = snapshot.get("controls", {}).get("edit")
+                if control != {"value":"aXbcd","start":2,"end":2}:
+                    raise AssertionError(f"{label}: contenteditable focusTransfer control differs")
+                continue
+            if not selection_matches(snapshot.get("selection"), expectation["final"]):
+                raise AssertionError(f"{label}: contenteditable {name} final selection differs")
+            for event in snapshot.get("events", []):
+                event_type = event.get("type")
+                constructor = "KeyboardEvent" if event_type in ("keydown","keypress") else "InputEvent"
+                if any((
+                    event.get("target") != "ce",
+                    event.get("currentTarget") != "ce",
+                    event.get("constructor") != constructor,
+                    event.get("isTrusted") is not True,
+                    event.get("bubbles") is not True,
+                    event.get("cancelable") is not (event_type != "input"),
+                    event.get("composed") is not True,
+                    event.get("defaultPrevented") is not False,
+                    event.get("isComposing") is not False,
+                )):
+                    raise AssertionError(f"{label}: contenteditable {name} event contract differs: {event!r}")
+                expected_point = expectation["final"] if event_type == "input" else expectation["initial"]
+                if not selection_matches(event.get("selection"), expected_point):
+                    raise AssertionError(f"{label}: contenteditable {name} event selection differs")
+                if event_type in ("keydown","keypress"):
+                    if event.get("data") is not None or event.get("inputType") is not None \
+                            or event.get("targetRanges") is not None:
+                        raise AssertionError(f"{label}: contenteditable {name} keyboard fields differ")
+                    continue
+                if event.get("data") != expectation["data"] \
+                        or event.get("inputType") != "insertText":
+                    raise AssertionError(f"{label}: contenteditable {name} input fields differ")
+                ranges = event.get("targetRanges")
+                if event_type == "input":
+                    if ranges != []:
+                        raise AssertionError(f"{label}: contenteditable {name} input ranges differ")
+                else:
+                    if not isinstance(ranges, list) or len(ranges) != 1:
+                        raise AssertionError(f"{label}: contenteditable {name} beforeinput ranges differ")
+                    range_value = ranges[0]
+                    start_path = _contenteditable_path_contract(range_value.get("startPath"))
+                    end_path = _contenteditable_path_contract(range_value.get("endPath"))
+                    parent, start, end = expectation["initial"]
+                    if range_value.get("startOffset") != start or range_value.get("endOffset") != end \
+                            or not start_path or start_path[0].get("parentId") != parent \
+                            or not end_path or end_path[0].get("parentId") != parent:
+                        raise AssertionError(f"{label}: contenteditable {name} target range differs")
     elif case == "protocol-negative":
         expected_errors = [False, True, True, True, True, True, True, True, True, True, True]
         actual_errors = [bool(item.get("actionError")) for item in observation["actions"]]
@@ -1129,6 +1458,25 @@ def compare_case(case: str, reference: dict[str, Any], candidate: dict[str, Any]
                 got.get("action", {}).get("actionError")
             ) or ref.get("snapshot") != got.get("snapshot"):
                 raise AssertionError(f"{label}: maxlength {name} differs")
+        return
+    if case == "contenteditable":
+        for name in (
+            "insertText","selectionReplacement","keyText","cancel",
+            "domReentry","falseIsland","emptySelection","focusTransfer",
+        ):
+            ref = reference.get(name, {})
+            got = candidate.get(name, {})
+            ref_snapshot = _contenteditable_snapshot_contract(ref.get("snapshot"))
+            got_snapshot = _contenteditable_snapshot_contract(got.get("snapshot"))
+            # Focusing a text control collapses Chrome's document Selection to
+            # body while Obscura retains the inactive rich selection. The
+            # qualified boundary is that focus and editing follow the text
+            # control; both complete raw Selection snapshots remain recorded.
+            if name == "focusTransfer":
+                if ref_snapshot is not None: ref_snapshot = {k:v for k,v in ref_snapshot.items() if k != "selection"}
+                if got_snapshot is not None: got_snapshot = {k:v for k,v in got_snapshot.items() if k != "selection"}
+            if ref.get("action") != got.get("action") or ref_snapshot != got_snapshot:
+                raise AssertionError(f"{label}: contenteditable {name} differs")
         return
     if case == "cancellation":
         for phase in ("keydown", "keypress", "beforeinput", "insertText"):

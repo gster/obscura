@@ -291,6 +291,14 @@ enum KeyboardEdit {
 }
 
 #[cfg(feature = "render")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContenteditableEdit {
+    NotApplicable,
+    Handled,
+    Unsupported,
+}
+
+#[cfg(feature = "render")]
 fn protocol_insert_text(kind: obscura_dom::tree::TextControlKind, text: &str) -> String {
     if kind == obscura_dom::tree::TextControlKind::TextArea {
         return kind.normalize(text);
@@ -4945,6 +4953,17 @@ impl ObscuraJsRuntime {
             && (input.windows_virtual_key_code == 8 || !input.commands.is_empty()) {
             return self.dispatch_keyboard_edit("", KeyboardEdit::Backward);
         }
+        if matches!(input.phase, KeyDown | RawKeyDown)
+            && input.windows_virtual_key_code == 46 {
+            let Some(node) = self.keyboard_target() else { return Ok(()); };
+            match self.native_contenteditable_edit(node, 22, "")? {
+                ContenteditableEdit::Handled => return self.native_input_checkpoint(),
+                ContenteditableEdit::Unsupported => {
+                    return Err("INPUT_CONTENTEDITABLE_UNSUPPORTED")
+                }
+                ContenteditableEdit::NotApplicable => return Ok(()),
+            }
+        }
         if input.phase == RawKeyDown || input.text.is_empty() { return Ok(()); }
         let allowed = self.native_keyboard_event("keypress", input)?;
         self.native_input_checkpoint()?;
@@ -4960,6 +4979,16 @@ impl ObscuraJsRuntime {
     #[cfg(feature = "render")]
     fn dispatch_keyboard_edit(&mut self, text: &str, edit: KeyboardEdit) -> Result<(), &'static str> {
         let Some(node) = self.keyboard_target() else { return Ok(()); };
+        let contenteditable_kind = if matches!(edit, KeyboardEdit::InsertText | KeyboardEdit::Insert) {
+            21
+        } else {
+            22
+        };
+        match self.native_contenteditable_edit(node, contenteditable_kind, text)? {
+            ContenteditableEdit::Handled => return self.native_input_checkpoint(),
+            ContenteditableEdit::Unsupported => return Err("INPUT_CONTENTEDITABLE_UNSUPPORTED"),
+            ContenteditableEdit::NotApplicable => {}
+        }
         // Resolve once before delivery so explicitly unsupported editors fail
         // without partial dispatch. A focused non-editable target is still a
         // valid beforeinput target in Chromium; it simply has no edit or input
@@ -5060,6 +5089,44 @@ impl ObscuraJsRuntime {
             self.native_text_event(kind + 1, node, accepted)?;
         }
         self.native_input_checkpoint()
+    }
+
+    #[cfg(feature = "render")]
+    fn native_contenteditable_edit(
+        &mut self,
+        node: NodeId,
+        kind: i32,
+        text: &str,
+    ) -> Result<ContenteditableEdit, &'static str> {
+        use deno_core::v8;
+        let function = self.native_text.clone().ok_or("INPUT_UNAVAILABLE")?;
+        self.begin_javascript_task();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, function);
+        let nodes = v8::Array::new(scope, 1);
+        let node_value = v8::Integer::new_from_unsigned(scope, node.raw());
+        if !nodes.set_index(scope, 0, node_value.into()).unwrap_or(false) {
+            return Err("INPUT_DISPATCH_FAILED");
+        }
+        let arguments = [
+            v8::Integer::new(scope, kind).into(),
+            nodes.into(),
+            v8::String::new(scope, text).ok_or("INPUT_DISPATCH_FAILED")?.into(),
+        ];
+        let receiver = v8::undefined(scope).into();
+        let result = function.call(scope, receiver, &arguments).ok_or("INPUT_DISPATCH_FAILED")?;
+        let status = result.int32_value(scope).ok_or("INPUT_DISPATCH_FAILED")?;
+        match status {
+            0 => Ok(ContenteditableEdit::NotApplicable),
+            1 => Ok(ContenteditableEdit::Handled),
+            -1 => Ok(ContenteditableEdit::Unsupported),
+            _ => Err("INPUT_DISPATCH_FAILED"),
+        }
     }
 
     #[cfg(feature = "render")]
@@ -8421,6 +8488,372 @@ mod tests {
         assert_eq!(rt.evaluate("[document.activeElement.id,observed]").unwrap(), serde_json::json!([
             "b", [["beforeinput","InputEvent","Q","insertText",true,true,true,true]]
         ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_contenteditable_insert_preserves_inline_dom_and_selection_contract() {
+        let mut rt = setup_runtime(
+            r#"<div id=root contenteditable=true>ab<span id=sp>CD</span>ef <span id=island contenteditable=false>LOCK</span> gh</div>"#,
+        );
+        rt.evaluate(r#"(() => {
+            globalThis.editEvents = [];
+            globalThis.callbackOrder = [];
+            const root = document.getElementById('root');
+            root.addEventListener('beforeinput', event => {
+                callbackOrder.push(event.type);
+                const ranges = event.getTargetRanges();
+                editEvents.push([event.type,event.data,event.inputType,event.isTrusted,
+                    event.target.id,ranges.length,ranges[0]?.startOffset,ranges[0]?.endOffset]);
+            });
+            root.addEventListener('input', event => {
+                callbackOrder.push(event.type);
+                editEvents.push([event.type,event.data,event.inputType,event.isTrusted,event.target.id,
+                    event.getTargetRanges().length,null,null]);
+            });
+            root.focus();
+            getSelection().collapse(document.getElementById('sp').firstChild,1);
+            globalThis.InputEvent = function() { throw Error('public constructor used'); };
+            EventTarget.prototype.dispatchEvent = function() { throw Error('public dispatcher used'); };
+            CharacterData.prototype.replaceData = function() { throw Error('public mutator used'); };
+        })()"#).unwrap();
+
+        rt.dispatch_insert_text("X").unwrap();
+        assert_eq!(
+            rt.evaluate(r#"[root.innerHTML,root.textContent,
+                getSelection().anchorNode.parentNode.id,getSelection().anchorOffset,
+                getSelection().focusNode.parentNode.id,getSelection().focusOffset,editEvents]"#).unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">CXD</span>ef <span id=\"island\" contenteditable=\"false\">LOCK</span> gh",
+                "abCXDef LOCK gh","sp",2,"sp",2,[
+                    ["beforeinput","X","insertText",true,"root",1,1,1],
+                    ["input","X","insertText",true,"root",0,null,null]
+                ]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            editEvents=[]; const text=document.getElementById('sp').firstChild;
+            const range=document.createRange(); range.setStart(text,0); range.setEnd(text,3);
+            const selection=getSelection(); selection.removeAllRanges(); selection.addRange(range);
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Y").unwrap();
+        assert_eq!(
+            rt.evaluate(r#"[root.innerHTML,getSelection().anchorNode.parentNode.id,
+                getSelection().anchorOffset,editEvents]"#).unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">Y</span>ef <span id=\"island\" contenteditable=\"false\">LOCK</span> gh",
+                "sp",1,[
+                    ["beforeinput","Y","insertText",true,"root",1,0,3],
+                    ["input","Y","insertText",true,"root",0,null,null]
+                ]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            editEvents=[]; const span=document.getElementById('sp'); span.textContent='CD';
+            getSelection().collapse(span.firstChild,1);
+            root.addEventListener('beforeinput', event => event.preventDefault(), {once:true});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Q").unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,getSelection().anchorOffset,editEvents]").unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">CD</span>ef <span id=\"island\" contenteditable=\"false\">LOCK</span> gh",
+                1,[["beforeinput","Q","insertText",true,"root",1,1,1]]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            editEvents=[]; const span=document.getElementById('sp');
+            getSelection().collapse(span.firstChild,1);
+            root.addEventListener('beforeinput', () => root.append('M'), {once:true});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Q").unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,getSelection().anchorOffset,editEvents]").unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">CQD</span>ef <span id=\"island\" contenteditable=\"false\">LOCK</span> ghM",
+                2,[
+                    ["beforeinput","Q","insertText",true,"root",1,1,1],
+                    ["input","Q","insertText",true,"root",0,null,null]
+                ]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            editEvents=[]; const island=document.getElementById('island');
+            getSelection().collapse(island.firstChild,2);
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Z").unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,getSelection().anchorOffset,editEvents]").unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">CQD</span>ef <span id=\"island\" contenteditable=\"false\">LOCK</span> ghM",
+                2,[["beforeinput","Z","insertText",true,"root",1,2,2]]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            editEvents=[]; callbackOrder=[];
+            const wrapper=document.getElementById('sp');
+            const text=wrapper.firstChild;
+            const leftText=wrapper.previousSibling;
+            const followingText=wrapper.nextSibling;
+            const island=document.getElementById('island');
+            const nodeLabel=node=>node===leftText?'left':node===followingText?'following':
+                node===wrapper?'wrapper':node===island?'island':null;
+            const range=document.createRange(); range.setStart(text,0); range.setEnd(text,3);
+            const selection=getSelection(); selection.removeAllRanges(); selection.addRange(range);
+            globalThis.mutationRecords=[];
+            globalThis.mutationRecordObjects=[];
+            new MutationObserver(records => {
+                callbackOrder.push('observer-old');
+                for (const record of records) {
+                    mutationRecordObjects.push(record);
+                    mutationRecords.push([
+                        record.type,record.target.nodeName,record.oldValue,
+                        record.addedNodes.length,record.removedNodes.length,
+                        nodeLabel(record.previousSibling),nodeLabel(record.nextSibling),
+                        nodeLabel(record.removedNodes[0] ?? null),record.attributeNamespace
+                    ]);
+                }
+            }).observe(root,{subtree:true,characterData:true,childList:true,
+                characterDataOldValue:true});
+            globalThis.noOldValueRecords=[];
+            const noOldValueObserver=new MutationObserver(records => {
+                callbackOrder.push('observer-no-old');
+                for (let i=0;i<records.length;i++) noOldValueRecords.push([
+                    records[i].type,records[i].oldValue,records[i].removedNodes.length,
+                    records[i]===mutationRecordObjects[i]
+                ]);
+            });
+            noOldValueObserver.observe(root,{subtree:true,characterDataOldValue:true,childList:true});
+            noOldValueObserver.observe(root,{subtree:true,characterData:true,childList:true});
+            globalThis.implicitOldValueRecords=[];
+            new MutationObserver(records => {
+                callbackOrder.push('observer-implicit-old');
+                for (const record of records) implicitOldValueRecords.push([
+                    record.type,record.oldValue
+                ]);
+            }).observe(root,{subtree:true,characterDataOldValue:true,childList:true});
+            globalThis.disconnectedDeliveries=0;
+            const disconnectedObserver=new MutationObserver(() => disconnectedDeliveries++);
+            disconnectedObserver.observe(root,{subtree:true,characterData:true,childList:true});
+            const parentNodeDescriptor=Object.getOwnPropertyDescriptor(Node.prototype,'parentNode');
+            const isConnectedDescriptor=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected');
+            const querySelectorAllDescriptor=Object.getOwnPropertyDescriptor(
+                Document.prototype,'querySelectorAll');
+            globalThis.removePoison={parentNode:0,isConnected:0,querySelectorAll:0};
+            globalThis.removePoisonSnapshot=null;
+            root.addEventListener('input',()=>{
+                disconnectedObserver.disconnect();
+                queueMicrotask(()=>{
+                    removePoisonSnapshot={...removePoison};
+                    Object.defineProperty(Node.prototype,'parentNode',parentNodeDescriptor);
+                    Object.defineProperty(Node.prototype,'isConnected',isConnectedDescriptor);
+                    Object.defineProperty(Document.prototype,'querySelectorAll',
+                        querySelectorAllDescriptor);
+                });
+            },{once:true});
+            Object.defineProperty(Node.prototype,'parentNode',{configurable:true,get(){
+                removePoison.parentNode++; throw Error('public parentNode used');
+            }});
+            Object.defineProperty(Node.prototype,'isConnected',{configurable:true,get(){
+                removePoison.isConnected++; throw Error('public isConnected used');
+            }});
+            Object.defineProperty(Document.prototype,'querySelectorAll',{configurable:true,value(){
+                removePoison.querySelectorAll++; throw Error('public querySelectorAll used');
+            }});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("").unwrap();
+        assert_eq!(
+            rt.evaluate(r#"[root.innerHTML,getSelection().anchorNode===root.firstChild,
+                getSelection().anchorOffset,editEvents,removePoisonSnapshot,mutationRecords,
+                noOldValueRecords,implicitOldValueRecords,disconnectedDeliveries,
+                callbackOrder]"#).unwrap(),
+            serde_json::json!([
+                "abef <span id=\"island\" contenteditable=\"false\">LOCK</span> ghM",
+                true,2,[
+                    ["beforeinput","","insertText",true,"root",1,0,3],
+                    ["input","","insertText",true,"root",0,null,null]
+                ],{"parentNode":0,"isConnected":0,"querySelectorAll":0},[
+                    ["characterData","#text","ab",0,0,null,null,null,null],
+                    ["childList","DIV",null,0,1,"left","following","wrapper",null],
+                    ["childList","DIV",null,0,1,"left","island","following",null]
+                ],[
+                    ["characterData",null,0,false],
+                    ["childList",null,1,false],
+                    ["childList",null,1,false]
+                ],[
+                    ["characterData","ab"],
+                    ["childList",null],
+                    ["childList",null]
+                ],0,["beforeinput","input","observer-old","observer-no-old",
+                    "observer-implicit-old"]
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_contenteditable_requires_live_focus_and_protected_primitives() {
+        let mut rt = setup_runtime(
+            r#"<div id=root contenteditable=true>ab<span id=sp>CD</span>ef</div><input id=edit value=ab><p id=tail>zz</p>"#,
+        );
+        rt.evaluate(r#"(() => {
+            root.focus(); getSelection().collapse(sp.firstChild,1);
+            edit.focus(); edit.setSelectionRange(1,1);
+        })()"#).unwrap();
+        rt.dispatch_insert_text("X").unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,edit.value,edit.selectionStart]").unwrap(),
+            serde_json::json!(["ab<span id=\"sp\">CD</span>ef","aXb",2])
+        );
+
+        rt.evaluate(r#"(() => {
+            const range=document.createRange(); range.setStart(sp.firstChild,0);
+            range.setEnd(tail.firstChild,1); const selection=getSelection();
+            selection.removeAllRanges(); selection.addRange(range);
+            edit.focus(); edit.setSelectionRange(2,2);
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Y").unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,edit.value,edit.selectionStart]").unwrap(),
+            serde_json::json!(["ab<span id=\"sp\">CD</span>ef","aXYb",3])
+        );
+
+        rt.evaluate(r#"(() => {
+            globalThis.editEvents=[]; root.focus(); getSelection().collapse(sp.firstChild,1);
+            root.addEventListener('beforeinput',event=>{
+                editEvents.push([event.type,event.data,event.isTrusted]); edit.focus();
+            },{once:true});
+            root.addEventListener('input',event=>editEvents.push([event.type,event.data,event.isTrusted]));
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Q").unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,edit.value,document.activeElement.id,editEvents]").unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">CD</span>ef","aXYb","edit",[["beforeinput","Q",true]]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            root.focus(); getSelection().collapse(sp.firstChild,1);
+            globalThis.poisonCalls={data:0,nodeType:0,slice:0,toLowerCase:0};
+            Object.defineProperty(CharacterData.prototype,'data',{configurable:true,
+                get(){poisonCalls.data++;throw Error('public data getter used')},
+                set(){poisonCalls.data++;throw Error('public data setter used')}});
+            Object.defineProperty(Node.prototype,'nodeType',{configurable:true,
+                get(){poisonCalls.nodeType++;throw Error('public nodeType used')}});
+            String.prototype.slice=function(){poisonCalls.slice++;throw Error('public slice used')};
+            String.prototype.toLowerCase=function(){poisonCalls.toLowerCase++;throw Error('public lower used')};
+        })()"#).unwrap();
+        rt.dispatch_insert_text("Y").unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,getSelection().anchorOffset,poisonCalls]").unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">CYD</span>ef",2,
+                {"data":0,"nodeType":0,"slice":0,"toLowerCase":0}
+            ])
+        );
+
+        let mut unsupported = setup_runtime("<div id=root contenteditable=true><span id=sp>CD</span></div>");
+        unsupported.evaluate(r#"(() => {
+            globalThis.editEvents=[]; root.focus(); const range=document.createRange();
+            range.setStart(sp.firstChild,0); range.setEnd(sp.firstChild,2);
+            const selection=getSelection(); selection.removeAllRanges(); selection.addRange(range);
+            root.addEventListener('beforeinput',event=>editEvents.push(event.type));
+        })()"#).unwrap();
+        assert_eq!(
+            unsupported.dispatch_insert_text("").unwrap_err(),
+            "INPUT_CONTENTEDITABLE_UNSUPPORTED"
+        );
+        assert_eq!(
+            unsupported.evaluate("[root.innerHTML,editEvents]").unwrap(),
+            serde_json::json!(["<span id=\"sp\">CD</span>",[]])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_contenteditable_key_text_edits_and_unqualified_commands_fail_explicitly() {
+        let mut rt = setup_runtime("<div id=root contenteditable=true>ab<span id=sp>CD</span>ef</div>");
+        rt.evaluate(r#"(() => {
+            globalThis.editEvents=[]; root.focus();
+            getSelection().collapse(sp.firstChild,1);
+            for (const type of ['keydown','keypress','beforeinput','input'])
+                root.addEventListener(type,event=>editEvents.push([
+                    event.type,event.key??null,event.data??null,event.inputType??null,event.target.id
+                ]));
+        })()"#).unwrap();
+        let text = KeyboardInput {
+            key: "x".into(), code: "KeyX".into(), text: "x".into(),
+            windows_virtual_key_code: 88, ..KeyboardInput::default()
+        };
+        rt.dispatch_keyboard_input(text).unwrap();
+        assert_eq!(
+            rt.evaluate("[root.innerHTML,getSelection().anchorOffset,editEvents]").unwrap(),
+            serde_json::json!([
+                "ab<span id=\"sp\">CxD</span>ef",2,[
+                    ["keydown","x",null,null,"root"],
+                    ["keypress","x",null,null,"root"],
+                    ["beforeinput",null,"x","insertText","root"],
+                    ["input",null,"x","insertText","root"]
+                ]
+            ])
+        );
+
+        for (key, code, virtual_key, text) in [
+            ("Backspace", "Backspace", 8, ""),
+            ("Delete", "Delete", 46, ""),
+            ("Enter", "Enter", 13, "\r"),
+        ] {
+            let error = rt.dispatch_keyboard_input(KeyboardInput {
+                key: key.into(), code: code.into(), text: text.into(),
+                windows_virtual_key_code: virtual_key, ..KeyboardInput::default()
+            }).unwrap_err();
+            assert_eq!(error, "INPUT_CONTENTEDITABLE_UNSUPPORTED");
+        }
+        assert_eq!(
+            rt.evaluate("root.innerHTML").unwrap(),
+            serde_json::json!("ab<span id=\"sp\">CxD</span>ef")
+        );
+
+        let mut blocked = setup_runtime(
+            "<div id=root contenteditable=true>a<span id=island contenteditable=false>LOCK</span>b</div>",
+        );
+        blocked.evaluate(r#"(() => {
+            globalThis.editEvents=[]; root.focus(); getSelection().collapse(island.firstChild,2);
+            for (const type of ['beforeinput','input'])
+                root.addEventListener(type,event=>editEvents.push(event.type));
+        })()"#).unwrap();
+        for (key, code, virtual_key, text) in [
+            ("Backspace", "Backspace", 8, ""),
+            ("Delete", "Delete", 46, ""),
+            ("Enter", "Enter", 13, "\r"),
+        ] {
+            blocked.evaluate(
+                "(() => { editEvents=[]; getSelection().collapse(island.firstChild,2); })()",
+            ).unwrap();
+            let error = blocked.dispatch_keyboard_input(KeyboardInput {
+                key: key.into(), code: code.into(), text: text.into(),
+                windows_virtual_key_code: virtual_key, ..KeyboardInput::default()
+            }).unwrap_err();
+            assert_eq!(error, "INPUT_CONTENTEDITABLE_UNSUPPORTED");
+            assert_eq!(
+                blocked.evaluate("[root.innerHTML,editEvents]").unwrap(),
+                serde_json::json!([
+                    "a<span id=\"island\" contenteditable=\"false\">LOCK</span>b",[]
+                ])
+            );
+        }
+        blocked.evaluate("getSelection().removeAllRanges()").unwrap();
+        let error = blocked.dispatch_keyboard_input(KeyboardInput {
+            key: "Delete".into(), code: "Delete".into(),
+            windows_virtual_key_code: 46, ..KeyboardInput::default()
+        }).unwrap_err();
+        assert_eq!(error, "INPUT_CONTENTEDITABLE_UNSUPPORTED");
     }
 
     #[cfg(feature = "render")]

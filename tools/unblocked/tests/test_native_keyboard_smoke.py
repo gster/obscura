@@ -376,6 +376,89 @@ class NativeKeyboardSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "maxlength textarea differs"):
             compare_case("maxlength", reference, candidate, label="candidate")
 
+    def test_contenteditable_contract_keeps_dom_and_event_boundaries(self):
+        observation = self._contenteditable_observation()
+        assert_contract("contenteditable", observation, label="candidate")
+        observation["insertText"]["snapshot"]["events"][0]["isTrusted"] = False
+        with self.assertRaisesRegex(AssertionError, "event contract differs"):
+            assert_contract("contenteditable", observation, label="candidate")
+
+    def test_contenteditable_comparison_projects_qualified_fields_without_dropping_raw(self):
+        import copy
+
+        reference = self._contenteditable_observation()
+        candidate = copy.deepcopy(reference)
+        candidate["insertText"]["snapshot"]["selection"]["anchorPath"][0]["parentHTML"] = "different raw ancestor"
+        candidate["insertText"]["snapshot"]["unqualifiedRawField"] = {"complete": True}
+        compare_case("contenteditable", reference, candidate, label="candidate")
+        candidate["insertText"]["snapshot"]["selection"]["anchorPath"][0]["parentId"] = "changed"
+        with self.assertRaisesRegex(AssertionError, "contenteditable insertText differs"):
+            compare_case("contenteditable", reference, candidate, label="candidate")
+
+    @staticmethod
+    def _contenteditable_observation():
+        fixture = {
+            "insertText": ('ab<span id="ce-span">CXD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh', "abCXDef LOCK gh", ["beforeinput","input"], ("ce-span",1,1), ("ce-span",2,2), "X"),
+            "selectionReplacement": ('ab<span id="ce-span">Y</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh', "abYef LOCK gh", ["beforeinput","input"], ("ce-span",0,2), ("ce-span",1,1), "Y"),
+            "keyText": ('ab<span id="ce-span">CxD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh', "abCxDef LOCK gh", ["keydown","keypress","beforeinput","input"], ("ce-span",1,1), ("ce-span",2,2), "x"),
+            "cancel": ('ab<span id="ce-span">CD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh', "abCDef LOCK gh", ["beforeinput"], ("ce-span",1,1), ("ce-span",1,1), "Q"),
+            "domReentry": ('ab<span id="ce-span">CQD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> ghM', "abCQDef LOCK ghM", ["beforeinput","input"], ("ce-span",1,1), ("ce-span",2,2), "Q"),
+            "falseIsland": ('ab<span id="ce-span">CD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh', "abCDef LOCK gh", ["beforeinput"], ("ce-island",2,2), ("ce-island",2,2), "Z"),
+            "emptySelection": ('abef <span id="ce-island" contenteditable="false">LOCK</span> gh', "abef LOCK gh", ["beforeinput","input"], ("ce-span",0,2), ("ce",2,2), ""),
+        }
+
+        def path(parent):
+            return [{"nodeName":"#text","id":None,"siblingIndex":0,"parentId":parent,
+                     "parentHTML":f"raw {parent}"},
+                    {"nodeName":"DIV" if parent == "ce" else "SPAN","id":parent,
+                     "siblingIndex":1,"parentId":"ce" if parent != "ce" else None,
+                     "parentHTML":"raw document"}]
+
+        def selection(point):
+            parent, start, end = point
+            return {"anchorNode":"#text","anchorOffset":start,"focusNode":"#text","focusOffset":end,
+                    "anchorPath":path(parent),"focusPath":path(parent),
+                    "range":{"startPath":path(parent),"startOffset":start,
+                             "endPath":path(parent),"endOffset":end}}
+
+        observation = {}
+        for name, (html, text, types, initial, final, data) in fixture.items():
+            events = []
+            for event_type in types:
+                point = final if event_type == "input" else initial
+                input_event = event_type in ("beforeinput","input")
+                ranges = ([{"startPath":path(initial[0]),"startOffset":initial[1],
+                            "endPath":path(initial[0]),"endOffset":initial[2]}]
+                          if event_type == "beforeinput" else ([] if event_type == "input" else None))
+                events.append({"type":event_type,"target":"ce","currentTarget":"ce",
+                               "constructor":"InputEvent" if input_event else "KeyboardEvent",
+                               "isTrusted":True,"bubbles":True,"cancelable":event_type != "input",
+                               "composed":True,"defaultPrevented":False,"isComposing":False,
+                               "data":data if input_event else None,
+                               "inputType":"insertText" if input_event else None,
+                               "targetOuterHTML":f"<div id=\"ce\">{html}</div>",
+                               "targetTextContent":text,"selection":selection(point),
+                               "targetRanges":ranges})
+            observation[name] = {
+                "action":{"method":"Input.insertText","params":{"text":data},
+                          "response":{},"actionError":None},
+                "snapshot":{"outerHTML":f'<div id="ce" contenteditable="true">{html}</div>',
+                            "innerHTML":html,"textContent":text,"active":"ce","events":events,
+                            "selection":selection(final),
+                            "controls":{"edit":{"value":"abcd","start":0,"end":0},
+                                        "other":{"value":"new","start":0,"end":0}}},
+            }
+        observation["focusTransfer"] = {
+            "action":{"method":"Input.insertText","params":{"text":"X"},"response":{},"actionError":None},
+            "snapshot":{"outerHTML":'<div id="ce" contenteditable="true">ab<span id="ce-span">CD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh</div>',
+                        "innerHTML":'ab<span id="ce-span">CD</span>ef <span id="ce-island" contenteditable="false">LOCK</span> gh',
+                        "textContent":"abCDef LOCK gh","active":"edit","events":[],
+                        "selection":selection(("ce-span",1,1)),
+                        "controls":{"edit":{"value":"aXbcd","start":2,"end":2},
+                                    "other":{"value":"new","start":0,"end":0}}},
+        }
+        return observation
+
 
 if __name__ == "__main__":
     unittest.main()
