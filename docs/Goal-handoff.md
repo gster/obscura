@@ -5,12 +5,20 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`ada9a69ba33aa28cb98e6cccd8a85bdd9e27194f`，`Bound queued CDP WebSocket admission`。
+- 最近完成的实现提交：`6968a9d6876c9525912a4fbc1713aa074b697a9a`，`Bound pending CDP request heads`。
 - 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的 queued+active WebSocket admission、[`main.rs`](../crates/obscura-cli/src/main.rs) 的 `--max-connections` 投影，以及 [`cdp_ws_capacity.py`](../tools/unblocked/cdp_ws_capacity.py) 的单 worker 真实进程资格工具。
+- 本切片的实现入口是 [`server.rs`](../crates/obscura-cdp/src/server.rs) 的 accepted request-head reactor，以及 [`cdp_silent_pending.py`](../tools/unblocked/cdp_silent_pending.py) 的单 worker 真实进程资格工具。
 
 ## 最近完成的阶段
+
+OB-034 单 worker accepted silent/incomplete request-head 切片以 Mio READABLE reactor 和最早 deadline heap 替换每毫秒线性扫描。基础 accepted-incomplete 上限为 256；另有固定 16 条、100ms classification reserve，所以 hard total 为 272。完整 request head 在基础容量饱和时仍可进入 HTTP/WebSocket 分类；reserve 到期或 hard cap 返回完整 503/`max-pending-request-heads`，半包在 10 秒 TTL 返回完整 408/`request-head-timeout`，全静默连接到期只关闭且不伪造 HTTP bytes。读取的原始 prefix 逐字节保留，WebSocket 101 写出后才解锁同一 TCP write 中已随 upgrade head 到达的 frame tail。shutdown 直接释放全部 pending，不等待 TTL；deadline heap 对 stale entry 有固定 compaction 边界。
+
+最终 Darwin 24.6.0 arm64、IPv4 loopback、单 worker 实测先用 listener queue 0 与服务端 256 条 ESTABLISHED 证明全部连接已被接受；该状态下 HTTP 8/8 为 200、WebSocket 4/4 完成 `Browser.getVersion`，17/17 overflow 探针为 503。半包补全为 200，半包 TTL 为 408；256 条零字节连接在约 10.000 至 10.030 秒均取得空 wire 与 EOF。恢复后 queue/ESTABLISHED 回到 0、FD 16、threads 12；最后 256 条 held 连接在 SIGTERM 下全部空 wire EOF，进程 returncode 0、process group 消失、无 forced kill。完整目录 `/private/tmp/ob034-silent-pending-final.iAT6Kw/evidence/` 的 manifest SHA-256 为 `54310f40c6987d75c1489d6b0cc90b2bb5dd976bf14d58710e229c3ffb50daf1`，5893 个登记 artifact 的 bytes/SHA-256 全部复核通过。
+
+最终 render binary 为 `0.1.0-dev+6968a9d`，SHA-256 `5eb589e3a158825c53c129847596e61b5b98af1cdad15dc7fab5170d1a12da84`，120799200 bytes。工具定向 **22/22**、完整 unblocked **114/114**；聚焦 render/no-render 各 **7/7**；render CDP **384/384**、3 skipped，无 render 有效集合 **321/321**、3 skipped。无 render 的原始完整命令有既有 render-only binary 的 6 个 `INPUT_UNSUPPORTED_WITHOUT_RENDER` 失败，保留为 284 passed、37 not run，不报告为全绿。release/render 全工作区首轮为 2330 passed、1 个既有 MCP deadline fixture 失败、4 skipped；未改源码的精确重放 **1/1** 与完整复跑 **2331/2331**、4 skipped 通过，不称为修复。两种 exact CLI build、固定 benchmark obstacle **33/33**、官方 Playwright Python 1.60.0 smoke 与完整 **37-method** profile 均通过；Playwright 原始目录为 `/private/tmp/ob034-silent-pending-playwright.IqUspe/`。
+
+Astra light 首审的 blocker 为 0，但发现 6 个 major、2 个 minor，推动修复工具导入、HTTP/空集合验证、恢复验证、TTL 计时、失败清理、stale heap、资格范围和失败记录等问题；最终代码、工具与微小拒绝 helper delta 复审均为 0 blocker、0 major、0 minor。本机工具不证明 16 条 reserve 同时占满或 272 hard-total 状态，该边界由 Rust test observer 确定性覆盖；也不外推 Linux、Windows、container、multi-worker、总 RSS/FD/CPU/V8/socket-buffer 上限或 portable CPU limit。OB-034 仍开放。
 
 OB-034 单 worker WebSocket admission 切片把 `--max-connections` 从 active processor 计数提升为 authorized upgrade handoff 与 active processor 共用的 RAII permit。permit 在完整且授权的 upgrade request 进入有界 handoff 前取得，覆盖 queued handoff、Page/V8/persistence 初始化和连接处理，直到 processor 清理后才释放；达到共享上限返回完整 503/`X-Obscura-Reason: max-connections`。handoff channel 满或关闭时返回完整 503/`ws-handoff-saturated` 并释放 permit；shutdown 先关闭 receiver、丢弃并释放 queued envelope，再等待 active drain。active 计数继续只服务 shutdown drain 与 idle trim，不再冒充 admission authority。
 
@@ -175,7 +183,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序推进：
 
 1. 在每个需要产品资格的平台分别运行真实 writer 的 main/iframe/Worker 矩阵；当前只完成本机，不把它外推为跨平台资格，也不把 terminal return boundary 称为 OS thread join。
-2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_ws_capacity.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace、silent-pending、发布工具可重复制造的 handoff saturation 证据与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量或 RSS 采样外推为总容量/总 RSS 上限。
+2. 在 Linux release 平台分别运行 `tools/unblocked/cdp_capacity.py`、`tools/unblocked/cdp_ws_capacity.py`、`tools/unblocked/cdp_silent_pending.py`、`tools/unblocked/cdp_multi_worker.py` 和 `tools/unblocked/cdp_multi_worker_lifecycle.py`，保留完整原始目录；当前只有 Darwin 证据，不能复制结论。再推进 Windows console/process-handle lifecycle、container network namespace、发布工具可重复制造的 handoff saturation 证据与剩余 input qualification；自动 restart/session migration 和共享 multi-worker storage ownership 仍是显式未资格边界。不要把本机 kernel queue、Mio 控制流、逻辑数量、CPU/FD 事实或 RSS 采样外推为总容量/总资源上限。
 
 开始下一段实现前先 fetch `origin/main`，并通过 fast-forward 或合并吸收远端更新，避免重复实现。一次只运行一个 Cargo 进程。代码稳定后合并验证，验证通过后及时提交并推送到 `origin/main`，然后在本地主仓库干净且可安全快进时同步其 `main`。
 
