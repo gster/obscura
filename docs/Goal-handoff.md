@@ -5,12 +5,18 @@
 ## 当前基线
 
 - 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`2fbcc0cc84464aa70b3576660bd6a3436a0f3a2f`，`Qualify maxlength text editing`。
-- 该实现提交与本交接更新验证完成后须推送到 `origin/main`，并再次核对 `HEAD`、`main`、`origin/main` 与远端 ref 对齐。
+- 最近完成的实现提交：`17e70390b076aeb30c36fb4f8df81e6a94984991`，`Qualify ignored CDP input events`。
+- 发布核对要求：`HEAD`、本地 `main`、`origin/main` 与远端 `refs/heads/main` 必须对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 本切片的实现入口是 [`runtime.rs`](../crates/obscura-js/src/runtime.rs) 的共享 native edit 路径、[`bootstrap.js`](../crates/obscura-js/js/bootstrap.js) 的 textarea line-break edit kind，以及 [`native_keyboard_smoke.py`](../tools/unblocked/native_keyboard_smoke.py) 的 Chrome/Obscura 成对资格工具。
+- 最新切片入口是 [`dispatch.rs`](../crates/obscura-cdp/src/dispatch.rs) 的 session contribution 与 dispatcher fast path、[`input.rs`](../crates/obscura-cdp/src/domains/input.rs) 的参数/抑制入口、[`target.rs`](../crates/obscura-cdp/src/domains/target.rs) 的 detach cleanup，以及 [`native_keyboard_smoke.py`](../tools/unblocked/native_keyboard_smoke.py) 的 Chrome/Obscura 成对资格工具。
 
 ## 最近完成的阶段
+
+OB-021 `Input.setIgnoreInputEvents` 已从静默假成功改为 Chrome 152 实测语义：每个 attached session 持有 contribution，同一 target 取 OR；false 只清调用 session，导航保留，detach/target close 清理，新 attachment 默认 false，跨 target 独立。有效 ignore 抑制 mouse/wheel/key 且不进入 Page/V8、input navigation 或 command-driven screencast sampling，`Input.insertText` 仍执行。缺失/非法 boolean 为 `-32602`，无效 session 为 `-32000`。`dispatchTouchEvent`、完整 mouse parity 与 no-render 实际输入没有因此资格化。
+
+最终 committed binary 来自 `17e70390b076aeb30c36fb4f8df81e6a94984991`，版本 `0.1.0-dev+17e7039`；render SHA-256 `c11a56645b610023a939e55d6cdc3b68d0d22c3953f7bfb3fdb79cc17be38778`，120747312 bytes；no-render SHA-256 `917461f738497888068a760a676faf422d5c70228dedaf6286809331bdd2837d`，78920272 bytes。九组 Chrome 152/Obscura paired qualification 全部通过，最终目录 `/private/tmp/ob021-ignore-committed-final.It7IaM/`，结果 JSON SHA-256 `6d6030955ebba17b43a40dd0cc7a2fef87cf486e92f76c2db564295eb3701b1e`，runner stderr 0 bytes。首次 full-snapshot paired 失败 `/private/tmp/ob021-ignore-paired-precommit.dmzWLQ/` 原样保留；它只暴露既有 click/`which`/coordinate caret 差异，最终 comparator 保留所有 raw 字段但不把这些独立 mouse parity 当作本 gate 已资格化。
+
+聚焦 render **2/2**、no-render control-plane **1/1**，CDP release/render **393/393**、3 skipped；全工作区 release/render **2343/2343**、4 skipped；工具 unittest **138/138**。固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33**。官方 Playwright Python 1.60.0 smoke、完整 **37-method** profile 与三项 migration gates 通过；目录 `/private/tmp/ob021-ignore-playwright-committed.sZ2T13/`，smoke SHA-256 `ade4335aeaefc5c2688d91955a6e5dd2123d943557cd36f4f32b1cb7aaf798fc`，protocol log SHA-256 `44d23d36aad212883732625750b556f851823f1263a5eb742833bd79fcd1292a`，migration SHA-256 `34930fd93b13b8e7aa7487ebbb50115d17532d5c39356597004e5afa51076211`。Astra light 终审为 0 blocker、0 major、0 minor、0 nit。完整 Cargo 原始日志在 `/private/tmp/ob021-ignore-gates.jBTQtk/`。
 
 OB-021 ordinary input/textarea `maxlength` 用户编辑切片已覆盖 `Input.insertText`、带 `text` 的 `Input.dispatchKeyEvent`、textarea Enter 和官方 `Locator.fill()`。容量按 UTF-16 code unit 计算且不拆 Unicode scalar；`Input.insertText`（包括 Locator.fill）的单行换行归一为空格，textarea 归一为 LF。native edit 在 `beforeinput` 后重新读取目标、value、selection、readonly 与 maxlength，因此 handler 动态 grow/shrink、value/selection 重入和脚本已有超长值的 selection 删除都按最终状态执行。`beforeinput.data` 保留请求，`input.data` 只含实际接纳前缀；无选区且无可接纳文本时不修改值、不发送 `input`，有选区时即使没有插入容量仍删除选区并发送 `input(data="")`。Chrome 152 实测的 `insertText` 与 key-text caret 差异原样保留。
 

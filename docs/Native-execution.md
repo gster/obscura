@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | 坐标鼠标输入 | `runtime/src/manual.rs`、`runtime/src/automation.rs`，CDP 自有页面脚本 | `obscura-browser::Page::dispatch_mouse_input` → JS runtime 私有事件桥与 renderer hit-test | move/press/release 已迁移并有 Chrome 对照；完整 pointer capture、hover、多按钮与 user activation 未资格化 |
 | Wheel | `crates/obscura-cdp/src/domains/input.rs` 页面脚本 | `Page::dispatch_wheel_input` → 私有事件桥与 renderer 滚动状态 | 已接入；九组 Chrome 对照通过，独立覆盖 metadata、嵌套边界、取消、页面覆盖、零增量和缺少 delta。完整手势锁定/惯性、scroll snap 和缩放未资格化 |
-| 键盘与文本 | 历史 manual/automation 输入；CDP `dispatchKeyEvent`、`insertText` 页面脚本 | `Page::dispatch_keyboard_input` / `Page::insert_text` → runtime 受保护事件与原生编辑 | 已归口；八组 Chrome 对照覆盖阶段、选择区、取消、元数据、公开 API 覆盖、focus/document 重入、参数错误，以及普通 input/textarea maxlength 用户编辑的 17 个子场景；真实待处理导航另由 Rust 回归覆盖。contenteditable、IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作和复杂表单默认动作未资格化 |
+| 键盘与文本 | 历史 manual/automation 输入；CDP `dispatchKeyEvent`、`insertText` 页面脚本 | `Page::dispatch_keyboard_input` / `Page::insert_text` → runtime 受保护事件与原生编辑；CDP context 持有 session-scoped ignore contribution | 已归口；九组 Chrome 对照覆盖阶段、选择区、取消、元数据、公开 API 覆盖、focus/document 重入、参数错误、普通 input/textarea maxlength 的 17 个子场景，以及 `setIgnoreInputEvents` 的 mouse/wheel/key 抑制、insertText 例外、双 session、导航、detach 与跨 target 生命周期；真实待处理导航另由 Rust 回归覆盖。`dispatchTouchEvent`、contenteditable、IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作和复杂表单默认动作未资格化 |
 | 导航等待 | `runtime/src/browser.rs` 的 v1/v2 等待策略 | `obscura-browser/src/lifecycle.rs`、`Page::navigate_with_wait` | 底层已共享；记录旧 Load/DOMContentLoaded 差异由官方导航参数选择，不恢复版本专属等待器 |
 | 元素与文本等待 | 历史 browser `wait` 和 automation locator 循环 | `Page::wait_for_selector` / `Page::wait_for_text` 使用 `advance_automation` 和原生 DOM 读取；CLI、MCP、公开 Rust API 只做入口适配；官方 Playwright 继续负责 Locator 产品 | 已归口到单一绝对 deadline。首次 probe 可在零预算命中，定时器和排队导航在同一预算内推进；慢导航不再被短轮询 timeout 取走后丢失；页面覆盖公开 `querySelector` 不改变 selector 结果。MCP 保留原成功/超时文本，并新增真正的小数秒 timeout 支持；非法或溢出 timeout 明确失败。公开 Rust 等待从 `&self` 有意改为 `&mut self`，以类型系统表达推进期间的独占所有权；这是明确接受的源代码兼容性变更，调用方需持有可变 `Page`，从而避免 `RefCell` 跨 await 的运行时借用 panic。调用方取消、官方 Locator action 重试和 CDP 会话关闭仍遵循各自产品契约 |
 | 异步推进 | 历史 network tick、automation settle | Page `advance_automation`/`settle`/`settle_for_duration` 与 runtime event loop | 条件等待已共享；固定 CLI `--wait`、自适应 settle、导航 lifecycle 与 load/network-idle 仍是不同契约。CDP server 的调度及错误的 network-idle 投影需要单独资格化，不合并成含混的“等待完成” |
@@ -19,6 +19,8 @@
 | CDP 服务暴露 | 父进程拥有的 stdio 私有 RPC | `obscura-cdp/src/server.rs` bind/listen 与 CLI serve 参数 | 与 OB-034 协作，明确监听和访问边界；不以旧 stdio 隔离或 allowlist 握手冒充当前网络服务保护 |
 
 后续交付顺序：mouse、wheel、键盘/文本有界资格完成后，明确执行推进与等待契约、观察与限额资格、旧启动保护逐项终态。上述清单全部获得实现或明确终态及相应证据之前，OB-021 保持未关闭。
+
+`Input.setIgnoreInputEvents` 的当前边界是 session ownership 与 target-effective OR：true 添加调用 session contribution，false 只移除调用 session；导航保留，detach 和 target teardown 清理，新 session 默认 false，不同 target 隔离。有效 ignore 的 mouse/wheel/key 在参数校验后返回空成功，不进入 Page/V8、input navigation 或 command-driven screencast sampling；`Input.insertText` 不受该开关影响。no-render 只覆盖状态/参数控制面，未取得实际坐标或键盘执行资格。paired 工具保留完整原始事件，但恢复阶段不以 click synthesis、legacy `which`、非 control target value 或 coordinate-event caret timing 作为本 gate 的通过条件；这些仍是独立 mouse parity 工作。
 
 原始采集数据与工具日志完整保存，不脱敏、不删字段。产品响应 body 的容量失败与工具证据采集不是同一契约，不应通过静默删减原始证据来满足产品限额。
 
