@@ -282,11 +282,49 @@ pub struct KeyboardInput {
 }
 
 #[cfg(feature = "render")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyboardEdit {
+    InsertText,
     Insert,
     Backward,
     LineBreak,
+}
+
+#[cfg(feature = "render")]
+fn protocol_insert_text(kind: obscura_dom::tree::TextControlKind, text: &str) -> String {
+    if kind == obscura_dom::tree::TextControlKind::TextArea {
+        return kind.normalize(text);
+    }
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            normalized.push(' ');
+        } else if ch == '\n' {
+            normalized.push(' ');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    kind.normalize(&normalized)
+}
+
+#[cfg(feature = "render")]
+fn utf16_prefix(text: &str, capacity: usize) -> &str {
+    let mut units = 0usize;
+    let mut end = 0usize;
+    for (offset, ch) in text.char_indices() {
+        let next = units + ch.len_utf16();
+        if next > capacity {
+            break;
+        }
+        units = next;
+        end = offset + ch.len_utf8();
+    }
+    &text[..end]
 }
 
 fn mouse_button_mask(button: i16) -> Option<u8> {
@@ -4813,7 +4851,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             return self
-                .dispatch_keyboard_edit(text, KeyboardEdit::Insert)
+                .dispatch_keyboard_edit(text, KeyboardEdit::InsertText)
                 .map_err(str::to_owned);
         }
         #[cfg(not(feature = "render"))]
@@ -4855,7 +4893,7 @@ impl ObscuraJsRuntime {
     #[cfg(feature = "render")]
     fn keyboard_text_target(
         &self,
-    ) -> Result<Option<(NodeId, obscura_dom::tree::TextControlState, bool)>, &'static str> {
+    ) -> Result<Option<(NodeId, obscura_dom::tree::TextControlState, bool, Option<usize>)>, &'static str> {
         let Some(node) = self.keyboard_target() else { return Ok(None); };
         self.with_dom(|dom| {
             for id in std::iter::once(node).chain(dom.ancestors(node)) {
@@ -4869,8 +4907,15 @@ impl ObscuraJsRuntime {
             if !control.kind.supports_selection() {
                 return Err("INPUT_ELEMENT_UNSUPPORTED");
             }
-            let readonly = dom.get_node(node).is_some_and(|element| element.get_attribute("readonly").is_some());
-            Ok(Some((node, control, readonly)))
+            let element = dom.get_node(node).ok_or("INPUT_TARGET_CHANGED")?;
+            let readonly = element.get_attribute("readonly").is_some();
+            let maxlength = element.get_attribute("maxlength").and_then(|value| {
+                let value = value.trim_start_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c'));
+                let value = value.strip_prefix('+').unwrap_or(value);
+                let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<usize>().ok().filter(|max| *max <= i32::MAX as usize)
+            });
+            Ok(Some((node, control, readonly, maxlength)))
         }).ok_or("NO_DOCUMENT")?
     }
 
@@ -4921,7 +4966,7 @@ impl ObscuraJsRuntime {
         // event after the cancelable beforeinput phase.
         let _ = self.keyboard_text_target()?;
         let kind = match edit {
-            KeyboardEdit::Insert => 8,
+            KeyboardEdit::InsertText | KeyboardEdit::Insert => 8,
             KeyboardEdit::Backward => 10,
             KeyboardEdit::LineBreak => 18,
         };
@@ -4930,7 +4975,7 @@ impl ObscuraJsRuntime {
         if !allowed { return Ok(()); }
         // A beforeinput listener can replace the document, move focus or alter
         // value/selection. Resolve all of them again before calculating the edit.
-        let Some((node, control, readonly)) = self.keyboard_text_target()? else { return Ok(()); };
+        let Some((node, control, readonly, maxlength)) = self.keyboard_text_target()? else { return Ok(()); };
         if readonly { return Ok(()); }
         if matches!(edit, KeyboardEdit::LineBreak)
             && control.kind != obscura_dom::tree::TextControlKind::TextArea {
@@ -4946,14 +4991,28 @@ impl ObscuraJsRuntime {
         let mut start = units.binary_search(&control.start).map_err(|_| "INPUT_SELECTION_UNSUPPORTED")?;
         let end = units.binary_search(&control.end).map_err(|_| "INPUT_SELECTION_UNSUPPORTED")?;
         if matches!(edit, KeyboardEdit::Backward) && start == end { start = start.saturating_sub(1); }
-        let text = match edit {
-            KeyboardEdit::Insert => text,
-            KeyboardEdit::Backward => "",
-            KeyboardEdit::LineBreak => "\n",
+        let requested = match edit {
+            KeyboardEdit::InsertText => protocol_insert_text(control.kind, text),
+            KeyboardEdit::Insert => text.to_owned(),
+            KeyboardEdit::Backward => String::new(),
+            KeyboardEdit::LineBreak => "\n".to_owned(),
+        };
+        let selected_units = (control.end - control.start) as usize;
+        let retained_units = units.last().copied().unwrap_or(0) as usize - selected_units;
+        let accepted = if matches!(
+            edit,
+            KeyboardEdit::InsertText | KeyboardEdit::Insert | KeyboardEdit::LineBreak
+        ) {
+            match maxlength {
+                Some(max) => utf16_prefix(&requested, max.saturating_sub(retained_units)),
+                None => requested.as_str(),
+            }
+        } else {
+            requested.as_str()
         };
         let mut value = control.value.clone();
-        value.replace_range(offsets[start]..offsets[end], text);
-        let prefix = &value[..offsets[start] + text.len()];
+        value.replace_range(offsets[start]..offsets[end], accepted);
+        let prefix = &value[..offsets[start] + accepted.len()];
         let prefix = if control.kind == obscura_dom::tree::TextControlKind::TextArea {
             control.kind.normalize(prefix)
         } else {
@@ -4965,16 +5024,41 @@ impl ObscuraJsRuntime {
             }
         };
         value = control.kind.normalize(&value);
-        let caret = (prefix.encode_utf16().count() as u32).min(value.encode_utf16().count() as u32);
+        let value_units = value.encode_utf16().count() as u32;
+        let caret = if edit == KeyboardEdit::InsertText {
+            control.start.saturating_add(requested.encode_utf16().count() as u32).min(value_units)
+        } else {
+            (prefix.encode_utf16().count() as u32).min(value_units)
+        };
         if value == control.value && control.start == control.end { return Ok(()); }
-        self.editable_text(node, &value)?;
+        // Backward commands remain outside this protocol text qualification.
+        if edit == KeyboardEdit::Backward {
+            self.editable_text(node, &value)?;
+        }
         let mut state = self.state.borrow_mut();
         let dom = state.dom.as_ref().ok_or("NO_DOCUMENT")?;
         dom.set_user_text_value(node, &value).ok_or("INPUT_TARGET_CHANGED")?;
         dom.set_text_selection(node, caret, caret, "none").ok_or("INPUT_TARGET_CHANGED")?;
         invalidate_input_render(&mut state);
         drop(state);
-        self.native_text_event(kind + 1, node, text)?;
+        if edit == KeyboardEdit::InsertText
+            && control.kind == obscura_dom::tree::TextControlKind::TextArea
+            && accepted.contains('\n')
+        {
+            let mut segment_start = 0;
+            for (offset, _) in accepted.match_indices('\n') {
+                if offset > segment_start {
+                    self.native_text_event(kind + 1, node, &accepted[segment_start..offset])?;
+                }
+                self.native_text_event(20, node, "")?;
+                segment_start = offset + 1;
+            }
+            if segment_start < accepted.len() {
+                self.native_text_event(kind + 1, node, &accepted[segment_start..])?;
+            }
+        } else {
+            self.native_text_event(kind + 1, node, accepted)?;
+        }
         self.native_input_checkpoint()
     }
 
@@ -8337,6 +8421,233 @@ mod tests {
         assert_eq!(rt.evaluate("[document.activeElement.id,observed]").unwrap(), serde_json::json!([
             "b", [["beforeinput","InputEvent","Q","insertText",true,true,true,true]]
         ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_insert_text_matches_maxlength_and_multiline_chrome_semantics() {
+        let mut rt = setup_runtime(
+            "<input id=i maxlength=4 value=ABCD><textarea id=t maxlength=3></textarea>",
+        );
+        rt.evaluate(r#"(() => {
+            globalThis.inputEvents = [];
+            const record = event => inputEvents.push([
+                event.type,event.data,event.target.value,event.target.selectionStart,
+                event.target.selectionEnd,event.target.getAttribute('maxlength')
+            ]);
+            for (const target of [i,t]) for (const type of ['beforeinput','input'])
+                target.addEventListener(type, record);
+            i.focus(); i.setSelectionRange(1,3);
+        })()"#).unwrap();
+        rt.dispatch_insert_text("😀X").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,i.selectionEnd,inputEvents]").unwrap(),
+            serde_json::json!([
+                "A😀D",4,4,[
+                    ["beforeinput","😀X","ABCD",1,3,"4"],
+                    ["input","😀","A😀D",4,4,"4"]
+                ]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            inputEvents=[]; i.maxLength=1; i.value=''; i.setSelectionRange(0,0); i.focus();
+        })()"#).unwrap();
+        rt.dispatch_insert_text("😀").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!(["",0,[["beforeinput","😀","",0,0,"1"]]])
+        );
+
+        rt.evaluate(r#"(() => {
+            inputEvents=[]; i.maxLength=3; i.value='ABCD'; i.setSelectionRange(1,4); i.focus();
+        })()"#).unwrap();
+        rt.dispatch_insert_text("").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "A",1,[
+                    ["beforeinput","","ABCD",1,4,"3"],
+                    ["input","","A",1,1,"3"]
+                ]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            inputEvents=[]; i.maxLength=4; i.value='X'; i.setSelectionRange(1,1); i.focus();
+            i.addEventListener('beforeinput', () => { i.maxLength=2; }, {once:true});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("ABC").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "XA",2,[
+                    ["beforeinput","ABC","X",1,1,"4"],
+                    ["input","A","XA",2,2,"2"]
+                ]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            inputEvents=[]; i.maxLength=2; i.value='X'; i.setSelectionRange(1,1); i.focus();
+            i.addEventListener('beforeinput', () => { i.maxLength=4; }, {once:true});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("ABC").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "XABC",4,[
+                    ["beforeinput","ABC","X",1,1,"2"],
+                    ["input","ABC","XABC",4,4,"4"]
+                ]
+            ])
+        );
+
+        rt.evaluate(r#"(() => {
+            inputEvents=[]; i.maxLength=4; i.value='ABCD'; i.setSelectionRange(4,4); i.focus();
+            i.addEventListener('beforeinput', () => {
+                i.value='Q'; i.setSelectionRange(1,1);
+            }, {once:true});
+        })()"#).unwrap();
+        rt.dispatch_insert_text("XY").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "QXY",3,[
+                    ["beforeinput","XY","ABCD",4,4,"4"],
+                    ["input","XY","QXY",3,3,"4"]
+                ]
+            ])
+        );
+
+        rt.evaluate("(() => { inputEvents=[];i.setAttribute('maxlength','4suffix');i.value='';i.setSelectionRange(0,0); })()").unwrap();
+        rt.dispatch_insert_text("ABCDE").unwrap();
+        assert_eq!(rt.evaluate("[i.value,inputEvents[inputEvents.length-1][1]]").unwrap(), serde_json::json!(["ABCD","ABCD"]));
+        rt.evaluate("(() => { inputEvents=[];i.setAttribute('maxlength','-1');i.value='';i.setSelectionRange(0,0); })()").unwrap();
+        rt.dispatch_insert_text("ABCDE").unwrap();
+        assert_eq!(rt.evaluate("[i.value,inputEvents[inputEvents.length-1][1]]").unwrap(), serde_json::json!(["ABCDE","ABCDE"]));
+
+        rt.evaluate("(() => { inputEvents=[];t.focus();t.setSelectionRange(0,0); })()").unwrap();
+        rt.dispatch_insert_text("A\r\nB😀").unwrap();
+        assert_eq!(
+            rt.evaluate("[t.value,t.selectionStart,t.selectionEnd,inputEvents]").unwrap(),
+            serde_json::json!([
+                "A\nB",3,3,[
+                    ["beforeinput","A\r\nB😀","",0,0,"3"],
+                    ["input","A","A\nB",3,3,"3"],
+                    ["input",null,"A\nB",3,3,"3"],
+                    ["input","B","A\nB",3,3,"3"]
+                ]
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_protocol_text_normalizes_input_newlines_and_keys_use_actual_caret() {
+        let mut rt = setup_runtime("<input id=i maxlength=4 value=ABCD>");
+        rt.evaluate(r#"(() => {
+            globalThis.inputEvents=[];
+            for (const type of ['keydown','keypress','beforeinput','input'])
+                i.addEventListener(type,e=>inputEvents.push([e.type,e.data,i.value,i.selectionStart]));
+            i.focus();i.setSelectionRange(1,3);
+        })()"#).unwrap();
+        rt.dispatch_keyboard_input(KeyboardInput {
+            text: "😀X".into(),
+            ..KeyboardInput::default()
+        }).unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "A😀D",3,[
+                    ["keydown",null,"ABCD",1],
+                    ["keypress",null,"ABCD",1],
+                    ["beforeinput","😀X","ABCD",1],
+                    ["input","😀","A😀D",3]
+                ]
+            ])
+        );
+
+        rt.evaluate("(() => { inputEvents=[];i.maxLength=2;i.value='ABC';i.setSelectionRange(1,2); })()").unwrap();
+        rt.dispatch_insert_text("X").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "AC",2,[
+                    ["beforeinput","X","ABC",1],
+                    ["input","","AC",2]
+                ]
+            ])
+        );
+        rt.evaluate("(() => { inputEvents=[];i.value='ABC';i.setSelectionRange(1,2); })()").unwrap();
+        rt.dispatch_keyboard_input(KeyboardInput {
+            text: "X".into(),
+            ..KeyboardInput::default()
+        }).unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "AC",1,[
+                    ["keydown",null,"ABC",1],
+                    ["keypress",null,"ABC",1],
+                    ["beforeinput","X","ABC",1],
+                    ["input","","AC",1]
+                ]
+            ])
+        );
+
+        rt.evaluate("(() => { inputEvents=[];i.removeAttribute('maxlength');i.value='';i.setSelectionRange(0,0); })()").unwrap();
+        rt.dispatch_insert_text("A\nB").unwrap();
+        assert_eq!(
+            rt.evaluate("[i.value,i.selectionStart,inputEvents]").unwrap(),
+            serde_json::json!([
+                "A B",3,[
+                    ["beforeinput","A\nB","",0],
+                    ["input","A B","A B",3]
+                ]
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_line_break_obeys_textarea_maxlength_without_a_protocol_error() {
+        let mut rt = setup_runtime("<textarea id=t maxlength=3>ABC</textarea>");
+        rt.evaluate(r#"(() => {
+            globalThis.lineEvents=[];
+            for (const type of ['keydown','keypress','beforeinput','input'])
+                t.addEventListener(type,e=>lineEvents.push([e.type,e.inputType,e.data,t.value,t.selectionStart]));
+            t.focus();t.setSelectionRange(3,3);
+        })()"#).unwrap();
+        let enter = || KeyboardInput {
+            key: "Enter".into(), code: "Enter".into(), text: "\r".into(),
+            windows_virtual_key_code: 13, ..KeyboardInput::default()
+        };
+        rt.dispatch_keyboard_input(enter()).unwrap();
+        assert_eq!(
+            rt.evaluate("[t.value,t.selectionStart,lineEvents]").unwrap(),
+            serde_json::json!([
+                "ABC",3,[
+                    ["keydown",null,null,"ABC",3],
+                    ["keypress",null,null,"ABC",3],
+                    ["beforeinput","insertLineBreak",null,"ABC",3]
+                ]
+            ])
+        );
+
+        rt.evaluate("(() => { lineEvents=[];t.value='AB';t.setSelectionRange(2,2); })()").unwrap();
+        rt.dispatch_keyboard_input(enter()).unwrap();
+        assert_eq!(
+            rt.evaluate("[t.value,t.selectionStart,lineEvents]").unwrap(),
+            serde_json::json!([
+                "AB\n",3,[
+                    ["keydown",null,null,"AB",2],
+                    ["keypress",null,null,"AB",2],
+                    ["beforeinput","insertLineBreak",null,"AB",2],
+                    ["input","insertLineBreak",null,"AB\n",3]
+                ]
+            ])
+        );
     }
 
     #[cfg(feature = "render")]

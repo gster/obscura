@@ -19003,6 +19003,9 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   };
 
   function textEvent(kind,path,value) {
+    if (kind === 20) return dispatch('input',path,{bubbles:true,cancelable:false,
+      composed:true,data:null,inputType:'insertText',isComposing:false,
+      dataTransfer:null,getTargetRanges(){return []}},NativeInputEvent);
     if (kind === 18 || kind === 19) return dispatch(kind === 18 ? 'beforeinput' : 'input',path,
       {bubbles:true,cancelable:kind===18,composed:true,data:null,inputType:'insertLineBreak',
         isComposing:false,dataTransfer:null,getTargetRanges(){return []}},NativeInputEvent);

@@ -38,6 +38,7 @@ CASES = (
     "metadata",
     "poison",
     "reentrancy",
+    "maxlength",
     "protocol-negative",
 )
 
@@ -60,7 +61,11 @@ HTML = r'''<!doctype html>
     altKey:e.altKey, ctrlKey:e.ctrlKey, metaKey:e.metaKey, shiftKey:e.shiftKey,
     keyCode:e.keyCode, charCode:e.charCode, which:e.which,
     data:e.data === undefined ? null : e.data,
-    inputType:e.inputType === undefined ? null : e.inputType});
+    inputType:e.inputType === undefined ? null : e.inputType,
+    targetValue:e.target && typeof e.target.value === 'string' ? e.target.value : null,
+    targetSelectionStart:e.target && typeof e.target.selectionStart === 'number' ? e.target.selectionStart : null,
+    targetSelectionEnd:e.target && typeof e.target.selectionEnd === 'number' ? e.target.selectionEnd : null,
+    targetMaxlength:e.target && e.target.getAttribute ? e.target.getAttribute('maxlength') : null});
   globalThis.__resetKeyProbe = () => { globalThis.__keyEvents=[];
     globalThis.__poisonCalls={KeyboardEvent:0,InputEvent:0,Event:0,dispatchEvent:0}; };
   globalThis.__snapshotKeyProbe = () => ({events:globalThis.__keyEvents,
@@ -327,6 +332,207 @@ def _reentrancy(page: Any) -> dict[str, Any]:
             "documentAction":document_action, "documentSnapshot":document_snapshot}
 
 
+def _prepare_maxlength(
+    page: Any,
+    *,
+    node: str,
+    maxlength: str,
+    value: str,
+    start: int,
+    end: int,
+    beforeinput_hook: str | None = None,
+) -> None:
+    page.reload()
+    page.evaluate(
+        """args => {
+          const target = document.querySelector(args.node);
+          target.setAttribute('maxlength', args.maxlength);
+          target.value = args.value;
+          target.focus();
+          target.setSelectionRange(args.start, args.end);
+          globalThis.__resetKeyProbe();
+          if (args.beforeinputHook) {
+            target.addEventListener('beforeinput', Function(args.beforeinputHook), {once:true});
+          }
+        }""",
+        {
+            "node": node,
+            "maxlength": maxlength,
+            "value": value,
+            "start": start,
+            "end": end,
+            "beforeinputHook": beforeinput_hook,
+        },
+    )
+
+
+def _maxlength(page: Any) -> dict[str, Any]:
+    records: dict[str, Any] = {}
+
+    _prepare_maxlength(page, node="#edit", maxlength="4", value="", start=0, end=0)
+    records["partial"] = {
+        "action": _dispatch(page, {"text": "A😀BC"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="0", value="", start=0, end=0)
+    records["zero"] = {
+        "action": _dispatch(page, {"text": "A"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="4", value="ABCD", start=1, end=3)
+    records["selection"] = {
+        "action": _dispatch(page, {"text": "😀X"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(
+        page,
+        node="#edit",
+        maxlength="4",
+        value="X",
+        start=1,
+        end=1,
+        beforeinput_hook="document.getElementById('edit').maxLength=2",
+    )
+    records["dynamicShrink"] = {
+        "action": _dispatch(page, {"text": "ABC"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(
+        page,
+        node="#edit",
+        maxlength="2",
+        value="X",
+        start=1,
+        end=1,
+        beforeinput_hook="document.getElementById('edit').maxLength=4",
+    )
+    records["dynamicGrow"] = {
+        "action": _dispatch(page, {"text": "ABC"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(
+        page,
+        node="#edit",
+        maxlength="4",
+        value="ABCD",
+        start=4,
+        end=4,
+        beforeinput_hook=(
+            "const target=document.getElementById('edit');"
+            "target.value='Q';target.setSelectionRange(1,1)"
+        ),
+    )
+    records["reentryValueSelection"] = {
+        "action": _dispatch(page, {"text": "XY"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="3", value="ABCD", start=1, end=4)
+    records["overlongDelete"] = {
+        "action": _dispatch(page, {"text": ""}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="2", value="ABC", start=1, end=2)
+    records["selectionNoCapacity"] = {
+        "action": _dispatch(page, {"text": "X"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="4suffix", value="", start=0, end=0)
+    records["parsedPrefix"] = {
+        "action": _dispatch(page, {"text": "ABCDE"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="-1", value="", start=0, end=0)
+    records["negativeUnbounded"] = {
+        "action": _dispatch(page, {"text": "ABCDE"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="2", value="", start=0, end=0)
+    records["inputNewline"] = {
+        "action": _dispatch(page, {"text": "A\r\nB"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#other", maxlength="3", value="", start=0, end=0)
+    records["textarea"] = {
+        "action": _dispatch(page, {"text": "A\r\nB😀"}, "Input.insertText"),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="4", value="ABCD", start=1, end=3)
+    records["keyText"] = {
+        "action": _dispatch(
+            page,
+            {
+                "type": "keyDown",
+                "key": "",
+                "code": "",
+                "text": "😀X",
+                "unmodifiedText": "😀X",
+                "windowsVirtualKeyCode": 0,
+            },
+        ),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="2", value="ABC", start=1, end=2)
+    records["keyTextNoCapacity"] = {
+        "action": _dispatch(
+            page,
+            {
+                "type": "keyDown",
+                "key": "",
+                "code": "",
+                "text": "X",
+                "unmodifiedText": "X",
+                "windowsVirtualKeyCode": 0,
+            },
+        ),
+        "snapshot": _snapshot(page),
+    }
+
+    enter = {
+        "type": "keyDown",
+        "key": "Enter",
+        "code": "Enter",
+        "text": "\r",
+        "unmodifiedText": "\r",
+        "windowsVirtualKeyCode": 13,
+    }
+    _prepare_maxlength(page, node="#other", maxlength="3", value="ABC", start=3, end=3)
+    records["lineBreakFull"] = {
+        "action": _dispatch(page, enter),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#other", maxlength="3", value="AB", start=2, end=2)
+    records["lineBreakOneCapacity"] = {
+        "action": _dispatch(page, enter),
+        "snapshot": _snapshot(page),
+    }
+
+    _prepare_maxlength(page, node="#edit", maxlength="4", value="", start=0, end=0)
+    fill_error: dict[str, Any] | None = None
+    try:
+        page.locator("#edit").fill("A😀BC")
+    except Exception as error:
+        fill_error = error_record(error)
+    records["locatorFill"] = {
+        "action": {"method": "Locator.fill", "actionError": fill_error},
+        "snapshot": _snapshot(page),
+    }
+    return records
+
+
 def _protocol_negative(page: Any) -> dict[str, Any]:
     cases = [
         ("Input.dispatchKeyEvent", {"type":"keyDown"}),
@@ -348,6 +554,7 @@ def run_case(page: Any, case: str) -> dict[str, Any]:
     if case == "metadata": return _metadata(page)
     if case == "poison": return _poison(page)
     if case == "reentrancy": return _reentrancy(page)
+    if case == "maxlength": return _maxlength(page)
     if case == "protocol-negative": return _protocol_negative(page)
     raise ValueError(case)
 
@@ -440,6 +647,121 @@ def assert_contract(case: str, observation: dict[str, Any], *, label: str) -> No
         document = observation["documentSnapshot"]
         if document != {"active":"next", "value":"XYnew"}:
             raise AssertionError(f"{label}: document.open retarget differs: {observation!r}")
+    elif case == "maxlength":
+        expected_values = {
+            "partial": ("edit", "A😀B", 4),
+            "zero": ("edit", "", 0),
+            "selection": ("edit", "A😀D", 4),
+            "dynamicShrink": ("edit", "XA", 2),
+            "dynamicGrow": ("edit", "XABC", 4),
+            "reentryValueSelection": ("edit", "QXY", 3),
+            "overlongDelete": ("edit", "A", 1),
+            "selectionNoCapacity": ("edit", "AC", 2),
+            "parsedPrefix": ("edit", "ABCD", 4),
+            "negativeUnbounded": ("edit", "ABCDE", 5),
+            "inputNewline": ("edit", "A ", 2),
+            "textarea": ("other", "A\nB", 3),
+            "keyText": ("edit", "A😀D", 3),
+            "keyTextNoCapacity": ("edit", "AC", 1),
+            "lineBreakFull": ("other", "ABC", 3),
+            "lineBreakOneCapacity": ("other", "AB\n", 3),
+            "locatorFill": ("edit", "A😀B", 4),
+        }
+        for name, (node, value, caret) in expected_values.items():
+            record = observation.get(name, {})
+            action = record.get("action", {})
+            if action.get("actionError"):
+                raise AssertionError(f"{label}: maxlength {name} action failed: {action!r}")
+            snapshot = record.get("snapshot", {})
+            field = snapshot.get("values", {}).get(node, {})
+            if (field.get("value"), field.get("start"), field.get("end")) != (value, caret, caret):
+                raise AssertionError(f"{label}: maxlength {name} value/selection differs: {record!r}")
+        expected_target_events = {
+            "partial": [("beforeinput", "A😀BC"), ("input", "A😀B")],
+            "zero": [("beforeinput", "A")],
+            "selection": [("beforeinput", "😀X"), ("input", "😀")],
+            "dynamicShrink": [("beforeinput", "ABC"), ("input", "A")],
+            "dynamicGrow": [("beforeinput", "ABC"), ("input", "ABC")],
+            "reentryValueSelection": [("beforeinput", "XY"), ("input", "XY")],
+            "overlongDelete": [("beforeinput", ""), ("input", "")],
+            "selectionNoCapacity": [("beforeinput", "X"), ("input", "")],
+            "parsedPrefix": [("beforeinput", "ABCDE"), ("input", "ABCD")],
+            "negativeUnbounded": [("beforeinput", "ABCDE"), ("input", "ABCDE")],
+            "inputNewline": [("beforeinput", "A\r\nB"), ("input", "A ")],
+            "textarea": [
+                ("beforeinput", "A\r\nB😀"),
+                ("input", "A"),
+                ("input", None),
+                ("input", "B"),
+            ],
+            "keyText": [
+                ("keydown", None),
+                ("keypress", None),
+                ("beforeinput", "😀X"),
+                ("input", "😀"),
+            ],
+            "keyTextNoCapacity": [
+                ("keydown", None),
+                ("keypress", None),
+                ("beforeinput", "X"),
+                ("input", ""),
+            ],
+            "lineBreakFull": [
+                ("keydown", None),
+                ("keypress", None),
+                ("beforeinput", None),
+            ],
+            "lineBreakOneCapacity": [
+                ("keydown", None),
+                ("keypress", None),
+                ("beforeinput", None),
+                ("input", None),
+            ],
+            "locatorFill": [("beforeinput", "A😀BC"), ("input", "A😀B")],
+        }
+        for name, expected in expected_target_events.items():
+            node = expected_values[name][0]
+            events = observation[name]["snapshot"].get("events", [])
+            actual = [
+                (event.get("type"), event.get("data"))
+                for event in events
+                if event.get("currentTarget") == node
+            ]
+            if actual != expected:
+                raise AssertionError(f"{label}: maxlength {name} events differ: {actual!r}")
+        expected_event_states = {
+            "selection": [("ABCD", 1, 3, "4"), ("A😀D", 4, 4, "4")],
+            "dynamicShrink": [("X", 1, 1, "4"), ("XA", 2, 2, "2")],
+            "dynamicGrow": [("X", 1, 1, "2"), ("XABC", 4, 4, "4")],
+            "reentryValueSelection": [("ABCD", 4, 4, "4"), ("QXY", 3, 3, "4")],
+            "textarea": [
+                ("", 0, 0, "3"),
+                ("A\nB", 3, 3, "3"),
+                ("A\nB", 3, 3, "3"),
+                ("A\nB", 3, 3, "3"),
+            ],
+            "keyTextNoCapacity": [
+                ("ABC", 1, 2, "2"),
+                ("ABC", 1, 2, "2"),
+                ("ABC", 1, 2, "2"),
+                ("AC", 1, 1, "2"),
+            ],
+        }
+        for name, expected in expected_event_states.items():
+            node = expected_values[name][0]
+            events = observation[name]["snapshot"].get("events", [])
+            actual = [
+                (
+                    event.get("targetValue"),
+                    event.get("targetSelectionStart"),
+                    event.get("targetSelectionEnd"),
+                    event.get("targetMaxlength"),
+                )
+                for event in events
+                if event.get("currentTarget") == node
+            ]
+            if actual != expected:
+                raise AssertionError(f"{label}: maxlength {name} event states differ: {actual!r}")
     elif case == "protocol-negative":
         expected_errors = [False, True, True, True, True, True, True]
         actual_errors = [bool(item.get("actionError")) for item in observation["actions"]]
@@ -461,6 +783,33 @@ def compare_case(case: str, reference: dict[str, Any], candidate: dict[str, Any]
         for key in ("focusSnapshot", "documentSnapshot"):
             if reference.get(key) != candidate.get(key):
                 raise AssertionError(f"{label}: {key} differs")
+        return
+    if case == "maxlength":
+        for name in (
+            "partial",
+            "zero",
+            "selection",
+            "dynamicShrink",
+            "dynamicGrow",
+            "reentryValueSelection",
+            "overlongDelete",
+            "selectionNoCapacity",
+            "parsedPrefix",
+            "negativeUnbounded",
+            "inputNewline",
+            "textarea",
+            "keyText",
+            "keyTextNoCapacity",
+            "lineBreakFull",
+            "lineBreakOneCapacity",
+            "locatorFill",
+        ):
+            ref = reference.get(name, {})
+            got = candidate.get(name, {})
+            if bool(ref.get("action", {}).get("actionError")) != bool(
+                got.get("action", {}).get("actionError")
+            ) or ref.get("snapshot") != got.get("snapshot"):
+                raise AssertionError(f"{label}: maxlength {name} differs")
         return
     if case == "cancellation":
         for phase in ("keydown", "keypress", "beforeinput", "insertText"):
@@ -574,15 +923,23 @@ def run_engine(engine: str, *, obscura_bin: Path, persona: str, root: Path,
     return record
 
 
-def run(*, obscura_bin: Path, output: Path, persona: str, engines: list[str], cases: list[str], reference_json: Path | None = None) -> dict[str, Any]:
+def run(*, obscura_bin: Path, output: Path, persona: str, engines: list[str], cases: list[str],
+        reference_json: Path | None = None,
+        chrome_executable_override: Path | None = None) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="ob027-native-keyboard-", dir=output.parent)).resolve()
     result: dict[str, Any] = {"schemaVersion":1,"status":"running","root":str(root),"cases":cases,"engines":{},"comparison":{}}
     try:
         chrome_executable: Path | None = None
         if "chrome" in engines:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as playwright: chrome_executable = Path(playwright.chromium.executable_path)
+            if chrome_executable_override is not None:
+                chrome_executable = chrome_executable_override.resolve()
+            else:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as playwright:
+                    chrome_executable = Path(playwright.chromium.executable_path)
+            if not chrome_executable.is_file():
+                raise FileNotFoundError(f"Chrome executable does not exist: {chrome_executable}")
         for engine in engines:
             result["engines"][engine] = run_engine(engine, obscura_bin=obscura_bin, persona=persona, root=root, cases=cases, chrome_executable=chrome_executable)
         reference_document = json.loads(reference_json.read_text()) if reference_json else result["engines"].get("chrome", {}).get("workerResult")
@@ -624,6 +981,7 @@ def main() -> int:
     parser.add_argument("--with-chrome", action="store_true")
     parser.add_argument("--chrome-only", action="store_true")
     parser.add_argument("--reference-json", type=Path)
+    parser.add_argument("--chrome-executable", type=Path)
     parser.add_argument("--case", action="append", choices=CASES)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--persona", default=DEFAULT_PERSONA)
@@ -637,7 +995,15 @@ def main() -> int:
     if args.reference_json and args.chrome_only: parser.error("--reference-json cannot be combined with --chrome-only")
     cases = args.case or list(CASES)
     engines = ["chrome"] if args.chrome_only else ["obscura"] + (["chrome"] if args.with_chrome else [])
-    result = run(obscura_bin=args.obscura_bin, output=args.output.resolve(), persona=args.persona, engines=engines, cases=cases, reference_json=args.reference_json)
+    result = run(
+        obscura_bin=args.obscura_bin,
+        output=args.output.resolve(),
+        persona=args.persona,
+        engines=engines,
+        cases=cases,
+        reference_json=args.reference_json,
+        chrome_executable_override=args.chrome_executable,
+    )
     print(json.dumps(result, indent=2, ensure_ascii=True)); return 0 if result["status"] == "passed" else 1
 
 

@@ -460,11 +460,18 @@ platforms. Native coordinate input requires the render build.
 
 ## Native keyboard and text qualification
 
-`native_keyboard_smoke.py` uses Playwright's raw CDP session against seven
+`native_keyboard_smoke.py` uses Playwright's raw CDP session against eight
 isolated local cases. It checks `Input.insertText` selection replacement and
 empty deletion, keyDown/rawKeyDown/char/keyUp phase order, cancellation,
 keyboard metadata, browser-owned dispatch despite poisoned public APIs,
-focus/document reentry, and malformed protocol parameters.
+focus/document reentry, ordinary input/textarea `maxlength` edits, and malformed
+protocol parameters. The maxlength case retains the original requested text in
+`beforeinput`, verifies the actual UTF-16/scalar-aligned inserted prefix in
+`input`, covers zero capacity, selection replacement, dynamic bounds, an
+already-overlong scripted value, textarea newline normalization, key text, and
+the official `Locator.fill()` path. Each event also records the target value,
+selection and maxlength at dispatch time; paired comparison retains and checks
+the complete snapshot rather than projecting only the final control value.
 
 ```bash
 RUN_ROOT="$(mktemp -d)"
@@ -480,15 +487,17 @@ uv run --project tools/unblocked --frozen --python 3.12 \
 bundled with the locked client. `--chrome-only` validates the reference
 contract, while the default CI mode checks Obscura against the embedded stable
 contract. `--reference-json` accepts either a worker result or a complete prior
-runner result. Every browser runs in a separate process under a 45-second
+runner result. If the locked Chromium executable is not installed,
+`--chrome-executable PATH` selects an explicit reference binary and records the
+exact command and reported browser version. Every browser runs in a separate process under a 45-second
 worker deadline. Complete browser/worker byte streams, `pw:protocol`, fixture
 request/response bytes, HTML, checkpoints and failed comparisons remain in the
 result directory without field removal.
 
-This gate qualifies ordinary input/textarea selection edits, readonly and
-non-editable beforeinput behavior, the listed event phases and metadata, and
-the measured focus/document reentry. It does not qualify contenteditable,
-IME/composition, grapheme or word editing, arbitrary editor commands,
-platform-shortcut defaults, complex implicit form submission, button/checkbox
-activation, or maxlength truncation. Keyboard and text native input currently
-requires the render build; no-render reports it as unsupported.
+This gate qualifies ordinary input/textarea selection edits and maxlength user
+edits, readonly and non-editable beforeinput behavior, the listed event phases
+and metadata, and the measured focus/document reentry. It does not qualify
+contenteditable, IME/composition, grapheme or word editing, arbitrary editor
+commands, platform-shortcut defaults, complex implicit form submission, or
+button/checkbox activation. Keyboard and text native input currently requires
+the render build; no-render reports it as unsupported.

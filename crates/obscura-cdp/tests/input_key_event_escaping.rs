@@ -194,8 +194,8 @@ async fn insert_text_types_into_the_focused_field() {
     .await;
     assert_eq!(
         v["result"]["value"].as_str().unwrap_or_default(),
-        r#""he'll\\obye""#,
-        "text inputs preserve quotes and backslashes but strip newlines"
+        r#""he'll\\o bye""#,
+        "Input.insertText preserves quotes and backslashes and maps a line break to a space"
     );
 }
 
@@ -276,6 +276,290 @@ async fn insert_text_uses_the_native_text_path_and_real_input_events() {
                 ["input", "insertText", "中🚀", true, true, false, "A中🚀B"]
             ]
         ])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_applies_maxlength_after_reentry_and_emits_actual_text() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression": r#"(() => {
+            i.maxLength=4;i.value='ABCD';i.focus();i.setSelectionRange(1,3);
+            globalThis.__maxlengthEvents=[];
+            for (const type of ['beforeinput','input']) i.addEventListener(type,e=>{
+                __maxlengthEvents.push([e.type,e.data,i.value,i.selectionStart,i.selectionEnd,i.getAttribute('maxlength')]);
+            });
+        })()"#,
+        "returnByValue": true
+    }), session_id).await;
+    cdp(&mut ctx, 3, "Input.insertText", json!({"text":"😀X"}), session_id).await;
+    let partial = cdp(&mut ctx, 4, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,i.selectionEnd,__maxlengthEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(partial["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["A😀D",4,4,[
+            ["beforeinput","😀X","ABCD",1,3,"4"],
+            ["input","😀","A😀D",4,4,"4"]
+        ]])
+    );
+
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression":"__maxlengthEvents=[];i.maxLength=1;i.value='';i.setSelectionRange(0,0)",
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 6, "Input.insertText", json!({"text":"😀"}), session_id).await;
+    let no_capacity = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,__maxlengthEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(no_capacity["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["",0,[["beforeinput","😀","",0,0,"1"]]])
+    );
+
+    cdp(&mut ctx, 8, "Runtime.evaluate", json!({
+        "expression":r#"(() => {
+            __maxlengthEvents=[];i.maxLength=3;i.value='ABCD';i.setSelectionRange(1,4);
+        })()"#,
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 9, "Input.insertText", json!({"text":""}), session_id).await;
+    let deletion = cdp(&mut ctx, 10, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,__maxlengthEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(deletion["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["A",1,[
+            ["beforeinput","","ABCD",1,4,"3"],
+            ["input","","A",1,1,"3"]
+        ]])
+    );
+
+    cdp(&mut ctx, 11, "Runtime.evaluate", json!({
+        "expression":r#"(() => {
+            __maxlengthEvents=[];i.maxLength=4;i.value='X';i.setSelectionRange(1,1);
+            i.addEventListener('beforeinput',()=>{i.maxLength=2},{once:true});
+        })()"#,
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 12, "Input.insertText", json!({"text":"ABC"}), session_id).await;
+    let reentry = cdp(&mut ctx, 13, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,__maxlengthEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(reentry["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["XA",2,[
+            ["beforeinput","ABC","X",1,1,"4"],
+            ["input","A","XA",2,2,"2"]
+        ]])
+    );
+
+    cdp(&mut ctx, 14, "Runtime.evaluate", json!({
+        "expression":"__maxlengthEvents=[];i.maxLength=2;i.value='ABC';i.setSelectionRange(1,2)",
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 15, "Input.insertText", json!({"text":"X"}), session_id).await;
+    let retained = cdp(&mut ctx, 16, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,__maxlengthEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(retained["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["AC",2,[
+            ["beforeinput","X","ABC",1,2,"2"],
+            ["input","","AC",2,2,"2"]
+        ]])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_normalizes_multiline_payloads_before_maxlength() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":url,"waitUntil":"load"}), session_id).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression":r#"(() => {
+            a.maxLength=3;a.value='';a.focus();a.setSelectionRange(0,0);
+            globalThis.__multilineEvents=[];
+            for(const type of ['beforeinput','input']) a.addEventListener(type,e=>{
+                __multilineEvents.push([e.type,e.data,a.value,a.selectionStart,a.selectionEnd]);
+            });
+        })()"#,
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 3, "Input.insertText", json!({"text":"A\r\nB😀"}), session_id).await;
+    let textarea = cdp(&mut ctx, 4, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([a.value,a.selectionStart,a.selectionEnd,__multilineEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(textarea["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["A\nB",3,3,[
+            ["beforeinput","A\r\nB😀","",0,0],
+            ["input","A","A\nB",3,3],
+            ["input",null,"A\nB",3,3],
+            ["input","B","A\nB",3,3]
+        ]])
+    );
+
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression":r#"(() => {
+            i.removeAttribute('maxlength');i.value='';i.focus();i.setSelectionRange(0,0);
+            globalThis.__singleLineEvents=[];
+            for(const type of ['beforeinput','input']) i.addEventListener(type,e=>{
+                __singleLineEvents.push([e.type,e.data,i.value,i.selectionStart]);
+            });
+        })()"#,
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 6, "Input.insertText", json!({"text":"A\r\nB"}), session_id).await;
+    let input = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,__singleLineEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(input["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["A B",3,[
+            ["beforeinput","A\r\nB","",0],
+            ["input","A B","A B",3]
+        ]])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn key_text_maxlength_uses_actual_prefix_and_actual_caret() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":url,"waitUntil":"load"}), session_id).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression":r#"(() => {
+            i.maxLength=4;i.value='ABCD';i.focus();i.setSelectionRange(1,3);
+            globalThis.__keyMaxEvents=[];
+            for(const type of ['keydown','keypress','beforeinput','input']) i.addEventListener(type,e=>{
+                __keyMaxEvents.push([e.type,e.data,i.value,i.selectionStart]);
+            });
+        })()"#,
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 3, "Input.dispatchKeyEvent", json!({
+        "type":"keyDown","text":"😀X"
+    }), session_id).await;
+    let result = cdp(&mut ctx, 4, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,i.selectionEnd,__keyMaxEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(result["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["A😀D",3,3,[
+            ["keydown",null,"ABCD",1],
+            ["keypress",null,"ABCD",1],
+            ["beforeinput","😀X","ABCD",1],
+            ["input","😀","A😀D",3]
+        ]])
+    );
+
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression":"__keyMaxEvents=[];i.maxLength=2;i.value='ABC';i.setSelectionRange(1,2)",
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 6, "Input.dispatchKeyEvent", json!({
+        "type":"keyDown","text":"X"
+    }), session_id).await;
+    let retained = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([i.value,i.selectionStart,i.selectionEnd,__keyMaxEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(retained["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["AC",1,1,[
+            ["keydown",null,"ABC",1],
+            ["keypress",null,"ABC",1],
+            ["beforeinput","X","ABC",1],
+            ["input","","AC",1]
+        ]])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn enter_obeys_textarea_maxlength_without_a_protocol_error() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":url,"waitUntil":"load"}), session_id).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression":r#"(() => {
+            a.maxLength=3;a.value='ABC';a.focus();a.setSelectionRange(3,3);
+            globalThis.__lineEvents=[];
+            for(const type of ['keydown','keypress','beforeinput','input']) a.addEventListener(type,e=>{
+                __lineEvents.push([e.type,e.inputType,e.data,a.value,a.selectionStart]);
+            });
+        })()"#,
+        "returnByValue":true
+    }), session_id).await;
+    let enter = json!({
+        "type":"keyDown","key":"Enter","code":"Enter","text":"\r",
+        "windowsVirtualKeyCode":13
+    });
+    cdp(&mut ctx, 3, "Input.dispatchKeyEvent", enter.clone(), session_id).await;
+    let full = cdp(&mut ctx, 4, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([a.value,a.selectionStart,__lineEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(full["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["ABC",3,[
+            ["keydown",null,null,"ABC",3],
+            ["keypress",null,null,"ABC",3],
+            ["beforeinput","insertLineBreak",null,"ABC",3]
+        ]])
+    );
+
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression":"__lineEvents=[];a.value='AB';a.setSelectionRange(2,2)",
+        "returnByValue":true
+    }), session_id).await;
+    cdp(&mut ctx, 6, "Input.dispatchKeyEvent", enter, session_id).await;
+    let available = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression":"JSON.stringify([a.value,a.selectionStart,__lineEvents])",
+        "returnByValue":true
+    }), session_id).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(available["result"]["value"].as_str().unwrap()).unwrap(),
+        json!(["AB\n",3,[
+            ["keydown",null,null,"AB",2],
+            ["keypress",null,null,"AB",2],
+            ["beforeinput","insertLineBreak",null,"AB",2],
+            ["input","insertLineBreak",null,"AB\n",3]
+        ]])
     );
 }
 
