@@ -649,6 +649,7 @@ async fn insert_text_processes_same_document_navigation_and_emits_frame_event() 
         session_id,
     )
     .await;
+    let loader_id = ctx.current_loader_ids[&page_id].clone();
     ctx.pending_events.clear();
     cdp(
         &mut ctx,
@@ -682,12 +683,18 @@ async fn insert_text_processes_same_document_navigation_and_emits_frame_event() 
         .expect("input-triggered same-document navigation must emit Page.frameNavigated");
     assert_eq!(frame.session_id.as_deref(), Some(session_id));
     assert_eq!(frame.params["frame"]["id"], page_id);
+    assert_eq!(frame.params["frame"]["loaderId"], loader_id);
     assert!(
         frame.params["frame"]["url"]
             .as_str()
             .is_some_and(|url| url.ends_with("#typed")),
         "unexpected frame event: {frame:?}"
     );
+    assert_eq!(ctx.current_loader_ids[&page_id], loader_id);
+    assert!(ctx.pending_events.iter().all(|event| {
+        event.method != "Runtime.executionContextsCleared"
+            && event.method != "Page.lifecycleEvent"
+    }));
 }
 
 #[tokio::test(flavor = "current_thread")]

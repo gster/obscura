@@ -2865,9 +2865,11 @@ mod tests {
         let events: Vec<_> = result["events"].as_array().unwrap().iter()
             .filter(|event| event["url"].as_str().unwrap().ends_with("/script-request"))
             .collect();
-        assert_eq!(events.len(), 1, "{output}");
-        assert_eq!(events[0]["phase"], "completed");
-        let request_id = events[0]["request_id"].as_str().unwrap();
+        assert_eq!(events.len(), 2, "{output}");
+        assert_eq!(events[0]["phase"], "started");
+        assert_eq!(events[1]["phase"], "completed");
+        assert_eq!(events[0]["request_id"], events[1]["request_id"]);
+        let request_id = events[1]["request_id"].as_str().unwrap();
         let body_before = state.page_mut().get_response_body_result(request_id).unwrap().unwrap();
         assert_eq!(tool_network_requests(&mut state).unwrap(), output);
         let body_after = state.page_mut().get_response_body_result(request_id).unwrap().unwrap();

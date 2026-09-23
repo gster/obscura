@@ -1961,6 +1961,8 @@ async fn cdp_processor(
         }
         intercepted_paused.retain(|_, pause| !pause.resolver.is_closed());
         cleanup_detached_fetch_owners(&mut ctx, &mut intercepted_paused);
+        crate::domains::page::service_network_idle_candidates(&mut ctx);
+        forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
@@ -1971,6 +1973,10 @@ async fn cdp_processor(
             let screencast_active = has_active_screencast(&ctx);
             let has_intercept_rx = intercept_rx.is_some();
             let network_notifiers = ctx.pages.iter().map(|page| page.network_teardown_notify.clone()).collect();
+            let network_activity_notifiers = ctx.network_idle_candidates.keys()
+                .filter_map(|page_id| ctx.get_page(page_id).map(|page| page.network_activity_notify()))
+                .collect();
+            let network_idle_deadline = crate::domains::page::next_network_idle_deadline(&ctx);
             tokio::select! {
                 biased;
                 msg = rx.recv() => match msg {
@@ -1983,6 +1989,21 @@ async fn cdp_processor(
                 },
                 _ = wait_network_teardown(network_notifiers) => {
                     sync_live_page_network_events(&mut ctx);
+                    crate::domains::page::service_network_idle_candidates(&mut ctx);
+                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                    None
+                },
+                _ = wait_network_activity(network_activity_notifiers) => {
+                    // Project request terminals before lifecycle quiet events.
+                    // Playwright observes the same ordering from Chromium.
+                    sync_live_page_network_events(&mut ctx);
+                    crate::domains::page::service_network_idle_candidates(&mut ctx);
+                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                    None
+                },
+                _ = wait_network_idle_deadline(network_idle_deadline) => {
+                    sync_live_page_network_events(&mut ctx);
+                    crate::domains::page::service_network_idle_candidates(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                     None
                 },
@@ -2002,6 +2023,7 @@ async fn cdp_processor(
                     }
                     service_live_page_render_resources(&mut ctx);
                     sync_live_page_network_events(&mut ctx);
+                    crate::domains::page::service_network_idle_candidates(&mut ctx);
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
@@ -2117,6 +2139,8 @@ async fn cdp_processor(
         // pump will park cheaply if its next task is a distant timer.
         runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
         runtime_pump_error_streak = 0;
+        crate::domains::page::service_network_idle_candidates(&mut ctx);
+        forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
 
     }
 
@@ -2441,6 +2465,21 @@ async fn wait_network_teardown(notifiers: Vec<Arc<Notify>>) {
     futures_util::future::select_all(waiters).await;
 }
 
+async fn wait_network_activity(notifiers: Vec<Arc<Notify>>) {
+    if notifiers.is_empty() { std::future::pending::<()>().await; }
+    let waiters: Vec<_> = notifiers.into_iter()
+        .map(|notify| Box::pin(notify.notified_owned()))
+        .collect();
+    futures_util::future::select_all(waiters).await;
+}
+
+async fn wait_network_idle_deadline(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
     // Several pages on one connection can be live at once (#872), each with its
     // own event loop, so pump a turn on *every* live page rather than only the
@@ -2640,9 +2679,21 @@ fn forward_navigating_native_network_events(
         event.request_id = loader_id.to_string();
     }
 
+    // A main-Document terminal determines whether the provisional loader
+    // commits or aborts. Keep that terminal until the navigation task returns
+    // so a 204/205 response cannot race out as loadingFinished before it is
+    // reclassified as net::ERR_ABORTED. Starts still stream immediately, as do
+    // complete subresource lifecycles.
+    let projected_indices = events.iter().enumerate().filter_map(|(index, event)| {
+        should_forward_during_navigation(event).then_some(index)
+    }).collect::<Vec<_>>();
+    let projected = projected_indices.iter()
+        .map(|index| events[*index].clone())
+        .collect::<Vec<_>>();
+
     let previous_loader = ctx.current_loader_ids.insert(page_id.to_string(), loader_id.to_string());
     crate::domains::page::emit_runtime_network_events(
-        ctx, session_id, frame_id, page_url, page_id, &events,
+        ctx, session_id, frame_id, page_url, page_id, &projected,
     );
     match previous_loader {
         Some(previous) => {
@@ -2657,11 +2708,16 @@ fn forward_navigating_native_network_events(
     // Keep response metadata for frame MIME/body alias selection after the
     // Page returns, but mark these copies as already projected so the shared
     // navigation emitter cannot send any Network phase twice.
-    for event in &mut events {
+    for index in projected_indices {
+        let event = &mut events[index];
         event.pending = true;
         event.request_started = true;
     }
     events
+}
+
+fn should_forward_during_navigation(event: &obscura_browser::NetworkEvent) -> bool {
+    event.resource_type != "Document" || event.pending || event.redirect
 }
 
 fn has_active_screencast(ctx: &CdpContext) -> bool {
@@ -3108,6 +3164,7 @@ async fn process_with_interception(
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let previous_document = page.document_identity();
     let live_native_network_events = page.native_network_event_queue();
     let live_native_network_notify = page.network_teardown_notify.clone();
     let live_document_url = url.to_string();
@@ -3116,7 +3173,10 @@ async fn process_with_interception(
     ctx.navigating_document_loader = Some((page.network_document_generation, loader_id.clone()));
     ctx.document_loaders.insert((page_id.clone(), page.network_document_generation + 1), loader_id.clone());
 
-    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
+    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(
+        obscura_browser::Page,
+        Result<(), obscura_browser::PageError>,
+    )>(1);
     let url_owned = url.to_string();
     let nav_v8_lock = ctx.v8_lock.clone();
 
@@ -3135,13 +3195,12 @@ async fn process_with_interception(
             page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
         } else {
             page.navigate_with_wait(&url_owned, wait_until).await
-        }
-        .map_err(|e| e.to_string());
+        };
         drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });
 
-    let navigate_result: Result<(), String>;
+    let navigate_result: Result<(), obscura_browser::PageError>;
     let page_back: Option<obscura_browser::Page>;
     let mut live_native_metadata = Vec::new();
 
@@ -3304,7 +3363,8 @@ async fn process_with_interception(
     let network_observation_failure = page.network_observation_failure();
     let page_url = page.url_string();
     let page_id_for_events = page.id.clone();
-    let reached_network_idle = page.lifecycle.is_network_idle();
+    let lifecycle = page.lifecycle;
+    let navigation_committed = page.document_identity() != previous_document;
 
     ctx.pages.push(page);
     ctx.navigating_page_id = None;
@@ -3313,38 +3373,63 @@ async fn process_with_interception(
     ctx.navigating_document_loader = None;
 
     let navigation_succeeded = navigate_result.is_ok();
+    let navigation_abort_error = match &navigate_result {
+        Err(obscura_browser::PageError::NavigationAborted { error_text }) => {
+            Some(error_text.clone())
+        }
+        _ => None,
+    };
     let response = match navigate_result {
-        Ok(()) => crate::types::CdpResponse::success(
+        Ok(()) => crate::types::CdpResponse::success(req.id, if navigation_committed {
+            json!({"frameId": frame_id, "loaderId": loader_id})
+        } else {
+            json!({"frameId": frame_id})
+        }, req.session_id.clone()),
+        Err(obscura_browser::PageError::NavigationAborted { error_text }) => {
+            crate::types::CdpResponse::success(
+                req.id,
+                json!({"frameId": frame_id, "loaderId": loader_id, "errorText": error_text}),
+                req.session_id.clone(),
+            )
+        }
+        Err(e) => crate::types::CdpResponse::error(
             req.id,
-            json!({"frameId": frame_id, "loaderId": loader_id}),
+            -32000,
+            e.to_string(),
             req.session_id.clone(),
         ),
-        Err(e) => crate::types::CdpResponse::error(req.id, -32000, e, req.session_id.clone()),
     };
-
-    if send_command_response {
-        if let Ok(json) = serde_json::to_string(&response) {
-            let _ = reply_tx.send(json);
-        }
-    }
 
     // Shared event emission: includes the post-#190 Network.requestWillBeSent
     // -before-frameNavigated ordering, the #189 requestId=loaderId trick that
     // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
     // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
     // to the WS reply channel.
-    if navigation_succeeded {
-    crate::domains::page::emit_navigation_events(
-        ctx,
-        &session_for_events,
-        &frame_id,
-        &loader_id,
-        &page_url,
-        &page_id_for_events,
-        &network_events,
-        wait_until,
-        reached_network_idle,
-    );
+    // A waitUntil deadline can fail after the new document has committed.
+    // Its command still reports the timeout, but CDP must observe the actual
+    // document/context/loader transition and its completed lifecycle events.
+    if navigation_committed {
+        crate::domains::page::emit_navigation_events(
+            ctx,
+            &session_for_events,
+            &frame_id,
+            &loader_id,
+            &page_url,
+            &page_id_for_events,
+            &network_events,
+            lifecycle,
+        );
+    } else if let Some(error_text) = navigation_abort_error.as_deref() {
+        crate::domains::page::emit_aborted_navigation_events(
+            ctx,
+            &session_for_events,
+            &frame_id,
+            &loader_id,
+            &page_url,
+            &page_id_for_events,
+            &network_events,
+            error_text,
+        );
     } else {
         crate::domains::page::emit_runtime_network_events(ctx, &session_for_events,
             &frame_id, &page_url, &page_id_for_events, &network_events);
@@ -3352,6 +3437,20 @@ async fn process_with_interception(
     if let Some(failure) = network_observation_failure.as_ref() {
         emit_network_observation_failure(ctx, &page_id_for_events, failure);
     }
+    // Chrome delivers the terminal provisional-load events before resolving
+    // Page.navigate for 204/205 responses. Playwright tears down its provisional
+    // navigation bookkeeping as soon as that command response arrives, so make
+    // the aborted request and frameStoppedLoading observable first.
+    if navigation_abort_error.is_some() {
+        forward_pending_events(ctx, Some(reply_tx));
+    }
+
+    if send_command_response {
+        if let Ok(json) = serde_json::to_string(&response) {
+            let _ = reply_tx.send(json);
+        }
+    }
+
     #[cfg(feature = "render")]
     if navigation_succeeded {
         if let Err(error) = crate::domains::page::queue_screencast_frame(
@@ -3360,7 +3459,9 @@ async fn process_with_interception(
             tracing::warn!("could not produce post-navigation screencast frame: {error}");
         }
     }
-    forward_pending_events(ctx, Some(reply_tx));
+    if navigation_abort_error.is_none() {
+        forward_pending_events(ctx, Some(reply_tx));
+    }
 }
 
 async fn process_cdp_message(
@@ -3652,7 +3753,8 @@ where
 pub(crate) mod tests {
     use super::{
         browser_close_response, handle_fetch_resolution, is_navigate_method,
-        parse_cdp_headers, raw_header_bytes_to_cdp_string, InterceptedPause,
+        parse_cdp_headers, raw_header_bytes_to_cdp_string,
+        should_forward_during_navigation, InterceptedPause,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
@@ -3694,6 +3796,260 @@ pub(crate) mod tests {
                 .try_init();
             capture
         }).clone()
+    }
+
+    #[test]
+    fn provisional_document_terminal_waits_for_navigation_outcome() {
+        fn event(resource_type: &str, pending: bool) -> obscura_browser::NetworkEvent {
+            obscura_browser::NetworkEvent {
+                document_generation: 1,
+                document_url: "https://example.test/".into(),
+                initiator_request_id: None,
+                retired_document_url: None,
+                pending,
+                error: None,
+                request_body_present: false,
+                request_body_request_id: None,
+                request_body_size: 0,
+                transport_request_body_present: false,
+                transport_request_body_request_id: None,
+                transport_request_body_size: 0,
+                request_started: !pending,
+                redirect: false,
+                response_body_request_id: None,
+                response_body_capture_error: None,
+                request_id: "request-1".into(),
+                url: "https://example.test/".into(),
+                method: "GET".into(),
+                resource_type: resource_type.into(),
+                status: if pending { 0 } else { 204 },
+                status_text: String::new(),
+                headers: Default::default(),
+                response_headers: Arc::new(Default::default()),
+                raw_headers: None,
+                request_raw_headers: None,
+                body_size: 0,
+                timestamp: 0.0,
+            }
+        }
+
+        assert!(should_forward_during_navigation(&event("Document", true)));
+        assert!(!should_forward_during_navigation(&event("Document", false)));
+        let mut redirect = event("Document", false);
+        redirect.redirect = true;
+        assert!(should_forward_during_navigation(&redirect));
+        assert!(should_forward_during_navigation(&event("Fetch", false)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_network_idle_timeout_keeps_cdp_loader_and_context_current() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                if request_index == 0 {
+                    let body = "<title>new</title><script>fetch('/held').catch(()=>{})</script>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                }
+            }
+        });
+
+        tokio::task::LocalSet::new().run_until(async {
+            let browser_context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+                "cdp-network-idle-timeout".into(),
+                obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+                None,
+                None,
+                true,
+            ));
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(browser_context);
+            let page_id = ctx.create_page();
+            let session_id = format!("{page_id}-session");
+            ctx.sessions.insert(session_id.clone(), page_id.clone());
+            ctx.runtime_enabled_sessions.insert(session_id.clone());
+            ctx.lifecycle_enabled_sessions.insert(session_id.clone());
+            ctx.ensure_default_context(&page_id).unwrap();
+            ctx.current_loader_ids.insert(page_id.clone(), "loader-before".into());
+            ctx.get_page_mut(&page_id).unwrap()
+                .set_navigation_timeout(std::time::Duration::from_millis(700));
+
+            let (intercept_tx, intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+            ctx.intercept_tx = Some(intercept_tx);
+            let mut intercept_rx = Some(intercept_rx);
+            let (_server_tx, mut server_rx) = crate::inbound::channel();
+            let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
+            let mut intercepted_paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            super::process_with_interception(
+                &json!({
+                    "id": 7,
+                    "method": "Page.navigate",
+                    "params": {"url": format!("http://{address}/"), "waitUntil": "networkidle0"},
+                    "sessionId": session_id,
+                }).to_string(),
+                &mut ctx,
+                &reply_tx,
+                &mut server_rx,
+                &mut intercept_rx,
+                &mut intercepted_paused,
+                &mut deferred,
+                true,
+            ).await;
+
+            let mut messages = Vec::new();
+            while let Ok(envelope) = reply_rx.try_recv() {
+                messages.push(serde_json::from_str::<Value>(envelope.as_str()).unwrap());
+            }
+            let response = messages.iter().find(|message| message["id"] == 7)
+                .expect("Page.navigate returns its waitUntil timeout");
+            assert_eq!(response["error"]["code"], -32000);
+            assert!(response["error"]["message"].as_str().unwrap().contains("Network idle wait exceeded"));
+
+            let current_loader = &ctx.current_loader_ids[&page_id];
+            assert_ne!(current_loader, "loader-before");
+            assert_eq!(
+                ctx.document_loaders[&(page_id.clone(), ctx.get_page(&page_id).unwrap().network_document_generation)],
+                *current_loader,
+            );
+            assert!(messages.iter().any(|message| {
+                message["method"] == "Page.frameNavigated"
+                    && message["params"]["frame"]["loaderId"] == *current_loader
+            }));
+            assert!(messages.iter().any(|message| message["method"] == "Runtime.executionContextsCleared"));
+            assert!(messages.iter().any(|message| message["method"] == "Runtime.executionContextCreated"));
+            let lifecycle: Vec<_> = messages.iter().filter_map(|message| {
+                (message["method"] == "Page.lifecycleEvent")
+                    .then(|| message["params"]["name"].as_str().unwrap_or_default())
+            }).collect();
+            assert!(lifecycle.contains(&"DOMContentLoaded"), "actual DCL must be projected: {lifecycle:?}");
+            assert!(lifecycle.contains(&"load"), "actual load must be projected: {lifecycle:?}");
+            assert!(!lifecycle.contains(&"networkIdle"), "timeout must not fabricate idle");
+            assert!(ctx.network_idle_candidates.contains_key(&page_id));
+            drop(ctx);
+        }).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), fixture)
+            .await.expect("fixture server should finish").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_pre_dcl_timeout_does_not_fabricate_lifecycle_success() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut document, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let count = document.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body = "<title>pre-dcl</title><link rel=stylesheet href='/slow.css'>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            document.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stylesheet, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let count = stylesheet.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(request.starts_with(b"GET /slow.css "));
+            tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+            stylesheet.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx").await.unwrap();
+        });
+
+        tokio::task::LocalSet::new().run_until(async {
+            let browser_context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+                "cdp-pre-dcl-timeout".into(),
+                obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+                None,
+                None,
+                true,
+            ));
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(browser_context);
+            let page_id = ctx.create_page();
+            let session_id = format!("{page_id}-session");
+            ctx.sessions.insert(session_id.clone(), page_id.clone());
+            ctx.runtime_enabled_sessions.insert(session_id.clone());
+            ctx.lifecycle_enabled_sessions.insert(session_id.clone());
+            ctx.ensure_default_context(&page_id).unwrap();
+            ctx.current_loader_ids.insert(page_id.clone(), "loader-before".into());
+            ctx.get_page_mut(&page_id).unwrap()
+                .set_navigation_timeout(std::time::Duration::from_millis(700));
+
+            let (intercept_tx, intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+            ctx.intercept_tx = Some(intercept_tx);
+            let mut intercept_rx = Some(intercept_rx);
+            let (_server_tx, mut server_rx) = crate::inbound::channel();
+            let (reply_tx, mut reply_rx, _) = crate::outbound::channel();
+            let mut intercepted_paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            super::process_with_interception(
+                &json!({
+                    "id": 8,
+                    "method": "Page.navigate",
+                    "params": {"url": format!("http://{address}/"), "waitUntil": "networkidle0"},
+                    "sessionId": session_id,
+                }).to_string(),
+                &mut ctx,
+                &reply_tx,
+                &mut server_rx,
+                &mut intercept_rx,
+                &mut intercepted_paused,
+                &mut deferred,
+                true,
+            ).await;
+
+            let mut messages = Vec::new();
+            while let Ok(envelope) = reply_rx.try_recv() {
+                messages.push(serde_json::from_str::<Value>(envelope.as_str()).unwrap());
+            }
+            let response = messages.iter().find(|message| message["id"] == 8)
+                .expect("Page.navigate returns its pre-DCL timeout");
+            assert_eq!(response["error"]["code"], -32000);
+            assert!(response["error"]["message"].as_str().unwrap().contains("Network idle wait exceeded"));
+            assert_ne!(ctx.current_loader_ids[&page_id], "loader-before");
+            assert!(messages.iter().any(|message| message["method"] == "Page.frameNavigated"));
+            assert!(messages.iter().any(|message| message["method"] == "Runtime.executionContextsCleared"));
+            assert!(messages.iter().any(|message| message["method"] == "Runtime.executionContextCreated"));
+            assert!(!messages.iter().any(|message| {
+                (message["method"] == "Page.lifecycleEvent"
+                    && matches!(message["params"]["name"].as_str(), Some("DOMContentLoaded") | Some("load")))
+                    || matches!(message["method"].as_str(), Some("Page.domContentEventFired") | Some("Page.loadEventFired"))
+            }), "a parser-blocked committed document must not claim DCL/load");
+            assert!(!ctx.network_idle_candidates.contains_key(&page_id));
+            assert!(ctx.get_page(&page_id).unwrap().lifecycle.is_loading());
+            drop(ctx);
+        }).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), fixture)
+            .await.expect("stylesheet fixture should finish").unwrap();
     }
 
     async fn wait_for_log(capture: &CompleteLogCapture, marker: &str) {

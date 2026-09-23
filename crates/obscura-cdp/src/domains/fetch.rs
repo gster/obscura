@@ -656,13 +656,16 @@ mod tests {
         assert_eq!(result.value, Some(json!([text.len(), binary.len(), 7])));
         page.sync_js_network_events();
         let events: Vec<_> = page.network_events.drain(..).collect();
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 5);
+        assert_eq!(events.iter().filter(|event| event.pending).count(), 2);
+        let completed: Vec<_> = events.iter().filter(|event| !event.pending).collect();
+        assert_eq!(completed.len(), 3);
         grant_network_body_access(
             &mut ctx,
             &session,
-            &events.iter().map(|event| event.request_id.as_str()).collect::<Vec<_>>(),
+            &completed.iter().map(|event| event.request_id.as_str()).collect::<Vec<_>>(),
         );
-        for (event, bytes) in events.iter().zip([&text, &binary, &module]) {
+        for (event, bytes) in completed.iter().zip([&text, &binary, &module]) {
             assert_eq!(event.body_size, bytes.len());
             let value = super::super::network::handle("getResponseBody", &json!({"requestId": event.request_id}), &mut ctx, &session).await.unwrap();
             let actual = if value["base64Encoded"] == true {
@@ -670,8 +673,8 @@ mod tests {
             } else { value["body"].as_str().unwrap().as_bytes().to_vec() };
             assert_eq!(&actual, bytes);
         }
-        assert_eq!(events[2].resource_type, "Script");
-        let request_id = &events[1].request_id;
+        assert_eq!(completed[2].resource_type, "Script");
+        let request_id = &completed[1].request_id;
         ctx.get_page_mut(&page_id).unwrap().alias_response_body(request_id, "js-alias");
         grant_network_body_access(&mut ctx, &session, &[request_id, "js-alias"]);
         let result = handle("takeResponseBodyAsStream", &json!({"requestId": "js-alias"}), &mut ctx, &session).await.unwrap();

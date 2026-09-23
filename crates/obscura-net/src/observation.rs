@@ -62,6 +62,7 @@ pub struct RequestTrace {
     capture_redirect_response_bodies: bool,
     observer: Option<Arc<dyn RequestLifecycleObserver>>,
     observed_resource_type: Option<ResourceType>,
+    network_activity_generation: Option<u64>,
     /// Serializes the terminal state transition with its observer callback.
     /// Teardown can call `fail` and know that, when it returns, no earlier
     /// terminal callback for this trace remains in flight.
@@ -97,6 +98,7 @@ impl RequestTrace {
             capture_redirect_response_bodies: true,
             observer: None,
             observed_resource_type: None,
+            network_activity_generation: None,
             terminal_serial: Arc::new(Mutex::new(())),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             cancel_reason: Arc::new(Mutex::new(None)),
@@ -111,6 +113,15 @@ impl RequestTrace {
         self.observer = Some(observer);
         self.observed_resource_type = Some(resource_type);
         self
+    }
+
+    pub fn with_network_activity_generation(mut self, generation: Option<u64>) -> Self {
+        self.network_activity_generation = generation;
+        self
+    }
+
+    pub fn network_activity_generation(&self) -> Option<u64> {
+        self.network_activity_generation
     }
 
     /// Native navigation owns final-response storage because it must classify

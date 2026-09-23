@@ -1,4 +1,4 @@
-use obscura_browser::lifecycle::WaitUntil;
+use obscura_browser::lifecycle::{LifecycleState, WaitUntil, NETWORK_IDLE_QUIET_WINDOW};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
@@ -1003,8 +1003,7 @@ pub fn emit_navigation_events(
     page_url: &str,
     page_id: &str,
     network_events: &[obscura_browser::NetworkEvent],
-    wait_until: WaitUntil,
-    reached_network_idle: bool,
+    lifecycle: LifecycleState,
 ) {
     let generation = ctx.get_page(page_id).map_or(0, |page| page.network_document_generation);
     let request_bodies = ctx.get_page(page_id).map(|page| page.request_body_store())
@@ -1033,6 +1032,7 @@ pub fn emit_navigation_events(
         .insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
     let es = session_id.clone();
+    let lifecycle_sessions = ctx.lifecycle_sessions_for_page(page_id);
     let ts = timestamp();
 
     // Real Chrome uses the navigation's loaderId as the main document's
@@ -1107,11 +1107,11 @@ pub fn emit_navigation_events(
 
     let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
     let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
-    let mut phase1 = vec![CdpEvent {
-        method: "Page.lifecycleEvent".into(),
-        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
-        session_id: es.clone(),
-    }];
+    let mut phase1 = lifecycle_sessions.iter().map(|session| CdpEvent::with_session(
+        "Page.lifecycleEvent",
+        json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+        session.clone(),
+    )).collect::<Vec<_>>();
     for runtime_session in &runtime_sessions {
         phase1.push(CdpEvent::with_session(
             "Runtime.executionContextsCleared",
@@ -1132,7 +1132,13 @@ pub fn emit_navigation_events(
             ));
         }
     }
-    phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
+    for session in &lifecycle_sessions {
+        phase1.push(CdpEvent::with_session(
+            "Page.lifecycleEvent",
+            json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}),
+            session.clone(),
+        ));
+    }
     ctx.pending_events.extend(phase1);
 
     if ctx.fetch_intercept.enabled {
@@ -1207,31 +1213,61 @@ pub fn emit_navigation_events(
         }
     }
 
-    let mut phase3 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
+    let mut phase3 = Vec::new();
+    let parser_reached_dcl = !matches!(
+        lifecycle,
+        LifecycleState::Idle | LifecycleState::Loading | LifecycleState::Failed,
+    );
+    if parser_reached_dcl {
+        for session in &lifecycle_sessions {
+            phase3.push(CdpEvent::with_session(
+                "Page.lifecycleEvent",
+                json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
+                session.clone(),
+            ));
+        }
+        phase3.push(CdpEvent {
             method: "Page.domContentEventFired".into(),
             params: json!({"timestamp": ts}),
             session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.loadEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-    ];
-    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
+        });
+    }
+    // DCL-returning navigations preserve the historical CDP completion
+    // projection for clients that wait on the Page domain. A timeout while
+    // the parser is still blocked must not synthesize either success event.
+    if parser_reached_dcl {
+        for session in &lifecycle_sessions {
+            phase3.push(CdpEvent::with_session(
+                "Page.lifecycleEvent",
+                json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
+                session.clone(),
+            ));
+        }
+        phase3.push(CdpEvent {
+        method: "Page.loadEventFired".into(),
+        params: json!({"timestamp": ts}),
+        session_id: es.clone(),
+        });
+    }
+    if lifecycle.is_network_almost_idle() {
         let idle_ts = timestamp();
-        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
+        for session in &lifecycle_sessions {
+            phase3.push(CdpEvent::with_session(
+                "Page.lifecycleEvent",
+                json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkAlmostIdle", "timestamp": idle_ts}),
+                session.clone(),
+            ));
+        }
+    }
+    if lifecycle.is_network_idle() {
+        let idle_ts = timestamp();
+        for session in &lifecycle_sessions {
+            phase3.push(CdpEvent::with_session(
+                "Page.lifecycleEvent",
+                json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}),
+                session.clone(),
+            ));
+        }
     }
     phase3.push(CdpEvent {
         method: "Page.frameStoppedLoading".into(),
@@ -1239,6 +1275,13 @@ pub fn emit_navigation_events(
         session_id: es,
     });
     ctx.pending_events.extend(phase3);
+    register_network_idle_candidate(
+        ctx,
+        frame_id,
+        loader_id,
+        page_id,
+        lifecycle,
+    );
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
     // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
@@ -1265,6 +1308,163 @@ pub fn emit_navigation_events(
     ));
 }
 
+fn register_network_idle_candidate(
+    ctx: &mut CdpContext,
+    frame_id: &str,
+    loader_id: &str,
+    page_id: &str,
+    lifecycle: LifecycleState,
+) {
+    if matches!(
+        lifecycle,
+        LifecycleState::Idle | LifecycleState::Loading | LifecycleState::Failed,
+    ) {
+        ctx.network_idle_candidates.remove(page_id);
+        return;
+    }
+    if lifecycle.is_network_idle() {
+        ctx.network_idle_candidates.remove(page_id);
+        return;
+    }
+    let Some(page) = ctx.get_page(page_id) else {
+        return;
+    };
+    let document = page.document_identity();
+    let activity_generation = page.network_activity_snapshot().generation;
+    ctx.network_idle_candidates.insert(
+        page_id.to_string(),
+        crate::dispatch::CdpNetworkIdleCandidate {
+            document,
+            activity_generation,
+            frame_id: frame_id.to_string(),
+            loader_id: loader_id.to_string(),
+            replacement_quiet_floor: page.document_changed_at(),
+            almost_idle: crate::dispatch::NetworkQuietCandidate {
+                emitted: lifecycle.is_network_almost_idle(),
+                ..Default::default()
+            },
+            idle: Default::default(),
+        },
+    );
+    service_network_idle_candidates(ctx);
+}
+
+fn update_network_quiet_candidate(
+    candidate: &mut crate::dispatch::NetworkQuietCandidate,
+    active: u32,
+    threshold: u32,
+    tracker_quiet_since: Option<std::time::Instant>,
+    quiet_floor: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if candidate.emitted {
+        return false;
+    }
+    if active > threshold {
+        candidate.since = None;
+        return false;
+    }
+    candidate.since = tracker_quiet_since.map(|since| {
+        quiet_floor.map_or(since, |floor| since.max(floor))
+    });
+    let Some(since) = candidate.since else {
+        return false;
+    };
+    if now.duration_since(since) >= NETWORK_IDLE_QUIET_WINDOW {
+        candidate.emitted = true;
+        return true;
+    }
+    false
+}
+
+pub(crate) fn service_network_idle_candidates(ctx: &mut CdpContext) {
+    service_network_idle_candidates_at(ctx, std::time::Instant::now());
+}
+
+fn service_network_idle_candidates_at(ctx: &mut CdpContext, now: std::time::Instant) {
+    let page_ids: Vec<String> = ctx.network_idle_candidates.keys().cloned().collect();
+    for page_id in page_ids {
+        let Some(page) = ctx.get_page(&page_id) else {
+            ctx.network_idle_candidates.remove(&page_id);
+            continue;
+        };
+        let document = page.document_identity();
+        let document_changed_at = page.document_changed_at();
+        let snapshot = page.network_activity_snapshot();
+        let Some(candidate) = ctx.network_idle_candidates.get(&page_id) else {
+            continue;
+        };
+        let loader_is_current = ctx.current_loader_ids.get(&page_id)
+            .is_some_and(|loader_id| loader_id == &candidate.loader_id);
+        if snapshot.generation != candidate.activity_generation || !loader_is_current {
+            ctx.network_idle_candidates.remove(&page_id);
+            continue;
+        }
+
+        let candidate = ctx.network_idle_candidates.get_mut(&page_id).unwrap();
+        if document != candidate.document {
+            candidate.document = document;
+            candidate.replacement_quiet_floor = document_changed_at.or(Some(now));
+            if !candidate.almost_idle.emitted {
+                candidate.almost_idle.since = Some(now);
+            }
+            if !candidate.idle.emitted {
+                candidate.idle.since = Some(now);
+            }
+        }
+        let emit_almost = update_network_quiet_candidate(
+            &mut candidate.almost_idle,
+            snapshot.active,
+            2,
+            snapshot.below_two_since,
+            candidate.replacement_quiet_floor,
+            now,
+        );
+        let emit_idle = update_network_quiet_candidate(
+            &mut candidate.idle,
+            snapshot.active,
+            0,
+            snapshot.below_zero_since,
+            candidate.replacement_quiet_floor,
+            now,
+        );
+        let frame_id = candidate.frame_id.clone();
+        let loader_id = candidate.loader_id.clone();
+        let sessions = ctx.lifecycle_sessions_for_page(&page_id);
+        if emit_almost {
+            let ts = timestamp();
+            for session in &sessions {
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.lifecycleEvent",
+                    json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkAlmostIdle", "timestamp": ts}),
+                    session.clone(),
+                ));
+            }
+        }
+        if emit_idle {
+            let ts = timestamp();
+            for session in sessions {
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.lifecycleEvent",
+                    json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}),
+                    session,
+                ));
+            }
+            ctx.network_idle_candidates.remove(&page_id);
+        }
+    }
+}
+
+pub(crate) fn next_network_idle_deadline(ctx: &CdpContext) -> Option<std::time::Instant> {
+    ctx.network_idle_candidates
+        .values()
+        .flat_map(|candidate| [candidate.almost_idle, candidate.idle])
+        .filter(|candidate| !candidate.emitted)
+        .filter_map(|candidate| candidate.since)
+        .filter_map(|since| since.checked_add(NETWORK_IDLE_QUIET_WINDOW))
+        .min()
+}
+
 /// Emit completed script-initiated requests after the document lifecycle has
 /// already finished. These requests belong to the current document loader and
 /// must not replay frame navigation or load lifecycle events.
@@ -1275,6 +1475,24 @@ pub(crate) fn emit_runtime_network_events(
     page_url: &str,
     page_id: &str,
     network_events: &[obscura_browser::NetworkEvent],
+) {
+    emit_runtime_network_events_with_document_loader(
+        ctx,
+        frame_id,
+        page_url,
+        page_id,
+        network_events,
+        None,
+    );
+}
+
+fn emit_runtime_network_events_with_document_loader(
+    ctx: &mut CdpContext,
+    frame_id: &str,
+    page_url: &str,
+    page_id: &str,
+    network_events: &[obscura_browser::NetworkEvent],
+    document_loader: Option<&str>,
 ) {
     let request_bodies = ctx.get_page(page_id).map(|page| page.request_body_store())
         .or_else(|| ctx.navigating_request_bodies.as_ref()
@@ -1299,7 +1517,11 @@ pub(crate) fn emit_runtime_network_events(
     }
     for network_event in network_events {
         let page_url = if network_event.document_url.is_empty() { page_url } else { &network_event.document_url };
-        let loader_id = if network_event.document_generation == u64::MAX { loader_id.clone() } else {
+        let loader_id = if network_event.resource_type == "Document"
+            && document_loader.is_some()
+        {
+            document_loader.unwrap().to_string()
+        } else if network_event.document_generation == u64::MAX { loader_id.clone() } else {
             ctx.document_loaders.entry((page_id.to_string(), network_event.document_generation))
                 .or_insert_with(|| loader_id.clone()).clone()
         };
@@ -1354,6 +1576,146 @@ pub(crate) fn emit_runtime_network_events(
     });
 }
 
+/// Project a navigation response which did not commit a document. Chrome keeps
+/// the attempted loader as the Document request id, reports the received
+/// response, then terminates that same request with `net::ERR_ABORTED` and a
+/// frameStoppedLoading event. The old document and its current loader remain
+/// installed.
+pub(crate) fn emit_aborted_navigation_events(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    page_url: &str,
+    page_id: &str,
+    network_events: &[obscura_browser::NetworkEvent],
+    error_text: &str,
+) {
+    let final_document = network_events.iter().rposition(|event| {
+        event.resource_type == "Document" && !event.pending && !event.redirect
+    });
+    let mut projected = network_events.to_vec();
+    for (index, event) in projected.iter_mut().enumerate() {
+        if event.resource_type != "Document" {
+            continue;
+        }
+        let internal_id = event.request_id.clone();
+        if let Some(page) = ctx.get_page_mut(page_id) {
+            if event.pending {
+                if event.request_body_present {
+                    page.alias_request_body(&internal_id, loader_id);
+                } else {
+                    page.clear_request_body_alias(loader_id);
+                }
+            } else if !event.redirect {
+                page.alias_response_body(&internal_id, loader_id);
+            }
+        }
+        event.request_id = loader_id.to_string();
+        if Some(index) == final_document {
+            event.error = Some(error_text.to_string());
+        }
+    }
+    emit_runtime_network_events_with_document_loader(
+        ctx,
+        frame_id,
+        page_url,
+        page_id,
+        &projected,
+        Some(loader_id),
+    );
+    let mut stopped_sessions = ctx.lifecycle_sessions_for_page(page_id);
+    if let Some(session) = session_id {
+        if !stopped_sessions.contains(session) {
+            stopped_sessions.push(session.clone());
+        }
+    }
+    if stopped_sessions.is_empty() {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame_id}),
+            session_id: None,
+        });
+    } else {
+        for session in stopped_sessions {
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Page.frameStoppedLoading",
+                json!({"frameId": frame_id}),
+                session,
+            ));
+        }
+    }
+}
+
+/// Complete an in-page action's pending navigation and project its committed
+/// or aborted provisional loader exactly once. Runtime evaluation and native
+/// Input dispatch both use this path, so a 204/205 keeps the old document while
+/// still producing responseReceived, loadingFailed and frameStoppedLoading.
+pub(crate) async fn emit_pending_action_navigation(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+) -> Result<bool, String> {
+    let (previous_document, outcome) = {
+        let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+        let previous_document = page.document_identity();
+        let outcome = match page.process_pending_navigation().await {
+            Ok(false) => return Ok(false),
+            Ok(true) => None,
+            Err(obscura_browser::PageError::NavigationAborted { error_text }) => {
+                Some(error_text)
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        (previous_document, outcome)
+    };
+    let (frame_id, current_url, page_id, network_events, lifecycle, current_document) = {
+        let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+        page.sync_js_network_events();
+        (
+            page.frame_id.clone(),
+            page.url_string(),
+            page.id.clone(),
+            page.network_events.drain(..).collect::<Vec<_>>(),
+            page.lifecycle,
+            page.document_identity(),
+        )
+    };
+    if outcome.is_none() && current_document == previous_document {
+        emit_runtime_network_events(
+            ctx, session_id, &frame_id, &current_url, &page_id, &network_events,
+        );
+        let loader_id = ctx.current_loader_ids.get(&page_id).cloned()
+            .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({
+                "frame": frame_value(
+                    &frame_id, None, &loader_id, &current_url, "text/html",
+                ),
+                "type": "Navigation",
+            }),
+            session_id: session_id.clone(),
+        });
+        return Ok(true);
+    }
+    let attempted_url = network_events.iter().rev().find_map(|event| {
+        (event.resource_type == "Document").then_some(event.url.clone())
+    }).unwrap_or_else(|| current_url.clone());
+    let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    if let Some(error_text) = outcome.as_deref() {
+        emit_aborted_navigation_events(
+            ctx, session_id, &frame_id, &loader_id, &attempted_url, &page_id,
+            &network_events, error_text,
+        );
+    } else {
+        emit_navigation_events(
+            ctx, session_id, &frame_id, &loader_id, &current_url, &page_id,
+            &network_events, lifecycle,
+        );
+    }
+    Ok(true)
+}
+
 fn network_response_value(event: &obscura_browser::NetworkEvent) -> Value {
     json!({"url": event.url, "status": event.status, "statusText": event.status_text,
         "headers": &*event.response_headers, "rawHeaders": event.raw_headers,
@@ -1406,7 +1768,7 @@ fn emit_network_result(
         queue_network_event(ctx, &sessions, "Network.loadingFailed",
             json!({"requestId": request_id, "timestamp": event.timestamp,
                 "type": event.resource_type, "errorText": error,
-                "canceled": error.starts_with("Aborted")}));
+                "canceled": error.starts_with("Aborted") || error == "net::ERR_ABORTED"}));
     } else {
         queue_network_event(ctx, &sessions, "Network.loadingFinished",
             json!({"requestId": request_id, "timestamp": event.timestamp,
@@ -1477,12 +1839,13 @@ async fn do_navigate(
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
-    let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
+    let (frame_id, loader_id, network_events, page_url, page_id, lifecycle, committed, abort_error, wait_error) = {
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
         let frame_id = page.frame_id.clone();
         let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+        let previous_document = page.document_identity();
 
         // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
         // must run BEFORE the page's own scripts (CDP contract). Hand them to
@@ -1494,49 +1857,94 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        if nav_method == "POST" && !nav_body.is_empty() {
+        let navigation = if nav_method == "POST" && !nav_body.is_empty() {
             page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
                 .await
-                .map_err(|e| e.to_string())?;
         } else {
             page.navigate_with_wait(url, wait_until)
                 .await
-                .map_err(|e| e.to_string())?;
-        }
+        };
+        let mut wait_error = None;
+        let abort_error = match navigation {
+            Ok(()) => None,
+            Err(obscura_browser::PageError::NavigationAborted { error_text }) => {
+                Some(error_text)
+            }
+            Err(error @ obscura_browser::PageError::NetworkIdleTimeout { .. }) => {
+                wait_error = Some(error.to_string());
+                None
+            }
+            Err(error) => return Err(error.to_string()),
+        };
 
-        let reached_network_idle = page.lifecycle.is_network_idle();
+        let lifecycle = page.lifecycle;
         // Fold in script-initiated requests (fetch/XHR/dynamic resource) so they
         // emit as Network events alongside static subresources (#406).
         page.sync_js_network_events();
         let network_events: Vec<_> = page.network_events.drain(..).collect();
         let page_url = page.url_string();
         let page_id = page.id.clone();
+        let committed = page.document_identity() != previous_document;
         (
             frame_id,
             loader_id,
             network_events,
             page_url,
             page_id,
-            reached_network_idle,
+            lifecycle,
+            committed,
+            abort_error,
+            wait_error,
         )
     };
 
-    emit_navigation_events(
-        ctx,
-        session_id,
-        &frame_id,
-        &loader_id,
-        &page_url,
-        &page_id,
-        &network_events,
-        wait_until,
-        reached_network_idle,
-    );
+    if committed {
+        emit_navigation_events(
+            ctx,
+            session_id,
+            &frame_id,
+            &loader_id,
+            &page_url,
+            &page_id,
+            &network_events,
+            lifecycle,
+        );
+    } else if let Some(error_text) = abort_error.as_deref() {
+        emit_aborted_navigation_events(
+            ctx,
+            session_id,
+            &frame_id,
+            &loader_id,
+            &page_url,
+            &page_id,
+            &network_events,
+            error_text,
+        );
+    } else {
+        emit_runtime_network_events(
+            ctx,
+            session_id,
+            &frame_id,
+            &page_url,
+            &page_id,
+            &network_events,
+        );
+    }
 
-    Ok(json!({
-        "frameId": frame_id,
-        "loaderId": loader_id,
-    }))
+    // A network-idle deadline can expire after the document has committed.
+    // Keep the command error, but project the real commit and its lifecycle
+    // first so CDP does not retain the previous document's loader/context.
+    if let Some(error) = wait_error {
+        return Err(error);
+    }
+
+    Ok(if let Some(error_text) = abort_error {
+        json!({"frameId": frame_id, "loaderId": loader_id, "errorText": error_text})
+    } else if committed {
+        json!({"frameId": frame_id, "loaderId": loader_id})
+    } else {
+        json!({"frameId": frame_id})
+    })
 }
 
 pub async fn handle(
@@ -1585,7 +1993,6 @@ pub async fn handle(
                     CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
                     CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
                     CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() },
                     CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id, "timestamp": ts}), session_id: es },
                 ];
                 ctx.pending_events.extend(events);
@@ -1674,10 +2081,18 @@ pub async fn handle(
             let object = params
                 .as_object()
                 .ok_or("Page.setLifecycleEventsEnabled params must be an object")?;
-            if object.len() != 1 || params.get("enabled").and_then(Value::as_bool) != Some(true) {
-                return Err(
-                    "Page.setLifecycleEventsEnabled supports only enabled=true".to_string(),
-                );
+            let enabled = params.get("enabled").and_then(Value::as_bool)
+                .filter(|_| object.len() == 1)
+                .ok_or("Page.setLifecycleEventsEnabled requires exactly one boolean enabled field")?;
+            let session = session_id.as_ref()
+                .ok_or("Page.setLifecycleEventsEnabled requires an attached page session")?;
+            if ctx.get_session_page(session_id).is_none() {
+                return Err("No page for session".to_string());
+            }
+            if enabled {
+                ctx.lifecycle_enabled_sessions.insert(session.clone());
+            } else {
+                ctx.lifecycle_enabled_sessions.remove(session);
             }
             Ok(json!({}))
         }
@@ -1809,21 +2224,29 @@ pub async fn handle(
                 }
                 url
             };
-            if let Some(url) = target_url {
-                let nav_result = {
+            if let Some(url) = target_url.clone() {
+                let (previous_document, nav_result) = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
-                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
-                        .await
+                    let previous_document = page.document_identity();
+                    let result = page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
+                        .await;
+                    (previous_document, result)
                 };
                 // The native history owns commit/rollback, including redirects.
                 // Refresh the CDP view from it on both success and failure.
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     page.push_history(page.url_string());
                 }
-                nav_result.map_err(|e| e.to_string())?;
-                let (frame_id, page_id, network_events, page_url, reached_idle) = {
+                let abort_error = match nav_result {
+                    Ok(()) => None,
+                    Err(obscura_browser::PageError::NavigationAborted { error_text }) => {
+                        Some(error_text)
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                let (frame_id, page_id, network_events, page_url, lifecycle, committed) = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
@@ -1836,21 +2259,46 @@ pub async fn handle(
                         page.id.clone(),
                         page.network_events.drain(..).collect::<Vec<_>>(),
                         page.url_string(),
-                        page.lifecycle.is_network_idle(),
+                        page.lifecycle,
+                        page.document_identity() != previous_document,
                     )
                 };
                 let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
-                emit_navigation_events(
-                    ctx,
-                    session_id,
-                    &frame_id,
-                    &loader_id,
-                    &page_url,
-                    &page_id,
-                    &network_events,
-                    WaitUntil::DomContentLoaded,
-                    reached_idle,
-                );
+                if committed {
+                    emit_navigation_events(
+                        ctx,
+                        session_id,
+                        &frame_id,
+                        &loader_id,
+                        &page_url,
+                        &page_id,
+                        &network_events,
+                        lifecycle,
+                    );
+                } else if let Some(error_text) = abort_error.as_deref() {
+                    let attempted_url = network_events.iter().rev().find_map(|event| {
+                        (event.resource_type == "Document").then_some(event.url.clone())
+                    }).unwrap_or_else(|| target_url.as_deref().unwrap_or(&page_url).to_string());
+                    emit_aborted_navigation_events(
+                        ctx,
+                        session_id,
+                        &frame_id,
+                        &loader_id,
+                        &attempted_url,
+                        &page_id,
+                        &network_events,
+                        error_text,
+                    );
+                } else {
+                    emit_runtime_network_events(
+                        ctx,
+                        session_id,
+                        &frame_id,
+                        &page_url,
+                        &page_id,
+                        &network_events,
+                    );
+                }
             }
             Ok(json!({}))
         }
@@ -2082,6 +2530,529 @@ mod tests {
         ctx.network_body_sessions.insert(session.clone(), Default::default());
     }
 
+    fn enable_lifecycle(ctx: &mut CdpContext, session: &Option<String>) {
+        ctx.lifecycle_enabled_sessions.insert(
+            session.as_ref().expect("test lifecycle subscription needs a session").clone(),
+        );
+    }
+
+    fn lifecycle_names(ctx: &CdpContext) -> Vec<&str> {
+        ctx.pending_events.iter()
+            .filter(|event| event.method == "Page.lifecycleEvent")
+            .filter_map(|event| event.params["name"].as_str())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loaded_navigation_emits_network_idle_only_after_quiet_window() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_lifecycle(&mut ctx, &session);
+        let (frame_id, page_url) = {
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.navigate_with_wait(
+                "data:text/html,<title>quiet</title>",
+                WaitUntil::Load,
+            ).await.unwrap();
+            (page.frame_id.clone(), page.url_string())
+        };
+
+        emit_navigation_events(
+            &mut ctx,
+            &session,
+            &frame_id,
+            "loader-quiet",
+            &page_url,
+            &page_id,
+            &[],
+            LifecycleState::Loaded,
+        );
+        assert!(!lifecycle_names(&ctx).iter().any(|name| {
+            matches!(*name, "networkAlmostIdle" | "networkIdle")
+        }));
+        let since = ctx.network_idle_candidates[&page_id].idle.since.unwrap();
+
+        ctx.pending_events.clear();
+        service_network_idle_candidates_at(
+            &mut ctx,
+            since + NETWORK_IDLE_QUIET_WINDOW - std::time::Duration::from_millis(1),
+        );
+        assert!(lifecycle_names(&ctx).is_empty());
+
+        service_network_idle_candidates_at(
+            &mut ctx,
+            since + NETWORK_IDLE_QUIET_WINDOW,
+        );
+        assert_eq!(lifecycle_names(&ctx), vec!["networkAlmostIdle", "networkIdle"]);
+        assert!(!ctx.network_idle_candidates.contains_key(&page_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_open_resets_the_cdp_network_idle_quiet_window() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_lifecycle(&mut ctx, &session);
+        let (frame_id, page_url) = {
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.navigate_with_wait(
+                "data:text/html,<title>old</title>",
+                WaitUntil::Load,
+            ).await.unwrap();
+            (page.frame_id.clone(), page.url_string())
+        };
+        emit_navigation_events(
+            &mut ctx,
+            &session,
+            &frame_id,
+            "loader-document-open",
+            &page_url,
+            &page_id,
+            &[],
+            LifecycleState::Loaded,
+        );
+        let old_since = ctx.network_idle_candidates[&page_id].idle.since.unwrap();
+        ctx.pending_events.clear();
+        ctx.get_page_mut(&page_id).unwrap().evaluate(
+            "(()=>{document.open();document.write('<title>replacement</title>');document.close();return true})()",
+        );
+
+        service_network_idle_candidates_at(
+            &mut ctx,
+            old_since + NETWORK_IDLE_QUIET_WINDOW,
+        );
+        assert!(lifecycle_names(&ctx).is_empty());
+        let replacement_since = ctx.network_idle_candidates[&page_id]
+            .replacement_quiet_floor
+            .expect("replacement document restarts quiet timing");
+
+        service_network_idle_candidates_at(
+            &mut ctx,
+            replacement_since + NETWORK_IDLE_QUIET_WINDOW,
+        );
+        assert_eq!(lifecycle_names(&ctx), vec!["networkAlmostIdle", "networkIdle"]);
+        assert!(!ctx.network_idle_candidates.contains_key(&page_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lifecycle_events_fan_out_and_detach_does_not_retire_the_page_candidate() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let first = format!("{page_id}-session");
+        let second = format!("{page_id}-observer");
+        ctx.sessions.insert(first.clone(), page_id.clone());
+        ctx.sessions.insert(second.clone(), page_id.clone());
+        ctx.lifecycle_enabled_sessions.insert(first.clone());
+        ctx.lifecycle_enabled_sessions.insert(second.clone());
+        let session = Some(first.clone());
+        let (frame_id, page_url) = {
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.navigate_with_wait(
+                "data:text/html,<title>fanout</title>",
+                WaitUntil::Load,
+            ).await.unwrap();
+            (page.frame_id.clone(), page.url_string())
+        };
+        emit_navigation_events(
+            &mut ctx,
+            &session,
+            &frame_id,
+            "loader-fanout",
+            &page_url,
+            &page_id,
+            &[],
+            LifecycleState::Loaded,
+        );
+        for name in ["init", "commit", "DOMContentLoaded", "load"] {
+            let mut sessions = ctx.pending_events.iter()
+                .filter(|event| event.method == "Page.lifecycleEvent")
+                .filter(|event| event.params["name"] == name)
+                .filter_map(|event| event.session_id.clone())
+                .collect::<Vec<_>>();
+            sessions.sort();
+            let mut expected = vec![first.clone(), second.clone()];
+            expected.sort();
+            assert_eq!(sessions, expected);
+        }
+
+        let since = ctx.network_idle_candidates[&page_id].idle.since.unwrap();
+        ctx.pending_events.clear();
+        ctx.sessions.remove(&first);
+        ctx.lifecycle_enabled_sessions.remove(&first);
+        service_network_idle_candidates_at(
+            &mut ctx,
+            since + NETWORK_IDLE_QUIET_WINDOW,
+        );
+        assert_eq!(lifecycle_names(&ctx), vec!["networkAlmostIdle", "networkIdle"]);
+        assert!(ctx.pending_events.iter()
+            .filter(|event| event.method == "Page.lifecycleEvent")
+            .all(|event| event.session_id.as_deref() == Some(second.as_str())));
+        assert!(!ctx.network_idle_candidates.contains_key(&page_id));
+    }
+
+    #[test]
+    fn network_quiet_candidate_resets_on_threshold_crossing_epoch() {
+        let start = std::time::Instant::now();
+        let mut candidate = crate::dispatch::NetworkQuietCandidate::default();
+        assert!(!update_network_quiet_candidate(
+            &mut candidate,
+            0,
+            0,
+            Some(start),
+            None,
+            start,
+        ));
+        assert!(!update_network_quiet_candidate(
+            &mut candidate,
+            1,
+            0,
+            None,
+            None,
+            start + std::time::Duration::from_millis(100),
+        ));
+        assert!(!update_network_quiet_candidate(
+            &mut candidate,
+            0,
+            0,
+            Some(start + std::time::Duration::from_millis(101)),
+            None,
+            start + std::time::Duration::from_millis(101),
+        ));
+        assert!(!update_network_quiet_candidate(
+            &mut candidate,
+            0,
+            0,
+            Some(start + std::time::Duration::from_millis(101)),
+            None,
+            start + std::time::Duration::from_millis(600),
+        ));
+        assert!(update_network_quiet_candidate(
+            &mut candidate,
+            0,
+            0,
+            Some(start + std::time::Duration::from_millis(101)),
+            None,
+            start + std::time::Duration::from_millis(601),
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn superseding_document_discards_old_network_idle_candidate() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let (frame_id, page_url) = {
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.navigate("data:text/html,old").await.unwrap();
+            (page.frame_id.clone(), page.url_string())
+        };
+        emit_navigation_events(
+            &mut ctx,
+            &session,
+            &frame_id,
+            "loader-old",
+            &page_url,
+            &page_id,
+            &[],
+            LifecycleState::Loaded,
+        );
+        let since = ctx.network_idle_candidates[&page_id].idle.since.unwrap();
+
+        ctx.get_page_mut(&page_id).unwrap()
+            .navigate("data:text/html,new")
+            .await.unwrap();
+        ctx.pending_events.clear();
+        service_network_idle_candidates_at(
+            &mut ctx,
+            since + NETWORK_IDLE_QUIET_WINDOW,
+        );
+
+        assert!(!ctx.network_idle_candidates.contains_key(&page_id));
+        assert!(lifecycle_names(&ctx).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_content_navigation_does_not_fabricate_loader_or_lifecycle() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ).unwrap();
+        });
+        let context = std::sync::Arc::new(
+            obscura_browser::BrowserContext::with_storage_and_network(
+                "no-content-navigation".into(),
+                obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
+                None,
+                None,
+                true,
+            ),
+        );
+        let mut ctx = CdpContext::new_with_shared_context(context);
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let observer = format!("{page_id}-observer");
+        ctx.sessions.insert(observer.clone(), page_id.clone());
+        ctx.lifecycle_enabled_sessions.insert(observer.clone());
+        enable_network(&mut ctx, &session);
+        ctx.get_page_mut(&page_id).unwrap()
+            .navigate("data:text/html,<title>old</title>")
+            .await.unwrap();
+        let old_document = ctx.get_page(&page_id).unwrap().document_identity();
+        let old_url = ctx.get_page(&page_id).unwrap().url_string();
+        ctx.current_loader_ids.insert(page_id.clone(), "loader-old".into());
+        ctx.pending_events.clear();
+
+        let result = do_navigate(
+            &format!("http://{address}/no-content"),
+            &json!({"waitUntil": "load"}),
+            &mut ctx,
+            &session,
+        ).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result["frameId"], ctx.get_page(&page_id).unwrap().frame_id);
+        let attempted_loader = result["loaderId"].as_str().unwrap();
+        assert_eq!(result["errorText"], "net::ERR_ABORTED");
+        assert_eq!(ctx.get_page(&page_id).unwrap().document_identity(), old_document);
+        assert_eq!(ctx.get_page(&page_id).unwrap().url_string(), old_url);
+        assert_eq!(
+            ctx.get_page_mut(&page_id).unwrap().evaluate("document.title"),
+            json!("old"),
+        );
+        assert!(ctx.pending_events.iter().all(|event| {
+            !matches!(event.method.as_str(), "Page.frameNavigated" | "Page.lifecycleEvent")
+        }));
+        let request_ids = ctx.pending_events.iter().filter_map(|event| {
+            event.params.get("requestId").and_then(Value::as_str)
+        }).collect::<std::collections::HashSet<_>>();
+        assert_eq!(request_ids, std::collections::HashSet::from([attempted_loader]));
+        let failed = ctx.pending_events.iter().find(|event| {
+            event.method == "Network.loadingFailed"
+        }).expect("204 must abort the attempted Document request");
+        assert_eq!(failed.params["errorText"], "net::ERR_ABORTED");
+        assert_eq!(failed.params["canceled"], true);
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.method != "Network.loadingFinished"
+        }));
+        let stopped_sessions = ctx.pending_events.iter().filter_map(|event| {
+            (event.method == "Page.frameStoppedLoading")
+                .then(|| event.session_id.as_deref().unwrap_or_default())
+        }).collect::<std::collections::HashSet<_>>();
+        assert_eq!(stopped_sessions, std::collections::HashSet::from([
+            session.as_deref().unwrap(), observer.as_str(),
+        ]));
+        assert!(!ctx.network_idle_candidates.contains_key(&page_id));
+        assert_eq!(ctx.current_loader_ids[&page_id], "loader-old");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_content_history_navigation_projects_aborted_document_events() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, status) in [(0, 200), (1, 200), (2, 204), (3, 205)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let body = match (index, status) {
+                    (0, 200) => "<title>old</title>",
+                    (1, 200) => "<title>current</title>",
+                    _ => "",
+                };
+                let status_text = match status {
+                    200 => "OK",
+                    204 => "No Content",
+                    205 => "Reset Content",
+                    _ => unreachable!(),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(
+            obscura_browser::BrowserContext::with_storage_and_network(
+                "history-no-content".into(),
+                obscura_net::EffectivePersona::builtin(
+                    obscura_net::StealthProfile::WindowsChrome145,
+                ),
+                None,
+                None,
+                true,
+            ),
+        );
+        let mut ctx = CdpContext::new_with_shared_context(context);
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        enable_network(&mut ctx, &session);
+        let old_url = format!("http://{address}/old");
+        let current_url = format!("http://{address}/current");
+        {
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.navigate_with_wait(&old_url, WaitUntil::DomContentLoaded)
+                .await.unwrap();
+            page.reset_history();
+            page.navigate_with_wait(&current_url, WaitUntil::DomContentLoaded)
+                .await.unwrap();
+        }
+        let previous_loader = "loader-current";
+        ctx.current_loader_ids.insert(page_id.clone(), previous_loader.into());
+        ctx.pending_events.clear();
+        let current_index = ctx.get_page(&page_id).unwrap().history_index;
+        let old_entry = ctx.get_page(&page_id).unwrap().history.iter()
+            .position(|url| url == &old_url).expect("old URL remains in native history");
+
+        for expected_status in [204, 205] {
+            handle(
+                "navigateToHistoryEntry",
+                &json!({"entryId": old_entry}),
+                &mut ctx,
+                &session,
+            ).await.expect("204/205 history navigation follows CDP abort semantics");
+
+            let page = ctx.get_page(&page_id).unwrap();
+            assert_eq!(page.history_index, current_index, "aborted traversal must roll back history");
+            assert_eq!(page.url_string(), current_url);
+            assert_eq!(ctx.get_page_mut(&page_id).unwrap().evaluate("document.title"), json!("current"));
+            assert_eq!(ctx.current_loader_ids[&page_id], previous_loader);
+
+            let failed = ctx.pending_events.iter().find(|event| {
+                event.method == "Network.loadingFailed"
+            }).expect("aborted history navigation must terminate the Document request");
+            let attempted_loader = failed.params["requestId"].as_str().unwrap();
+            assert_eq!(failed.params["errorText"], "net::ERR_ABORTED");
+            assert_eq!(failed.params["canceled"], true);
+            let response = ctx.pending_events.iter().find(|event| {
+                event.method == "Network.responseReceived"
+                    && event.params["requestId"] == attempted_loader
+            }).expect("the received no-content response remains observable");
+            assert_eq!(response.params["response"]["status"], expected_status);
+            let failed_index = ctx.pending_events.iter().position(|event| {
+                event.method == "Network.loadingFailed"
+                    && event.params["requestId"] == attempted_loader
+            }).unwrap();
+            let response_index = ctx.pending_events.iter().position(|event| {
+                event.method == "Network.responseReceived"
+                    && event.params["requestId"] == attempted_loader
+            }).unwrap();
+            let request_index = ctx.pending_events.iter().position(|event| {
+                event.method == "Network.requestWillBeSent"
+                    && event.params["requestId"] == attempted_loader
+            }).unwrap();
+            let stopped_index = ctx.pending_events.iter().position(|event| {
+                event.method == "Page.frameStoppedLoading"
+            }).expect("aborted history navigation stops the attempted load");
+            assert!(request_index < response_index && response_index < failed_index);
+            assert!(failed_index < stopped_index);
+            assert!(!ctx.pending_events.iter().any(|event| {
+                event.method == "Network.loadingFinished"
+                    && event.params["requestId"] == attempted_loader
+            }));
+            assert!(!ctx.pending_events.iter().any(|event| {
+                matches!(event.method.as_str(), "Page.frameNavigated" | "Page.lifecycleEvent")
+            }));
+            ctx.pending_events.clear();
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_timeout_projects_a_committed_document_before_error() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session = format!("{page_id}-session");
+        ctx.sessions.insert(session.clone(), page_id.clone());
+        ctx.runtime_enabled_sessions.insert(session.clone());
+        ctx.lifecycle_enabled_sessions.insert(session.clone());
+        ctx.ensure_default_context(&page_id).unwrap();
+        handle(
+            "navigate",
+            &json!({"url": "data:text/html,<title>old</title>", "waitUntil": "load"}),
+            &mut ctx,
+            &Some(session.clone()),
+        ).await.unwrap();
+        let previous_loader = ctx.current_loader_ids[&page_id].clone();
+        ctx.pending_events.clear();
+
+        let mut intercepted = ctx.get_page_mut(&page_id).unwrap().enable_interception();
+        ctx.get_page_mut(&page_id).unwrap()
+            .set_navigation_timeout(std::time::Duration::from_millis(700));
+        let held_request = tokio::spawn(async move {
+            let request = intercepted.recv().await.expect("fetch is intercepted");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(request);
+        });
+
+        let error = handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<title>new</title><script>fetch('https://example.test/held').catch(()=>{})</script>",
+                "waitUntil": "networkidle0"
+            }),
+            &mut ctx,
+            &Some(session.clone()),
+        ).await.unwrap_err();
+
+        assert!(error.contains("Network idle wait exceeded"), "unexpected error: {error}");
+        let current_loader = &ctx.current_loader_ids[&page_id];
+        assert_ne!(current_loader, &previous_loader);
+        assert_eq!(ctx.document_loaders[&(page_id.clone(), ctx.get_page(&page_id).unwrap().network_document_generation)], *current_loader);
+        assert!(ctx.pending_events.iter().any(|event| {
+            event.method == "Page.frameNavigated"
+                && event.params["frame"]["loaderId"] == *current_loader
+        }));
+        assert!(ctx.pending_events.iter().any(|event| {
+            event.method == "Runtime.executionContextsCleared"
+        }));
+        assert!(ctx.pending_events.iter().any(|event| {
+            event.method == "Runtime.executionContextCreated"
+        }));
+        let lifecycle: Vec<_> = ctx.pending_events.iter().filter_map(|event| {
+            (event.method == "Page.lifecycleEvent")
+                .then(|| event.params["name"].as_str().unwrap_or_default())
+        }).collect();
+        assert!(lifecycle.contains(&"DOMContentLoaded"), "missing actual DCL: {lifecycle:?}");
+        assert!(lifecycle.contains(&"load"), "missing actual load: {lifecycle:?}");
+        assert!(!lifecycle.contains(&"networkIdle"), "timeout must not fabricate networkIdle");
+        assert!(ctx.network_idle_candidates.contains_key(&page_id));
+        held_request.abort();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn raw_headers_survive_proxy_redirect_callbacks_page_and_cdp_events() {
         use base64::Engine;
@@ -2137,11 +3108,13 @@ mod tests {
         assert!(navigation[0].pending);
         assert!(!navigation[1].pending);
         assert_eq!(navigation[0].request_id, navigation[1].request_id);
-        assert_eq!(scripted.len(), 2);
-        assert!(scripted[0].redirect);
+        assert_eq!(scripted.len(), 3);
+        assert!(scripted[0].pending);
+        assert!(scripted[1].redirect);
         assert_eq!(scripted[0].request_id, scripted[1].request_id);
+        assert_eq!(scripted[1].request_id, scripted[2].request_id);
         for (event, (request, response)) in navigation.iter().filter(|event| !event.pending)
-            .chain(scripted.iter().filter(|event| !event.redirect))
+            .chain(scripted.iter().filter(|event| !event.pending && !event.redirect))
             .zip(responses.lock().unwrap().iter())
         {
             assert_eq!(event.raw_headers, response.raw_headers);
@@ -2170,7 +3143,7 @@ mod tests {
         assert!(scripted_cookies.iter().any(|value| value.windows(b"first=Raw+/=123".len()).any(|part| part == b"first=Raw+/=123")));
         drop(observed);
         ctx.fetch_intercept.enabled = true;
-        emit_navigation_events(&mut ctx, &session, "frame-raw", "loader-raw", "http://raw-headers.test/", &page_id, &navigation, WaitUntil::Load, false);
+        emit_navigation_events(&mut ctx, &session, "frame-raw", "loader-raw", "http://raw-headers.test/", &page_id, &navigation, LifecycleState::Loaded);
         emit_runtime_network_events(&mut ctx, &session, "frame-raw", "http://raw-headers.test/", &page_id, &scripted);
         let values = |capture: &Value, name: &[u8]| -> Vec<Vec<u8>> {
             assert_eq!(capture["encoding"], "base64");
@@ -2181,6 +3154,8 @@ mod tests {
             }).collect()
         };
         let mut response_count = 0;
+        let mut script_start_count = 0;
+        let mut transport_request_count = 0;
         for event in &ctx.pending_events {
             if event.method == "Network.responseReceived" {
                 let raw = &event.params["response"]["rawHeaders"];
@@ -2189,13 +3164,31 @@ mod tests {
                 assert_eq!(values(raw, b"x-bytes"), [b"\x80\xff".to_vec()]);
                 assert_eq!(values(raw, b"set-cookie"), [b"first=Raw+/=123; Path=/".to_vec(), b"second=Keep; Path=/".to_vec()]);
                 response_count += 1;
-            } else if event.method == "Network.requestWillBeSent" || event.method == "Fetch.requestPaused" {
+            } else if event.method == "Network.requestWillBeSent" {
+                let raw = &event.params["request"]["rawHeaders"];
+                if raw["captureStage"] == "scriptRequest" {
+                    script_start_count += 1;
+                    assert!(values(raw, b"authorization").is_empty());
+                } else {
+                    assert_eq!(raw["captureStage"], "transportRequest");
+                    assert_eq!(values(raw, b"authorization"), [b"Bearer Raw+/=123".to_vec()]);
+                    transport_request_count += 1;
+                }
+            } else if event.method == "Network.requestWillBeSentExtraInfo" {
+                let raw = &event.params["rawHeaders"];
+                assert_eq!(raw["captureStage"], "transportRequest");
+                assert_eq!(values(raw, b"authorization"), [b"Bearer Raw+/=123".to_vec()]);
+                transport_request_count += 1;
+            } else if event.method == "Fetch.requestPaused" {
                 let raw = &event.params["request"]["rawHeaders"];
                 assert_eq!(raw["captureStage"], "transportRequest");
                 assert_eq!(values(raw, b"authorization"), [b"Bearer Raw+/=123".to_vec()]);
+                transport_request_count += 1;
             }
         }
         assert_eq!(response_count, 2);
+        assert_eq!(script_start_count, 1);
+        assert!(transport_request_count >= 2);
         for request in server.join().unwrap() {
             assert!(request.windows(b"authorization: Bearer Raw+/=123\r\n".len())
                 .any(|part| part == b"authorization: Bearer Raw+/=123\r\n"));
@@ -2291,17 +3284,20 @@ mod tests {
         assert_eq!(result.value, Some(json!([2 * 1024 * 1024 + 31, [2 * 1024 * 1024 + 17, 0, 16]])));
         page.sync_js_network_events();
         let events: Vec<_> = page.network_events.drain(..).collect();
-        assert_eq!(events.len(), 4, "both workers must report to their owning page");
+        assert_eq!(events.len(), 8, "both worker starts and terminals must reach their owning page");
+        assert_eq!(events.iter().filter(|event| event.pending).count(), 4);
+        let completed: Vec<_> = events.iter().filter(|event| !event.pending).collect();
+        assert_eq!(completed.len(), 4);
         page.sync_js_network_events();
         assert!(page.network_events.is_empty(), "observations must drain exactly once");
-        let ids: std::collections::HashSet<_> = events.iter().map(|event| &event.request_id).collect();
-        assert_eq!(ids.len(), events.len());
+        let ids: std::collections::HashSet<_> = completed.iter().map(|event| &event.request_id).collect();
+        assert_eq!(ids.len(), completed.len());
         let values = |capture: &obscura_net::HeaderCapture, name: &[u8]| -> Vec<Vec<u8>> {
             capture.fields.iter().filter(|field| field.name == name).map(|field| field.value.clone()).collect()
         };
         assert_eq!(requests.lock().unwrap().len(), 5);
         assert_eq!(responses.lock().unwrap().len(), 5);
-        for event in &events {
+        for event in &completed {
             let responses = responses.lock().unwrap();
             let (request, response) = responses.iter().find(|(request, _)| request.url.as_str() == event.url).unwrap();
             assert_eq!(event.request_raw_headers, request.raw_headers);
@@ -2329,12 +3325,15 @@ mod tests {
             assert!(cookies.iter().any(|value| value.windows(b"first=Raw+/=123".len()).any(|part| part == b"first=Raw+/=123")));
         }
         emit_runtime_network_events(&mut ctx, &session, "frame-worker", "http://worker-headers.test/", &page_id, &events);
-        for event in &events {
+        for event in &completed {
+            let started = events.iter().find(|candidate| {
+                candidate.pending && candidate.request_id == event.request_id
+            }).unwrap();
             let emitted: Vec<_> = ctx.pending_events.iter().filter(|item| item.params["requestId"] == event.request_id).collect();
             assert_eq!(emitted.len(), 4);
             assert!(emitted.iter().all(|item| item.session_id == session));
             assert_eq!(emitted[0].method, "Network.requestWillBeSent");
-            assert_eq!(emitted[0].params["request"]["rawHeaders"], json!(event.request_raw_headers));
+            assert_eq!(emitted[0].params["request"]["rawHeaders"], json!(started.request_raw_headers));
             assert_eq!(emitted[0].params["type"], event.resource_type);
             assert_eq!(emitted[1].method, "Network.requestWillBeSentExtraInfo");
             assert_eq!(emitted[1].params["rawHeaders"], json!(event.request_raw_headers));
@@ -2344,28 +3343,25 @@ mod tests {
             assert_eq!(emitted[3].method, "Network.loadingFinished");
             assert_eq!(emitted[3].params["encodedDataLength"], event.body_size);
         }
-        let binary = events.iter().find(|event| event.url.ends_with("/binary")).unwrap();
+        let binary = completed.iter().find(|event| event.url.ends_with("/binary")).unwrap();
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": binary.request_id}), &mut ctx, &session).await.unwrap();
         let fetched = super::super::fetch::handle("getResponseBody", &json!({"requestId": binary.request_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(fetched, body);
         let binary_bytes: Vec<u8> = (0..2 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
         assert_eq!(body, json!({"body": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &binary_bytes), "base64Encoded": true}));
-        let text = events.iter().find(|event| event.url.ends_with("/text")).unwrap();
+        let text = completed.iter().find(|event| event.url.ends_with("/text")).unwrap();
         let body = super::super::network::handle("getResponseBody", &json!({"requestId": text.request_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(body, json!({"body": "w".repeat(2 * 1024 * 1024 + 31), "base64Encoded": false}));
         let fetched = super::super::fetch::handle("getResponseBody", &json!({"requestId": text.request_id}), &mut ctx, &session).await.unwrap();
         assert_eq!(fetched, body);
-        // Navigation-time Fetch observations use the same completed capture.
-        // A live pre-transport pause cannot have transport headers yet.
+        // Script requests are paused live before transport. Re-projecting their
+        // completed observations through navigation must not synthesize a late
+        // Fetch pause after the response has already arrived.
         ctx.pending_events.clear();
         ctx.fetch_intercept.enabled = true;
-        emit_navigation_events(&mut ctx, &session, "frame-worker", "loader-worker", "http://worker-headers.test/", &page_id, &events, WaitUntil::Load, false);
+        emit_navigation_events(&mut ctx, &session, "frame-worker", "loader-worker", "http://worker-headers.test/", &page_id, &events, LifecycleState::Loaded);
         let paused: Vec<_> = ctx.pending_events.iter().filter(|event| event.method == "Fetch.requestPaused").collect();
-        assert_eq!(paused.len(), events.len());
-        for (paused, event) in paused.iter().zip(&events) {
-            assert_eq!(paused.params["request"]["rawHeaders"], json!(event.request_raw_headers));
-            assert_eq!(paused.params["resourceType"], event.resource_type);
-        }
+        assert!(paused.is_empty(), "completed script observations must not generate retrospective pauses");
         assert_eq!(server.join().unwrap().len(), 5);
     }
 
@@ -2468,6 +3464,13 @@ mod tests {
             names.contains(&"Page.loadEventFired"),
             "loadEventFired must be emitted, got {names:?}"
         );
+        assert!(
+            !ctx.pending_events.iter().any(|event| {
+                event.method == "Page.lifecycleEvent"
+                    && event.params["name"] == "networkIdle"
+            }),
+            "Page.enable must not fabricate networkIdle without a 500ms quiet window"
+        );
         let frame_navigated = ctx
             .pending_events
             .iter()
@@ -2523,7 +3526,7 @@ mod tests {
             let url=page.url_string();
             let (old, events): (Vec<_>, Vec<_>) = page.network_events.drain(..).partition(|event| event.request_id == request.network_id);
             delayed.extend(old);
-            emit_navigation_events(&mut ctx,&session,&frame,&format!("loader-new-{index}"),&url,&page_id,&events,WaitUntil::Load,false);
+            emit_navigation_events(&mut ctx,&session,&frame,&format!("loader-new-{index}"),&url,&page_id,&events,LifecycleState::Loaded);
         }
         assert!(!ctx.pending_events.iter().any(|event| event.method == "Network.loadingFailed" && event.params["requestId"] == request.network_id));
         // Deliberately deliver the original Worker's terminal after both newer
@@ -2576,7 +3579,7 @@ mod tests {
         assert!(events[0].document_generation < page.network_document_generation);
         assert_eq!(events[0].document_url, "about:blank");
         let frame = page.frame_id.clone();
-        emit_navigation_events(&mut ctx, &session, &frame, "loader-new", "http://new.test/", &page_id, &events, WaitUntil::Load, false);
+        emit_navigation_events(&mut ctx, &session, &frame, "loader-new", "http://new.test/", &page_id, &events, LifecycleState::Loaded);
         let failed = ctx.pending_events.iter().filter(|event| event.method == "Network.loadingFailed").collect::<Vec<_>>();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].session_id, session);
@@ -3132,8 +4135,7 @@ mod tests {
             "https://example.test/document",
             &page_id,
             &[event],
-            WaitUntil::Load,
-            false,
+            LifecycleState::Loaded,
         );
         assert_eq!(
             crate::domains::network::get_response_body(&ctx, &Some(first), "loader-visible").unwrap()["body"],
@@ -3217,8 +4219,7 @@ mod tests {
             "https://example.test/final",
             &page_id,
             &events,
-            WaitUntil::Load,
-            false,
+            LifecycleState::Loaded,
         );
 
         let starts = ctx.pending_events.iter()
@@ -4529,21 +5530,38 @@ mod tests {
                 .await
                 .is_err()
         );
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        let session = Some(session_id.clone());
+        ctx.sessions.insert(session_id.clone(), page_id);
         handle(
             "setLifecycleEventsEnabled",
             &json!({"enabled": true}),
-            &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)),
-            &None,
+            &mut ctx,
+            &session,
         )
         .await
-        .expect("the observed fixed-on lifecycle shape must remain compatible");
+        .expect("enabled=true registers the attached session");
+        assert!(ctx.lifecycle_enabled_sessions.contains(&session_id));
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": false}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("enabled=false removes only this attached session");
+        assert!(!ctx.lifecycle_enabled_sessions.contains(&session_id));
         for params in [
             json!({}),
-            json!({"enabled": false}),
             json!({"enabled": true, "invented": true}),
+            json!({"enabled": "true"}),
         ] {
             assert!(
-                handle("setLifecycleEventsEnabled", &params, &mut CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145)), &None)
+                handle("setLifecycleEventsEnabled", &params, &mut ctx, &session)
                     .await
                     .is_err(),
                 "must reject {params}"

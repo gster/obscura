@@ -49,6 +49,32 @@ document.getElementById('f').addEventListener('submit', function(e) { e.preventD
     format!("http://{addr}/")
 }
 
+async fn serve_no_content_form(status: u16) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let response = if request.starts_with("GET /no-content") {
+                format!(
+                    "HTTP/1.1 {status} No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                let body = r#"<!doctype html><style>button{position:absolute;left:20px;top:20px;width:100px;height:40px}</style><title>old</title><body id="old"><form action="/no-content"><button id="submit" type="submit">Go</button></form></body>"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    format!("http://{addr}/")
+}
+
 async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session_id: &str) -> Value {
     let resp = dispatch(
         &CdpRequest {
@@ -187,6 +213,78 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
         "/submitted",
         "a CDP click on a submit button must fire the cancelable submit event and be vetoable"
     );
+}
+
+#[cfg(feature = "render")]
+#[tokio::test(flavor = "current_thread")]
+async fn cdp_click_no_content_form_preserves_document_and_aborts_loader() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    for status in [204, 205] {
+        let url = serve_no_content_form(status).await;
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let session_id = format!("input-no-content-{status}");
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+        cdp(&mut ctx, 1, "Network.enable", json!({}), &session_id).await;
+        cdp(
+            &mut ctx,
+            2,
+            "Page.setLifecycleEventsEnabled",
+            json!({"enabled": true}),
+            &session_id,
+        ).await;
+        navigate(&mut ctx, &url, &session_id).await;
+        let (old_document, old_url, old_lifecycle, old_loader) = {
+            let page = ctx.get_page(&page_id).unwrap();
+            (
+                page.document_identity(),
+                page.url_string(),
+                page.lifecycle,
+                ctx.current_loader_ids[&page_id].clone(),
+            )
+        };
+        ctx.pending_events.clear();
+
+        for (id, phase) in [(3, "mousePressed"), (4, "mouseReleased")] {
+            cdp(
+                &mut ctx,
+                id,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": phase,
+                    "x": 70.0,
+                    "y": 40.0,
+                    "button": "left",
+                    "clickCount": 1,
+                }),
+                &session_id,
+            ).await;
+        }
+
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        assert_eq!(page.document_identity(), old_document);
+        assert_eq!(page.url_string(), old_url);
+        assert_eq!(page.lifecycle, old_lifecycle);
+        assert_eq!(page.evaluate("document.title"), json!("old"));
+        assert_eq!(page.evaluate("document.body.id"), json!("old"));
+        assert_eq!(ctx.current_loader_ids[&page_id], old_loader);
+        let failed = ctx.pending_events.iter().filter(|event| {
+            event.method == "Network.loadingFailed"
+        }).collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1, "{status}: expected one loadingFailed");
+        assert_eq!(failed[0].params["errorText"], "net::ERR_ABORTED");
+        assert_eq!(failed[0].params["canceled"], true);
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.method != "Network.loadingFinished"
+                && event.method != "Page.frameNavigated"
+                && event.method != "Page.lifecycleEvent"
+        }));
+        assert_eq!(ctx.pending_events.iter().filter(|event| {
+            event.method == "Page.frameStoppedLoading"
+        }).count(), 1);
+    }
 }
 
 // requestSubmit(submitter) must validate its argument before doing anything

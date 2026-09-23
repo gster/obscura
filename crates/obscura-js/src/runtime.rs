@@ -1873,6 +1873,7 @@ impl ObscuraJsRuntime {
         frame.intercept_response_patterns = parent.intercept_response_patterns.clone();
         frame.page_in_flight = parent.page_in_flight.clone();
         frame.stealth_client = parent.stealth_client.clone();
+        frame.network_activity_generation = parent.network_activity_generation;
         // A frame realm shares the page transport, so its renderer cache must
         // not open synchronous requests either. Frame geometry currently
         // resolves against the main document's renderer state, so frame-scoped
@@ -2152,6 +2153,7 @@ impl ObscuraJsRuntime {
         }
         state.cookie_jar = Some(client.cookie_jar.clone());
         state.http_client = Some(client.policy_client());
+        state.network_activity_generation = Some(client.network_activity_snapshot().generation);
         state.stealth_client = Some(client);
         #[cfg(feature = "render")]
         state.render_resources.set_sync_loading_enabled(false);
@@ -5984,6 +5986,7 @@ impl ObscuraJsRuntime {
         let initiator = initiator.expect("checked above");
         let referrer_policy = state.referrer_policy;
         let callbacks = state.callbacks.clone();
+        let network_activity_generation = state.network_activity_generation;
         let trace_epoch = self.render_trace_epoch.borrow().clone();
         let response_bodies = state.network_response_bodies.clone();
         let request_bodies = state.network_request_bodies.clone();
@@ -6027,6 +6030,7 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.network_activity_generation = network_activity_generation;
                     request.referrer_policy = referrer_policy;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
@@ -6046,7 +6050,8 @@ impl ObscuraJsRuntime {
                         let request_id = format!("render-{generation}-{ordinal}");
                         let trace = obscura_net::observation::RequestTrace::new(
                             response_bodies, request_bodies, request_id,
-                        ).observe(trace_epoch.clone(), kind);
+                        ).with_network_activity_generation(network_activity_generation)
+                            .observe(trace_epoch.clone(), kind);
                         let registration = trace_epoch.register(&trace);
                         match (registration, trace.begin(parsed.as_str(), "GET", None, None)) {
                             (Some(_registration), Ok(())) => stealth_client.fetch_resource_traced(
@@ -7252,6 +7257,27 @@ impl ObscuraJsRuntime {
         pre_send.saturating_add(transport)
     }
 
+    pub fn begin_network_document(&self) -> u64 {
+        let mut state = self.state.borrow_mut();
+        let generation = state.ensure_persona_transport().begin_network_document();
+        state.network_activity_generation = Some(generation);
+        generation
+    }
+
+    pub fn network_activity_snapshot(&self) -> obscura_net::NetworkActivitySnapshot {
+        self.state
+            .borrow_mut()
+            .ensure_persona_transport()
+            .network_activity_snapshot()
+    }
+
+    pub fn network_activity_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.state
+            .borrow_mut()
+            .ensure_persona_transport()
+            .network_activity_notify()
+    }
+
     fn has_pending_network_requests(&self) -> bool {
         self.active_network_requests() > 0
     }
@@ -7345,6 +7371,11 @@ impl ObscuraJsRuntime {
     /// Native document identity, including synchronous document.open replacement.
     pub fn document_epoch(&self) -> u64 {
         self.state.borrow().input_document_epoch.get()
+    }
+
+    /// Monotonic time at which the current native document was installed.
+    pub fn document_changed_at(&self) -> std::time::Instant {
+        self.state.borrow().input_document_changed_at.get()
     }
 
     /// Clear V8's termination flag after a watchdog armed externally (via the
@@ -9211,12 +9242,15 @@ mod tests {
         assert!(!result.thrown, "{result:?}");
         assert_eq!(result.value.unwrap(), serde_json::json!([text.len(), "x", "x", binary.len(), 0, 16, invalid]));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 3);
-        for (event, expected) in events.iter().zip([&text, &binary, &invalid]) {
+        assert_eq!(events.len(), 6);
+        assert_eq!(events.iter().filter(|event| event.pending).count(), 3);
+        let completed: Vec<_> = events.iter().filter(|event| !event.pending).collect();
+        assert_eq!(completed.len(), 3);
+        for (event, expected) in completed.iter().zip([&text, &binary, &invalid]) {
             let (body, _) = rt.get_network_response_body_result(&event.request_id).unwrap().unwrap();
             assert_eq!(body.with_bytes(|bytes| bytes.to_vec()).unwrap(), *expected);
         }
-        let binary_id = &events[1].request_id;
+        let binary_id = &completed[1].request_id;
         rt.state.borrow().network_response_bodies.lock().unwrap().alias(binary_id, "stream-alias").unwrap();
         let stream = rt.take_network_response_body_result("stream-alias").unwrap().unwrap();
         let (canonical, _) = rt.get_network_response_body_result(binary_id).unwrap().unwrap();
@@ -9313,8 +9347,10 @@ mod tests {
         }"#, None, &[], true, true).await.unwrap();
         assert_eq!(result.value, Some(serde_json::json!(true)));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
+        assert_eq!(events.len(), 2);
+        assert!(events[0].pending);
+        let event = &events[1];
+        assert!(event.request_started);
         assert!(event.error.is_some());
         assert_eq!(event.status, 0);
         assert_eq!(event.request_body_size, 2);
@@ -9340,11 +9376,13 @@ mod tests {
         let result = rt.call_function_on_for_cdp("async () => {try {await fetch('/redirect');return false;} catch(_) {return true;}}", None, &[], true, true).await.unwrap();
         assert_eq!(result.value, Some(serde_json::json!(true)));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].status, 302);
-        assert!(events[0].error.as_ref().unwrap().contains("forbidden"));
-        assert_eq!(events[0].response_headers["location"], "http://127.0.0.1/private?full=secret");
-        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "AP9S");
+        assert_eq!(events.len(), 2);
+        assert!(events[0].pending);
+        assert_eq!(events[1].status, 302);
+        assert!(events[1].request_started);
+        assert!(events[1].error.as_ref().unwrap().contains("forbidden"));
+        assert_eq!(events[1].response_headers["location"], "http://127.0.0.1/private?full=secret");
+        assert_eq!(rt.get_network_response_body(&events[1].request_id).unwrap().body, "AP9S");
         server.join().unwrap();
     }
 
@@ -9398,18 +9436,19 @@ mod tests {
         let result = rt.call_function_on_for_cdp("async () => (await fetch('/redirect', {headers:{'X-Full':'secret'}})).text()", None, &[], true, true).await.unwrap();
         assert_eq!(result.value, Some(serde_json::json!("complete")));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 4, "{events:?}");
-        assert!(events[0].url.ends_with("/redirect") && events[0].redirect);
-        assert_eq!(events[0].status, 302);
-        assert!(events[1].pending && events[1].url.ends_with("/final"));
-        assert_eq!(events[2].method, "OPTIONS");
-        assert_eq!(events[2].initiator_request_id.as_ref(), Some(&events[0].request_id));
-        assert_ne!(events[2].request_id, events[0].request_id);
-        assert_eq!(events[0].request_id, events[1].request_id);
-        assert_eq!(events[0].request_id, events[3].request_id);
-        assert!(events[3].request_started && !events[3].redirect);
-        assert_eq!(rt.get_network_response_body(events[0].response_body_request_id.as_ref().unwrap()).unwrap().body, "redirect-secret");
-        assert_eq!(rt.get_network_response_body(&events[3].request_id).unwrap().body, "complete");
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert!(events[0].pending && events[0].url.ends_with("/redirect"));
+        assert!(events[1].url.ends_with("/redirect") && events[1].redirect);
+        assert_eq!(events[1].status, 302);
+        assert!(events[2].pending && events[2].url.ends_with("/final"));
+        assert_eq!(events[3].method, "OPTIONS");
+        assert_eq!(events[3].initiator_request_id.as_ref(), Some(&events[1].request_id));
+        assert_ne!(events[3].request_id, events[1].request_id);
+        assert_eq!(events[1].request_id, events[2].request_id);
+        assert_eq!(events[1].request_id, events[4].request_id);
+        assert!(events[4].request_started && !events[4].redirect);
+        assert_eq!(rt.get_network_response_body(events[1].response_body_request_id.as_ref().unwrap()).unwrap().body, "redirect-secret");
+        assert_eq!(rt.get_network_response_body(&events[4].request_id).unwrap().body, "complete");
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("GET ") && requests[1].starts_with("OPTIONS ") && requests[2].starts_with("GET "));
     }
@@ -9597,10 +9636,14 @@ mod tests {
         let result = rt.call_function_on_for_cdp("async () => { try { await fetch('http://cross.test/denied'); return 'unexpected'; } catch(e) { return e.name; } }", None, &[], true, true).await.unwrap();
         assert_eq!(result.value, Some(serde_json::json!("TypeError")));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 1);
-        assert!(events[0].error.as_ref().unwrap().contains("CORS"));
-        assert_eq!(events[0].status, 200);
-        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "not-exposed");
+        assert_eq!(events.len(), 2);
+        assert!(events[0].pending);
+        let event = &events[1];
+        assert!(!event.pending);
+        assert_eq!(events[0].request_id, event.request_id);
+        assert!(event.error.as_ref().unwrap().contains("CORS"));
+        assert_eq!(event.status, 200);
+        assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, "not-exposed");
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
@@ -9624,10 +9667,14 @@ mod tests {
         rt.run_event_loop_bounded(3000).await.unwrap();
         assert_eq!(rt.evaluate("__largeWorkerBody").unwrap(), serde_json::json!([bytes.len(), 0, 16]));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 1);
-        let (body, _) = rt.get_network_response_body_result(&events[0].request_id).unwrap().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].pending);
+        let event = &events[1];
+        assert!(!event.pending);
+        assert_eq!(events[0].request_id, event.request_id);
+        let (body, _) = rt.get_network_response_body_result(&event.request_id).unwrap().unwrap();
         assert_eq!(body.with_bytes(|bytes| bytes.to_vec()).unwrap(), bytes);
-        assert_eq!(events[0].resource_type, obscura_net::ResourceType::Fetch);
+        assert_eq!(event.resource_type, obscura_net::ResourceType::Fetch);
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
@@ -9663,7 +9710,8 @@ mod tests {
         assert_eq!(result.value.unwrap(), serde_json::json!({"fetch":binary,"xhr":binary,"cross":binary,"cookie":"session=raw-secret",
             "identity":["x86",obscura_net::StealthProfile::WindowsChrome145.platform().2,obscura_net::StealthProfile::WindowsChrome145.full_version()]}));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 7);
+        assert_eq!(events.iter().filter(|event| event.pending).count(), 3);
         assert_eq!(events.iter().filter(|event| event.method == "OPTIONS").count(), 1);
         for event in events.into_iter().filter(|event| !event.pending && event.method != "OPTIONS") {
             assert_eq!(event.body_size, 4);
@@ -9851,8 +9899,9 @@ mod tests {
         }"#, None, &[], true, true).await.unwrap();
         assert_eq!(result.value.unwrap(), serde_json::json!([true, true]));
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 2);
-        for event in events {
+        assert_eq!(events.len(), 4);
+        assert_eq!(events.iter().filter(|event| event.pending).count(), 2);
+        for event in events.into_iter().filter(|event| !event.pending) {
             assert!(event.error.is_some());
             assert_eq!(event.status, 200);
             assert!(event.raw_headers.is_some());
@@ -9917,8 +9966,68 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(parent.cookie_jar.as_ref().unwrap(), frame.cookie_jar.as_ref().unwrap()));
         assert!(std::sync::Arc::ptr_eq(parent.http_client.as_ref().unwrap(), frame.http_client.as_ref().unwrap()));
         assert!(std::sync::Arc::ptr_eq(parent.stealth_client.as_ref().unwrap(), frame.stealth_client.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(
+            &parent.stealth_client.as_ref().unwrap().network_activity_notify(),
+            &frame.stealth_client.as_ref().unwrap().network_activity_notify(),
+        ));
         assert!(std::sync::Arc::ptr_eq(&parent.page_in_flight, &frame.page_in_flight));
         assert_eq!(frame.stealth_client.as_ref().unwrap().transport_params().proxy_url.as_deref(), Some("http://127.0.0.1:9"));
+    }
+
+    #[test]
+    fn runtime_forwards_document_scoped_network_activity() {
+        let rt = ObscuraJsRuntime::with_base_url_and_proxy(
+            "http://standalone.test/",
+            Some("http://127.0.0.1:9".into()),
+            test_persona(),
+        );
+        let generation = rt.begin_network_document();
+        assert_eq!(rt.network_activity_snapshot().generation, generation);
+        let tracker = rt
+            .state
+            .borrow_mut()
+            .ensure_persona_transport()
+            .network_activity_tracker();
+        let guard = tracker.begin();
+        assert_eq!(rt.network_activity_snapshot().active, 1);
+        drop(guard);
+        assert_eq!(rt.network_activity_snapshot().active, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_and_ssrf_rejected_fetches_reset_document_quiet_evidence() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://example.test/page");
+        rt.run_page_init();
+        rt.begin_network_document();
+        rt.set_blocked_urls(vec!["blocked.example".into()]);
+        let before_blocked = rt.network_activity_snapshot();
+        let result = rt.call_function_on_for_cdp(
+            "async()=>{try{await fetch('https://blocked.example/data')}catch(_){};return true}",
+            None,
+            &[],
+            true,
+            true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(true)));
+        let after_blocked = rt.network_activity_snapshot();
+        assert_eq!(after_blocked.active, 0);
+        assert!(after_blocked.epoch >= before_blocked.epoch + 2);
+        assert!(after_blocked.below_zero_since > before_blocked.below_zero_since);
+
+        let before_ssrf = after_blocked;
+        let result = rt.call_function_on_for_cdp(
+            "async()=>{try{await fetch('http://127.0.0.1:9/private')}catch(_){};return true}",
+            None,
+            &[],
+            true,
+            true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(true)));
+        let after_ssrf = rt.network_activity_snapshot();
+        assert_eq!(after_ssrf.active, 0);
+        assert!(after_ssrf.epoch >= before_ssrf.epoch + 2);
+        assert!(after_ssrf.below_zero_since > before_ssrf.below_zero_since);
     }
 
     #[cfg(feature = "render")]
@@ -11005,6 +11114,52 @@ return {before,removed,reinsert,moved,cleared};
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_fetch_keeps_the_document_generation_frozen_at_creation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let original_generation = rt.begin_network_document();
+        rt.execute_script("worker-generation", r#"
+            globalThis.__workerGenerationState = null;
+            const source = `
+                postMessage('ready');
+                onmessage = async () => {
+                    try { await fetch('http://127.0.0.1:9/private'); } catch (_) {}
+                    postMessage('done');
+                    close();
+                };
+            `;
+            globalThis.__workerGenerationUrl = URL.createObjectURL(
+                new Blob([source], {type:'application/javascript'})
+            );
+            globalThis.__workerGeneration = new Worker(__workerGenerationUrl);
+            __workerGeneration.onmessage = event => {
+                __workerGenerationState = event.data;
+                if (event.data === 'done') URL.revokeObjectURL(__workerGenerationUrl);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerGenerationState").unwrap(),
+            serde_json::json!("ready"),
+        );
+
+        let successor_generation = rt.begin_network_document();
+        assert_ne!(successor_generation, original_generation);
+        let before = rt.network_activity_snapshot();
+        rt.execute_script("worker-generation-fetch", "__workerGeneration.postMessage('go')")
+            .unwrap();
+        rt.run_event_loop_bounded(1_000).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerGenerationState").unwrap(),
+            serde_json::json!("done"),
+        );
+        assert_eq!(
+            rt.network_activity_snapshot(),
+            before,
+            "a worker created by the retired document must not reset the successor quiet window",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_network_keeps_interception_callbacks_and_response_bodies() {
         use std::io::{Read, Write};
         use std::sync::{Arc, Mutex};
@@ -11086,10 +11241,13 @@ return {before,removed,reinsert,moved,cleared};
         assert_eq!(ids.len(), 3, "parent and worker interception IDs must not collide");
         assert_eq!(observed.lock().unwrap().len(), 3);
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 3, "worker response events must reach the owner");
-        let ids: std::collections::HashSet<_> = events.iter().map(|event| &event.request_id).collect();
+        assert_eq!(events.len(), 6, "worker request starts and terminals must reach the owner");
+        assert_eq!(events.iter().filter(|event| event.pending).count(), 3);
+        let completed: Vec<_> = events.iter().filter(|event| !event.pending).collect();
+        assert_eq!(completed.len(), 3);
+        let ids: std::collections::HashSet<_> = completed.iter().map(|event| &event.request_id).collect();
         assert_eq!(ids.len(), 3);
-        let event = events.iter().find(|event| event.url.ends_with("/workers/data.txt")).unwrap();
+        let event = completed.iter().find(|event| event.url.ends_with("/workers/data.txt")).unwrap();
         assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, "worker-data");
         assert!(requests.lock().unwrap().iter().any(|request| request.starts_with("GET /workers/data.txt ") && request.to_lowercase().contains("cookie: worker_probe=shared")));
         server.join().unwrap();
@@ -25525,14 +25683,17 @@ return {before,removed,reinsert,moved,cleared};
         assert_eq!(value["directRedirected"], false);
 
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 3);
-        assert!(events[0].redirect && events[0].url.ends_with("/hop/1"));
-        assert_eq!(events[0].request_id, events[1].request_id);
-        assert_ne!(events[1].request_id, events[2].request_id);
+        assert_eq!(events.len(), 5);
+        assert_eq!(events.iter().filter(|event| event.pending).count(), 2);
+        let completed: Vec<_> = events.iter().filter(|event| !event.pending).collect();
+        assert_eq!(completed.len(), 3);
+        assert!(completed[0].redirect && completed[0].url.ends_with("/hop/1"));
+        assert_eq!(completed[0].request_id, completed[1].request_id);
+        assert_ne!(completed[1].request_id, completed[2].request_id);
         assert!(
-            events[1].url.ends_with("/hop/0"),
+            completed[1].url.ends_with("/hop/0"),
             "network response event did not report the final URL: {:?}",
-            events[0].url
+            completed[0].url
         );
     }
 
@@ -25650,23 +25811,26 @@ return {before,removed,reinsert,moved,cleared};
             )]
         );
         let events = rt.take_js_network_events();
-        assert_eq!(events.len(), 2);
-        assert!(events[0].redirect);
-        assert_eq!(events[0].request_id, events[1].request_id);
-        assert!(events[0].request_body_present);
-        assert_eq!(events[0].request_body_size, 7);
-        assert!(events[0].transport_request_body_present);
-        assert_eq!(events[0].transport_request_body_size, 7);
-        assert_eq!(events[1].method, expected_method);
-        assert!(events[1].url.ends_with("/final"));
+        assert_eq!(events.len(), 3);
+        assert!(events[0].pending);
+        let completed: Vec<_> = events.iter().filter(|event| !event.pending).collect();
+        assert_eq!(completed.len(), 2);
+        assert!(completed[0].redirect);
+        assert_eq!(completed[0].request_id, completed[1].request_id);
+        assert!(completed[0].request_body_present);
+        assert_eq!(completed[0].request_body_size, 7);
+        assert!(completed[0].transport_request_body_present);
+        assert_eq!(completed[0].transport_request_body_size, 7);
+        assert_eq!(completed[1].method, expected_method);
+        assert!(completed[1].url.ends_with("/final"));
         if expected_method == "GET" {
-            assert!(!events[1].request_body_present);
-            assert!(events[1].request_body_request_id.is_none());
-            assert!(rt.get_network_request_body_result(&events[1].request_id).is_none());
+            assert!(!completed[1].request_body_present);
+            assert!(completed[1].request_body_request_id.is_none());
+            assert!(rt.get_network_request_body_result(&completed[1].request_id).is_none());
         } else {
-            assert!(events[1].request_body_present);
-            assert_eq!(events[1].request_body_size, 7);
-            let body = rt.get_network_request_body_result(&events[1].request_id)
+            assert!(completed[1].request_body_present);
+            assert_eq!(completed[1].request_body_size, 7);
+            let body = rt.get_network_request_body_result(&completed[1].request_id)
                 .expect("logical request body alias").expect("retained request body");
             assert_eq!(body.read(0, 99).unwrap(), b"payload");
         }

@@ -248,6 +248,9 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    /// Page network-activity generation that owns this request. Standalone
+    /// clients leave this unset and account against the current generation.
+    pub network_activity_generation: Option<u64>,
 }
 
 impl ResourceRequest {
@@ -260,6 +263,7 @@ impl ResourceRequest {
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
+            network_activity_generation: None,
         }
     }
 
@@ -297,6 +301,7 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            network_activity_generation: None,
         }
     }
 
@@ -319,7 +324,13 @@ impl ResourceRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024),
+            network_activity_generation: None,
         }
+    }
+
+    pub fn with_network_activity_generation(mut self, generation: Option<u64>) -> Self {
+        self.network_activity_generation = generation;
+        self
     }
 
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {

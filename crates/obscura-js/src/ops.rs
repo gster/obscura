@@ -421,6 +421,7 @@ pub struct ObscuraState {
     pub js_network_events: crate::network_observation::NetworkObservationQueue,
     pub network_document_generation: u64,
     pub network_document_url: String,
+    pub network_activity_generation: Option<u64>,
     pub network_teardown_events: Arc<std::sync::Mutex<crate::network_observation::NetworkObservationQueue>>,
     pub network_teardown_notify: Arc<tokio::sync::Notify>,
     pub(crate) fetch_cancellations: HashMap<String, (tokio::sync::watch::Sender<Option<String>>, Option<String>)>,
@@ -459,6 +460,10 @@ pub struct ObscuraState {
     /// advances for `document.open()`, whose replacement reuses the same
     /// document object and may reuse DOM node ids.
     pub input_document_epoch: Cell<u64>,
+    /// Monotonic instant at which the installed input document last changed.
+    /// Readiness observers created after a synchronous `document.open()` use
+    /// this to require the replacement's complete quiet window.
+    pub input_document_changed_at: Cell<std::time::Instant>,
     pub document_lifecycle: u8,
     /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
     /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
@@ -675,6 +680,7 @@ impl ObscuraState {
             fetched_urls: Vec::new(),
             js_network_events,
             network_document_generation: 0, network_document_url: String::new(),
+            network_activity_generation: None,
             network_teardown_events,
             network_teardown_notify: Arc::new(tokio::sync::Notify::new()),
             fetch_cancellations: HashMap::new(),
@@ -688,6 +694,7 @@ impl ObscuraState {
             activity_generation: 0,
             document_generation: 0,
             input_document_epoch: Cell::new(0),
+            input_document_changed_at: Cell::new(std::time::Instant::now()),
             document_lifecycle: 0,
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
@@ -3249,6 +3256,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "document_write_reset" => {
             *gs.write_stream.borrow_mut() = None;
             gs.input_document_epoch.set(gs.input_document_epoch.get().wrapping_add(1));
+            gs.input_document_changed_at.set(std::time::Instant::now());
             "true".into()
         }
         "input_document_epoch" => gs.input_document_epoch.get().to_string(),
@@ -3878,11 +3886,15 @@ impl NetworkRequest {
         });
         let trace = obscura_net::observation::RequestTrace::new(
             state.borrow().network_response_bodies.clone(), state.borrow().network_request_bodies.clone(), id.clone(),
-        );
+        ).with_network_activity_generation(state.borrow().network_activity_generation);
         trace.begin(url, method, headers, body)?;
         let document_generation = state.borrow().network_document_generation;
         let document_url = state.borrow().network_document_url.clone();
         Ok(Self { document_generation, document_url, state, id, trace, network_start: Arc::new(std::sync::atomic::AtomicU8::new(0)), hop_starts: Vec::new(), hop_interceptions: Vec::new(), interception_id: None, response_interception_id: None, response_status_texts: Vec::new(), retained_response_bodies: HashMap::new(), initiator_request_id: None, resource_type, finished: false, emitted_exchanges: 0 })
+    }
+
+    fn network_activity_generation(&self) -> Option<u64> {
+        self.trace.network_activity_generation()
     }
 
     fn set_response_status_text(&mut self, index: usize, status_text: Option<String>) {
@@ -3920,7 +3932,9 @@ impl NetworkRequest {
             response_body_capture_error: None, response_body: None, body_size: 0,
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
         });
-        self.state.borrow_mut().js_network_events.try_extend(events)?;
+        let mut state = self.state.borrow_mut();
+        state.js_network_events.try_extend(events)?;
+        state.network_teardown_notify.notify_one();
         self.emitted_exchanges += redirect_count;
         start.store(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -4133,7 +4147,27 @@ async fn fetch_url_inner(
         url
     );
 
-    let (page_in_flight, intercept_tx, callbacks, http_client, stealth_client, referrer, referrer_policy) = {
+    // Account from the first native pre-send decision. Blocked URL, SSRF and
+    // interception failures are logical requests too, and must reset a quiet
+    // window even when no transport is opened. Freeze the owning document
+    // generation before any await so a retired Worker/runtime cannot start
+    // activity in its successor document.
+    let shared = state.borrow().borrow::<SharedState>().clone();
+    let (page_in_flight, stealth_client, network_activity_generation) = {
+        let mut gs = shared.borrow_mut();
+        (
+            Arc::clone(&gs.page_in_flight),
+            gs.ensure_persona_transport(),
+            gs.network_activity_generation,
+        )
+    };
+    let mut page_in_flight_guard = Some(PageInFlightGuard::new(
+        page_in_flight,
+        stealth_client.network_activity_tracker(),
+        network_activity_generation,
+    ));
+
+    let (intercept_tx, callbacks, http_client, referrer, referrer_policy) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -4152,7 +4186,6 @@ async fn fetch_url_inner(
         // Record the resource the page pulled in via fetch()/XHR so `--dump
         // assets` can list it (issue #301). URL is already absolute here.
         push_capped(&mut gs.fetched_urls, url.clone(), MAX_FETCHED_URLS);
-        let stealth_client = gs.ensure_persona_transport();
         tracing::debug!(
             "op_fetch_url: intercept_enabled={}, has_tx={}",
             gs.intercept_enabled,
@@ -4169,11 +4202,9 @@ async fn fetch_url_inner(
             None
         };
         (
-            Arc::clone(&gs.page_in_flight),
             itx,
             gs.callbacks.clone(),
             gs.http_client.clone(),
-            stealth_client,
             gs.dom.as_ref().and_then(DomTree::document_url).and_then(|url| url::Url::parse(&url).ok()),
             gs.referrer_policy,
         )
@@ -4198,9 +4229,6 @@ async fn fetch_url_inner(
             .to_string());
         }
     }
-    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut page_in_flight_guard = Some(PageInFlightGuard(page_in_flight));
-
     // Slots the interception channel can override via Continue so a consumer
     // can rewrite url/method/headers/body before the request goes out.
     let mut override_url: Option<String> = None;
@@ -4377,6 +4405,11 @@ async fn fetch_url_inner(
     });
     custom_headers.retain(|(key, _)| !key.eq_ignore_ascii_case("referer") && !key.eq_ignore_ascii_case("origin") && !key.to_ascii_lowercase().starts_with("sec-"));
 
+    // Publish the logical request start before yielding to preflight or the
+    // transport. CDP clients (including Playwright's network-idle tracker)
+    // must observe an in-flight request while its response is still pending.
+    observation.start_before_preflight()
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     drop(page_in_flight_guard.take());
     scripted_preflight(state.clone(), &stealth_client, &url, &method, &custom_headers,
         &page_origin, &mode, credentials, referrer.as_ref(), referrer_policy, observation).await?;
@@ -4520,10 +4553,28 @@ async fn scripted_preflight(
     Ok(())
 }
 
-struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
+struct PageInFlightGuard {
+    counter: Arc<std::sync::atomic::AtomicU32>,
+    _activity: obscura_net::NetworkActivityGuard,
+}
+
+impl PageInFlightGuard {
+    fn new(
+        counter: Arc<std::sync::atomic::AtomicU32>,
+        activity: Arc<obscura_net::NetworkActivityTracker>,
+        generation: Option<u64>,
+    ) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let activity = generation
+            .map(|generation| activity.begin_for_generation(generation))
+            .unwrap_or_else(|| activity.begin());
+        Self { counter, _activity: activity }
+    }
+}
+
 impl Drop for PageInFlightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -4557,9 +4608,18 @@ async fn pause_response_hop(
                 && glob_match(&pattern.url_pattern, response.url.as_str())))
     };
     let Some(tx) = tx.filter(|_| matches) else { return Ok(()); };
-    let page_in_flight = shared.borrow().page_in_flight.clone();
-    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _page_in_flight_guard = PageInFlightGuard(page_in_flight);
+    let (page_in_flight, network_activity) = {
+        let mut state = shared.borrow_mut();
+        (
+            state.page_in_flight.clone(),
+            state.ensure_persona_transport().network_activity_tracker(),
+        )
+    };
+    let _page_in_flight_guard = PageInFlightGuard::new(
+        page_in_flight,
+        network_activity,
+        observation.network_activity_generation(),
+    );
 
     let exchange = observation.trace.last().expect("response trace exists before response-stage pause");
     let exchange_index = observation.trace.len().saturating_sub(1);
@@ -4675,9 +4735,18 @@ async fn pause_redirect_hop(
         } else { None }
     };
     let Some(tx) = intercept else { return Ok(None); };
-    let page_in_flight = shared.borrow().page_in_flight.clone();
-    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _page_in_flight_guard = PageInFlightGuard(page_in_flight);
+    let (page_in_flight, network_activity) = {
+        let mut state = shared.borrow_mut();
+        (
+            state.page_in_flight.clone(),
+            state.ensure_persona_transport().network_activity_tracker(),
+        )
+    };
+    let _page_in_flight_guard = PageInFlightGuard::new(
+        page_in_flight,
+        network_activity,
+        observation.network_activity_generation(),
+    );
     let id = shared.borrow().intercept_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let request_id = format!("intercept-{id}");
     *observation.hop_interceptions.last_mut().unwrap() = Some(request_id.clone());
@@ -7872,6 +7941,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.network_activity_generation = gs.network_activity_generation;
         request.referrer_policy = gs.referrer_policy;
         match profile {
             ImageRequestProfile::CorsInclude => {

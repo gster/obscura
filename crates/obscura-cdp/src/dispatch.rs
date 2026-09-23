@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use obscura_browser::{BrowserContext, NetworkHistory, NetworkHistoryLimits, Page};
+use obscura_browser::{BrowserContext, DocumentIdentity, NetworkHistory, NetworkHistoryLimits, Page};
 use crate::domains::fetch::RoutedInterceptedRequest;
 use serde_json::{json, Value};
 
@@ -89,6 +89,23 @@ impl NetworkAgentLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NetworkQuietCandidate {
+    pub since: Option<std::time::Instant>,
+    pub emitted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CdpNetworkIdleCandidate {
+    pub document: DocumentIdentity,
+    pub activity_generation: u64,
+    pub frame_id: String,
+    pub loader_id: String,
+    pub replacement_quiet_floor: Option<std::time::Instant>,
+    pub almost_idle: NetworkQuietCandidate,
+    pub idle: NetworkQuietCandidate,
+}
+
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub(crate) navigating_page_id: Option<String>,
@@ -103,6 +120,10 @@ pub struct CdpContext {
     pub(crate) pending_fetch_policy_cleanup: HashSet<String>,
     pub(crate) navigating_document_loader: Option<(u64, String)>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
+    /// Attached sessions that explicitly enabled Page lifecycle events.
+    /// Subscriptions are independent: disabling or detaching one session must
+    /// not suppress a sibling session's current-document events.
+    pub lifecycle_enabled_sessions: HashSet<String>,
     /// Each attached CDP session owns an Input.setIgnoreInputEvents
     /// contribution. Mouse/key input is ignored when any live session for the
     /// target contributes true. Navigation preserves contributions; detach and
@@ -113,6 +134,10 @@ pub struct CdpContext {
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
     pub document_loaders: HashMap<(String, u64), String>,
+    /// Post-navigation network quiet facts are observed asynchronously. This
+    /// lets Page.navigate return at DCL/load while official clients waiting for
+    /// networkidle receive a real later lifecycle event for the same loader.
+    pub(crate) network_idle_candidates: HashMap<String, CdpNetworkIdleCandidate>,
     /// Legacy source-compatibility field. Network routing no longer reads or
     /// writes this single-owner map; subscriptions are session-scoped below.
     #[doc(hidden)]
@@ -336,9 +361,11 @@ impl CdpContext {
             pending_fetch_policy_cleanup: HashSet::new(),
             navigating_document_loader: None,
             sessions: HashMap::new(),
+            lifecycle_enabled_sessions: HashSet::new(),
             input_ignored_sessions: HashSet::new(),
             current_loader_ids: HashMap::new(),
             document_loaders: HashMap::new(),
+            network_idle_candidates: HashMap::new(),
             network_owners: HashMap::new(),
             network_enabled_sessions: HashSet::new(),
             network_agent_limits: HashMap::new(),
@@ -583,6 +610,7 @@ impl CdpContext {
         }
         self.current_loader_ids.remove(id);
         self.document_loaders.retain(|(page_id, _), _| page_id != id);
+        self.network_idle_candidates.remove(id);
         self.network_owners.retain(|(page_id, _), _| page_id != id);
         self.network_request_sessions.retain(|(page_id, _), _| page_id != id);
         self.network_redirect_responses
@@ -598,6 +626,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.input_ignored_sessions.remove(session_id);
+            self.lifecycle_enabled_sessions.remove(session_id);
             self.runtime_enabled_sessions.remove(session_id);
             self.disable_network_session(session_id);
         }
@@ -759,6 +788,15 @@ impl CdpContext {
 
     pub(crate) fn network_sessions_for_page(&self, page_id: &str) -> Vec<String> {
         let mut sessions = self.network_enabled_sessions.iter()
+            .filter(|session| self.sessions.get(*session).is_some_and(|owner| owner == page_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions
+    }
+
+    pub(crate) fn lifecycle_sessions_for_page(&self, page_id: &str) -> Vec<String> {
+        let mut sessions = self.lifecycle_enabled_sessions.iter()
             .filter(|session| self.sessions.get(*session).is_some_and(|owner| owner == page_id))
             .cloned()
             .collect::<Vec<_>>();

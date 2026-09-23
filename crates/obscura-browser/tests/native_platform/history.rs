@@ -160,7 +160,22 @@ async fn session_history_failed_and_no_content_traversals_do_not_move_cursor() {
             .await
             .unwrap();
         let result = page.process_pending_navigation().await;
-        assert_eq!(result.is_err(), failure == 0, "{result:?}");
+        match failure {
+            0 => assert!(
+                matches!(result, Err(obscura_browser::PageError::NetworkError(_))),
+                "{result:?}"
+            ),
+            204 | 205 => assert!(
+                matches!(
+                    result,
+                    Err(obscura_browser::PageError::NavigationAborted {
+                        ref error_text
+                    }) if error_text == "net::ERR_ABORTED"
+                ),
+                "{result:?}"
+            ),
+            _ => unreachable!(),
+        }
         assert_eq!(
             history_eval(
                 &mut page,

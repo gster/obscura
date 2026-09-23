@@ -637,7 +637,10 @@ async fn single_page_sessionless_pause_resolution_and_navigation_disconnect() {
             "limit": 1000,
         })).await;
         let stream_record = history["records"].as_array().unwrap().iter()
-            .find(|record| record["event"]["url"] == format!("{base}/sessionless-stream"))
+            .find(|record| {
+                record["event"]["url"] == format!("{base}/sessionless-stream")
+                    && record["responseBody"]["key"].is_string()
+            })
             .expect("response-stage stream observation remains in persistent history");
         let body_key = stream_record["responseBody"]["key"].clone();
         let retained = client.ok(None, "Obscura.getNetworkBody", json!({

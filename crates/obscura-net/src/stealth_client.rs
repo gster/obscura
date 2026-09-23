@@ -4,6 +4,7 @@
 pub(crate) mod transport;
 use transport::header;
 use crate::observation::RequestTrace;
+use crate::{NetworkActivityGuard, NetworkActivitySnapshot, NetworkActivityTracker};
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -211,6 +212,7 @@ pub struct StealthHttpClient {
     /// Detached workers share this set; sibling pages get independent sets.
     pub extra_headers: Arc<RwLock<HashMap<String, String>>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    network_activity: Arc<NetworkActivityTracker>,
     resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     policy: Option<Arc<crate::client::ObscuraHttpClient>>,
     transport: TransportParams,
@@ -264,6 +266,7 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            network_activity: Arc::new(NetworkActivityTracker::new()),
             resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             policy: Some(policy),
             transport: TransportParams {
@@ -292,6 +295,7 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            network_activity: Arc::new(NetworkActivityTracker::new()),
             resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             policy,
             transport: TransportParams {
@@ -354,6 +358,7 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: self.extra_headers.clone(),
             in_flight: self.in_flight.clone(),
+            network_activity: self.network_activity.clone(),
             resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             policy: Some(policy),
             transport,
@@ -368,7 +373,7 @@ impl StealthHttpClient {
     /// pipe"). Workers run on their own thread and runtime, so they must build
     /// their own transport instead of sharing the page's.
     ///
-    /// Cookies, in-flight accounting, header overrides and the policy
+    /// Cookies, in-flight/activity accounting, header overrides and the policy
     /// (interceptor, blocked trackers) stay shared - only the pool is new.
     pub fn detached(&self) -> Self {
         let params = &self.transport;
@@ -384,6 +389,7 @@ impl StealthHttpClient {
             cookie_jar: self.cookie_jar.clone(),
             extra_headers: self.extra_headers.clone(),
             in_flight: self.in_flight.clone(),
+            network_activity: self.network_activity.clone(),
             resource_loader: self.resource_loader.clone(),
             policy: self.policy.clone(),
             transport: params.clone(),
@@ -482,6 +488,9 @@ impl StealthHttpClient {
         callbacks: Option<&CallbackRegistry>,
         trace: Option<&RequestTrace>,
     ) -> Result<Response, ObscuraNetError> {
+        let activity_generation = request
+            .network_activity_generation
+            .or_else(|| trace.and_then(RequestTrace::network_activity_generation));
         let Some(cache_key) = self.resource_cache_key(url, &request).await else {
             return self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[], trace).await;
         };
@@ -507,6 +516,11 @@ impl StealthHttpClient {
 
         match acquisition {
             Acquisition::Cached(response) => {
+                let _activity = StealthInFlightGuard::new(
+                    &self.in_flight,
+                    &self.network_activity,
+                    activity_generation,
+                );
                 if let Some(trace) = trace {
                     trace.start()?;
                     let mut observed = response.clone();
@@ -519,7 +533,13 @@ impl StealthHttpClient {
                 self.fire_logical_resource_callbacks(callbacks, url, &request, &response).await;
                 Ok(response)
             }
-            Acquisition::Follower(mut receiver) => loop {
+            Acquisition::Follower(mut receiver) => {
+                let activity = StealthInFlightGuard::new(
+                    &self.in_flight,
+                    &self.network_activity,
+                    activity_generation,
+                );
+                loop {
                 if let Some(trace) = trace { trace.start()?; }
                 let outcome = { receiver.borrow().clone() };
                 if let Some(outcome) = outcome {
@@ -534,12 +554,15 @@ impl StealthHttpClient {
                             Ok(response)
                         }
                         SharedFetchOutcome::RetryUncoalesced => {
+                            drop(activity);
                             self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[], trace).await
                         }
                     };
                 }
                 if receiver.changed().await.is_err() {
+                    drop(activity);
                     break self.fetch_method_with_profile(url, request, callbacks, http::Method::GET, &[], trace).await;
+                }
                 }
             },
             Acquisition::Leader(sender) => {
@@ -658,7 +681,14 @@ impl StealthHttpClient {
         callbacks: Option<&CallbackRegistry>, mut method: http::Method, initial_body: &[u8],
         trace: Option<&RequestTrace>,
     ) -> Result<Response, ObscuraNetError> {
-        let _in_flight = InFlightGuard::new(&self.in_flight);
+        let activity_generation = request
+            .network_activity_generation
+            .or_else(|| trace.and_then(RequestTrace::network_activity_generation));
+        let _in_flight = StealthInFlightGuard::new(
+            &self.in_flight,
+            &self.network_activity,
+            activity_generation,
+        );
         let mut request_body = initial_body.to_vec();
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -954,7 +984,11 @@ impl StealthHttpClient {
         observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
         trace: Option<&RequestTrace>,
     ) -> Result<Response, ObscuraNetError> {
-        let in_flight = InFlightGuard::new(&self.in_flight);
+        let in_flight = StealthInFlightGuard::new(
+            &self.in_flight,
+            &self.network_activity,
+            trace.and_then(RequestTrace::network_activity_generation),
+        );
         if let Some(host) = url.host_str() {
             if self.block_trackers() && crate::blocklist::is_blocked(host) {
                 tracing::debug!("Blocked tracker: {}", url);
@@ -1053,8 +1087,44 @@ impl StealthHttpClient {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn begin_network_document(&self) -> u64 {
+        self.network_activity.begin_document()
+    }
+
+    pub fn network_activity_snapshot(&self) -> NetworkActivitySnapshot {
+        self.network_activity.snapshot()
+    }
+
+    pub fn network_activity_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.network_activity.notify()
+    }
+
+    pub fn network_activity_tracker(&self) -> Arc<NetworkActivityTracker> {
+        self.network_activity.clone()
+    }
+
     pub fn is_network_idle(&self) -> bool {
         self.active_requests() == 0
+    }
+}
+
+struct StealthInFlightGuard {
+    _counter: InFlightGuard,
+    _activity: NetworkActivityGuard,
+}
+
+impl StealthInFlightGuard {
+    fn new(
+        counter: &Arc<std::sync::atomic::AtomicU32>,
+        activity: &Arc<NetworkActivityTracker>,
+        generation: Option<u64>,
+    ) -> Self {
+        Self {
+            _counter: InFlightGuard::new(counter),
+            _activity: generation
+                .map(|generation| activity.begin_for_generation(generation))
+                .unwrap_or_else(|| activity.begin()),
+        }
     }
 }
 
@@ -1359,6 +1429,10 @@ mod tests {
         // identity stays shared
         assert!(StdArc::ptr_eq(&original.cookie_jar, &sibling.cookie_jar));
         assert!(StdArc::ptr_eq(&original.in_flight, &sibling.in_flight));
+        assert!(StdArc::ptr_eq(
+            &original.network_activity_notify(),
+            &sibling.network_activity_notify(),
+        ));
         assert!(StdArc::ptr_eq(&original.extra_headers, &sibling.extra_headers),
             "header overrides must reach the worker's requests");
         assert_eq!(sibling.extra_headers.blocking_read().get("x-probe").map(String::as_str), Some("1"));
@@ -1396,6 +1470,14 @@ mod tests {
         assert!(!StdArc::ptr_eq(&policy.in_flight, &first.in_flight));
         assert!(!StdArc::ptr_eq(&first.in_flight, &second.in_flight));
         assert!(StdArc::ptr_eq(&first.in_flight, &worker.in_flight));
+        assert!(!StdArc::ptr_eq(
+            &first.network_activity_notify(),
+            &second.network_activity_notify(),
+        ));
+        assert!(StdArc::ptr_eq(
+            &first.network_activity_notify(),
+            &worker.network_activity_notify(),
+        ));
         first
             .in_flight
             .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -1403,6 +1485,36 @@ mod tests {
         assert_eq!(worker.active_requests(), 3);
         assert_eq!(second.active_requests(), 0);
         assert_eq!(policy.active_requests(), 0);
+    }
+
+    #[test]
+    fn policy_rebinding_keeps_page_network_activity_tracker() {
+        use std::sync::Arc as StdArc;
+        let original_policy = StdArc::new(crate::client::ObscuraHttpClient::new());
+        let client = super::StealthHttpClient::with_policy_persona(
+            StdArc::new(crate::cookies::CookieJar::new()),
+            None,
+            original_policy,
+            &default_persona(),
+        );
+        let replacement_policy = StdArc::new(crate::client::ObscuraHttpClient::new());
+        let rebound = client.with_policy_binding(client.cookie_jar.clone(), replacement_policy);
+        assert!(StdArc::ptr_eq(
+            &client.network_activity_notify(),
+            &rebound.network_activity_notify(),
+        ));
+    }
+
+    #[test]
+    fn transport_guard_updates_legacy_counter_and_activity_tracker() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let activity = std::sync::Arc::new(crate::NetworkActivityTracker::new());
+        let guard = super::StealthInFlightGuard::new(&counter, &activity, None);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(activity.snapshot().active, 1);
+        drop(guard);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(activity.snapshot().active, 0);
     }
 
     struct CaptureHeaders(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>);
@@ -1770,6 +1882,7 @@ mod tests {
 
     use super::StealthHttpClient;
     use crate::client::{ObscuraNetError, RequestInfo, SsrfGuardResolver};
+    use crate::NetworkActivityTracker;
     use std::collections::HashMap;
     use crate::cookies::CookieJar;
     use primp::dns::{Name, Resolve};
@@ -1963,6 +2076,7 @@ mod tests {
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            network_activity: Arc::new(NetworkActivityTracker::new()),
             resource_loader: Arc::new(std::sync::Mutex::new(crate::client::ResourceLoaderState::default())),
             policy: None,
             transport: super::TransportParams {

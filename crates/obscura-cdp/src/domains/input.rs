@@ -171,33 +171,7 @@ async fn process_input_navigation(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<(), String> {
-    let moved_frame = {
-        let page = ctx
-            .get_session_page_mut(session_id)
-            .ok_or_else(|| "Input requires an attached page session".to_string())?;
-        let moved = page
-            .process_pending_navigation()
-            .await
-            .map_err(|error| error.to_string())?;
-        moved.then(|| (page.id.clone(), page.frame_id.clone(), page.url_string()))
-    };
-    if let Some((page_id, frame_id, url)) = moved_frame {
-        let loader_id = ctx
-            .current_loader_ids
-            .get(&page_id)
-            .cloned()
-            .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-        ctx.pending_events.push(crate::types::CdpEvent {
-            method: "Page.frameNavigated".into(),
-            params: json!({
-                "frame": crate::domains::page::frame_value(
-                    &frame_id, None, &loader_id, &url, "text/html",
-                ),
-                "type": "Navigation",
-            }),
-            session_id: session_id.clone(),
-        });
-    }
+    crate::domains::page::emit_pending_action_navigation(ctx, session_id).await?;
     Ok(())
 }
 

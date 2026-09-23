@@ -395,6 +395,7 @@ struct WorkerConfig {
     persona: obscura_net::EffectivePersona,
     document_generation: u64,
     document_url: String,
+    network_activity_generation: Option<u64>,
     teardown_events: std::sync::Arc<std::sync::Mutex<crate::network_observation::NetworkObservationQueue>>,
     teardown_notify: std::sync::Arc<tokio::sync::Notify>,
     policy: std::sync::Arc<std::sync::Mutex<WorkerPolicy>>,
@@ -1101,6 +1102,7 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         persona: parent.persona.clone(),
         document_generation: parent.network_document_generation,
         document_url: parent.network_document_url.clone(), teardown_events: parent.network_teardown_events.clone(),
+        network_activity_generation: parent.network_activity_generation,
         teardown_notify: parent.network_teardown_notify.clone(),
         policy: registry.borrow().policy.clone(), resources: resources.clone(), url: url.into(), globals, blobs,
         identity: parent.device_identity.clone(), cookies: parent.cookie_jar.clone(),
@@ -1189,6 +1191,7 @@ async fn run_worker(id: u32, config: WorkerConfig,
         state.cookie_jar = config.cookies;
         state.network_document_generation = config.document_generation;
         state.network_document_url = config.document_url;
+        state.network_activity_generation = config.network_activity_generation;
         state.js_network_events = config.teardown_events.lock().unwrap().sibling();
         state.network_teardown_events = config.teardown_events.clone();
         state.network_teardown_notify = config.teardown_notify.clone();

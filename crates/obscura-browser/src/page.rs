@@ -456,6 +456,34 @@ pub struct DocumentIdentity {
     document_epoch: Option<u64>,
 }
 
+/// Exact evidence for one document reaching a network quiet threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkIdleEvidence {
+    pub document: DocumentIdentity,
+    pub max_in_flight: u32,
+    pub quiet_window: std::time::Duration,
+    pub activity_epoch: u64,
+    pub active_requests: u32,
+}
+
+/// Network-idle is an observed navigation outcome, never an implicit success
+/// after a private timer expires. A superseding client navigation is internal
+/// control flow: the outer navigation chain immediately advances to the new
+/// document instead of waiting on the retired one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkIdleOutcome {
+    Reached(NetworkIdleEvidence),
+    TimedOut {
+        document: DocumentIdentity,
+        max_in_flight: u32,
+        active_requests: u32,
+        activity_epoch: u64,
+    },
+    Superseded {
+        document: DocumentIdentity,
+    },
+}
+
 /// Failures that prevent an automation wait from producing an outcome.
 #[derive(Debug, thiserror::Error)]
 pub enum AutomationWaitError {
@@ -2109,7 +2137,8 @@ impl Page {
             ))?;
         let trace = obscura_net::observation::RequestTrace::new(
             self.response_bodies.clone(), self.request_bodies.clone(), request_id,
-        ).observe(observer, resource_type);
+        ).with_network_activity_generation(Some(self.network_activity_snapshot().generation))
+            .observe(observer, resource_type);
         trace.begin(url.as_str(), method, None, body)
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         Ok(trace)
@@ -3372,20 +3401,53 @@ impl Page {
         // the automation request already has an explicit timeout.
         let nav_timeout = self.navigation_timeout();
         let nav_timeout_ms = duration_millis_u64(nav_timeout);
+        let task_deadline = std::time::Instant::now()
+            .checked_add(nav_timeout)
+            .unwrap_or_else(std::time::Instant::now);
+        let previous_document = self.document_identity();
+        let previous_lifecycle = self.lifecycle;
 
         let history = self.requested_history.take().unwrap_or_default();
-        let result = match tokio::time::timeout(
-            nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ResourceRequest::navigation(), history, None),
+        let result = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(task_deadline),
+            self.navigate_with_wait_post_inner(
+                url_str,
+                wait_until,
+                method,
+                body,
+                ResourceRequest::navigation(),
+                history,
+                Some(task_deadline),
+            ),
         )
         .await
         {
             Ok(r) => r,
             Err(_) => {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                Err(PageError::NetworkError(format!(
-                    "navigation exceeded {nav_timeout_ms}ms deadline"
-                )))
+                let committed = self.document_identity() != previous_document;
+                if let Some(max_in_flight) = wait_until.network_idle_threshold() {
+                    if committed {
+                        let active_requests = self.network_activity_snapshot().active;
+                        Err(PageError::NetworkIdleTimeout {
+                            max_in_flight,
+                            active_requests,
+                        })
+                    } else {
+                        self.lifecycle = previous_lifecycle;
+                        Err(PageError::NetworkError(format!(
+                            "navigation exceeded {nav_timeout_ms}ms deadline"
+                        )))
+                    }
+                } else {
+                    self.lifecycle = if committed {
+                        crate::lifecycle::LifecycleState::Failed
+                    } else {
+                        previous_lifecycle
+                    };
+                    Err(PageError::NetworkError(format!(
+                        "navigation exceeded {nav_timeout_ms}ms deadline"
+                    )))
+                }
             }
         };
         // Direct embedders historically observe navigation/static resource
@@ -3393,7 +3455,7 @@ impl Page {
         // already have drained live starts through the shared native queue;
         // this takes only the remaining events and is therefore exactly-once.
         self.sync_js_network_events();
-        if result.is_ok() {
+        if result.is_ok() || matches!(&result, Err(PageError::NetworkIdleTimeout { .. })) {
             self.sync_virtual_url();
             self.push_history(self.url_string());
         }
@@ -3435,6 +3497,142 @@ impl Page {
             runtime_generation: self.network_document_generation,
             document_epoch: self.js.as_ref().map(ObscuraJsRuntime::document_epoch),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn document_changed_at(&self) -> Option<std::time::Instant> {
+        self.js.as_ref().map(ObscuraJsRuntime::document_changed_at)
+    }
+
+    #[doc(hidden)]
+    pub fn network_activity_snapshot(&self) -> obscura_net::NetworkActivitySnapshot {
+        self.stealth_client.network_activity_snapshot()
+    }
+
+    #[doc(hidden)]
+    pub fn network_activity_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.stealth_client.network_activity_notify()
+    }
+
+    async fn wait_for_network_idle(
+        &mut self,
+        max_in_flight: u32,
+        deadline: std::time::Instant,
+    ) -> Result<NetworkIdleOutcome, PageError> {
+        use crate::lifecycle::NETWORK_IDLE_QUIET_WINDOW;
+
+        let mut document = self.document_identity();
+        let activity_generation = self.network_activity_snapshot().generation;
+        let activity_notify = self.network_activity_notify();
+        let watchdog = self.js.as_ref().map(|js| js.execution_deadline(deadline));
+        let mut replacement_quiet_floor = self.document_changed_at();
+        let mut runtime_idle = self.js.is_none();
+
+        let outcome = loop {
+            if self.js.as_ref().and_then(|js| js.pending_navigation_url()).is_some() {
+                break Ok(NetworkIdleOutcome::Superseded { document });
+            }
+
+            let snapshot = self.network_activity_snapshot();
+            if snapshot.generation != activity_generation {
+                break Ok(NetworkIdleOutcome::Superseded { document });
+            }
+            let now = std::time::Instant::now();
+            let current_document = self.document_identity();
+            if current_document != document {
+                // document.open()/write()/close installs a replacement
+                // Document without committing a navigation or rotating the
+                // page transport generation. Keep waiting for the replacement
+                // and require a fresh full quiet window.
+                document = current_document;
+                replacement_quiet_floor = self.document_changed_at().or(Some(now));
+                runtime_idle = false;
+            }
+            let tracker_quiet_since = if max_in_flight == 0 {
+                snapshot.below_zero_since
+            } else {
+                snapshot.below_two_since
+            };
+            let quiet_since = tracker_quiet_since.map(|since| {
+                replacement_quiet_floor.map_or(since, |floor| since.max(floor))
+            });
+            if snapshot.active <= max_in_flight {
+                if quiet_since.is_some_and(|since| {
+                    now.duration_since(since) >= NETWORK_IDLE_QUIET_WINDOW
+                }) {
+                    break Ok(NetworkIdleOutcome::Reached(NetworkIdleEvidence {
+                        document,
+                        max_in_flight,
+                        quiet_window: NETWORK_IDLE_QUIET_WINDOW,
+                        activity_epoch: snapshot.epoch,
+                        active_requests: snapshot.active,
+                    }));
+                }
+            }
+
+            if now >= deadline {
+                break Ok(NetworkIdleOutcome::TimedOut {
+                    document,
+                    max_in_flight,
+                    active_requests: snapshot.active,
+                    activity_epoch: snapshot.epoch,
+                });
+            }
+
+            let wake_at = quiet_since
+                .and_then(|since| since.checked_add(NETWORK_IDLE_QUIET_WINDOW))
+                .map_or(deadline, |quiet| quiet.min(deadline));
+            let notified = activity_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let armed_snapshot = self.network_activity_snapshot();
+            if armed_snapshot.generation != snapshot.generation
+                || armed_snapshot.epoch != snapshot.epoch
+                || armed_snapshot.active != snapshot.active
+            {
+                runtime_idle = false;
+                continue;
+            }
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at));
+            tokio::pin!(sleep);
+            if runtime_idle {
+                tokio::select! {
+                    _ = &mut notified => runtime_idle = false,
+                    _ = &mut sleep => {}
+                }
+            } else {
+                tokio::select! {
+                    _ = &mut notified => runtime_idle = false,
+                    _ = &mut sleep => {}
+                    turn = self.run_autonomous_event_loop_turn() => {
+                        match turn {
+                            Ok(idle) => runtime_idle = idle,
+                            Err(_) if std::time::Instant::now() >= deadline => {
+                                let snapshot = self.network_activity_snapshot();
+                                break Ok(NetworkIdleOutcome::TimedOut {
+                                    document,
+                                    max_in_flight,
+                                    active_requests: snapshot.active,
+                                    activity_epoch: snapshot.epoch,
+                                });
+                            }
+                            Err(error) => break Err(PageError::LifecycleError(error)),
+                        }
+                    }
+                }
+            }
+        };
+
+        let watchdog_exceeded = watchdog.is_some_and(|guard| guard.finish());
+        if watchdog_exceeded && matches!(
+            &outcome,
+            Ok(NetworkIdleOutcome::Reached(_) | NetworkIdleOutcome::Superseded { .. })
+        ) {
+            return Err(PageError::LifecycleError(
+                "network idle event-loop work exceeded the navigation deadline".into(),
+            ));
+        }
+        outcome
     }
 
     /// Wait for a selector through the native DOM. Author overrides of
@@ -3830,8 +4028,6 @@ impl Page {
         #[cfg(feature = "render")]
         if let Some(js) = &self.js {js.save_session_scroll();}
         let previous_lifecycle = self.lifecycle;
-        // The previous document's background loads end with the document.
-        self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
         // A failed navigation must not erase unflushed script terminals from
         // the prior document. Static navigation captures can be replaced.
@@ -3881,6 +4077,7 @@ impl Page {
             self.referrer.clear();
             self.referrer_policy = ReferrerPolicy::default();
             self.navigate_blank();
+            self.stealth_client.begin_network_document();
             self.init_js();
             let _watchdog = deadline.and_then(|end| self.js.as_ref().map(|js| js.execution_deadline(end)));
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
@@ -3894,6 +4091,28 @@ impl Page {
                     if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
                         tracing::debug!("Preload script error on about:blank: {}", e);
                     }
+                }
+            }
+            if let Some(max_in_flight) = wait_until.network_idle_threshold() {
+                let idle_deadline = deadline.unwrap_or_else(|| {
+                    std::time::Instant::now()
+                        .checked_add(self.navigation_timeout())
+                        .unwrap_or_else(std::time::Instant::now)
+                });
+                match self.wait_for_network_idle(max_in_flight, idle_deadline).await? {
+                    NetworkIdleOutcome::Reached(_) if max_in_flight == 0 => {
+                        self.lifecycle = LifecycleState::NetworkIdle;
+                    }
+                    NetworkIdleOutcome::Reached(_) => {
+                        self.lifecycle = LifecycleState::NetworkAlmostIdle;
+                    }
+                    NetworkIdleOutcome::TimedOut { active_requests, .. } => {
+                        return Err(PageError::NetworkIdleTimeout {
+                            max_in_flight,
+                            active_requests,
+                        });
+                    }
+                    NetworkIdleOutcome::Superseded { .. } => return Ok(()),
                 }
             }
             return Ok(());
@@ -3981,8 +4200,18 @@ impl Page {
 
         if matches!(response.status, 204 | 205) {
             self.lifecycle = previous_lifecycle;
-            return Ok(());
+            return Err(PageError::NavigationAborted {
+                error_text: "net::ERR_ABORTED".to_string(),
+            });
         }
+        // Commit starts only after a response is known to replace the current
+        // document. A failed or 204/205 navigation leaves the old runtime,
+        // frames, renderer resources, DOM and page-scoped activity intact.
+        self.retire_render_resources();
+        self.pending_frame_work.clear();
+        self.frames.clear();
+        self.retire_js_network_events();
+        self.stealth_client.begin_network_document();
         self.url = Some(if response.redirected_from.is_empty() {url.clone()} else {response.url.clone()});
         self.session_history.borrow_mut().commit_document(
             &self.url_string(), &history_kind, history_request,
@@ -4126,72 +4355,29 @@ impl Page {
 
         self.lifecycle = LifecycleState::Loaded;
 
-        if matches!(
-            wait_until,
-            crate::lifecycle::WaitUntil::NetworkIdle0 | crate::lifecycle::WaitUntil::NetworkIdle2
-        ) {
-            let threshold = match wait_until {
-                crate::lifecycle::WaitUntil::NetworkIdle0 => 0,
-                crate::lifecycle::WaitUntil::NetworkIdle2 => 2,
-                _ => 0,
-            };
-
-            // Same hazard as the post-script settle: a synchronous poll can pin
-            // the thread past the 5s network-idle deadline, so arm a watchdog
-            // that terminates the isolate ~500ms past it.
-            let netidle_wd = self
-                .js
-                .as_mut()
-                .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-            let mut idle_since: Option<tokio::time::Instant> = None;
-
-            loop {
-                let active = self
-                    .js
-                    .as_ref()
-                    .map(|js| js.active_network_requests())
-                    .unwrap_or_else(|| self.stealth_client.active_requests());
-                let now = tokio::time::Instant::now();
-
-                if active <= threshold {
-                    if idle_since.is_none() {
-                        idle_since = Some(now);
-                    }
-                    if now.duration_since(idle_since.unwrap())
-                        >= tokio::time::Duration::from_millis(500)
-                    {
-                        break;
-                    }
-                } else {
-                    idle_since = None;
+        if let Some(max_in_flight) = wait_until.network_idle_threshold() {
+            let idle_deadline = deadline.unwrap_or_else(|| {
+                std::time::Instant::now()
+                    .checked_add(self.navigation_timeout())
+                    .unwrap_or_else(std::time::Instant::now)
+            });
+            match self.wait_for_network_idle(max_in_flight, idle_deadline).await? {
+                NetworkIdleOutcome::Reached(_) if max_in_flight == 0 => {
+                    self.lifecycle = LifecycleState::NetworkIdle;
                 }
-
-                if now >= deadline {
-                    tracing::debug!(
-                        "Network idle timeout reached with {} active requests",
-                        active
-                    );
-                    break;
+                NetworkIdleOutcome::Reached(_) => {
+                    self.lifecycle = LifecycleState::NetworkAlmostIdle;
                 }
-
-                if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
-                    )
-                    .await;
-                } else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                NetworkIdleOutcome::TimedOut {
+                    active_requests, ..
+                } => {
+                    return Err(PageError::NetworkIdleTimeout {
+                        max_in_flight,
+                        active_requests,
+                    });
                 }
+                NetworkIdleOutcome::Superseded { .. } => return Ok(()),
             }
-
-            if let Some(token) = netidle_wd {
-                if let Some(js) = self.js.as_mut() {
-                    js.disarm_watchdog(token);
-                }
-            }
-            self.lifecycle = LifecycleState::NetworkIdle;
         }
 
         Ok(())
@@ -5664,6 +5850,8 @@ impl Page {
         if let Some(navigation) = self.js.as_ref().and_then(|js| js.take_pending_navigation_request()) {
             let obscura_js::ops::PendingNavigation { url, method, body, request, history } = navigation;
             let nav_timeout_ms = duration_millis_u64(deadline.saturating_duration_since(std::time::Instant::now()));
+            let previous_document = self.document_identity();
+            let previous_lifecycle = self.lifecycle;
             let result = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
                 self.navigate_with_wait_post_inner(
@@ -5678,11 +5866,19 @@ impl Page {
             )
             .await
             .map_err(|_| {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                self.lifecycle = if self.document_identity() == previous_document {
+                    previous_lifecycle
+                } else {
+                    crate::lifecycle::LifecycleState::Failed
+                };
                 PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
             })?;
             result.map_err(|error| {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                self.lifecycle = if self.document_identity() == previous_document {
+                    previous_lifecycle
+                } else {
+                    crate::lifecycle::LifecycleState::Failed
+                };
                 error
             })?;
             self.sync_virtual_url();
@@ -6144,6 +6340,314 @@ mod tests {
             std::sync::Arc::ptr_eq(&first.stealth_client.in_flight, &worker.in_flight),
             "a page must include its detached Worker requests in networkidle"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_quiet_window_resets_after_rapid_activity() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "network-idle-rapid-activity".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("network-idle-rapid-activity".into(), context);
+        page.stealth_client.begin_network_document();
+        let tracker = page.stealth_client.network_activity_tracker();
+        let activity = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tracker.begin().finish();
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = page.wait_for_network_idle(
+            0,
+            started + std::time::Duration::from_secs(2),
+        ).await.unwrap();
+        activity.await.unwrap();
+
+        assert!(matches!(outcome, super::NetworkIdleOutcome::Reached(_)));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(575),
+            "rapid activity must restart the 500ms quiet window"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_two_allows_two_active_requests_but_zero_times_out() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "network-idle-thresholds".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("network-idle-thresholds".into(), context);
+        page.stealth_client.begin_network_document();
+        let tracker = page.stealth_client.network_activity_tracker();
+        let first = tracker.begin();
+        let second = tracker.begin();
+
+        let outcome = page.wait_for_network_idle(
+            2,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        ).await.unwrap();
+        assert!(matches!(
+            outcome,
+            super::NetworkIdleOutcome::Reached(super::NetworkIdleEvidence {
+                max_in_flight: 2,
+                active_requests: 2,
+                ..
+            })
+        ));
+
+        let outcome = page.wait_for_network_idle(
+            0,
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        ).await.unwrap();
+        assert!(matches!(
+            outcome,
+            super::NetworkIdleOutcome::TimedOut {
+                max_in_flight: 0,
+                active_requests: 2,
+                ..
+            }
+        ));
+        drop((first, second));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_timeout_keeps_loaded_document_usable() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "network-idle-timeout".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("network-idle-timeout".into(), context);
+        page.set_navigation_timeout(std::time::Duration::from_millis(700));
+        let mut intercepted = page.enable_interception();
+        let held_request = tokio::spawn(async move {
+            let request = intercepted.recv().await.expect("scripted fetch was intercepted");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(request);
+        });
+
+        let error = page.navigate_with_wait(
+            "data:text/html,<title>still-usable</title><script>fetch('https://example.test/held').catch(()=>{})</script>",
+            crate::lifecycle::WaitUntil::NetworkIdle0,
+        ).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::PageError::NetworkIdleTimeout {
+                max_in_flight: 0,
+                active_requests: 1,
+            }
+        ), "unexpected network-idle error: {error:?}");
+        assert!(page.lifecycle.is_loaded());
+        assert_eq!(page.url_string().split(',').next(), Some("data:text/html"));
+        assert_eq!(page.evaluate("document.title"), serde_json::json!("still-usable"));
+        held_request.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_open_during_network_idle_requires_a_fresh_quiet_window() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "network-idle-document-open".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("network-idle-document-open".into(), context);
+        page.set_navigation_timeout(std::time::Duration::from_secs(3));
+
+        let started = std::time::Instant::now();
+        page.navigate_with_wait(
+            "data:text/html,<title>old</title><script>setTimeout(()=>{document.open();document.write('<title>replacement</title><body id=done>ready</body>');document.close();globalThis.__opened=true},100)</script>",
+            crate::lifecycle::WaitUntil::NetworkIdle0,
+        ).await.unwrap();
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(575),
+            "document.open must restart the 500ms quiet window"
+        );
+        assert_eq!(page.evaluate("globalThis.__opened"), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_document_open_before_idle_wait_keeps_its_change_timestamp() {
+        let context = std::sync::Arc::new(super::BrowserContext::with_options(
+            "network-idle-parser-document-open".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            crate::BrowserContextOptions::default(),
+        ));
+        let mut page = super::Page::new("network-idle-parser-document-open".into(), context);
+        page.set_navigation_timeout(std::time::Duration::from_secs(3));
+
+        let started = std::time::Instant::now();
+        page.navigate_with_wait(
+            "data:text/html,<script>const end=Date.now()+450;while(Date.now()<end){};document.open();document.write('<body id=replacement>ready</body>');document.close();globalThis.__opened=true</script>",
+            crate::lifecycle::WaitUntil::NetworkIdle0,
+        ).await.unwrap();
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(875),
+            "a parser-time replacement must retain its own 500ms quiet floor"
+        );
+        assert_eq!(page.evaluate("globalThis.__opened"), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_content_navigation_aborts_and_preserves_the_old_document() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break None,
+                    Err(error) => panic!("slow fixture accept failed: {error}"),
+                }
+            };
+            let Some(mut stream) = stream.take() else { return; };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ).unwrap();
+        });
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "no-content-preserves-document".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("no-content-preserves-document".into(), context);
+        page.navigate("data:text/html,<title>old</title><body id=old>kept</body>")
+            .await.unwrap();
+        let old_document = page.document_identity();
+        let old_url = page.url_string();
+        let old_lifecycle = page.lifecycle;
+
+        let error = page.navigate(&format!("http://{address}/no-content"))
+            .await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(
+            error,
+            super::PageError::NavigationAborted { ref error_text }
+                if error_text == "net::ERR_ABORTED"
+        ));
+        assert_eq!(page.document_identity(), old_document);
+        assert_eq!(page.url_string(), old_url);
+        assert_eq!(page.lifecycle, old_lifecycle);
+        assert_eq!(page.evaluate("document.title"), serde_json::json!("old"));
+        assert_eq!(page.evaluate("document.body.id"), serde_json::json!("old"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_no_content_navigation_preserves_the_old_document_lifecycle() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ).unwrap();
+        });
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "pending-no-content-preserves-document".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("pending-no-content-preserves-document".into(), context);
+        page.navigate("data:text/html,<title>old</title><body id=old>kept</body>")
+            .await.unwrap();
+        let old_document = page.document_identity();
+        let old_url = page.url_string();
+        let old_lifecycle = page.lifecycle;
+        page.evaluate(&format!("location.href='http://{address}/no-content'"));
+
+        let error = page.process_pending_navigation().await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(
+            error,
+            super::PageError::NavigationAborted { ref error_text }
+                if error_text == "net::ERR_ABORTED"
+        ));
+        assert_eq!(page.document_identity(), old_document);
+        assert_eq!(page.url_string(), old_url);
+        assert_eq!(page.lifecycle, old_lifecycle);
+        assert_eq!(page.evaluate("document.title"), serde_json::json!("old"));
+        assert_eq!(page.evaluate("document.body.id"), serde_json::json!("old"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn precommit_navigation_timeout_preserves_the_old_document_lifecycle() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break None,
+                    Err(error) => panic!("slow fixture accept failed: {error}"),
+                }
+            };
+            let Some(mut stream) = stream.take() else { return; };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 18\r\nConnection: close\r\n\r\n<title>late</title>",
+            );
+        });
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "precommit-timeout-preserves-document".into(),
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("precommit-timeout-preserves-document".into(), context);
+        page.navigate("data:text/html,<title>old</title>").await.unwrap();
+        page.set_navigation_timeout(std::time::Duration::from_millis(50));
+        let old_document = page.document_identity();
+        let old_lifecycle = page.lifecycle;
+
+        let error = page.navigate_with_wait(
+            &format!("http://{address}/slow"),
+            crate::lifecycle::WaitUntil::NetworkIdle0,
+        ).await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, super::PageError::NetworkError(_)));
+        assert_eq!(page.document_identity(), old_document);
+        assert_eq!(page.lifecycle, old_lifecycle);
+        assert_eq!(page.evaluate("document.title"), serde_json::json!("old"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11186,6 +11690,20 @@ pub enum PageError {
 
     #[error("Document lifecycle failed: {0}")]
     LifecycleError(String),
+
+    #[error(
+        "Network idle wait exceeded the navigation deadline with {active_requests} active requests (maximum {max_in_flight})"
+    )]
+    NetworkIdleTimeout {
+        max_in_flight: u32,
+        active_requests: u32,
+    },
+
+    /// The transport completed but the response does not create a new
+    /// document. CDP projects this as a successful Page.navigate response with
+    /// `errorText`, matching Chromium's navigation contract.
+    #[error("Navigation aborted: {error_text}")]
+    NavigationAborted { error_text: String },
 
     /// A page kept triggering its own navigations until the chain's limit
     /// was exhausted. HTTP 3xx redirects are followed one layer down, in

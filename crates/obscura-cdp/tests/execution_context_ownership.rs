@@ -189,13 +189,17 @@ async fn navigation_context_events_preserve_order_for_every_runtime_attachment()
         cdp(&mut ctx, id, "Runtime.enable", json!({}), Some(session)).await;
     }
     cdp(
-        &mut ctx, 12, "Page.createIsolatedWorld",
+        &mut ctx, 12, "Page.setLifecycleEventsEnabled",
+        json!({"enabled": true}), Some(&first),
+    ).await;
+    cdp(
+        &mut ctx, 13, "Page.createIsolatedWorld",
         json!({"worldName": "utility"}), Some(&first),
     ).await;
     ctx.pending_events.clear();
 
     cdp(
-        &mut ctx, 13, "Page.navigate",
+        &mut ctx, 14, "Page.navigate",
         json!({"url": "data:text/html,<p>replacement</p>", "waitUntil": "load"}),
         Some(&first),
     ).await;

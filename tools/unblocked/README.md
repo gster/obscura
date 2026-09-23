@@ -180,6 +180,56 @@ records its assertions and errors in JSON. CI uploads the complete directory
 on success or failure and validates the combined regular-smoke and migration
 protocol inventory against the declared CDP profile.
 
+## Network-idle truthfulness smoke
+
+Build a release binary and run the dedicated official Playwright Python gate.
+Create the evidence directory before starting because the shell opens the raw
+protocol and stdout files before Python starts:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 \
+  cargo build --release -p obscura-cli --bins --no-default-features
+RUN_ROOT="$(mktemp -d)"
+EVIDENCE="$RUN_ROOT/network-idle"
+mkdir "$EVIDENCE"
+DEBUG=pw:protocol \
+  uv run --project tools/unblocked --frozen --python 3.12 \
+  python tools/unblocked/network_idle_smoke.py \
+    --obscura-bin target/release/obscura \
+    --output "$EVIDENCE" \
+    > "$EVIDENCE/probe.stdout.json" \
+    2> "$EVIDENCE/playwright-protocol.log"
+```
+
+The gate uses `BrowserType.connect_over_cdp` and
+`page.goto(..., wait_until="networkidle")` for five deterministic cases. A
+static document must remain quiet for at least 500ms, a 1.5-second scripted
+fetch must finish before the later 500ms quiet window, and a held fetch must
+produce an explicit Playwright timeout while leaving the loaded page usable.
+A parser-time `document.open()` replacement after roughly 450ms of synchronous
+script work must receive fresh current-loader CDP
+`networkAlmostIdle` and `networkIdle` evidence, with `networkIdle` arriving at
+least 450ms after the replacement's retained wall-clock sample. A 204
+navigation must fail with the exact abort class, retain the old document, and
+pair one attempted-loader request start and response with
+`loadingFailed(net::ERR_ABORTED, canceled=true)` plus `frameStoppedLoading`,
+without lifecycle events for the aborted loader. Load and DOMContentLoaded
+therefore cannot stand in for network-idle.
+
+The output keeps the complete fixture request and response headers and bodies,
+Playwright events, selected raw CDP event params, exact timeout errors and
+tracebacks, the untouched `pw:protocol` stream, and Obscura stdout/stderr byte
+streams. `manifest.json` records every retained file's byte length and SHA-256.
+The collector does not redact, truncate, normalize, or delete captured fields.
+The caller owns the evidence directory and decides when to remove it.
+
+This gate qualifies only the pinned Playwright client, the named binary and
+persona, and these fixed local fetch timings. Chrome comparison runs must use
+the same fixture and timing matrix and retain a separate complete evidence
+directory. The result does not claim all resource types, redirects, preflight,
+workers, multi-session lifecycle fanout, real-site behavior, cross-platform
+parity, or complete Chrome navigation semantics.
+
 ## Single-worker OS backlog qualification
 
 `cdp_capacity.py` qualifies the actual IPv4 loopback listen queue in front of

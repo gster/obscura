@@ -1083,6 +1083,71 @@ async fn cacheable_identical_subresources_share_one_in_flight_request() {
 }
 
 #[tokio::test]
+async fn coalesced_followers_and_cache_hits_preserve_document_scoped_activity() {
+    let (url, network_requests) = cacheable_resource_fixture(
+        200,
+        "Cache-Control: public, max-age=3600\r\n",
+    )
+    .await;
+    let initiator = url.join("/page.html").unwrap();
+    let client = Arc::new(primp_client(
+        Arc::new(CookieJar::new()),
+        None,
+        true,
+    ));
+    let generation = client.begin_network_document();
+
+    let mut fetches = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let url = url.clone();
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator)
+            .with_network_activity_generation(Some(generation));
+        fetches.spawn(async move {
+            client
+                .fetch_resource_with_callbacks(&url, request, None)
+                .await
+                .unwrap()
+        });
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if client.network_activity_snapshot().active == 8 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "followers were not counted");
+        tokio::task::yield_now().await;
+    }
+    while let Some(response) = fetches.join_next().await {
+        assert_eq!(response.unwrap().status, 200);
+    }
+    assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(client.network_activity_snapshot().active, 0);
+
+    let successor = client.begin_network_document();
+    let before_stale_hit = client.network_activity_snapshot();
+    let stale_request = ResourceRequest::subresource(ResourceType::Script, &initiator)
+        .with_network_activity_generation(Some(generation));
+    client.fetch_resource_with_callbacks(&url, stale_request, None)
+        .await.unwrap();
+    assert_eq!(
+        client.network_activity_snapshot(),
+        before_stale_hit,
+        "an old document cache hit must not reset the successor quiet window",
+    );
+
+    let before_current_hit = client.network_activity_snapshot();
+    let current_request = ResourceRequest::subresource(ResourceType::Script, &initiator)
+        .with_network_activity_generation(Some(successor));
+    client.fetch_resource_with_callbacks(&url, current_request, None)
+        .await.unwrap();
+    let after_current_hit = client.network_activity_snapshot();
+    assert!(after_current_hit.epoch > before_current_hit.epoch);
+    assert!(after_current_hit.below_zero_since > before_current_hit.below_zero_since);
+    assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn cacheable_identical_module_scripts_share_one_in_flight_request() {
     let (url, network_requests) = cacheable_resource_fixture(
         200,

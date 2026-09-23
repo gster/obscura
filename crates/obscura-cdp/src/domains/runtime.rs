@@ -1,4 +1,3 @@
-use obscura_browser::lifecycle::WaitUntil;
 use obscura_js::runtime::RemoteObjectInfo;
 use serde_json::{json, Value};
 
@@ -49,35 +48,7 @@ async fn emit_post_eval_nav(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<(), String> {
-    let page = ctx
-        .get_session_page_mut(session_id)
-        .ok_or("No page")?;
-    let did_navigate = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
-    if !did_navigate {
-        return Ok(());
-    }
-    let (frame_id, page_url, page_id, network_events, reached_idle) = {
-        let p = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-        (
-            p.frame_id.clone(),
-            p.url_string(),
-            p.id.clone(),
-            p.network_events.drain(..).collect::<Vec<_>>(),
-            p.lifecycle.is_network_idle(),
-        )
-    };
-    let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
-    super::page::emit_navigation_events(
-        ctx,
-        session_id,
-        &frame_id,
-        &loader_id,
-        &page_url,
-        &page_id,
-        &network_events,
-        WaitUntil::Load,
-        reached_idle,
-    );
+    super::page::emit_pending_action_navigation(ctx, session_id).await?;
     Ok(())
 }
 
@@ -730,6 +701,93 @@ mod tests {
         assert_eq!(reply["result"]["value"], json!(2.0));
         assert!(reply.get("exceptionDetails").is_none());
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_no_content_navigation_uses_the_aborted_loader_sequence() {
+        use std::io::{Read as _, Write as _};
+
+        for (status, expression_kind) in [(204, "location"), (205, "form")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(format!(
+                    "HTTP/1.1 {status} No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ).as_bytes()).unwrap();
+            });
+            let context = std::sync::Arc::new(
+                obscura_browser::BrowserContext::with_storage_and_network(
+                    format!("runtime-{status}-abort"),
+                    obscura_net::EffectivePersona::builtin(
+                        obscura_net::StealthProfile::WindowsChrome145,
+                    ),
+                    None,
+                    None,
+                    true,
+                ),
+            );
+            let mut ctx = CdpContext::new_with_shared_context(context);
+            let page_id = ctx.create_page();
+            let session = Some(format!("{page_id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+            crate::domains::network::handle("enable", &json!({}), &mut ctx, &session)
+                .await.unwrap();
+            ctx.lifecycle_enabled_sessions.insert(session.clone().unwrap());
+            let (old_document, old_url, old_lifecycle) = {
+                let page = ctx.get_page_mut(&page_id).unwrap();
+                page.navigate("data:text/html,<title>old</title><body id=old>kept</body>")
+                    .await.unwrap();
+                page.network_events.clear();
+                (page.document_identity(), page.url_string(), page.lifecycle)
+            };
+            ctx.current_loader_ids.insert(page_id.clone(), "loader-old".into());
+            ctx.pending_events.clear();
+            let target = format!("http://{address}/no-content");
+            let expression = if expression_kind == "location" {
+                format!("location.assign({})", serde_json::to_string(&target).unwrap())
+            } else {
+                format!(
+                    "(()=>{{let f=document.createElement('form');f.action={};document.body.append(f);f.submit();return 'queued'}})()",
+                    serde_json::to_string(&target).unwrap(),
+                )
+            };
+
+            handle(
+                "evaluate",
+                &json!({"expression": expression, "returnByValue": true}),
+                &mut ctx,
+                &session,
+            ).await.expect("the script command succeeds even though its navigation aborts");
+            server.join().unwrap();
+
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            assert_eq!(page.document_identity(), old_document);
+            assert_eq!(page.url_string(), old_url);
+            assert_eq!(page.lifecycle, old_lifecycle);
+            assert_eq!(page.evaluate("document.title"), json!("old"));
+            assert_eq!(page.evaluate("document.body.id"), json!("old"));
+            assert_eq!(ctx.current_loader_ids[&page_id], "loader-old");
+            assert!(ctx.pending_events.iter().all(|event| {
+                event.method != "Page.lifecycleEvent"
+                    && event.method != "Page.frameNavigated"
+            }));
+            let failed = ctx.pending_events.iter().filter(|event| {
+                event.method == "Network.loadingFailed"
+            }).collect::<Vec<_>>();
+            assert_eq!(failed.len(), 1, "{status}: expected one loadingFailed");
+            assert_eq!(failed[0].params["errorText"], "net::ERR_ABORTED");
+            assert_eq!(failed[0].params["canceled"], true);
+            assert!(ctx.pending_events.iter().all(|event| {
+                event.method != "Network.loadingFinished"
+            }));
+            assert_eq!(ctx.pending_events.iter().filter(|event| {
+                event.method == "Page.frameStoppedLoading"
+            }).count(), 1);
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_await_promise_reports_the_requested_timeout() {
         let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));

@@ -10,6 +10,7 @@ pub mod encoding;
 pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
+pub mod network_activity;
 pub mod stealth_client;
 
 pub use client::{
@@ -24,6 +25,7 @@ pub use encoding::{
 };
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
+pub use network_activity::{NetworkActivityGuard, NetworkActivitySnapshot, NetworkActivityTracker};
 pub use stealth_client::{
     StealthHttpClient, StealthProfile, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
