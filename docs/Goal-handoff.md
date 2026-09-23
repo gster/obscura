@@ -4,21 +4,21 @@
 
 ## 当前基线
 
-- 当前 goal：继续执行 [`docs/TODO.md`](TODO.md)，整体 goal 仍然有效，尚未完成。
-- 最近完成的实现提交：`9a8b6dfd2c0abd12b18aae642f31bf3c39b620c6`，`Make V8 startup flags fail closed`。
+- 当前 goal：按用户最新要求，本轮任务提交后暂停；[`docs/TODO.md`](TODO.md) 中的整体工作仍未完成。
+- 最近完成的实现提交：`75972fa7877d0ce29663baec01c73ef9df1270a4`，`Make network idle waits truthful`。
 - 发布核对要求：`HEAD`、本地 `main`、`origin/main` 与远端 `refs/heads/main` 必须对齐。
 - 继续使用现有工作树 `/Users/gster1981/work/obscura`，分支为 `codex/goal`。
-- 当前未提交切片入口是 [`network_activity.rs`](../crates/obscura-net/src/network_activity.rs)、[`page.rs`](../crates/obscura-browser/src/page.rs) 的共享等待 outcome，以及 [`domains/page.rs`](../crates/obscura-cdp/src/domains/page.rs) / [`server.rs`](../crates/obscura-cdp/src/server.rs) 的 CDP loader、lifecycle 与 aborted-navigation 投影。
+- 已提交切片入口是 [`network_activity.rs`](../crates/obscura-net/src/network_activity.rs)、[`page.rs`](../crates/obscura-browser/src/page.rs) 的共享等待 outcome，以及 [`domains/page.rs`](../crates/obscura-cdp/src/domains/page.rs) / [`server.rs`](../crates/obscura-cdp/src/server.rs) 的 CDP loader、lifecycle 与 aborted-navigation 投影。
 
 ## 当前推进中的切片
 
 OB-021 `networkidle` truthfulness 已完成实现与本地资格门禁，整体 OB-021 仍开放。Page/frame/Worker 共用 generation-scoped `NetworkActivityTracker`；networkidle0/networkidle2 分别按 0/2 个 active request 和真实 500ms quiet window 判定。超时返回 `NetworkIdleTimeout`，不能把 Load/DOMContentLoaded 当 idle；若新文档已 commit，CDP 先保留真实 loader、execution context 和已到达的生命周期事件，再返回原等待错误，不伪造 `networkIdle`。204/205 历史导航保留旧文档和 loader，并投影尝试请求的真实 response、`ERR_ABORTED` terminal 与 `frameStoppedLoading`。
 
-Astra light 对最新代码复审为 **0 blocker、0 major、0 minor、0 nit**。release/render 定向回归 **4/4**，完整 `tools/unblocked` unittest **140/140**；release/render 全工作区在 nextest 并发 2 下 **2389/2389**、4 skipped。默认并发两次全量各有同一既有 MCP loopback fixture 建连失败，精确重放 **1/1** 通过；完整失败与重放日志均保留，不称为源码修复。no-render/render exact CLI build 均通过；候选 binary SHA-256 分别为 `8de4455745dc543698cb2ea29a57ab6c284ef67d39c5658e440eb6de27b6414e`（79063808 bytes）与 `f20059b5e63a38fc0271bf50834803b1094a62bfb4fcb8fce2710731921cb4c4`（120960288 bytes）。
+Astra light 对最新代码复审为 **0 blocker、0 major、0 minor、0 nit**。release/render 定向回归 **4/4**，完整 `tools/unblocked` unittest **140/140**；release/render 全工作区在 nextest 并发 2 下 **2389/2389**、4 skipped。默认并发两次全量各有同一既有 MCP loopback fixture 建连失败，精确重放 **1/1** 通过；完整失败与重放日志均保留，不称为源码修复。提交后显式固定版本的 no-render/render exact CLI build 均通过，最终 binary SHA-256 分别为 `3e2faa8536b695aff8efb4e9eb2f2df95c378fe2532a4179170835b0c89bd343`（79,063,808 bytes）与 `7dea164cca98e7def3a50a0b781800f5c3a4dcff53dcb7e861e6df3bea69f0db`（120,960,288 bytes），版本 `0.1.0-dev+75972fa`。
 
-候选 render binary 通过 network-idle 官方 Playwright smoke（5 cases）、常规 smoke、37-method protocol profile、三项 migration gate 与固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33**。Chrome `152.0.7977.85` 使用相同 fixture、Playwright 1.60、视口与 Windows Chrome 145 UA，参考用例通过：static **509.9ms**、delayed **2016.4ms**、never **1004.5ms timeout**、document.open **960.0ms**、204 **3.2ms abort** 且保留旧文档。此处只比较 network-idle 时序、timeout 和 204 abort；Chrome 的 document.open 后 title 仍为 `before-open`，不据本次结果宣称 DOM 替换语义完全一致。完整证据保存在 `/private/tmp/ob021-network-idle-final-build/`。性能对照另使用独立 clean 基线 `e90bf32` 与候选二进制，固定同一 Playwright fixture、persona、viewport、settle/capture path，按 baseline/candidate 交错 3 轮：静态 network idle 中位数分别为 **601.9ms/600.2ms**（差异在噪声内；基线已比 Chrome 参考慢约 92ms，候选未新增该差值）；delayed 为 **512.7ms/2024.2ms**，候选增加约 1.5s 是正确等待 1.5s fetch 加 quiet window，且接近 Chrome；never 由基线 false success 改为候选与 Chrome 一致的显式 timeout；204 由基线约 4005ms timeout 改为候选与 Chrome 一致的真实 abort。基线不通过当前正确性 smoke 属预期，首轮 Chrome harness 的 detach 顺序错误和原始输出亦完整保留。
+提交后的 render binary 通过 network-idle 官方 Playwright smoke（5 cases）、常规 smoke、37-method protocol profile、三项 migration gate 与固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33**。Chrome `152.0.7977.85` 使用相同 fixture、Playwright 1.60、视口与 Windows Chrome 145 UA，参考用例通过：static **509.9ms**、delayed **2016.4ms**、never **1004.5ms timeout**、document.open **960.0ms**、204 **3.2ms abort** 且保留旧文档。此处只比较 network-idle 时序、timeout 和 204 abort；Chrome 的 document.open 后 title 仍为 `before-open`，不据本次结果宣称 DOM 替换语义完全一致。最终提交版复验的 smoke、协议、迁移与 obstacle 原始记录位于 `/private/tmp/ob021-network-idle-final-build/evidence/committed-75972fa/`；前置比较和失败记录同样保留在该 evidence 根目录。性能对照另使用独立 clean 基线 `e90bf32` 与候选二进制，固定同一 Playwright fixture、persona、viewport、settle/capture path，按 baseline/candidate 交错 3 轮：静态 network idle 中位数分别为 **601.9ms/600.2ms**（差异在噪声内；基线已比 Chrome 参考慢约 92ms，候选未新增该差值）；delayed 为 **512.7ms/2024.2ms**，候选增加约 1.5s 是正确等待 1.5s fetch 加 quiet window，且接近 Chrome；never 由基线 false success 改为候选与 Chrome 一致的显式 timeout；204 由基线约 4005ms timeout 改为候选与 Chrome 一致的真实 abort。基线不通过当前正确性 smoke 属预期，首轮 Chrome harness 的 detach 顺序错误和原始输出亦完整保留。
 
-当前最大的再生文件是 `/private/tmp/ob021-network-idle-final-build/target`（约 16 GiB）；所有 Cargo 与官方客户端门禁已结束后可用精确 `cargo clean --target-dir` 删除，保留同目录 raw logs、证据和独立二进制。工具 `uv` 本轮新建的 `tools/unblocked/.venv`（约 134 MiB）也可在所有 smoke 完成后清理。仅移除本任务临时 baseline worktree `/private/tmp/ob021-network-idle-baseline`；不要动既有 diagnostic worktree `/private/tmp/obscura-resume-20260917/diagnostic`。
+完成所有门禁后，已用精确 `cargo clean --target-dir /private/tmp/ob021-network-idle-final-build/target` 清掉 15.8 GiB/6115 个再生文件，并移除本轮新建的 `tools/unblocked/.venv`（原占用 137 MiB）；raw logs、完整 smoke/protocol/fixture 证据及独立最终二进制仍保留在 `/private/tmp/ob021-network-idle-final-build/`。仅移除本任务临时 baseline worktree `/private/tmp/ob021-network-idle-baseline`；不要动既有 diagnostic worktree `/private/tmp/obscura-resume-20260917/diagnostic`。
 
 ## 最近完成的阶段
 
