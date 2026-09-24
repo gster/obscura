@@ -872,7 +872,7 @@ async fn failure_observation_unintercepted_redirect_preflight_has_ordered_starts
         }
         // A final Runtime call drains the terminal event batch as well.
         client.ok(Some(&session),"Runtime.evaluate",json!({"expression":"1"})).await;
-        let starts=client.events.iter().filter(|e|e["method"]=="Network.requestWillBeSent" && e["params"]["requestId"].as_str().is_some_and(|id|id.starts_with("fetch-"))).collect::<Vec<_>>();
+        let starts=client.events.iter().filter(|e|e["method"]=="Network.requestWillBeSent" && e["sessionId"]==session && e["params"]["requestId"].as_str().is_some_and(|id|id.starts_with("fetch-"))).collect::<Vec<_>>();
         assert_eq!(starts.len(),3,"{starts:?}");
         assert_eq!(starts[0]["params"]["request"]["url"],url);
         assert!(starts[1]["params"]["request"]["url"].as_str().unwrap().contains("localhost:"));

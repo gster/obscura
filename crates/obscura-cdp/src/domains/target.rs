@@ -320,6 +320,7 @@ pub async fn handle(
                 let page_id = ctx.sessions.get(session_id).cloned();
                 ctx.sessions.remove(session_id);
                 ctx.runtime_enabled_sessions.remove(session_id);
+                ctx.network_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
                 }

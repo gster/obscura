@@ -138,7 +138,8 @@ async fn read_stealth_body_limited(
 /// from the UA string (notably the GREASE sec-ch-ua brand, its version and the
 /// brand order), so the profile must track a real build rather than a generic
 /// "Chrome" persona.
-/// ALPS and trust-anchor contents still differ from the reference Chrome.
+/// Chrome 153 carries a captured h2 ALPS offer and version-pinned trust-anchor IDs.
+/// Other version profiles retain their previous transport bytes.
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StealthProfile {
@@ -400,7 +401,7 @@ impl StealthHttpClient {
     }
 
     fn block_trackers(&self) -> bool {
-        self.policy.as_ref().map_or(true, |p| p.block_trackers)
+        self.policy.as_ref().map_or(false, |p| p.block_trackers)
     }
 
     async fn intercept(

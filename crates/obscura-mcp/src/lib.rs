@@ -2334,13 +2334,14 @@ mod tests {
                 document_generation: 7, document_url: "https://example.test/".into(),
                 retired_document_url: Some("https://example.test/old".into()),
                 initiator_request_id: None, pending: false, error: None,
-                request_body_size: 3, request_started: true, redirect: false,
+                request_body_size: 3, request_post_data: None, request_started: true, redirect: false,
                 response_body_request_id: Some("fetch-1-hop-0".into()),
                 request_id: "fetch-1".into(), url: "https://example.test/api".into(),
                 method: "POST".into(), resource_type: "Fetch".into(), status: 200,
                 status_text: "OK".into(), headers: Default::default(),
                 response_headers: Default::default(), raw_headers: None,
-                request_raw_headers: None, body_size: 4, timestamp: 123.5,
+                request_raw_headers: None, body_size: 4, timestamp: 123.5, request_timestamp: 122.5,
+                request_prepared_timestamp: None, response_headers_timestamp: None,
             }
         }
         let mut event = observation();

@@ -300,6 +300,20 @@ fn subresource_referrer_and_fetch_site_follow_default_browser_policy() {
 
     assert_eq!(request_fetch_site(&request, &same_origin), "same-origin");
     assert_eq!(request_fetch_site(&request, &cross_origin), "cross-site");
+    assert_eq!(request_fetch_site(&request, &downgrade), "cross-site");
+    assert_eq!(request_fetch_site(&request, &Url::parse("https://other.example/image.png").unwrap()), "cross-site");
+    let southwest = ResourceRequest::subresource(ResourceType::Fetch,
+        &Url::parse("https://www.southwest.com/air/booking/select-depart.html").unwrap());
+    assert_eq!(request_fetch_site(&southwest,
+        &Url::parse("https://soptimize.southwest.com/rest/v1/delivery").unwrap()), "same-site");
+    let private_suffix = ResourceRequest::subresource(ResourceType::Fetch,
+        &Url::parse("https://a.github.io/").unwrap());
+    assert_eq!(request_fetch_site(&private_suffix,
+        &Url::parse("https://b.github.io/").unwrap()), "cross-site");
+    let uk = ResourceRequest::subresource(ResourceType::Fetch,
+        &Url::parse("https://a.example.co.uk/").unwrap());
+    assert_eq!(request_fetch_site(&uk,
+        &Url::parse("https://b.example.co.uk/").unwrap()), "same-site");
     assert_eq!(
         request_referrer(&request, &same_origin).as_deref(),
         Some("https://app.example/path?q=1")

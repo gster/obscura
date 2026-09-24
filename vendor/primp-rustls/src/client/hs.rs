@@ -95,7 +95,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     CompressCertificate,
                     ECPointFormats,
                     SessionTicket,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     SupportedVersions,
                     EllipticCurves,
                     StatusRequest,
@@ -127,7 +127,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     PSKKeyExchangeModes,
                     Unknown(0xCA34),
                     EllipticCurves,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     ExtendedMasterSecret,
                     SupportedVersions,
                     StatusRequest,
@@ -147,7 +147,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     grease_first,
                     CompressCertificate,
                     ServerName,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     ECPointFormats,
                     KeyShare,
                     RenegotiationInfo,
@@ -186,7 +186,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     SupportedVersions,
                     CompressCertificate,
                     StatusRequest,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     PSKKeyExchangeModes,
                     grease_last,
                 ])
@@ -208,7 +208,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     CompressCertificate,
                     PSKKeyExchangeModes,
                     EllipticCurves,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     SCT,
                     grease_last,
                 ])
@@ -225,7 +225,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     SupportedVersions,
                     ExtendedMasterSecret,
                     CompressCertificate,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     RenegotiationInfo,
                     SignatureAlgorithms,
                     PSKKeyExchangeModes,
@@ -241,7 +241,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     EncryptedClientHello,
                     SupportedVersions,
                     SCT,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     EllipticCurves,
                     RenegotiationInfo,
                     KeyShare,
@@ -272,7 +272,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     ServerName,
                     SessionTicket,
                     ECPointFormats,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     SupportedVersions,
                     EncryptedClientHello,
                     EllipticCurves,
@@ -285,7 +285,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                 // Edge 152 order (no trust_anchors).
                 Some(vec![
                     grease_first,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     EncryptedClientHello,
                     ServerName,
                     SessionTicket,
@@ -315,7 +315,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     SCT,
                     SignatureAlgorithms,
                     ExtendedMasterSecret,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     PSKKeyExchangeModes,
                     EncryptedClientHello,
                     RenegotiationInfo,
@@ -351,7 +351,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     CompressCertificate,
                     ServerName,
                     SupportedVersions,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     PSKKeyExchangeModes,
                     KeyShare,
                     SignatureAlgorithms,
@@ -370,7 +370,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     StatusRequest,
                     ExtendedMasterSecret,
                     SessionTicket,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     CompressCertificate,
                     PSKKeyExchangeModes,
                     SupportedVersions,
@@ -396,7 +396,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     ServerName,
                     ExtendedMasterSecret,
                     EllipticCurves,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     CompressCertificate,
                     ECPointFormats,
                     grease_last,
@@ -418,7 +418,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     EllipticCurves,
                     EncryptedClientHello,
                     ALProtocolNegotiation,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     PSKKeyExchangeModes,
                     SupportedVersions,
                     grease_last,
@@ -440,7 +440,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     SignatureAlgorithms,
                     KeyShare,
                     SCT,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     ALProtocolNegotiation,
                     EllipticCurves,
                     PSKKeyExchangeModes,
@@ -479,7 +479,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     SCT,
                     SupportedVersions,
                     ECPointFormats,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     grease_last,
                 ])
             } else if be.version.major == 133 {
@@ -500,7 +500,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     ExtendedMasterSecret,
                     ServerName,
                     EncryptedClientHello,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     StatusRequest,
                     grease_last,
                 ])
@@ -521,7 +521,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     ServerName,
                     SCT,
                     ALProtocolNegotiation,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     SessionTicket,
                     SignatureAlgorithms,
                     grease_last,
@@ -532,7 +532,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     grease_first,
                     SupportedVersions,
                     PSKKeyExchangeModes,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     EncryptedClientHello,
                     SCT,
                     SessionTicket,
@@ -565,7 +565,7 @@ fn emulator_extension_order(be: &BrowserEmulator) -> Option<Vec<ExtensionType>> 
                     PSKKeyExchangeModes,
                     SCT,
                     ECPointFormats,
-                    Unknown(0x44cd),
+                    ApplicationSettingsNew,
                     SignatureAlgorithms,
                     SessionTicket,
                     grease_last,
@@ -865,13 +865,79 @@ fn named_groups_need_fips_fallback(groups: &[NamedGroup]) -> bool {
     groups.is_empty() || named_groups_degenerate(groups)
 }
 
-/// Empty `00 00` trust_anchors payload.
-///
-/// Chrome 152+ and Opera 136+ only. Edge never sends it.
+/// Chrome 153's compiled Chrome Root Store IDs. The set was checked against
+/// Chromium's root_store.textproto at tag 153.0.8010.50. Chrome shuffles their
+/// order once per process, then keeps it stable across connections. This is a
+/// versioned browser profile, not
+/// a copy of a site's certificate chain or a claim about custom CA overrides.
 #[cfg(feature = "impersonate")]
-fn trust_anchors_payload(be: &BrowserEmulator) -> Option<Payload<'static>> {
+const CHROME153_TRUST_ANCHOR_IDS: &[&[u8]] = &[
+    &[0xd6, 0x79, 0x09, 0x0d], &[0xd6, 0x79, 0x09, 0x0a],
+    &[0x82, 0xdf, 0x13, 0x02, 0x06], &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x12],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x08], &[0xd6, 0x79, 0x09, 0x04],
+    &[0xd6, 0x79, 0x09, 0x01], &[0xd6, 0x79, 0x09, 0x0f],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x13], &[0x82, 0xdf, 0x13, 0x02, 0x12],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0c], &[0xd6, 0x79, 0x09, 0x06],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0a],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x07],
+    &[0xd6, 0x79, 0x09, 0x0c], &[0x82, 0xdf, 0x13, 0x02, 0x0f],
+    &[0x82, 0xdf, 0x13, 0x02, 0x14], &[0x82, 0xdf, 0x13, 0x02, 0x01],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0d],
+    &[0x82, 0xdf, 0x13, 0x02, 0x0e],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x09],
+    &[0xd6, 0x79, 0x09, 0x0b], &[0xd6, 0x79, 0x09, 0x05],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0b],
+    &[0x82, 0xdf, 0x13, 0x02, 0x13], &[0x82, 0xdf, 0x13, 0x02, 0x0d],
+    &[0xd6, 0x79, 0x09, 0x08], &[0xd6, 0x79, 0x09, 0x07],
+];
+
+/// Encode a TLS TrustAnchorIDList from a versioned set of IDs.
+#[cfg(feature = "impersonate")]
+fn encode_trust_anchor_ids(ids: &[&[u8]]) -> Payload<'static> {
+    let list_len: usize = ids.iter().map(|id| id.len() + 1).sum();
+    let mut data = Vec::with_capacity(list_len + 2);
+    data.extend_from_slice(&(list_len as u16).to_be_bytes());
+    for id in ids {
+        data.push(id.len() as u8);
+        data.extend_from_slice(id);
+    }
+    Payload::new(data)
+}
+
+#[cfg(all(feature = "impersonate", feature = "std"))]
+fn chrome153_trust_anchor_ids(random: &dyn crate::crypto::SecureRandom) -> Vec<&'static [u8]> {
+    use std::sync::OnceLock;
+    static ORDER: OnceLock<Vec<usize>> = OnceLock::new();
+    if ORDER.get().is_none() {
+        let mut order: Vec<usize> = (0..CHROME153_TRUST_ANCHOR_IDS.len()).collect();
+        for i in (1..order.len()).rev() {
+            let Ok(value) = crate::rand::random_u32(random) else {
+                return CHROME153_TRUST_ANCHOR_IDS.to_vec();
+            };
+            let j = value as usize % (i + 1);
+            order.swap(i, j);
+        }
+        let _ = ORDER.set(order);
+    }
+    let Some(order) = ORDER.get() else {
+        return CHROME153_TRUST_ANCHOR_IDS.to_vec();
+    };
+    order.iter().map(|&i| CHROME153_TRUST_ANCHOR_IDS[i]).collect()
+}
+
+/// Trust Anchor IDs are profile data. Chrome 152 and Opera currently retain
+/// their prior empty lists until their exact source data has been verified.
+#[cfg(feature = "impersonate")]
+fn trust_anchors_payload(be: &BrowserEmulator, random: &dyn crate::crypto::SecureRandom) -> Option<Payload<'static>> {
     use crate::client::client_emulator::BrowserType;
     match be.browser_type {
+        BrowserType::Chrome if be.version.major == 153 => {
+            #[cfg(feature = "std")]
+            let ids = chrome153_trust_anchor_ids(random);
+            #[cfg(not(feature = "std"))]
+            let ids = CHROME153_TRUST_ANCHOR_IDS.to_vec();
+            Some(encode_trust_anchor_ids(&ids))
+        },
         BrowserType::Chrome if be.version.major >= 152 => Some(Payload::new(vec![0, 0])),
         // Opera 136+ is Chrome-152-based (Opera 135 == Chrome 151); future-proof.
         BrowserType::Opera if be.version.major >= 136 => Some(Payload::new(vec![0, 0])),
@@ -1138,14 +1204,18 @@ fn emit_client_hello_for_retry(
                 exts.session_ticket = Some(ClientSessionTicket::Request);
                 // Renegotiation info extension for Chrome fingerprinting
                 exts.renegotiation_info = Some(PayloadU8::empty());
-                // ALPS extension (0x44cd) — "һ2" (Cyrillic he + 2) looks like "h2" but bytes differ
-                // so servers never negotiate ALPS (rustls can't handle the response)
-                let mut v = vec![0, 4, 3]; // u16 total_len=4, u8 proto_len=3
-                v.extend_from_slice(b"\xC9\xBB\x32"); // һ2
-                exts.unknown_extensions
-                    .push((ExtensionType::Unknown(0x44cd), Payload::new(v)));
-                // trust_anchors (0xCA34): empty `00 00`.
-                if let Some(payload) = trust_anchors_payload(be) {
+                // Chrome 153 is the profile with a verified h2 ALPS payload.
+                // Keep other persona profiles' previous bytes until matching
+                // reference captures are available for their exact builds.
+                if be.browser_type == BrowserType::Chrome && be.version.major == 153 {
+                    if input.hello.alpn_protocols.iter().any(|proto| proto.as_ref() == b"h2") {
+                        exts.application_settings_new = Some(Payload::new(vec![0, 3, 2, b'h', b'2']));
+                    }
+                } else {
+                    exts.application_settings_new = Some(Payload::new(vec![0, 4, 3, 0xc9, 0xbb, b'2']));
+                }
+                // Trust Anchor IDs belong to the selected browser profile.
+                if let Some(payload) = trust_anchors_payload(be, config.provider.secure_random) {
                     exts.unknown_extensions
                         .push((ExtensionType::Unknown(0xCA34), payload));
                 }
@@ -2496,21 +2566,40 @@ mod tests {
     }
 
     #[test]
-    fn trust_anchors_payload_is_00_00_on_152_plus() {
-        use super::trust_anchors_payload;
+    fn trust_anchors_payload_tracks_chrome153_profile() {
+        use super::{trust_anchors_payload, CHROME153_TRUST_ANCHOR_IDS};
         use crate::client::client_emulator::BrowserVersion;
-        // Chrome 152+: present with raw bytes [0x00, 0x00] (empty u16 list),
-        // not zero-length (old Payload::empty() sent [] and was rejected).
-        for major in [152, 153, 200] {
+        let provider = crate::crypto::aws_lc_rs::default_provider();
+        let random = provider.secure_random;
+        let be = BrowserEmulator::new(BrowserType::Chrome, BrowserVersion::new(153, 0, 0));
+        let payload = trust_anchors_payload(&be, random).expect("must be present");
+        assert_eq!(CHROME153_TRUST_ANCHOR_IDS.len(), 28);
+        assert_eq!(payload.bytes().len(), 186);
+        assert_eq!(&payload.bytes()[..2], &[0, 184]);
+        let mut cursor = 2;
+        let mut actual = Vec::new();
+        while cursor < payload.bytes().len() {
+            let len = payload.bytes()[cursor] as usize;
+            cursor += len + 1;
+            actual.push(payload.bytes()[cursor - len..cursor].to_vec());
+        }
+        let mut expected: Vec<Vec<u8>> = CHROME153_TRUST_ANCHOR_IDS.iter().map(|id| id.to_vec()).collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(payload.bytes(), trust_anchors_payload(&be, random).unwrap().bytes());
+        // Other profiles retain their previous behavior until independently
+        // checked against a matching Chrome build.
+        for major in [152, 200] {
             let be = BrowserEmulator::new(BrowserType::Chrome, BrowserVersion::new(major, 0, 0));
-            let payload = trust_anchors_payload(&be).expect("must be present");
+            let payload = trust_anchors_payload(&be, random).expect("must be present");
             assert_eq!(payload.bytes(), &[0, 0], "wrong bytes for {major}");
         }
         // Pre-152 Chrome: absent.
         for major in [0, 148, 149, 150, 151] {
             let be = BrowserEmulator::new(BrowserType::Chrome, BrowserVersion::new(major, 0, 0));
             assert!(
-                trust_anchors_payload(&be).is_none(),
+                trust_anchors_payload(&be, random).is_none(),
                 "must be absent for {major}"
             );
         }
@@ -2518,7 +2607,7 @@ mod tests {
         for major in [150, 151, 152, 153] {
             let be = BrowserEmulator::new(BrowserType::Edge, BrowserVersion::new(major, 0, 0));
             assert!(
-                trust_anchors_payload(&be).is_none(),
+                trust_anchors_payload(&be, random).is_none(),
                 "Edge must never send trust_anchors (major={major})"
             );
         }
@@ -2561,7 +2650,7 @@ mod tests {
                 CompressCertificate,
                 PSKKeyExchangeModes,
                 EllipticCurves,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 SCT,
                 gl,
             ]
@@ -2585,7 +2674,7 @@ mod tests {
                 SupportedVersions,
                 ExtendedMasterSecret,
                 CompressCertificate,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 RenegotiationInfo,
                 SignatureAlgorithms,
                 PSKKeyExchangeModes,
@@ -2619,7 +2708,7 @@ mod tests {
                 SupportedVersions,
                 CompressCertificate,
                 StatusRequest,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 PSKKeyExchangeModes,
                 gl,
             ]
@@ -2643,7 +2732,7 @@ mod tests {
                 StatusRequest,
                 ExtendedMasterSecret,
                 SessionTicket,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 CompressCertificate,
                 PSKKeyExchangeModes,
                 SupportedVersions,
@@ -2676,7 +2765,7 @@ mod tests {
                 ServerName,
                 ExtendedMasterSecret,
                 EllipticCurves,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 CompressCertificate,
                 ECPointFormats,
                 gl,
@@ -2704,7 +2793,7 @@ mod tests {
                 CompressCertificate,
                 ServerName,
                 SupportedVersions,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 PSKKeyExchangeModes,
                 KeyShare,
                 SignatureAlgorithms,
@@ -2723,7 +2812,7 @@ mod tests {
                 gf,
                 CompressCertificate,
                 ServerName,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 ECPointFormats,
                 KeyShare,
                 RenegotiationInfo,
@@ -2760,7 +2849,7 @@ mod tests {
                 PSKKeyExchangeModes,
                 Unknown(0xCA34),
                 EllipticCurves,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 ExtendedMasterSecret,
                 SupportedVersions,
                 StatusRequest,
@@ -2783,7 +2872,7 @@ mod tests {
                 SCT,
                 SignatureAlgorithms,
                 ExtendedMasterSecret,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 PSKKeyExchangeModes,
                 EncryptedClientHello,
                 RenegotiationInfo,
@@ -2822,7 +2911,7 @@ mod tests {
                 PSKKeyExchangeModes,
                 SCT,
                 ECPointFormats,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 SignatureAlgorithms,
                 SessionTicket,
                 gl,
@@ -2840,7 +2929,7 @@ mod tests {
                 gf,
                 SupportedVersions,
                 PSKKeyExchangeModes,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 EncryptedClientHello,
                 SCT,
                 SessionTicket,
@@ -2880,7 +2969,7 @@ mod tests {
                 ServerName,
                 SCT,
                 ALProtocolNegotiation,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 SessionTicket,
                 SignatureAlgorithms,
                 gl,
@@ -2910,7 +2999,7 @@ mod tests {
                 ExtendedMasterSecret,
                 ServerName,
                 EncryptedClientHello,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 StatusRequest,
                 gl,
             ]
@@ -2940,7 +3029,7 @@ mod tests {
                 SCT,
                 SupportedVersions,
                 ECPointFormats,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 gl,
             ]
         );
@@ -2958,7 +3047,7 @@ mod tests {
                 SignatureAlgorithms,
                 KeyShare,
                 SCT,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 ALProtocolNegotiation,
                 EllipticCurves,
                 PSKKeyExchangeModes,
@@ -3002,7 +3091,7 @@ mod tests {
                 CompressCertificate,
                 ECPointFormats,
                 SessionTicket,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 SupportedVersions,
                 EllipticCurves,
                 StatusRequest,
@@ -3025,7 +3114,7 @@ mod tests {
             edge152,
             vec![
                 gf,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 EncryptedClientHello,
                 ServerName,
                 SessionTicket,
@@ -3063,7 +3152,7 @@ mod tests {
                 ServerName,
                 SessionTicket,
                 ECPointFormats,
-                Unknown(0x44cd),
+                ApplicationSettingsNew,
                 SupportedVersions,
                 EncryptedClientHello,
                 EllipticCurves,

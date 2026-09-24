@@ -151,6 +151,11 @@ async fn js_fetch_emits_network_request_and_response() {
     // client can read the captured JSON.
     let request_id = response_request_id(&ctx, "/api/data.json")
         .expect("fetch must emit Network.responseReceived with a requestId");
+    let start = ctx.pending_events.iter().find(|e| e.method == "Network.requestWillBeSent"
+        && e.params["requestId"] == request_id).unwrap().params["timestamp"].as_f64().unwrap();
+    let finish = ctx.pending_events.iter().find(|e| e.method == "Network.loadingFinished"
+        && e.params["requestId"] == request_id).unwrap().params["timestamp"].as_f64().unwrap();
+    assert!(finish > start, "a completed JS fetch must preserve its actual request start");
     let body = cdp(
         &mut ctx,
         2,

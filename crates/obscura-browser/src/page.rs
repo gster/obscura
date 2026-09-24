@@ -169,6 +169,7 @@ pub struct NetworkEvent {
     pub pending: bool,
     pub error: Option<String>,
     pub request_body_size: usize,
+    pub request_post_data: Option<String>,
     pub request_started: bool,
     pub redirect: bool,
     pub response_body_request_id: Option<String>,
@@ -184,6 +185,9 @@ pub struct NetworkEvent {
     pub request_raw_headers: Option<obscura_net::HeaderCapture>,
     pub body_size: usize,
     pub timestamp: f64,
+    pub request_timestamp: f64,
+    pub request_prepared_timestamp: Option<f64>,
+    pub response_headers_timestamp: Option<f64>,
 }
 
 /// Lifecycle phase of one observation, not a deduplicated request summary.
@@ -4387,6 +4391,7 @@ impl Page {
                 retired_document_url: retired_document_url.clone(),
                 initiator_request_id: ev.initiator_request_id.clone(),
                 pending: ev.pending, error: ev.error, request_body_size: ev.request_body_size,
+                request_post_data: ev.request_post_data,
                 request_started: ev.request_started, redirect: ev.redirect,
                 response_body_request_id: ev.response_body_request_id,
                 request_id: ev.request_id,
@@ -4401,6 +4406,9 @@ impl Page {
                 request_raw_headers: ev.request_raw_headers,
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
+                request_timestamp: ev.request_timestamp,
+                request_prepared_timestamp: ev.request_prepared_timestamp,
+                response_headers_timestamp: ev.response_headers_timestamp,
             });
         }
     }
@@ -4736,7 +4744,7 @@ impl Page {
             document_generation: u64::MAX, document_url: String::new(),
             initiator_request_id: None,
             retired_document_url: None,
-            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
+            pending: false, error: None, request_body_size: 0, request_post_data: None, request_started: false, redirect: false, response_body_request_id: None,
             request_id: request_id.clone(),
             url: url.to_string(),
             method: method.to_string(),
@@ -4749,6 +4757,9 @@ impl Page {
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
+            request_timestamp: timestamp,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         });
         request_id
     }

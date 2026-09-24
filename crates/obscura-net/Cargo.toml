@@ -28,6 +28,7 @@ futures-util = "0.3"
 bytes = "1"
 primp = { version = "=2.0.1", default-features = false, features = ["gzip", "brotli", "deflate", "zstd", "stream"] }
 http = "1"
+psl = "2"
 
 [dev-dependencies]
 socket2 = "0.6"

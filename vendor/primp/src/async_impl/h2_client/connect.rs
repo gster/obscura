@@ -663,11 +663,17 @@ impl H2Connector {
                 None
             };
 
+            let peer_application_settings = tls_stream.peer_application_settings().map(<[u8]>::to_vec);
+
             let (sr, mut conn) = with_timeout(
                 self.connect_timeout,
                 h2_builder.handshake::<_, Bytes>(tls_stream),
             )
             .await??;
+
+            if let Some(settings) = peer_application_settings {
+                conn.apply_peer_application_settings(&settings)?;
+            }
 
             if self.config.adaptive_window {
                 conn.set_target_window_size(1 << 20);

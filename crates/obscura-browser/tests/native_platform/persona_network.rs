@@ -73,6 +73,7 @@ fn native_persona_seed_and_frame_identity_are_stable() {
         device_memory: persona.device_memory(),
         screen_width: persona.screen_width(),
         screen_height: persona.screen_height(),
+        screen_color_depth: persona.screen_color_depth(),
     };
     let mut changed = spec.clone();
     changed.revision = "2".into();

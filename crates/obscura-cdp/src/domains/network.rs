@@ -38,15 +38,29 @@ pub async fn handle(
             {
                 return Err("Network.enable supports only empty params".to_string());
             }
+            if let Some(session) = session_id {
+                if ctx.sessions.contains_key(session) {
+                    ctx.network_enabled_sessions.insert(session.clone());
+                }
+            }
             Ok(json!({}))
         }
         "disable" => {
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.clear_response_bodies();
-            } else {
+            if let Some(session) = session_id {
+                ctx.network_enabled_sessions.remove(session);
+            }
+            if let Some(page_id) = session_id.as_ref().and_then(|session| ctx.sessions.get(session)).cloned() {
+                let other_subscriber = ctx.network_enabled_sessions.iter()
+                    .any(|session| ctx.sessions.get(session) == Some(&page_id));
+                if !other_subscriber {
+                    if let Some(page) = ctx.get_page_mut(&page_id) { page.clear_response_bodies(); }
+                    ctx.request_post_data.remove(&page_id);
+                }
+            } else if session_id.is_none() {
                 for page in &mut ctx.pages {
                     page.clear_response_bodies();
                 }
+                ctx.request_post_data.clear();
             }
             Ok(json!({}))
         }
@@ -147,6 +161,24 @@ pub async fn handle(
 
             get_response_body(ctx, session_id, request_id)
         }
+        "getRequestPostData" => {
+            let request_id = params.get("requestId").and_then(Value::as_str)
+                .ok_or("Network.getRequestPostData requires requestId")?;
+            let page_id = if let Some(session) = session_id {
+                ctx.sessions.get(session).ok_or_else(|| format!("No page found for sessionId {session}"))?
+            } else {
+                let mut owners = ctx.request_post_data.iter()
+                    .filter(|(_, entries)| entries.iter().any(|(id, _)| id == request_id));
+                let owner = owners.next().ok_or_else(|| format!("No request post data found for requestId {request_id}"))?;
+                if owners.next().is_some() { return Err(format!("Ambiguous requestId {request_id}; attach to a page session")); }
+                owner.0
+            };
+            let data = ctx.request_post_data.get(page_id)
+                .and_then(|entries| entries.iter().find(|(id, _)| id == request_id))
+                .map(|(_, data)| data)
+                .ok_or_else(|| format!("No request post data found for requestId {request_id}"))?;
+            Ok(json!({"postData": data}))
+        }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
 }
@@ -222,6 +254,21 @@ mod tests {
     use super::*;
     use obscura_net::CookieInfo;
 
+    #[tokio::test]
+    async fn disabling_one_network_session_keeps_the_other_sessions_request_data() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let page_id = ctx.create_page();
+        for session in ["owner", "observer"] {
+            ctx.sessions.insert(session.into(), page_id.clone());
+            handle("enable", &json!({}), &mut ctx, &Some(session.into())).await.unwrap();
+        }
+        ctx.record_request_post_data(&page_id, "r1", "a=1");
+        handle("disable", &json!({}), &mut ctx, &Some("observer".into())).await.unwrap();
+        assert_eq!(ctx.request_post_data[&page_id][0].1, "a=1");
+        assert!(ctx.network_enabled_sessions.contains("owner"));
+        handle("disable", &json!({}), &mut ctx, &Some("owner".into())).await.unwrap();
+        assert!(!ctx.request_post_data.contains_key(&page_id));
+    }
     fn sample_cookie(name: &str) -> CookieInfo {
         CookieInfo {
             name: name.to_string(),
@@ -433,6 +480,27 @@ mod tests {
 
         assert_eq!(result["body"], "<html><body>hello body</body></html>");
         assert_eq!(result["base64Encoded"], false);
+    }
+
+    #[tokio::test]
+    async fn get_request_post_data_is_page_scoped_and_bounded() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        let left = ctx.create_page();
+        let right = ctx.create_page();
+        let left_session = Some("left-session".to_string());
+        let right_session = Some("right-session".to_string());
+        ctx.sessions.insert(left_session.clone().unwrap(), left.clone());
+        ctx.sessions.insert(right_session.clone().unwrap(), right.clone());
+        ctx.record_request_post_data(&left, "request-1", "left-body");
+        ctx.record_request_post_data(&right, "request-1", "right-body");
+        let params = json!({"requestId": "request-1"});
+        assert_eq!(handle("getRequestPostData", &params, &mut ctx, &left_session).await.unwrap()["postData"], "left-body");
+        assert_eq!(handle("getRequestPostData", &params, &mut ctx, &right_session).await.unwrap()["postData"], "right-body");
+        assert!(handle("getRequestPostData", &params, &mut ctx, &None).await.unwrap_err().contains("Ambiguous"));
+        for index in 0..128 { ctx.record_request_post_data(&left, &format!("later-{index}"), "body"); }
+        assert!(handle("getRequestPostData", &params, &mut ctx, &left_session).await.is_err());
+        handle("disable", &json!({}), &mut ctx, &right_session).await.unwrap();
+        assert!(handle("getRequestPostData", &params, &mut ctx, &right_session).await.is_err());
     }
 
     #[tokio::test]

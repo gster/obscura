@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
@@ -65,6 +65,8 @@ pub struct CdpContext {
     pub current_loader_ids: HashMap<String, String>,
     pub document_loaders: HashMap<(String, u64), String>,
     pub network_owners: HashMap<(String, String), Option<String>>,
+    /// Recent text request bodies for Network.getRequestPostData, scoped to a page.
+    pub(crate) request_post_data: HashMap<String, VecDeque<(String, String)>>,
     /// Pages whose initial navigation event sequence has been emitted. A page
     /// is created already loaded (about:blank), but Chrome emits that load's
     /// events when the client attaches; Page.enable emits them once per page
@@ -94,6 +96,8 @@ pub struct CdpContext {
     /// Sessions that called Runtime.enable. Console and exception events are
     /// page-scoped but only delivered to these subscribers.
     pub runtime_enabled_sessions: HashSet<String>,
+    /// Page sessions that subscribed to Network events.
+    pub network_enabled_sessions: HashSet<String>,
     // Legacy direct-embedder configuration. Protocol-created worlds live only
     // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
@@ -188,6 +192,7 @@ impl CdpContext {
             current_loader_ids: HashMap::new(),
             document_loaders: HashMap::new(),
             network_owners: HashMap::new(),
+            request_post_data: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: crate::pending_events::PendingEvents::default(),
@@ -203,6 +208,7 @@ impl CdpContext {
             preload_scripts: Vec::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
+            network_enabled_sessions: HashSet::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -353,6 +359,17 @@ impl CdpContext {
         self.pages.iter_mut().find(|p| p.id == id)
     }
 
+    pub(crate) fn record_request_post_data(&mut self, page_id: &str, request_id: &str, data: &str) {
+        const MAX_REQUEST_BODIES_PER_PAGE: usize = 128;
+        let entries = self.request_post_data.entry(page_id.to_owned()).or_default();
+        if let Some((_, existing)) = entries.iter_mut().find(|(id, _)| id == request_id) {
+            *existing = data.to_owned();
+            return;
+        }
+        if entries.len() == MAX_REQUEST_BODIES_PER_PAGE { entries.pop_front(); }
+        entries.push_back((request_id.to_owned(), data.to_owned()));
+    }
+
     pub(crate) fn refresh_runtime_event_collection(&self, page_id: &str) {
         let enabled = self.runtime_enabled_sessions.iter().any(|session_id| {
             self.sessions
@@ -375,6 +392,7 @@ impl CdpContext {
         self.current_loader_ids.remove(id);
         self.document_loaders.retain(|(page_id, _), _| page_id != id);
         self.network_owners.retain(|(page_id, _), _| page_id != id);
+        self.request_post_data.remove(id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {
@@ -384,6 +402,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.network_enabled_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -754,6 +773,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Network.deleteCookies"
             | "Network.clearBrowserCookies"
             | "Network.getResponseBody"
+            | "Network.getRequestPostData"
             | "Fetch.continueRequest"
             | "Fetch.fulfillRequest"
             | "Fetch.failRequest"
@@ -994,6 +1014,42 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
                                     "description": event.description,
                                 },
                             },
+                        }),
+                    ),
+                    obscura_js::ops::RuntimeEvent::Script(event) => (
+                        "Obscura.scriptExecution",
+                        json!({
+                            "url": event.url,
+                            "sourceBytes": event.source_bytes,
+                            "sourceSha256": event.source_sha256,
+                            "startedAt": event.started_at,
+                            "finishedAt": event.finished_at,
+                            "durationMs": event.duration_ms,
+                            "outcome": event.outcome,
+                        }),
+                    ),
+                    obscura_js::ops::RuntimeEvent::Storage(event) => (
+                        "Obscura.storageMutation",
+                        json!({
+                            "origin": event.origin,
+                            "area": event.area,
+                            "operation": event.operation,
+                            "key": event.key,
+                            "oldBytes": event.old_bytes,
+                            "newBytes": event.new_bytes,
+                            "oldSha256": event.old_sha256,
+                            "newSha256": event.new_sha256,
+                            "timestamp": event.timestamp,
+                        }),
+                    ),
+                    obscura_js::ops::RuntimeEvent::Cookie(event) => (
+                        "Obscura.cookieWrite",
+                        json!({
+                            "origin": event.origin,
+                            "name": event.name,
+                            "assignmentBytes": event.assignment_bytes,
+                            "assignmentSha256": event.assignment_sha256,
+                            "timestamp": event.timestamp,
                         }),
                     ),
                 };

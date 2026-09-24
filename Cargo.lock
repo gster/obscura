@@ -2015,6 +2015,7 @@ dependencies = [
  "futures-util",
  "http",
  "primp",
+ "psl",
  "rcgen",
  "serde",
  "serde_json",
@@ -2400,8 +2401,6 @@ dependencies = [
 [[package]]
 name = "primp-h2"
 version = "0.4.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1781b16f0668f7b2d68adc4684b6d09802b03776c03c702a082dabba39cfb2c1"
 dependencies = [
  "atomic-waker",
  "bytes",

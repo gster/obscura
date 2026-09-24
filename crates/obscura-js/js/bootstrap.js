@@ -18191,6 +18191,10 @@ globalThis.__obscura_init = function() {
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _deviceIdentity = _domParse("device_identity");
+  if (_deviceIdentity) {
+    globalThis.screen.colorDepth = _deviceIdentity.screen_color_depth;
+    globalThis.screen.pixelDepth = _deviceIdentity.screen_color_depth;
+  }
   _fpSeed = _deviceIdentity ? _deviceIdentity.seed >>> 0 : Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any

@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    build_extension, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
+    build_extension, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent, RuntimeScriptEvent,
     StoredNetworkResponseBody,
 };
 #[cfg(feature = "render")]
@@ -1261,6 +1261,7 @@ impl ObscuraJsRuntime {
             device_memory: persona.device_memory(),
             screen_width: persona.screen_width(),
             screen_height: persona.screen_height(),
+            screen_color_depth: persona.screen_color_depth(),
         }));
         instance.set_locale(persona.language(), persona.languages());
         instance.set_do_not_track(persona.do_not_track());
@@ -6653,6 +6654,15 @@ impl ObscuraJsRuntime {
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        let trace = {
+            let state = self.state.borrow();
+            state.runtime_events_enabled && state.diagnostic_events_enabled
+        };
+        let started = trace.then(|| (
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64() * 1_000.0,
+            std::time::Instant::now(),
+        ));
         self.begin_javascript_task();
         let script_url = name.to_string();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
@@ -6660,6 +6670,7 @@ impl ObscuraJsRuntime {
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
         let mut termination_cleared = false;
+        let mut compiled = false;
         let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
             let mut entered = self.runtime();
             let scope = &mut entered.handle_scope();
@@ -6699,6 +6710,7 @@ impl ObscuraJsRuntime {
                     )),
                 };
             };
+            compiled = true;
             if script.run(scope).is_none() {
                 if scope.is_execution_terminating() {
                     scope.cancel_terminate_execution();
@@ -6732,7 +6744,27 @@ impl ObscuraJsRuntime {
                 Err(message)
             }
         };
-        self.finish_heap_checked(result)
+        let result = self.finish_heap_checked(result);
+        if let Some((started_at, started)) = started {
+            use sha2::Digest as _;
+            let outcome = if result.is_ok() { "ok" }
+                else if !compiled { "compile_error" }
+                else if termination_cleared { "terminated" }
+                else { "runtime_error" };
+            let mut state = self.state.borrow_mut();
+            if state.pending_runtime_events.len() >= 1_024 { state.pending_runtime_events.pop_front(); }
+            state.pending_runtime_events.push_back(RuntimeEvent::Script(RuntimeScriptEvent {
+                url: script_url,
+                source_bytes: source.len(),
+                source_sha256: format!("{:x}", sha2::Sha256::digest(source.as_bytes())),
+                started_at,
+                finished_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64() * 1_000.0,
+                duration_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                outcome: outcome.to_string(),
+            }));
+        }
+        result
     }
 
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<(), String> {
@@ -10742,6 +10774,46 @@ return {before,removed,reinsert,moved,cleared};
         .unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_diagnostics_record_script_outcome_and_storage_writes() {
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145));
+        rt.set_url("https://example.com/page");
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+        rt.set_runtime_events_enabled(true);
+        rt.state.borrow_mut().diagnostic_events_enabled = true;
+        rt.execute_script("https://example.com/app.js", "localStorage.setItem('key', 'secret');")
+            .unwrap();
+        let events = rt.take_pending_runtime_events();
+        assert_eq!(events.len(), 2);
+        let RuntimeEvent::Storage(storage) = &events[0] else { panic!("storage mutation missing"); };
+        assert_eq!(storage.origin, "https://example.com");
+        assert_eq!(storage.operation, "set");
+        assert_eq!(storage.key.as_deref(), Some("key"));
+        assert_eq!(storage.new_bytes, Some(6));
+        assert_ne!(storage.new_sha256.as_deref(), Some("secret"));
+        let RuntimeEvent::Script(script) = &events[1] else { panic!("script execution missing"); };
+        assert_eq!(script.url, "https://example.com/app.js");
+        assert_eq!(script.outcome, "ok");
+        assert!(script.finished_at >= script.started_at);
+        rt.execute_script("https://example.com/broken.js", "throw new Error('broken')")
+            .unwrap_err();
+        assert!(rt.take_pending_runtime_events().iter().any(|event|
+            matches!(event, RuntimeEvent::Script(script) if script.outcome == "runtime_error")));
+        rt.set_cookie_jar(std::sync::Arc::new(obscura_net::CookieJar::new()));
+        rt.execute_script("https://example.com/cookie.js", "document.cookie = 'session=secret; Path=/';")
+            .unwrap();
+        let cookie_events = rt.take_pending_runtime_events();
+        assert!(cookie_events.iter().any(|event| matches!(event, RuntimeEvent::Cookie(cookie)
+            if cookie.name == "session" && cookie.assignment_bytes > 0
+                && cookie.assignment_sha256 != "secret")));
+        rt.state.borrow_mut().diagnostic_events_enabled = false;
+        rt.execute_script("https://example.com/quiet.js", "localStorage.setItem('other', 'value');")
+            .unwrap();
+        assert!(rt.take_pending_runtime_events().is_empty());
+    }
+
     /// Reduced regression for the browser surfaces used by a real airline
     /// protection collector. Keep this host-neutral: the original minified
     /// script, cookies, and per-request tokens are deliberately not fixtures.
@@ -10760,6 +10832,7 @@ return {before,removed,reinsert,moved,cleared};
             device_memory: 32.0,
             screen_width: 1920,
             screen_height: 1080,
+            screen_color_depth: 24,
         }));
         rt.set_user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
         rt.set_user_agent_details("152.0.7977.83", "arm");
@@ -18269,6 +18342,7 @@ return {before,removed,reinsert,moved,cleared};
         );
         spec.screen_width = Some(2560);
         spec.screen_height = Some(1440);
+        spec.screen_color_depth = Some(30);
         spec.screen_avail_width = Some(2300);
         spec.screen_avail_height = Some(1200);
         spec.outer_width = Some(1000);
@@ -18291,6 +18365,7 @@ return {before,removed,reinsert,moved,cleared};
                    const battery = await navigator.getBattery();\
                    const storage = await navigator.storage.estimate();\
                    return [screen.width, screen.height, screen.availWidth, screen.availHeight,\
+                     screen.colorDepth, screen.pixelDepth,\
                      outerWidth, outerHeight, devicePixelRatio, navigator.connection.rtt,\
                      battery.charging, battery.level, storage.quota];\
                  }",
@@ -18310,6 +18385,8 @@ return {before,removed,reinsert,moved,cleared};
                 1440,
                 2300,
                 1200,
+                30,
+                30,
                 1000,
                 700,
                 2,

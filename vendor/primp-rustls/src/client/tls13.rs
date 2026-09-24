@@ -548,6 +548,15 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                 .map(|protocol| protocol.as_ref()),
             self.config.check_selected_alpn,
         )?;
+        if let Some(settings) = &exts.application_settings_new {
+            if cx.common.alpn_protocol() != Some(b"h2".as_slice()) {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::UnsolicitedEncryptedExtension,
+                ));
+            }
+            cx.common.peer_application_settings = Some(settings.bytes().to_vec());
+        }
         hs::process_client_cert_type_extension(
             cx.common,
             &self.config,
@@ -1371,6 +1380,17 @@ impl State<ClientConnectionData> for ExpectFinished {
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
+
+        // ALPS requires a client EncryptedExtensions message after the server
+        // Finished and before client authentication. Chrome's h2 setting is
+        // empty; the server's setting was retained above for the HTTP/2 layer.
+        if cx.common.peer_application_settings.is_some() {
+            let mut extensions = ServerExtensions::default();
+            extensions.application_settings_new = Some(Payload::empty());
+            flight.add(HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(
+                Box::new(extensions),
+            )));
+        }
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */

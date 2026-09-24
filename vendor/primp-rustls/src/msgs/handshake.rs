@@ -1007,6 +1007,10 @@ extension_struct! {
         ExtensionType::ApplicationSettings =>
             pub(crate) application_settings: Option<Payload<'a>>,
 
+        /// Current ALPS code point, used by Chrome HTTP/2.
+        ExtensionType::ApplicationSettingsNew =>
+            pub(crate) application_settings_new: Option<Payload<'a>>,
+
         /// Delegated credentials extension for Firefox fingerprinting (RFC 9347)
         ExtensionType::DelegatedCredentials =>
             pub(crate) delegated_credentials: Option<PayloadU16>,
@@ -1059,6 +1063,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello,
             encrypted_client_hello_outer,
             application_settings,
+            application_settings_new,
             delegated_credentials,
             order_seed,
             contiguous_extensions,
@@ -1081,6 +1086,7 @@ impl ClientExtensions<'_> {
             certificate_compression_algorithms,
             record_size_limit,
             application_settings: application_settings.map(|x| x.into_owned()),
+            application_settings_new: application_settings_new.map(|x| x.into_owned()),
             session_ticket,
             preshared_key_offer,
             early_data_request,
@@ -1374,6 +1380,10 @@ extension_struct! {
         /// Encrypted inner client hello response (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello_ack: Option<ServerEncryptedClientHello>,
+
+        /// Peer ALPS data in TLS 1.3 EncryptedExtensions.
+        ExtensionType::ApplicationSettingsNew =>
+            pub(crate) application_settings_new: Option<Payload<'a>>,
     } + {
         pub(crate) unknown_extensions: BTreeSet<u16>,
     }
@@ -1399,6 +1409,7 @@ impl ServerExtensions<'_> {
             early_data_ack,
             ticket_request,
             encrypted_client_hello_ack,
+            application_settings_new,
             unknown_extensions,
         } = self;
         ServerExtensions {
@@ -1419,6 +1430,7 @@ impl ServerExtensions<'_> {
             early_data_ack,
             ticket_request,
             encrypted_client_hello_ack,
+            application_settings_new: application_settings_new.map(|x| x.into_owned()),
             unknown_extensions,
         }
     }

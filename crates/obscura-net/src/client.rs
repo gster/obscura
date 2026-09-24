@@ -504,13 +504,20 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
         return "none";
     };
     if initiator.origin() == target.origin() {
-        "same-origin"
-    } else {
-        // A public-suffix-aware `same-site` classification will be added with
-        // the page resource scheduler. Until then, cross-site is the safe
-        // conservative value; it never overstates ambient trust.
-        "cross-site"
+        return "same-origin";
     }
+    if initiator.scheme() == target.scheme() {
+        match (initiator.host(), target.host()) {
+            (Some(url::Host::Domain(a)), Some(url::Host::Domain(b))) => {
+                if a == b || psl::domain_str(a).is_some_and(|site| psl::domain_str(b) == Some(site)) {
+                    return "same-site";
+                }
+            }
+            (Some(a), Some(b)) if a == b => return "same-site",
+            _ => {}
+        }
+    }
+    "cross-site"
 }
 
 pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {

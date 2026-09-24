@@ -406,6 +406,7 @@ pub async fn start_with_serve_options_access_and_limit(
             storage_dir,
             allow_file_access,
             allow_private_network,
+            block_trackers: std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref() == Some("1"),
             ..Default::default()
         },
     );
@@ -1533,17 +1534,35 @@ fn forward_pending_events(
         ctx.pending_events.clear();
         return;
     }
-    for event in ctx.pending_events.drain(..) {
-        let json = match serde_json::to_string(&event) {
-            Ok(json) => json,
-            Err(error) => {
-                warn!("closing CDP connection after pending event serialization failure: {error}");
-                reply_tx.close(OutboundCloseReason::PendingEventSerialization);
+    let events: Vec<_> = ctx.pending_events.drain(..).collect();
+    for mut event in events {
+        let mut recipients = vec![event.session_id.clone()];
+        // Fetch interception has one owner, but Network observation is a
+        // page-scoped subscription. An extra DevTools session must see the
+        // same requests even when another session initiated navigation.
+        if event.method.starts_with("Network.") {
+            if let Some(page_id) = event.session_id.as_ref().and_then(|session| ctx.sessions.get(session)) {
+                let mut peers = ctx.network_enabled_sessions.iter()
+                    .filter(|session| ctx.sessions.get(*session) == Some(page_id))
+                    .filter(|session| Some(session.as_str()) != event.session_id.as_deref())
+                    .cloned().collect::<Vec<_>>();
+                peers.sort_unstable();
+                recipients.extend(peers.into_iter().map(Some));
+            }
+        }
+        for recipient in recipients {
+            event.session_id = recipient;
+            let json = match serde_json::to_string(&event) {
+                Ok(json) => json,
+                Err(error) => {
+                    warn!("closing CDP connection after pending event serialization failure: {error}");
+                    reply_tx.close(OutboundCloseReason::PendingEventSerialization);
+                    return;
+                }
+            };
+            if reply_tx.send(json).is_err() {
                 return;
             }
-        };
-        if reply_tx.send(json).is_err() {
-            return;
         }
     }
 }
@@ -2495,6 +2514,37 @@ pub(crate) mod tests {
         assert_eq!(reply_rx.try_recv().unwrap().as_str(), expected);
         assert!(reply_rx.try_recv().is_err());
         assert!(!reply_tx.is_closed());
+    }
+
+    #[test]
+    fn network_events_reach_every_enabled_session_of_the_page() {
+        let mut ctx = crate::dispatch::CdpContext::new(
+            obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145),
+        );
+        let page = ctx.create_page();
+        ctx.sessions.insert("owner".into(), page.clone());
+        ctx.sessions.insert("observer".into(), page);
+        ctx.network_enabled_sessions.insert("owner".into());
+        ctx.network_enabled_sessions.insert("observer".into());
+        ctx.pending_events.push(crate::types::CdpEvent {
+            method: "Network.requestWillBeSent".into(), params: json!({"requestId": "r1"}),
+            session_id: Some("owner".into()),
+        });
+        ctx.pending_events.push(crate::types::CdpEvent {
+            method: "Page.frameNavigated".into(), params: json!({"frame": {}}),
+            session_id: Some("owner".into()),
+        });
+        let (tx, mut rx, _) = crate::outbound::channel();
+        super::forward_pending_events(&mut ctx, Some(&tx));
+        let events = (0..3).map(|_| serde_json::from_str::<serde_json::Value>(&rx.try_recv().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.iter().map(|event| (event["method"].as_str().unwrap(), event["sessionId"].as_str().unwrap()))
+            .collect::<Vec<_>>(), [
+            ("Network.requestWillBeSent", "owner"),
+            ("Network.requestWillBeSent", "observer"),
+            ("Page.frameNavigated", "owner"),
+        ]);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

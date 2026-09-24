@@ -3,13 +3,22 @@ use std::sync::Arc;
 
 use obscura_net::{CookieJar, EffectivePersona, ObscuraHttpClient, RobotsCache};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BrowserContextOptions {
     pub proxy_url: Option<String>,
     pub storage_dir: Option<PathBuf>,
     pub allow_file_access: bool,
     pub allow_private_network: bool,
     pub obey_robots: bool,
+    /// Explicit privacy policy. Enable when tracker blocking is desired.
+    pub block_trackers: bool,
+}
+
+impl Default for BrowserContextOptions {
+    fn default() -> Self {
+        Self { proxy_url: None, storage_dir: None, allow_file_access: false,
+            allow_private_network: false, obey_robots: false, block_trackers: false }
+    }
 }
 
 pub struct BrowserContext {
@@ -75,6 +84,7 @@ impl BrowserContext {
                 allow_file_access: false,
                 allow_private_network,
                 obey_robots: false,
+                block_trackers: false,
             },
         )
     }
@@ -122,6 +132,7 @@ impl BrowserContext {
             allow_file_access,
             allow_private_network,
             obey_robots,
+            block_trackers,
         } = options;
         let cookie_jar = Arc::new(CookieJar::new());
 
@@ -149,7 +160,7 @@ impl BrowserContext {
             proxy_url.as_deref(),
             allow_private_network,
         );
-        client.block_trackers = true;
+        client.block_trackers = block_trackers;
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = persona.user_agent().to_string();
         }
@@ -180,6 +191,7 @@ impl BrowserContext {
             device_memory: self.persona.device_memory(),
             screen_width: self.persona.screen_width(),
             screen_height: self.persona.screen_height(),
+            screen_color_depth: self.persona.screen_color_depth(),
         }
     }
 
@@ -217,7 +229,7 @@ impl BrowserContext {
             self.proxy_url.as_deref(),
             self.allow_private_network,
         );
-        client.block_trackers = true;
+        client.block_trackers = self.http_client.block_trackers;
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = persona.user_agent().to_string();
         }
@@ -264,7 +276,18 @@ mod tests {
         let ctx = BrowserContext::new("test".to_string(), persona());
         let client_ua = ctx.http_client.user_agent.read().await.clone();
         assert_eq!(ctx.persona().user_agent(), client_ua);
+        assert!(!ctx.http_client.block_trackers);
+    }
+
+    #[test]
+    fn tracker_policy_is_preserved_in_isolated_contexts() {
+        let ctx = BrowserContext::with_options("blocked".to_string(), persona(),
+            BrowserContextOptions { block_trackers: true, ..Default::default() });
         assert!(ctx.http_client.block_trackers);
+        let copy = ctx.isolated_copy("copy".to_string(), false);
+        assert!(copy.http_client.block_trackers);
+        assert!(!Arc::ptr_eq(&ctx.http_client, &copy.http_client));
+        assert!(!Arc::ptr_eq(&ctx.cookie_jar, &copy.cookie_jar));
     }
 
     #[test]

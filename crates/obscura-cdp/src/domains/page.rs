@@ -917,6 +917,11 @@ pub fn emit_navigation_events(
     let nav_idx: Option<usize> = network_events
         .iter()
         .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
+    for (event, request_id) in network_events.iter().zip(&nav_request_ids) {
+        if let Some(data) = &event.request_post_data {
+            ctx.record_request_post_data(page_id, request_id, data);
+        }
+    }
 
     // The main resource's body is stored under its internal request id, but the
     // client sees it as `loader_id` (the requestId we report above). Alias it so
@@ -945,7 +950,7 @@ pub fn emit_navigation_events(
         let rid = &nav_request_ids[idx];
         ctx.pending_events.push(CdpEvent {
             method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": network_request_value(net_event), "timestamp": net_event.request_timestamp, "wallTime": net_event.request_timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
     }
@@ -1011,7 +1016,7 @@ pub fn emit_navigation_events(
         if Some(i) != nav_idx && !net_event.request_started {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers, "rawHeaders": net_event.request_raw_headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                params: json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": network_request_value(net_event), "timestamp": net_event.request_timestamp, "wallTime": net_event.request_timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
                 session_id: owner_session.clone(),
             });
         }
@@ -1078,6 +1083,19 @@ pub fn emit_navigation_events(
     ));
 }
 
+fn network_request_value(event: &obscura_browser::NetworkEvent) -> Value {
+    let mut request = json!({"url": event.url, "method": event.method,
+        "headers": event.headers, "rawHeaders": event.request_raw_headers});
+    if event.request_body_size > 0 {
+        request["hasPostData"] = json!(true);
+        request["bodySize"] = json!(event.request_body_size);
+        if let Some(post_data) = &event.request_post_data {
+            request["postData"] = json!(post_data);
+        }
+    }
+    request
+}
+
 /// Emit completed script-initiated requests after the document lifecycle has
 /// already finished. These requests belong to the current document loader and
 /// must not replay frame navigation or load lifecycle events.
@@ -1111,6 +1129,9 @@ pub(crate) fn emit_runtime_network_events(
                 .or_insert_with(|| loader_id.clone()).clone()
         };
         let request_id = &network_event.request_id;
+        if let Some(data) = &network_event.request_post_data {
+            ctx.record_request_post_data(page_id, request_id, data);
+        }
         let owner_key = (page_id.to_string(), request_id.clone());
         let owner_session = ctx.network_owners.get(&owner_key).or_else(|| ctx.fetch_intercept.owners.get(page_id)).cloned().unwrap_or_else(|| session_id.clone());
         let session_id = &owner_session;
@@ -1124,16 +1145,9 @@ pub(crate) fn emit_runtime_network_events(
                 "redirectHasExtraInfo": false,
                 "loaderId": loader_id,
                 "documentURL": page_url,
-                "request": {
-                    "url": network_event.url,
-                    "method": network_event.method,
-                    "headers": network_event.headers,
-                    "rawHeaders": network_event.request_raw_headers,
-                    "hasPostData": network_event.request_body_size > 0,
-                    "bodySize": network_event.request_body_size,
-                },
-                "timestamp": network_event.timestamp,
-                "wallTime": network_event.timestamp,
+                "request": network_request_value(network_event),
+                "timestamp": network_event.request_timestamp,
+                "wallTime": network_event.request_timestamp,
                 "initiator": if let Some(parent) = &network_event.initiator_request_id {
                     json!({"type": "preflight", "requestId": parent})
                 } else { json!({"type": "script"}) },
@@ -1166,7 +1180,10 @@ fn emit_network_result(
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSentExtraInfo".into(),
                 params: json!({"requestId": request_id, "headers": raw.text_headers(), "rawHeaders": raw,
-                    "associatedCookies": [], "connectTiming": {"requestTime": event.timestamp},
+                    "associatedCookies": [], "connectTiming": {"requestTime": event.request_timestamp},
+                    "obscuraTiming": {"requestStartedAt": event.request_timestamp,
+                        "requestPreparedAt": event.request_prepared_timestamp,
+                        "responseHeadersAt": event.response_headers_timestamp},
                     "bodySize": event.request_body_size}),
                 session_id: session_id.clone(),
             });
@@ -2407,12 +2424,14 @@ mod tests {
             document_generation: 0, document_url: String::new(),
             initiator_request_id: None,
             retired_document_url: None,
-            pending: false, error: None, request_body_size: 0, request_started: false, redirect: false, response_body_request_id: None,
+            pending: false, error: None, request_body_size: 13, request_post_data: Some("route=BWI-MCO".into()), request_started: false, redirect: false, response_body_request_id: None,
             raw_headers: None,
-            request_raw_headers: None,
+            request_raw_headers: Some(obscura_net::HeaderCapture {
+                capture_stage: "transportRequest", encoding: "base64", fields: vec![],
+            }),
             request_id: "fetch-7".into(),
             url: "https://example.test/data.json".into(),
-            method: "GET".into(),
+            method: "POST".into(),
             resource_type: "Fetch".into(),
             status: 200,
             status_text: String::new(),
@@ -2423,7 +2442,17 @@ mod tests {
             )])),
             body_size: 12,
             timestamp: 42.0,
+            request_timestamp: 41.0,
+            request_prepared_timestamp: Some(41.25),
+            response_headers_timestamp: Some(41.75),
         };
+
+        let mut get_event = event.clone();
+        get_event.request_body_size = 0;
+        get_event.request_post_data = None;
+        let get_request = network_request_value(&get_event);
+        assert!(get_request.get("postData").is_none());
+        assert!(get_request.get("hasPostData").is_none());
 
         emit_runtime_network_events(
             &mut ctx,
@@ -2434,12 +2463,20 @@ mod tests {
             &[event],
         );
 
-        assert_eq!(ctx.pending_events.len(), 3);
+        assert_eq!(ctx.pending_events.len(), 4);
         assert_eq!(ctx.pending_events[0].method, "Network.requestWillBeSent");
+        assert_eq!(ctx.pending_events[0].params["timestamp"], 41.0);
+        assert_eq!(ctx.pending_events[0].params["request"]["postData"], "route=BWI-MCO");
+        assert_eq!(ctx.pending_events[0].params["request"]["bodySize"], 13);
+        assert_eq!(ctx.request_post_data[&page_id][0].1, "route=BWI-MCO");
         assert_eq!(ctx.pending_events[0].params["loaderId"], "loader-current");
-        assert_eq!(ctx.pending_events[1].method, "Network.responseReceived");
-        assert_eq!(ctx.pending_events[1].params["loaderId"], "loader-current");
-        assert_eq!(ctx.pending_events[2].method, "Network.loadingFinished");
+        assert_eq!(ctx.pending_events[1].method, "Network.requestWillBeSentExtraInfo");
+        assert_eq!(ctx.pending_events[1].params["obscuraTiming"]["requestPreparedAt"], 41.25);
+        assert_eq!(ctx.pending_events[1].params["obscuraTiming"]["responseHeadersAt"], 41.75);
+        assert_eq!(ctx.pending_events[2].method, "Network.responseReceived");
+        assert_eq!(ctx.pending_events[2].params["timestamp"], 42.0);
+        assert_eq!(ctx.pending_events[2].params["loaderId"], "loader-current");
+        assert_eq!(ctx.pending_events[3].method, "Network.loadingFinished");
         assert!(ctx.pending_events.iter().all(|event| {
             !matches!(
                 event.method.as_str(),
