@@ -4426,18 +4426,22 @@ async fn fetch_url_inner(
     let allow_private_network = http_client
         .as_ref()
         .is_some_and(|client| client.allow_private_network);
-    if let Ok(parsed_url) = url::Url::parse(&url) {
-        if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": url,
-                "headers": {},
-                "blocked": true,
-                "error": e,
-            })
-            .to_string());
-        }
+    // Same rule as the rewrite below: a URL the gate cannot parse is one it
+    // cannot check, so it never reaches the transport.
+    let gate_error = match url::Url::parse(&url) {
+        Ok(parsed_url) => validate_fetch_url(&parsed_url, allow_private_network).err(),
+        Err(err) => Some(format!("Unparsable URL blocked: {}", err)),
+    };
+    if let Some(e) = gate_error {
+        return Ok(serde_json::json!({
+            "status": 0,
+            "body": "",
+            "url": url,
+            "headers": {},
+            "blocked": true,
+            "error": e,
+        })
+        .to_string());
     }
     // Slots the interception channel can override via Continue so a consumer
     // can rewrite url/method/headers/body before the request goes out.
@@ -4581,17 +4585,30 @@ async fn fetch_url_inner(
         request_header_capture(final_headers), transport_body,
     ).map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     let url = if let Some(new_url) = override_url {
-        if let Ok(parsed) = url::Url::parse(&new_url) {
-            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+        // A rewrite the gate cannot parse is a rewrite the gate cannot check:
+        // refuse it here rather than hand the raw string to the transport.
+        let parsed = match url::Url::parse(&new_url) {
+            Ok(parsed) => parsed,
+            Err(err) => {
                 return Ok(serde_json::json!({
                     "status": 0,
                     "body": "",
                     "url": new_url,
                     "blocked": true,
-                    "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
+                    "error": format!("Intercept rewrite to unparsable URL blocked: {}", err),
                 })
                 .to_string());
             }
+        };
+        if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": new_url,
+                "blocked": true,
+                "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
+            })
+            .to_string());
         }
         new_url
     } else {
