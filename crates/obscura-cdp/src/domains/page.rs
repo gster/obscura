@@ -1101,7 +1101,7 @@ pub fn emit_navigation_events(
             ctx,
             page_id,
             rid,
-            json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": request, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": request, "timestamp": net_event.request_timestamp, "wallTime": net_event.request_timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
         );
     }
 
@@ -1203,7 +1203,7 @@ pub fn emit_navigation_events(
                 ctx,
                 page_id,
                 rid,
-                json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": request, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                json!({"requestId": rid, "redirectResponse": redirect_responses.remove(&redirect_key), "redirectHasExtraInfo": false, "loaderId": loader_id, "documentURL": page_url, "request": request, "timestamp": net_event.request_timestamp, "wallTime": net_event.request_timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             );
         }
         if net_event.redirect { redirect_responses.insert(redirect_key, network_response_value(net_event)); }
@@ -1552,8 +1552,8 @@ fn emit_runtime_network_events_with_document_loader(
                 "loaderId": loader_id,
                 "documentURL": page_url,
                 "request": request,
-                "timestamp": network_event.timestamp,
-                "wallTime": network_event.timestamp,
+                "timestamp": network_event.request_timestamp,
+                "wallTime": network_event.request_timestamp,
                 "initiator": if let Some(parent) = &network_event.initiator_request_id {
                     json!({"type": "preflight", "requestId": parent})
                 } else { json!({"type": "script"}) },
@@ -1733,7 +1733,10 @@ fn emit_network_result(
         if raw.capture_stage == "transportRequest" {
             queue_network_event(ctx, &sessions, "Network.requestWillBeSentExtraInfo",
                 json!({"requestId": request_id, "headers": raw.text_headers(), "rawHeaders": raw,
-                    "associatedCookies": [], "connectTiming": {"requestTime": event.timestamp},
+                    "associatedCookies": [], "connectTiming": {"requestTime": event.request_timestamp},
+                    "obscuraTiming": {"requestStartedAt": event.request_timestamp,
+                        "requestPreparedAt": event.request_prepared_timestamp,
+                        "responseHeadersAt": event.response_headers_timestamp},
                     "bodySize": event.transport_request_body_size,
                     "requestBodyPresent": event.request_body_present,
                     "requestBodyRequestId": event.request_body_request_id,
@@ -3647,7 +3650,9 @@ mod tests {
             request_started: false, redirect: false, response_body_request_id: None,
             response_body_capture_error: None,
             raw_headers: None,
-            request_raw_headers: None,
+            request_raw_headers: Some(obscura_net::HeaderCapture {
+                capture_stage: "transportRequest", encoding: "base64", fields: vec![],
+            }),
             request_id: "fetch-7".into(),
             url: "https://example.test/data.json".into(),
             method: "GET".into(),
@@ -3661,6 +3666,9 @@ mod tests {
             )])),
             body_size: 12,
             timestamp: 42.0,
+            request_timestamp: 41.0,
+            request_prepared_timestamp: Some(41.25),
+            response_headers_timestamp: Some(41.75),
         };
 
         emit_runtime_network_events(
@@ -3672,12 +3680,17 @@ mod tests {
             &[event],
         );
 
-        assert_eq!(ctx.pending_events.len(), 3);
+        assert_eq!(ctx.pending_events.len(), 4);
         assert_eq!(ctx.pending_events[0].method, "Network.requestWillBeSent");
+        assert_eq!(ctx.pending_events[0].params["timestamp"], 41.0);
         assert_eq!(ctx.pending_events[0].params["loaderId"], "loader-current");
-        assert_eq!(ctx.pending_events[1].method, "Network.responseReceived");
-        assert_eq!(ctx.pending_events[1].params["loaderId"], "loader-current");
-        assert_eq!(ctx.pending_events[2].method, "Network.loadingFinished");
+        assert_eq!(ctx.pending_events[1].method, "Network.requestWillBeSentExtraInfo");
+        assert_eq!(ctx.pending_events[1].params["obscuraTiming"]["requestPreparedAt"], 41.25);
+        assert_eq!(ctx.pending_events[1].params["obscuraTiming"]["responseHeadersAt"], 41.75);
+        assert_eq!(ctx.pending_events[2].method, "Network.responseReceived");
+        assert_eq!(ctx.pending_events[2].params["timestamp"], 42.0);
+        assert_eq!(ctx.pending_events[2].params["loaderId"], "loader-current");
+        assert_eq!(ctx.pending_events[3].method, "Network.loadingFinished");
         assert!(ctx.pending_events.iter().all(|event| {
             !matches!(
                 event.method.as_str(),
@@ -3734,6 +3747,9 @@ mod tests {
                 request_raw_headers: None,
                 body_size: 0,
                 timestamp: 42.0,
+                request_timestamp: 42.0,
+                request_prepared_timestamp: None,
+                response_headers_timestamp: None,
             }
         };
 
@@ -3871,6 +3887,9 @@ mod tests {
             request_raw_headers: Some(raw_headers.clone()),
             body_size: 0,
             timestamp: 42.0,
+            request_timestamp: 42.0,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         };
         let request = {
             let store = request_store.lock().unwrap_or_else(|error| error.into_inner());
@@ -3990,6 +4009,9 @@ mod tests {
             ])),
             body_size: 256,
             timestamp: 42.0,
+            request_timestamp: 42.0,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         };
 
         begin_network_request(
@@ -4126,6 +4148,9 @@ mod tests {
             ])),
             body_size: 19,
             timestamp: 42.0,
+            request_timestamp: 42.0,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         };
         emit_navigation_events(
             &mut ctx,
@@ -4204,6 +4229,9 @@ mod tests {
                 ])),
                 body_size: if redirect { 0 } else { 5 },
                 timestamp: if redirect { 1.0 } else { 2.0 },
+                request_timestamp: if redirect { 1.0 } else { 2.0 },
+                request_prepared_timestamp: None,
+                response_headers_timestamp: None,
             }
         };
         let events = [

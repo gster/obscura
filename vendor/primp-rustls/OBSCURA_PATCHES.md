@@ -1,16 +1,18 @@
 # Local patches to `primp-rustls` 0.23.43
 
 This crate is vendored and wired up via `[patch.crates-io]` in the root workspace
-for exactly one behavioural fix in the TLS
-ClientHello. Everything else is upstream, unmodified. The dependency's
+for the local ClientHello profile and ALPS handshake fixes. The dependency's
 Apache-2.0 / ISC / MIT licenses are retained (`LICENSE`, `LICENSE-APACHE`,
 `LICENSE-ISC`, `LICENSE-MIT`).
 
 The manifest declares an independent workspace, mirroring `vendor/primp`, so the
-crate is not absorbed into the host workspace:
+crate is not absorbed into the host workspace. The registry package omits
+upstream `testdata` and `test-ca` files required to compile its standalone
+unit tests; compile it and run the Obscura network and integration gates:
 
 ```sh
-cargo nextest run --release --manifest-path vendor/primp-rustls/Cargo.toml --lib
+cargo check --release --manifest-path vendor/primp-rustls/Cargo.toml --lib
+cargo nextest run --release -p obscura-net
 ```
 
 ## 1. ClientHello extension order is permuted per connection
@@ -71,17 +73,39 @@ per-connection seed:
 `emulator_extension_order` itself is untouched, so the crate's per-version
 golden tests still assert the captured orders.
 
+## 2. Chrome 153 ALPS and Trust Anchor IDs
+
+**Files:** `src/client/hs.rs`, `src/client/tls13.rs`,
+`src/msgs/{enums,handshake}.rs`, and `src/common_state.rs`.
+
+The Chrome 153 persona offers `h2` in extension `0x44cd` as the five-byte value
+`00 03 02 68 32`. The previous profile emitted a six-byte non-`h2` name,
+avoiding server negotiation because rustls did not support the client
+EncryptedExtensions message. The TLS 1.3 state machine now retains peer ALPS
+settings and sends the empty client ALPS extension in EncryptedExtensions
+before Finished when the server negotiates ALPS. The HTTP/2 caller reads the
+authenticated settings after the handshake.
+Other personas retain their previous ALPS bytes until checked against a
+matching reference browser build.
+
+Chrome 153's `0xca34` payload is a 186-byte TrustAnchorIDList. Its 28 IDs
+were matched as a set against Chromium's 153.0.8010.50 root store. Chrome
+shuffles them once per process and keeps the order across connections, so the
+profile follows that process-level behavior. Other browser
+versions keep their previous payloads pending matching reference captures.
+
 ## Not patched
 
-- TLS versions, cipher suites, named groups, signature algorithms, ALPS / ECH /
-  trust-anchor extension *contents* (only the ordering of the outer extension
-  list changed).
+- TLS versions, cipher suites, named groups, signature algorithms, and ECH
+  contents.
 - Certificate verification, crypto implementation, session resumption, retry
-  or redirect policy, HTTP/2 settings and frame ordering.
+  or redirect policy.
 
 ## Known remaining fidelity gap
 
 JA4 hashes extension *types* only, not extension *bodies*, so equal JA4 does not
 imply byte-identical ClientHellos. The bodies of `key_share`,
-`encrypted_client_hello`, `application_settings` and the built-in-verification
-extension have not been compared byte-for-byte against a real Chrome capture.
+`encrypted_client_hello` have not been compared byte-for-byte against a real
+Chrome capture. The TrustAnchorIDList reflects a Chrome profile; it does not
+replace rustls certificate verification or prove that Obscura trusts the same
+root store as Chrome.

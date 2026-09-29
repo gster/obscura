@@ -83,7 +83,8 @@ async def block_analytics(route):
 await page.route("**/*", block_analytics)
 ```
 
-Every build also ships with a tracker blocklist. See
+Every build also ships with an optional tracker blocklist; requests are allowed
+by default. See
 [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 ## From the Rust library

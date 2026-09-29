@@ -372,6 +372,9 @@ mod tests {
             response_body: None,
             body_size: 256,
             timestamp: 123.5,
+            request_timestamp: 123.5,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         }
     }
 

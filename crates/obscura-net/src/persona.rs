@@ -99,6 +99,8 @@ pub struct PersonaSpec {
     #[serde(default)]
     pub screen_height: Option<u32>,
     #[serde(default)]
+    pub screen_color_depth: Option<u32>,
+    #[serde(default)]
     pub screen_avail_width: Option<u32>,
     #[serde(default)]
     pub screen_avail_height: Option<u32>,
@@ -141,6 +143,7 @@ impl PersonaSpec {
             device_memory: None,
             screen_width: None,
             screen_height: None,
+            screen_color_depth: None,
             screen_avail_width: None,
             screen_avail_height: None,
             outer_width: None,
@@ -280,6 +283,10 @@ impl PersonaSpec {
         let screen_height = self
             .screen_height
             .unwrap_or(if macos { 1440 } else { 1080 });
+        let screen_color_depth = self.screen_color_depth.unwrap_or(24);
+        if !matches!(screen_color_depth, 24 | 30 | 32) {
+            return Err(PersonaError::field("screen_color_depth", "must be 24, 30, or 32"));
+        }
         if !(320..=16384).contains(&screen_width) || !(240..=16384).contains(&screen_height) {
             return Err(PersonaError::field(
                 "screen",
@@ -300,12 +307,12 @@ impl PersonaSpec {
         });
         if !(320..=screen_width).contains(&screen_avail_width)
             || !(240..=screen_height).contains(&screen_avail_height)
-            || !(320..=screen_width).contains(&outer_width)
-            || !(240..=screen_height).contains(&outer_height)
+            || !(320..=16384).contains(&outer_width)
+            || !(240..=16384).contains(&outer_height)
         {
             return Err(PersonaError::field(
                 "screen",
-                "available and outer dimensions must fit within the screen",
+                "available dimensions must fit within the screen and outer dimensions within supported bounds",
             ));
         }
 
@@ -392,6 +399,7 @@ impl PersonaSpec {
             device_memory,
             screen_width,
             screen_height,
+            screen_color_depth,
             screen_avail_width,
             screen_avail_height,
             outer_width,
@@ -434,6 +442,7 @@ pub struct EffectivePersona {
     device_memory: f64,
     screen_width: u32,
     screen_height: u32,
+    screen_color_depth: u32,
     screen_avail_width: u32,
     screen_avail_height: u32,
     outer_width: u32,
@@ -519,6 +528,9 @@ impl EffectivePersona {
     pub fn screen_height(&self) -> u32 {
         self.screen_height
     }
+    pub fn screen_color_depth(&self) -> u32 {
+        self.screen_color_depth
+    }
     pub fn screen_avail_width(&self) -> u32 {
         self.screen_avail_width
     }
@@ -575,6 +587,7 @@ impl EffectivePersona {
             device_memory: Some(self.device_memory),
             screen_width: Some(self.screen_width),
             screen_height: Some(self.screen_height),
+            screen_color_depth: Some(self.screen_color_depth),
             screen_avail_width: Some(self.screen_avail_width),
             screen_avail_height: Some(self.screen_avail_height),
             outer_width: Some(self.outer_width),
@@ -878,6 +891,26 @@ mod tests {
         assert_eq!(effective.persona_id(), "customer_a");
         assert_eq!(effective.languages(), ["fr-CA", "fr"]);
         assert_eq!(effective.accept_language(), "fr-CA,fr;q=0.9");
+    }
+
+    #[test]
+    fn screen_color_depth_is_validated_and_round_trips() {
+        let mut spec = PersonaSpec::preset(StealthProfile::MacChrome153);
+        assert_eq!(spec.clone().compile().unwrap().screen_color_depth(), 24);
+        spec.screen_color_depth = Some(30);
+        let persona = spec.compile().unwrap();
+        assert_eq!(persona.screen_color_depth(), 30);
+        assert_eq!(persona.to_spec().screen_color_depth, Some(30));
+        let mut invalid = PersonaSpec::preset(StealthProfile::MacChrome153);
+        invalid.screen_color_depth = Some(16);
+        assert!(matches!(invalid.compile(), Err(PersonaError::Field { field: "screen_color_depth", .. })));
+        let mut window = PersonaSpec::preset(StealthProfile::MacChrome153);
+        window.screen_width = Some(1365);
+        window.screen_height = Some(768);
+        window.outer_width = Some(1367);
+        window.outer_height = Some(848);
+        let window = window.compile().unwrap();
+        assert_eq!((window.outer_width(), window.outer_height()), (1367, 848));
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub struct CommonState {
     pub(crate) suite: Option<SupportedCipherSuite>,
     pub(crate) kx_state: KxState,
     pub(crate) alpn_protocol: Option<ProtocolName>,
+    pub(crate) peer_application_settings: Option<Vec<u8>>,
     pub(crate) aligned_handshake: bool,
     pub(crate) may_send_application_data: bool,
     pub(crate) may_receive_application_data: bool,
@@ -73,6 +74,7 @@ impl CommonState {
             suite: None,
             kx_state: KxState::default(),
             alpn_protocol: None,
+            peer_application_settings: None,
             aligned_handshake: true,
             may_send_application_data: false,
             may_receive_application_data: false,
@@ -147,6 +149,11 @@ impl CommonState {
     /// were offered or accepted by the peer).
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.get_alpn_protocol()
+    }
+
+    /// Returns the peer's ALPS data after TLS 1.3 negotiation, if any.
+    pub fn peer_application_settings(&self) -> Option<&[u8]> {
+        self.peer_application_settings.as_deref()
     }
 
     /// Retrieves the ciphersuite agreed with the peer.

@@ -54,6 +54,114 @@ The manifests report missing evidence rather than treating it as success. The
 initial record still has Linux results marked not-run, so this foundation does
 not close OB-001 or release gates.
 
+## Southwest direct-page differential capture
+
+`southwest_compare.py` runs the historical BWI → MCO direct URL in a fresh,
+anonymous browser context in a separately launched installed Chrome and in
+Obscura. It uses the official Playwright Python client only to drive CDP. Both
+engines use the same local HTTP proxy and a matched Chrome 153 macOS identity.
+The capture fixes viewport, screen dimensions, color depth, locale, timezone,
+and device scale in both anonymous contexts before navigation; its snapshots
+record those JS identity values so a mismatch is visible in the report.
+Shopping response status and business content are retained only in private
+raw evidence; they are not comparison or regression metrics because the
+endpoint can degrade with repeated access or IP conditions. The outgoing
+shopping request remains useful for comparing headers, cookies, body, and
+timing when both engines emit it.
+The script records raw CDP Network/Page/Runtime events, key response bodies,
+Cookie and localStorage snapshots, and Chrome NetLog. It writes `report.md`,
+`comparison.json`, and the complete private captures to an output directory
+outside Git. Pass `--url` to test a different date or route; the historical
+default date is 2026-09-30.
+
+```bash
+RUN_ROOT="$(mktemp -d)"
+tools/unblocked/.venv/bin/python tools/unblocked/southwest_compare.py \
+  --proxy http://127.0.0.1:7890 --output "$RUN_ROOT/direct"
+```
+
+For an actual TLS ClientHello comparison, start `proxy_tap.py` on a separate
+local port. It forwards unchanged bytes to the chosen upstream proxy and
+records only the first TLS handshake record for Southwest CONNECT tunnels.
+Run both browsers through that relay, then add its capture to the report:
+
+```bash
+tools/unblocked/.venv/bin/python tools/unblocked/proxy_tap.py \
+  --listen-port 17890 --upstream-port 7890 \
+  --output "$RUN_ROOT/hello.jsonl" \
+  --timings-output "$RUN_ROOT/tunnel-timings.jsonl" &
+TAP_PID=$!
+tools/unblocked/.venv/bin/python tools/unblocked/southwest_compare.py \
+  --proxy http://127.0.0.1:17890 --output "$RUN_ROOT/tap"
+kill "$TAP_PID"
+tools/unblocked/.venv/bin/python tools/unblocked/southwest_report.py \
+  "$RUN_ROOT/tap" --tap "$RUN_ROOT/hello.jsonl" \
+  --timings "$RUN_ROOT/tunnel-timings.jsonl"
+```
+
+The report matches Chrome ClientHello bytes to Chrome NetLog, then identifies
+the Obscura handshake and compares TLS extension structure and payload hashes.
+The Chrome 153 `ca34` Trust Anchor IDs are compared as a set: Chrome shuffles
+their order between processes while retaining it within a process. Extension
+order is reported for diagnosis but is not a hard regression gate. Chrome NetLog
+captures actual HTTP/2 SETTINGS, WINDOW_UPDATE, request header frames, and
+connection reuse. The relay cannot read encrypted Obscura HTTP/2 frames.
+The optional tunnel timing log records CONNECT request/reply, ClientHello,
+first server TLS bytes, capped bidirectional chunk timings and byte counts,
+total byte counts, and close time for Southwest hosts. The report includes
+these milestones when passed `--timings`.
+It cannot locate an encrypted HTTP request or response within a TLS tunnel.
+For JS fetch/XHR requests without a preflight, Obscura may deliver
+`requestWillBeSent` when the request completes. Its CDP timestamp still records
+the traced JS request start. Native navigation and resource events currently
+use completion time, so their apparent duration is not evidence of transport
+latency. The report subtracts start from finish for traced JS requests; this
+includes browser scheduling and is not a transport RTT.
+For traced JS requests, `Network.requestWillBeSentExtraInfo.obscuraTiming`
+adds the request start, primp preparation, and response-header timestamps.
+Preparation means headers and body were assembled before transport send; it
+does not establish when bytes reached the proxy or server.
+Obscura's CDP Debugger initializer does not emit `scriptParsed`, and its
+DOMStorage domain is unavailable. The comparison enables
+`OBSCURA_CDP_DIAGNOSTICS=1` for Obscura and captures native
+`Obscura.scriptExecution`, `Obscura.storageMutation`, and
+`Obscura.cookieWrite` events instead.
+These include classic-script execution outcome, source hash and duration, and
+storage operation, key, value size/hash and timestamp, plus attempted
+`document.cookie` writes with name, assignment size/hash and time. They are diagnostic CDP
+events, not equivalents of Chrome's `Debugger.scriptParsed` or DOMStorage
+events, and are off by default. The
+diagnostic never wraps page APIs or decodes the sensor payload. Obscura reports
+UTF-8 request bodies up to 16 KiB in CDP `postData`, so the report can compare
+the exact shopping payload SHA-256 without logging the content in the summary.
+For a specific request, `Network.getRequestPostData({"requestId": "..."})`
+returns the same bounded text from the owning page session. Recent captures
+are limited to 128 requests per page and are cleared when the last page
+Network session disables or the page closes; binary and larger bodies return
+an explicit unavailable error. All Network-enabled sessions attached to one
+page receive the same request events, regardless of which session navigated.
+
+The normal run allows third-party requests, matching Chrome's network policy.
+Use `--block-trackers` for a separate privacy-policy run. It starts Obscura
+with `OBSCURA_BLOCK_TRACKERS=1`. Keep both policy runs separate in the report.
+Run the stable regression gate against a prior pair with the same policy:
+
+```bash
+python3 tools/unblocked/southwest_gate.py "$RUN_ROOT/new" \
+  --baseline "$RUN_ROOT/old"
+```
+
+`regression.json` distinguishes new hard gaps (core script response body,
+request body, browser identity, Sec-Fetch-Site, and captured TLS shape) from observed changes (generic scripts, failed
+resources and storage). It ignores timing, dynamic cookie values and Akamai
+sensor tokens, which require repeated controlled measurements.
+The gate rejects pairs with different proxy, tracker policy, Chrome context,
+or persona inputs; start a new baseline after changing those controls.
+
+Raw traces, NetLog, TLS records, response bodies, Cookie values, and the Chrome
+profile are private session material. Keep the output directory outside the
+repository and do not publish it.
+
 ## Minimal CDP trace
 
 Install the Chromium revision bundled with the locked client, then write all

@@ -326,6 +326,11 @@ impl Size for WorkerEvent {
                     crate::ops::RuntimeEvent::Console(event) => event.kind.len() + event.args.iter().map(|arg| arg.to_string().len()).sum::<usize>(),
                     crate::ops::RuntimeEvent::Exception(event) => event.name.len() + event.description.len() + event.url.len()
                         + event.stack_trace.iter().map(|frame| frame.to_string().len()).sum::<usize>(),
+                    crate::ops::RuntimeEvent::Script(event) => event.url.len() + event.source_sha256.len() + event.outcome.len(),
+                    crate::ops::RuntimeEvent::Storage(event) => event.origin.len() + event.area.len()
+                        + event.operation.len() + event.key.as_ref().map_or(0, String::len),
+                    crate::ops::RuntimeEvent::Cookie(event) => event.origin.len() + event.name.len()
+                        + event.assignment_sha256.len(),
                 }).sum();
                 runtime + value.urls.iter().chain(value.console.iter()).map(String::len).sum::<usize>()
             }
@@ -1548,6 +1553,9 @@ mod tests {
             status_text: String::new(),
             response_headers: HashMap::new(), raw_headers: None, request_raw_headers: None,
             body_size: 256 * 1024 * 1024, timestamp: 0.0,
+            request_timestamp: 0.0,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         }
     }
 

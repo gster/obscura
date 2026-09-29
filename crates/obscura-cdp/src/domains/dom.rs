@@ -234,12 +234,15 @@ pub async fn handle(
         "scrollIntoViewIfNeeded" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = resolve_node_id(page, params)?;
-            // Obscura has no layout viewport to move, but the JS shim records
-            // this element for the hit testing used by subsequent input events.
+            // Playwright calls this before every click. Keep visible elements
+            // in place and center offscreen elements away from fixed edge bars.
             let code = format!(
                 "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
                  if (!el || typeof el.scrollIntoView !== 'function') return false; \
-                 el.scrollIntoView(); return true; }})()",
+                 var r = el.getBoundingClientRect(); \
+                 var visible = r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth; \
+                 el.scrollIntoView({{ block: visible ? 'nearest' : 'center', inline: visible ? 'nearest' : 'center' }}); \
+                 return true; }})()",
                 node_id
             );
             let did_scroll = page.evaluate(&code).as_bool().unwrap_or(false);
@@ -710,7 +713,7 @@ mod tests {
         crate::domains::page::handle(
             "navigate",
             &json!({
-                "url": "data:text/html,<main><button id=target>Go</button></main>",
+                "url": "data:text/html,<main><div style=height:300px></div><button id=target>Go</button><div style=height:1000px></div><button id=below>Below</button><div style=height:1000px></div></main><footer style=position:fixed;bottom:0;height:80px;width:1280px>Continue</footer>",
                 "waitUntil": "load"
             }),
             &mut ctx,
@@ -760,7 +763,32 @@ mod tests {
                 .unwrap()
                 .evaluate("globalThis.__obscura_click_target && globalThis.__obscura_click_target.id");
             assert_eq!(target_id, json!("target"));
+            assert_eq!(
+                ctx.get_session_page_mut(&session).unwrap().evaluate("window.scrollY"),
+                json!(0.0),
+                "a visible click target must not move behind a sticky header"
+            );
         }
+
+        let below = handle(
+            "querySelector",
+            &json!({ "selector": "#below" }),
+            &mut ctx,
+            &session,
+        ).await.unwrap();
+        handle(
+            "scrollIntoViewIfNeeded",
+            &json!({ "nodeId": below["nodeId"] }),
+            &mut ctx,
+            &session,
+        ).await.unwrap();
+        assert_eq!(
+            ctx.get_session_page_mut(&session).unwrap().evaluate(
+                "(function() { var r = document.getElementById('below').getBoundingClientRect(); return Math.abs(r.top + r.height / 2 - innerHeight / 2) < 1; })()"
+            ),
+            json!(true),
+            "an offscreen target must be centered away from fixed viewport bars"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

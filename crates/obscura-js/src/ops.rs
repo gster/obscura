@@ -199,6 +199,9 @@ pub struct JsNetworkEvent {
     pub request_raw_headers: Option<obscura_net::HeaderCapture>,
     pub body_size: usize,
     pub timestamp: f64,
+    pub request_timestamp: f64,
+    pub request_prepared_timestamp: Option<f64>,
+    pub response_headers_timestamp: Option<f64>,
 }
 
 #[cfg(feature = "render")]
@@ -354,6 +357,7 @@ pub struct DeviceIdentity {
     pub device_memory: f64,
     pub screen_width: u32,
     pub screen_height: u32,
+    pub screen_color_depth: u32,
 }
 
 pub type SharedWebStorage = Arc<std::sync::Mutex<HashMap<String, Vec<(String, String)>>>>;
@@ -401,10 +405,12 @@ pub struct ObscuraState {
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
     pub pending_binding_calls: Vec<(String, String)>,
-    // Console calls and uncaught script exceptions, in occurrence order.
+    // Console calls, uncaught exceptions, and opt-in diagnostics, in occurrence order.
     // The CDP layer drains this after commands and autonomous event-loop turns.
     pub pending_runtime_events: VecDeque<RuntimeEvent>,
     pub runtime_events_enabled: bool,
+    /// Emit native script/storage diagnostics only when explicitly requested.
+    pub diagnostic_events_enabled: bool,
     pub pending_console_messages: VecDeque<String>,
     pub console_messages_enabled: bool,
     pub runtime_exception_counter: u64,
@@ -671,6 +677,7 @@ impl ObscuraState {
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
             runtime_events_enabled: false,
+            diagnostic_events_enabled: std::env::var("OBSCURA_CDP_DIAGNOSTICS").ok().as_deref() == Some("1"),
             pending_console_messages: VecDeque::new(),
             console_messages_enabled: false,
             runtime_exception_counter: 0,
@@ -794,9 +801,45 @@ pub struct RuntimeExceptionEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct RuntimeScriptEvent {
+    pub url: String,
+    pub source_bytes: usize,
+    pub source_sha256: String,
+    pub started_at: f64,
+    pub finished_at: f64,
+    pub duration_ms: f64,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeStorageEvent {
+    pub origin: String,
+    pub area: String,
+    pub operation: String,
+    pub key: Option<String>,
+    pub old_bytes: Option<usize>,
+    pub new_bytes: Option<usize>,
+    pub old_sha256: Option<String>,
+    pub new_sha256: Option<String>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeCookieEvent {
+    pub origin: String,
+    pub name: String,
+    pub assignment_bytes: usize,
+    pub assignment_sha256: String,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     Console(RuntimeConsoleEvent),
     Exception(RuntimeExceptionEvent),
+    Script(RuntimeScriptEvent),
+    Storage(RuntimeStorageEvent),
+    Cookie(RuntimeCookieEvent),
 }
 
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
@@ -2018,6 +2061,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         let state = shared.borrow();
         let mut origin = url::Url::parse(&state.url).ok().map(|u| u.origin().ascii_serialization())
             .unwrap_or_else(|| "null".into());
+        let trace = state.runtime_events_enabled && state.diagnostic_events_enabled;
         let storage = if origin == "null" {
             origin = format!("{arg1}:null");
             &state.opaque_storage
@@ -2025,14 +2069,25 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         let args: Vec<String> = serde_json::from_str(&arg2).unwrap_or_default();
         let Some(operation) = args.first().map(String::as_str) else { return "null".into(); };
         let mut storage = storage.lock().unwrap_or_else(|e| e.into_inner());
+        let event_origin = origin.clone();
         let entries = storage.entry(origin).or_default();
         let key = args.get(1).map(String::as_str).unwrap_or("");
         let index = entries.iter().position(|(k, _)| k == key);
+        let mut mutation: Option<(&str, Option<String>, Option<String>, Option<String>)> = None;
         let result = match operation {
             "get" => index.map(|i| serde_json::json!(entries[i].1)).unwrap_or(serde_json::Value::Null),
             "keys" => serde_json::json!(entries.iter().map(|(k, _)| k).collect::<Vec<_>>()),
-            "clear" => { entries.clear(); serde_json::Value::Null }
-            "remove" => { if let Some(i) = index { entries.remove(i); } serde_json::Value::Null }
+            "clear" => {
+                if trace && !entries.is_empty() { mutation = Some(("clear", None, None, None)); }
+                entries.clear(); serde_json::Value::Null
+            }
+            "remove" => {
+                if let Some(i) = index {
+                    let old = entries.remove(i).1;
+                    if trace { mutation = Some(("remove", Some(key.to_owned()), Some(old), None)); }
+                }
+                serde_json::Value::Null
+            }
             "set" => {
                 let value = args.get(2).cloned().unwrap_or_default();
                 let size: usize = entries.iter().filter(|(k, _)| k != key)
@@ -2040,6 +2095,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 if size + key.encode_utf16().count() + value.encode_utf16().count() > 2_621_440 {
                     serde_json::json!({"error":"QuotaExceededError"})
                 } else {
+                    if trace {
+                        let old = index.map(|i| entries[i].1.clone());
+                        if old.as_deref() != Some(value.as_str()) {
+                            mutation = Some(("set", Some(key.to_owned()), old, Some(value.clone())));
+                        }
+                    }
                     if let Some(i) = index { entries[i].1 = value; }
                     else { entries.push((key.to_owned(), value)); }
                     serde_json::Value::Null
@@ -2047,6 +2108,22 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             }
             _ => serde_json::Value::Null,
         };
+        drop(storage);
+        drop(state);
+        if let Some((operation, key, old, new)) = mutation {
+            use sha2::Digest as _;
+            let digest = |value: &String| format!("{:x}", sha2::Sha256::digest(value.as_bytes()));
+            let event = RuntimeStorageEvent {
+                origin: event_origin, area: arg1, operation: operation.to_string(), key,
+                old_bytes: old.as_ref().map(String::len), new_bytes: new.as_ref().map(String::len),
+                old_sha256: old.as_ref().map(digest), new_sha256: new.as_ref().map(digest),
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64() * 1_000.0,
+            };
+            let mut state = shared.borrow_mut();
+            if state.pending_runtime_events.len() >= 1_024 { state.pending_runtime_events.pop_front(); }
+            state.pending_runtime_events.push_back(RuntimeEvent::Storage(event));
+        }
         return result.to_string();
     }
     if matches!(
@@ -3930,7 +4007,10 @@ impl NetworkRequest {
             transport_request_body_size: exchange.transport_request_body_size,
             request_started: false, redirect: false, response_body_request_id: None,
             response_body_capture_error: None, response_body: None, body_size: 0,
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+            timestamp: exchange.request_started_at,
+            request_timestamp: exchange.request_started_at,
+            request_prepared_timestamp: exchange.request_prepared_at,
+            response_headers_timestamp: exchange.response_headers_at,
         });
         let mut state = self.state.borrow_mut();
         state.js_network_events.try_extend(events)?;
@@ -4012,6 +4092,9 @@ impl NetworkRequest {
             request_raw_headers: exchange.request_headers.or_else(|| response.as_ref().and_then(|r| r.request_raw_headers.clone())),
             body_size: exchange.body_size,
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+            request_timestamp: exchange.request_started_at,
+            request_prepared_timestamp: exchange.request_prepared_at,
+            response_headers_timestamp: exchange.response_headers_at,
             error: if redirect { None } else { error },
             request_body_present: exchange.request_body_present,
             request_body_request_id: exchange.request_body_request_id,
@@ -4912,6 +4995,14 @@ async fn stealth_fetch_all(
 
         observation.trace.response(&r, r.status != 0);
         pause_response_hop(&state, observation, &mut r).await?;
+        // A local network policy can return status 0 without HTTP response
+        // headers. Do not report it as a server CORS rejection.
+        if r.status == 0 {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": current_url, "headers": {},
+                "blocked": true, "error": "Blocked",
+            }).to_string());
+        }
         if !(300..400).contains(&r.status) {
             break r;
         }
@@ -6100,8 +6191,8 @@ fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
 
 #[op2(fast)]
 fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
-    let gs = realm_state(scope, state);
-    let gs = gs.borrow();
+    let shared = realm_state(scope, state);
+    let gs = shared.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
         None => return,
@@ -6111,6 +6202,22 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
         Err(_) => return,
     };
     jar.set_cookie_from_js(cookie_str, &url);
+    let trace = gs.runtime_events_enabled && gs.diagnostic_events_enabled;
+    drop(gs);
+    if !trace { return; }
+    use sha2::Digest as _;
+    let name = cookie_str.split(';').next().unwrap_or("").split('=').next().unwrap_or("").trim();
+    let event = RuntimeCookieEvent {
+        origin: url.origin().ascii_serialization(),
+        name: name.to_string(),
+        assignment_bytes: cookie_str.len(),
+        assignment_sha256: format!("{:x}", sha2::Sha256::digest(cookie_str.as_bytes())),
+        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs_f64() * 1_000.0,
+    };
+    let mut gs = shared.borrow_mut();
+    if gs.pending_runtime_events.len() >= 1_024 { gs.pending_runtime_events.pop_front(); }
+    gs.pending_runtime_events.push_back(RuntimeEvent::Cookie(event));
 }
 
 struct HistorySerializer<'s> {

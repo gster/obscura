@@ -1523,6 +1523,42 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
                             },
                         }),
                     ),
+                    obscura_js::ops::RuntimeEvent::Script(event) => (
+                        "Obscura.scriptExecution",
+                        json!({
+                            "url": event.url,
+                            "sourceBytes": event.source_bytes,
+                            "sourceSha256": event.source_sha256,
+                            "startedAt": event.started_at,
+                            "finishedAt": event.finished_at,
+                            "durationMs": event.duration_ms,
+                            "outcome": event.outcome,
+                        }),
+                    ),
+                    obscura_js::ops::RuntimeEvent::Storage(event) => (
+                        "Obscura.storageMutation",
+                        json!({
+                            "origin": event.origin,
+                            "area": event.area,
+                            "operation": event.operation,
+                            "key": event.key,
+                            "oldBytes": event.old_bytes,
+                            "newBytes": event.new_bytes,
+                            "oldSha256": event.old_sha256,
+                            "newSha256": event.new_sha256,
+                            "timestamp": event.timestamp,
+                        }),
+                    ),
+                    obscura_js::ops::RuntimeEvent::Cookie(event) => (
+                        "Obscura.cookieWrite",
+                        json!({
+                            "origin": event.origin,
+                            "name": event.name,
+                            "assignmentBytes": event.assignment_bytes,
+                            "assignmentSha256": event.assignment_sha256,
+                            "timestamp": event.timestamp,
+                        }),
+                    ),
                 };
                 events.push(CdpEvent {
                     method: method.to_string(),

@@ -14,7 +14,8 @@ fn observation() -> NetworkEvent {
         method: "POST".into(), resource_type: "Fetch".into(), status: 200,
         status_text: "OK".into(), headers: Default::default(),
         response_headers: Default::default(), raw_headers: None,
-        request_raw_headers: None, body_size: 4, timestamp: 123.5,
+        request_raw_headers: None, body_size: 4, timestamp: 123.5, request_timestamp: 122.5,
+        request_prepared_timestamp: None, response_headers_timestamp: None,
     }
 }
 

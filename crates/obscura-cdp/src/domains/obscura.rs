@@ -242,6 +242,9 @@ mod tests {
             request_raw_headers: None,
             body_size: 4,
             timestamp: generation as f64,
+            request_timestamp: generation as f64,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         }
     }
 

@@ -1015,6 +1015,7 @@ async fn start_with_serve_options_access_limit_shutdown_and_ready(
             storage_dir,
             allow_file_access,
             allow_private_network,
+            block_trackers: std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref() == Some("1"),
             ..Default::default()
         },
     );
@@ -3830,6 +3831,9 @@ pub(crate) mod tests {
                 request_raw_headers: None,
                 body_size: 0,
                 timestamp: 0.0,
+                request_timestamp: 0.0,
+                request_prepared_timestamp: None,
+                response_headers_timestamp: None,
             }
         }
 

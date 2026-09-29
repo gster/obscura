@@ -190,6 +190,9 @@ pub struct NetworkEvent {
     pub request_raw_headers: Option<obscura_net::HeaderCapture>,
     pub body_size: usize,
     pub timestamp: f64,
+    pub request_timestamp: f64,
+    pub request_prepared_timestamp: Option<f64>,
+    pub response_headers_timestamp: Option<f64>,
 }
 
 /// Lifecycle phase of one observation, not a deduplicated request summary.
@@ -310,6 +313,9 @@ impl obscura_net::observation::RequestLifecycleObserver for PageRequestLifecycle
             request_raw_headers: exchange.request_headers.clone(),
             body_size: 0,
             timestamp: Self::timestamp(),
+            request_timestamp: exchange.request_started_at,
+            request_prepared_timestamp: exchange.request_prepared_at,
+            response_headers_timestamp: exchange.response_headers_at,
         };
         let request_body = self.body_candidate(
             event.request_body_present,
@@ -391,6 +397,9 @@ impl obscura_net::observation::RequestLifecycleObserver for PageRequestLifecycle
                 .or_else(|| response.and_then(|response| response.request_raw_headers.clone())),
             body_size: exchange.body_size,
             timestamp: Self::timestamp(),
+            request_timestamp: exchange.request_started_at,
+            request_prepared_timestamp: exchange.request_prepared_at,
+            response_headers_timestamp: exchange.response_headers_at,
         };
         let request_body = self.body_candidate(
             event.request_body_present,
@@ -5009,6 +5018,9 @@ impl Page {
                 request_raw_headers: ev.request_raw_headers,
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
+                request_timestamp: ev.request_timestamp,
+                request_prepared_timestamp: ev.request_prepared_timestamp,
+                response_headers_timestamp: ev.response_headers_timestamp,
             };
             let _ = self.commit_network_event_with_response(event, history_response_body);
         }
@@ -5527,6 +5539,9 @@ impl Page {
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
+            request_timestamp: timestamp,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         };
         (request_id, event)
     }
@@ -6001,6 +6016,9 @@ mod tests {
             request_raw_headers: None,
             body_size: 3,
             timestamp: 123.5,
+            request_timestamp: 123.5,
+            request_prepared_timestamp: None,
+            response_headers_timestamp: None,
         }
     }
 

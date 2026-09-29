@@ -21,7 +21,7 @@ This produces the release binary with geometry, screenshots, screencasting,
 and PDF export.
 
 Every build includes the primp/Rustls transport, browser TLS profiles,
-browser-identity protections, and tracker blocklist. See
+browser-identity protections, and an optional tracker blocklist. See
 [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 ## Without rendering

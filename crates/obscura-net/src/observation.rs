@@ -35,6 +35,10 @@ pub trait RequestLifecycleObserver: Send + Sync {
 pub struct Exchange {
     pub url: String,
     pub method: String,
+    pub request_started_at: f64,
+    /// Headers and body have been prepared by primp; this does not prove wire send.
+    pub request_prepared_at: Option<f64>,
+    pub response_headers_at: Option<f64>,
     pub request_headers: Option<HeaderCapture>,
     pub request_body_present: bool,
     pub request_body_size: usize,
@@ -159,6 +163,7 @@ impl RequestTrace {
         }
         self.exchanges.lock().unwrap_or_else(|e| e.into_inner()).push(Exchange {
             url: url.into(), method: method.into(), request_headers: headers,
+            request_started_at: now_timestamp(), request_prepared_at: None, response_headers_at: None,
             request_body_present: body.is_some(), request_body_size: body.map_or(0, <[u8]>::len),
             request_body_request_id: body_id,
             transport_request_body_present: false, transport_request_body_size: 0,
@@ -276,6 +281,7 @@ impl RequestTrace {
         }
         if let Some(exchange) = self.exchanges.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
             exchange.request_headers = Some(headers);
+            exchange.request_prepared_at.get_or_insert_with(now_timestamp);
         }
         self.start()
     }
@@ -297,6 +303,7 @@ impl RequestTrace {
             let mut exchanges = self.exchanges.lock().unwrap_or_else(|e| e.into_inner());
             let index = exchanges.len().saturating_sub(1);
             if let Some(exchange) = exchanges.last_mut() {
+                exchange.response_headers_at.get_or_insert_with(now_timestamp);
                 // Spool now rather than retaining every redirect body in memory.
                 // Header-only captures never register an empty successful body.
                 let is_redirect = (300..400).contains(&response.status)
@@ -402,6 +409,11 @@ impl Drop for RequestTrace {
             self.fail("Aborted");
         }
     }
+}
+
+fn now_timestamp() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64()
 }
 
 #[cfg(test)]

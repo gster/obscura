@@ -26,7 +26,10 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
   `cargo build` can re-link the whole workspace; the V8 compile is the cost, so
   avoid touching it when you don't need to.
 - **Browser identity baseline:** every build includes the primp/Rustls
-  transport, fingerprint protections, and tracker blocklist. Its AWS-LC build
+  transport, fingerprint protections, and an optional tracker blocklist.
+  Third-party requests are allowed by default for Chrome network parity;
+  enable the blocklist with `BrowserContextOptions.block_trackers` or
+  `OBSCURA_BLOCK_TRACKERS=1` for CDP serve. Its AWS-LC build
   needs CMake, Clang, and libclang; see
   `docs/Build-from-source.md` for platform requirements.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
@@ -49,7 +52,8 @@ The authoritative behavioral gate is the **obstacle course** in the companion
 repo `obscura-benchmark` (33 capability + speed stages, must stay 33/33):
 
 ```bash
-OBSCURA_BIN=./target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
+cd ../obscura-benchmark
+OBSCURA_PERSONA=windows_chrome145 OBSCURA_BIN=../obscura/target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
 ```
 
 It serves local fixtures, so it is deterministic and offline. WPT conformance

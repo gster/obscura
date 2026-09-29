@@ -476,6 +476,10 @@ impl<IO> TokioTlsStream<IO> {
         self.session.alpn_protocol()
     }
 
+    pub(crate) fn peer_application_settings(&self) -> Option<&[u8]> {
+        self.session.peer_application_settings()
+    }
+
     pub(crate) fn peer_certificates(&self) -> Option<&[rustls_pki_types::CertificateDer<'_>]> {
         self.session.peer_certificates()
     }
