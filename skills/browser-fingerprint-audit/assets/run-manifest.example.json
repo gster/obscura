@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "browser_label": "candidate-headless-cdp",
+  "role": "candidate",
+  "profile_dedicated": true,
+  "platform": {"os": null, "os_version": null, "arch": null},
+  "browser": {
+    "product": null, "full_version": null, "build_sha": null,
+    "target_chrome_full_version": null, "mode": "headless",
+    "startup_args_redacted": [], "startup_args_known": false,
+    "profile_strategy": "fresh-anonymous-context-in-dedicated-profile",
+    "extensions": null, "cdp_schema_revision": null
+  },
+  "host": {"cpu": null, "memory_gb": null, "gpu": null, "rendering_backend": null, "font_inventory_sha256": null},
+  "display": {"screen": null, "viewport": null, "device_scale_factor": null},
+  "locale": {"language": null, "timezone": null},
+  "network": {
+    "proxy_label": null, "proxy_mode": null, "tls_termination": "unknown",
+    "dns_mode": null, "expected_public_egress": [], "expected_dns_resolvers": [],
+    "egress_expectations_known": false
+  },
+  "automation": {"framework": "playwright-python", "framework_version": null, "transport": "cdp", "devtools_open": false},
+  "comparison": {"baseline_run": null, "scenario": "observation", "profile_state": "unknown"},
+  "unknowns": ["模板中的 null 和 unknown 项必须依据实际环境补全；未知项不得推测。"],
+  "notes": []
+}
