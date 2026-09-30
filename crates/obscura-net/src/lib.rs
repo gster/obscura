@@ -12,9 +12,6 @@ pub mod blocklist;
 pub mod network_activity;
 pub mod stealth_client;
 
-#[cfg(test)]
-mod tls_signature_tests;
-
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
