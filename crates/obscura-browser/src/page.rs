@@ -4393,11 +4393,9 @@ impl Page {
         for _ in 0..ROUNDS {
             if deadline.is_some_and(|end| std::time::Instant::now() >= end) { break; }
             if let Some(js) = &mut self.js {
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(ROUND_MS),
-                    js.run_event_loop(),
-                )
-                .await;
+                // A Tokio timeout cannot interrupt synchronous microtasks.
+                // Use the same cooperative, watchdog-bounded pump as settling.
+                let _ = js.run_event_loop_bounded(ROUND_MS).await;
             }
             if !self.advance_frames_until(deadline).await {
                 break;
@@ -5951,6 +5949,32 @@ impl Drop for Page {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_discovery_bounds_a_microtask_storm() {
+        let mut page = import_map_test_page(
+            "frame-discovery-microtasks",
+            "https://example.test/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        page.js.as_mut().unwrap().execute_script(
+            "frame-discovery-busy-task",
+            "setTimeout(() => {\
+               const end = Date.now() + 7000;\
+               const spin = () => { if (Date.now() < end) Promise.resolve().then(spin); };\
+               spin();\
+             }, 0);",
+        ).unwrap();
+
+        let started = std::time::Instant::now();
+        page.build_document_frames(None).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(6500),
+            "frame discovery must bound synchronous microtasks, not rely on a Tokio timeout: {:?}",
+            started.elapsed());
+        assert_eq!(page.js.as_mut().unwrap().evaluate("1 + 1").unwrap(), serde_json::json!(2.0),
+            "the page must remain usable after an overrun");
+    }
+
+
     fn js_network_event(request_id: &str) -> obscura_js::ops::JsNetworkEvent {
         obscura_js::ops::JsNetworkEvent {
             document_generation: 7,
