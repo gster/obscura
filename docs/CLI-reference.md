@@ -1,15 +1,14 @@
-> MCP 与有用的 CLI 保留，用于自动化和 agent 接入。所有入口自动使用统一 persona 和 primp；没有运行时 stealth 开关。
+> 有用的 CLI 保留，用于自动化和 agent 接入。所有入口自动使用统一 persona 和 primp；没有运行时 stealth 开关。
 
 ## `obscura`
 
-Global flags can appear before or after the subcommand. Their effect depends on the command; `--obey-robots` applies to fetch and scrape. Every product command requires `--persona` or `OBSCURA_PERSONA`; there is no implicit identity.
+Global flags can appear before or after the subcommand. Their effect depends on the command. Every product command requires `--persona` or `OBSCURA_PERSONA`; there is no implicit identity.
 
 ```
 -v, --verbose                Enable info logging
 -p, --port <PORT>            CDP port (default 9222)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --persona <VALUE>        Built-in preset name or PersonaSpec JSON path (required)
-    --obey-robots            Respect robots.txt
     --storage-dir <DIR>      Cookie persistence only; see storage limitations
     --allow-private-network  Permit loopback / RFC1918 / link-local
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
@@ -99,51 +98,6 @@ an entry without a port matches only a Host without a port.
 The exact HTTP discovery routes are `/json`, `/json/`, `/json/list`,
 `/json/version`, `/json/version/` (used by Playwright 1.60), and
 `/json/protocol`. Query-bearing and substring-lookalike routes are rejected.
-
-## `obscura scrape [URLS]...`
-
-Run a JS expression across many URLs in parallel.
-
-```
--e, --eval <JS>              JS to run on each page
-    --concurrency <N>        Parallel pages (default 10)
-    --format <FORMAT>        Output format (default json)
-    --timeout <SECONDS>      Per-URL timeout (default 60)
-    --proxy <URL>            HTTP or SOCKS5 proxy
-    --allow-private-network  Permit loopback / RFC1918 / link-local
--q, --quiet                  Suppress info logging
--v, --verbose                Enable verbose logging
-```
-
-`--proxy`, `--allow-private-network`, and `--v8-flags` are global flags: they work before or after any subcommand, and each `scrape` worker inherits the same effective values. V8 flags are applied in each worker before its first Page is created.
-
-Read URLs from stdin with `-`:
-
-```bash
-cat urls.txt | obscura --persona windows_chrome145 scrape - --eval "document.title" --concurrency 20
-```
-
-Requires `obscura-worker` next to `obscura` in `PATH`.
-
-## `obscura mcp`
-
-Run obscura as an MCP server.
-
-```
-    --http                   HTTP transport instead of stdio
-    --host <HOST>            HTTP bind host (default 127.0.0.1)
-    --port <PORT>            HTTP port (default 3000)
-    --proxy <URL>            HTTP or SOCKS5 proxy
-    --allow-private-network  Permit loopback / RFC1918 / link-local
--v, --verbose                Enable info logging
-```
-
-`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only; set `0.0.0.0` to bind all interfaces (for example a Docker Compose sidecar) and pair it with `OBSCURA_MCP_ALLOWED_ORIGINS`.
-
-Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
-
-Render-enabled builds add `browser_screenshot` and `browser_pdf` to the MCP
-tool list. Streaming screencasts are available through CDP rather than MCP.
 
 `--stealth` and `--user-agent` are not CLI or `serve` parameters. The active
 persona owns the primp transport profile, HTTP headers, Client Hints and

@@ -60,26 +60,6 @@ obscura serve --v8-flags "--max-old-space-size=2048"
 
 Flags you pass are appended after the defaults, and V8 uses the last value for a repeated flag, so your `--max-old-space-size` wins while the memory-tuning defaults stay in effect. Lower for memory-constrained hosts, raise for heavy SPAs.
 
-## Parallel scrape
-
-`obscura scrape` fans out a list of URLs across worker processes:
-
-```bash
-obscura scrape \
-  --concurrency 20 \
-  --format json \
-  --timeout 60 \
-  url1 url2 url3 ...
-```
-
-Reads URLs from stdin:
-
-```bash
-cat urls.txt | obscura scrape --concurrency 20 -
-```
-
-Requires `obscura-worker` next to `obscura` in `PATH`.
-
 ## Resource limits
 
 Per-process memory cap with systemd:
@@ -146,17 +126,6 @@ Operational options:
 
 `--allow-unauthenticated-remote` is only for an already authenticated outer
 boundary. Never bind `0.0.0.0` on a public IP without authentication and TLS.
-
-## MCP HTTP transport
-
-`obscura mcp --http` binds `127.0.0.1` by default. To reach it from another container, bind with `--host 0.0.0.0` and set an `Origin` allowlist so a browser page cannot drive it cross-origin:
-
-```bash
-OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
-  obscura mcp --http --host 0.0.0.0 --port 3000
-```
-
-Request bodies are capped at 16 MiB. Like the CDP server it has no built-in auth, so keep it on an internal network or behind an authenticating proxy. See [Use the MCP server](Use-the-MCP-server.md).
 
 ## Observability
 

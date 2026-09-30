@@ -92,7 +92,6 @@ The native renderer is shared by every capture surface:
 - CDP `Page.captureScreenshot`, `Page.startScreencast`,
   `Page.stopScreencast`, and `Page.printToPDF`.
 - Qualified Playwright screenshot and PDF calls, plus the underlying raw CDP methods.
-- MCP `browser_screenshot` and `browser_pdf`.
 
 It currently covers block, inline, flex, grid, table, float, positioned,
 overflow, and transformed layout, plus text, images, SVG, canvas, backgrounds,

@@ -4929,7 +4929,7 @@ async fn pause_redirect_hop(
 /// and CORS semantics but sends every hop through the primp stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar and records the same CDP/MCP network observations as every
+/// context jar and records the same CDP network observations as every
 /// other page request.
 async fn stealth_fetch_all(
     state: Rc<RefCell<OpState>>,

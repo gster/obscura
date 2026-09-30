@@ -79,19 +79,17 @@ edit instead.
 
 ## Architecture
 
-- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`), `serve` (CDP server), `scrape`, `mcp`. `--proxy` and `--allow-private-network` are global flags, valid before or after the subcommand and applied to every product entry point.
+- **obscura-cli** — CLI: `fetch` (`--dump assets|html|text|links|markdown|original|cookies`, `--eval <JS>`, `--screenshot <PNG>`) and `serve` (CDP server). `--proxy` and `--allow-private-network` are global flags, valid before or after the subcommand and applied to every product entry point.
 - **obscura-cdp** — Chrome DevTools Protocol server (WebSocket). Managed page
   sessions use `"{targetId}-session"`; explicit flattened attachments receive
   distinct session ids so Playwright can open raw page sessions.
 - **obscura-js** — V8/`deno_core` runtime. `js/bootstrap.js` is the DOM/browser shim; `src/ops.rs` bridges JS to Rust DOM ops; `src/runtime.rs` owns the isolate and the per-page `ObscuraState`.
 - **obscura-dom** — DOM tree (`src/tree.rs`).
-- **obscura-net** — HTTP client (`client.rs`), stealth client (`stealth_client.rs`, `stealth_transport.rs`), cookie jar, robots cache, tracker blocklist.
+- **obscura-net** — HTTP client (`client.rs`), stealth client (`stealth_client.rs`, `stealth_transport.rs`), cookie jar, tracker blocklist.
 - **obscura-browser** — the `Page` type, navigation, JS evaluation.
 - **obscura-render** — selector cascade, computed style, retained layout,
   scrolling, text shaping, images/SVG/canvas, and CPU-backed paint. The
   `render` feature powers geometry, screenshots, CDP screencasting, and PDF.
-- **obscura-mcp** — stateful MCP automation tools. Render builds expose
-  `browser_screenshot` and `browser_pdf`; streaming screencasts remain CDP-only.
 - **obscura** — embeddable Rust library API (git dependency; builds V8 locally, not on crates.io). Public request-interception API on `Page`: `add_preload_script`, `enable_interception` (channel of `InterceptedRequest`, resolved with `InterceptResolution::{Continue, Fulfill, Fail}`), and passive `on_request` / `on_response`. `op_fetch_url` invokes these for JS `fetch()`/XHR, so when touching it keep a `Continue` URL rewrite behind `validate_fetch_url` (the SSRF gate, same as redirects).
 
 ## Conventions
@@ -191,7 +189,7 @@ credentials):
 obscura --proxy http://USER:PASS@gate.nodemaven.com:8080 fetch https://example.com --dump text
 
 # SOCKS5
-obscura --proxy socks5://USER:PASS@gate.nodemaven.com:1080 scrape url1 url2 --concurrency 25
+obscura --proxy socks5://USER:PASS@gate.nodemaven.com:1080 fetch https://example.com --dump text
 ```
 
 The targeting options (country, region, session id) live in the proxy username,

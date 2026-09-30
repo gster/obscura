@@ -1,6 +1,6 @@
 ---
 name: obscura
-description: Operate and validate Obscura for JavaScript page loading, stealth browsing, anti-fingerprinting, tracker blocking, screenshots and visual comparison, CDP automation with official Playwright Python, screencasting, PDF export, MCP browser interaction, and web extraction. Use when running Obscura against deterministic fixtures or real sites, diagnosing rendering, geometry, resource, identity, or transport failures, or choosing the correct CLI, CDP, MCP, rendering, or stealth workflow.
+description: Operate and validate Obscura for JavaScript page loading, stealth browsing, anti-fingerprinting, tracker blocking, screenshots and visual comparison, CDP automation with official Playwright Python, screencasting, PDF export, and web extraction. Use when running Obscura against deterministic fixtures or real sites, diagnosing rendering, geometry, resource, identity, or transport failures, or choosing the correct CLI, CDP, rendering, or stealth workflow.
 ---
 
 # Obscura
@@ -60,8 +60,7 @@ fixed delay of `N` seconds. `--timeout` is also measured in seconds and bounds
 navigation separately.
 
 Use `--dump original` for a binary or raw HTTP response that should bypass DOM
-and JavaScript processing. Use `scrape` for many URLs when the requested output
-does not require one screenshot per URL.
+and JavaScript processing. Use `fetch --file` for raw HTTP batch requests, or CDP for rendered batch automation.
 
 ## Drive CDP
 
@@ -86,17 +85,6 @@ page activity; this is not fixed-frame-rate desktop capture.
 PDF output supports paper dimensions, margins, landscape, scale, backgrounds,
 and page ranges. It does not currently provide selectable text, tagged PDF,
 outlines, headers/footers, or complete CSS paged-media behavior.
-
-## Drive MCP
-
-Run `obscura mcp` for stdio or `obscura mcp --http --port 3000` for HTTP.
-Navigate first, then inspect or interact with the current page. Refresh a
-snapshot or interactive-element listing after navigation, clicking, scrolling,
-or a framework rerender because element references may have changed.
-
-Render-enabled MCP builds expose `browser_screenshot` as an MCP PNG image and
-`browser_pdf` as an embedded PDF resource. MCP does not stream screencast
-frames; choose CDP for that workflow.
 
 ## Validate visual behavior
 

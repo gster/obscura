@@ -86,9 +86,9 @@ jobs:
           BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/no-render
           if [ -f "$BIN_DIR/obscura.exe" ]; then
-            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/no-render/
+            cp "$BIN_DIR/obscura.exe" dist/no-render/
           else
-            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/no-render/
+            cp "$BIN_DIR/obscura" dist/no-render/
           fi
 
       - name: Build render-enabled release binary
@@ -100,9 +100,9 @@ jobs:
           BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/default
           if [ -f "$BIN_DIR/obscura.exe" ]; then
-            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/default/
+            cp "$BIN_DIR/obscura.exe" dist/default/
           else
-            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/default/
+            cp "$BIN_DIR/obscura" dist/default/
           fi
 
       - name: Smoke test release binaries (V8 snapshot)
@@ -137,16 +137,16 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker
-          tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
+          tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura
+          tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd dist/default
-          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}.zip obscura.exe
           cd ../no-render
-          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

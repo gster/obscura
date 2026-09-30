@@ -6,7 +6,7 @@
 
 本 fork 已收敛到 **CDP-first、未修改的 Playwright Python 客户端、macOS/Linux 独立内核**。
 
-自有 Python SDK 和配套 NDJSON runtime 已移除；保留 MCP 与有助于 agent 接入的 CLI。统一 persona 与经校准的 primp 已成为不可关闭的底层能力，后续优先修补 Chrome 行为差异。Southwest shopping 不再 403 且返回有效查询结果，是重要业务验收点。
+自有 Python SDK 和配套 NDJSON runtime 已移除；保留有助于 agent 接入的 CLI。统一 persona 与经校准的 primp 已成为不可关闭的底层能力，后续优先修补 Chrome 行为差异。Southwest shopping 不再 403 且返回有效查询结果，是重要业务验收点。
 
 强制 primp、版本化 persona 编译器、入口必配和 context 生命周期冻结已经落地；Linux/容器、字体、图形和完整传输指纹资格仍需独立验证。支持部分 CDP 和 Web API，不承诺完整 Chrome 或 Playwright 替代能力。当前事实和测试结果见 [SUMMARY](docs/SUMMARY.md)，开发顺序见 [TODO](docs/TODO.md)。
 

@@ -134,5 +134,4 @@ page.goto("https://example.com").await?;
 
 - Embedding the engine in a Rust service: this crate.
 - Driving through the supported official Playwright Python path: the [Playwright guide](Use-with-Playwright.md).
-- Giving an AI agent browser tools: the [MCP server](Use-the-MCP-server.md).
 - One-off fetches and scraping from the shell: the [CLI](CLI-reference.md).

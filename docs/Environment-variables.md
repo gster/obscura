@@ -125,17 +125,17 @@ the history stops with that complete capture error instead of accepting a
 record with a missing body.
 
 Without `--storage-dir`, the bounded history is memory-only and lasts for the
-browser context. With `--storage-dir` on `serve` or `mcp`, each context writes a
+browser context. With `--storage-dir` on `serve`, each context writes a
 private checksummed archive below `network-history/<history-id>/`; clean close
 records the terminal state and crash recovery exposes the valid committed
 prefix plus an explicit recovery failure for an incomplete or corrupt tail.
 
 ### `OBSCURA_PROXY`
 
-Default proxy URL used by `obscura-worker` for the parallel `scrape` command when no `--proxy` flag is set.
+Default proxy URL for `serve` when no `--proxy` flag is set. CDP child processes inherit it.
 
 ```bash
-OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
+OBSCURA_PROXY=http://proxy.example.com:8080 obscura serve
 ```
 
 ## Identity configuration
@@ -148,16 +148,6 @@ single PersonaSpec selected with `--persona` or `OBSCURA_PERSONA`. The legacy
 
 The built-in preset's timezone is part of that preset. Override it in an
 external PersonaSpec, not with a separate environment variable.
-
-## MCP
-
-### `OBSCURA_MCP_ALLOWED_ORIGINS`
-
-Comma-separated `Origin` allowlist for the HTTP MCP transport (`obscura mcp --http`). Off by default, which keeps the permissive behavior. When set, a browser request whose `Origin` is not listed is refused with `403` before it can drive the server; native, non-browser MCP clients (which send no `Origin`) are always allowed. Use it to stop cross-origin pages from reaching a loopback MCP port.
-
-```bash
-OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" obscura mcp --http --host 0.0.0.0
-```
 
 ## Logging
 
@@ -192,8 +182,6 @@ obscura serve --v8-flags "--max-old-space-size=2048 --expose-gc"
 ```
 
 Defaults are `--max-old-space-size=4096 --max-semi-space-size=4 --optimize-for-size` on 64-bit systems (a 4 GB old-space ceiling, a capped young generation, and codegen tuned for a smaller footprint to cut RSS). Anything you pass with `--v8-flags` is appended after these, and V8 uses the last value for a repeated flag, so your value wins for that flag while the other defaults stay in effect.
-
-`OBSCURA_V8_FLAGS` is reserved for the internal `obscura scrape` parent-to-`obscura-worker` startup protocol. It carries the already-computed effective flag string so every worker configures V8 before its first Page. It is not a user configuration surface; invoke `obscura` with `--v8-flags` instead. A directly launched worker rejects a missing or whitespace-only value with exit code 2.
 
 Within one process, the first non-empty trimmed flag string is authoritative. Repeating that exact string is idempotent. A different string, a first configuration after runtime construction starts, or a poisoned/incomplete application is an explicit startup error; product entry points do not silently continue with unknown V8 state.
 

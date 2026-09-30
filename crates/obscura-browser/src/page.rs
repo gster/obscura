@@ -627,7 +627,7 @@ pub struct Page {
     console_messages_enabled: std::cell::Cell<bool>,
     pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
-    /// is suspended for CDP/MCP tab switching.  These are restored only when
+    /// is suspended for CDP tab switching. These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
     suspended_started_script_ids: Vec<u32>,
     /// Re-creatable CDP handles retained while tab switching replaces this
@@ -4050,41 +4050,6 @@ impl Page {
         // the prior document. Static navigation captures can be replaced.
         self.network_events.retain(|event| event.document_generation != u64::MAX);
         let history_request = request.clone();
-
-        if self.context.obey_robots {
-            if url.scheme() == "http" || url.scheme() == "https" {
-                let origin = url.origin().ascii_serialization();
-                if !self.context.robots_cache.contains(&origin) {
-                    let mut robots_url = url.clone();
-                    robots_url.set_path("/robots.txt");
-                    robots_url.set_query(None);
-                    robots_url.set_fragment(None);
-                    let body = match self
-                        .stealth_client
-                        .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
-                        .await
-                    {
-                        Ok(resp) if resp.status == 200 => {
-                            String::from_utf8_lossy(&resp.body).into_owned()
-                        }
-                        _ => String::new(),
-                    };
-                    self.context.robots_cache.parse_and_store(
-                        &origin,
-                        &body,
-                        self.context.persona().user_agent(),
-                    );
-                }
-
-                if !self.context.robots_cache.is_allowed(&origin, url.path()) {
-                    self.lifecycle = LifecycleState::Failed;
-                    return Err(PageError::NetworkError(format!(
-                        "Blocked by robots.txt: {}",
-                        url
-                    )));
-                }
-            }
-        }
 
         if url.scheme() == "about" {
             self.session_history.borrow_mut()

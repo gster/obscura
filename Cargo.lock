@@ -1935,7 +1935,6 @@ dependencies = [
  "obscura-cdp",
  "obscura-dom",
  "obscura-js",
- "obscura-mcp",
  "obscura-net",
  "serde",
  "serde_json",
@@ -1987,22 +1986,6 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "obscura-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "obscura-browser",
- "obscura-dom",
- "obscura-net",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "url",

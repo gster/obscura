@@ -3,8 +3,6 @@
 ```bash
 obscura --persona windows_chrome145 fetch https://example.com
 obscura --persona windows_chrome145 serve
-obscura --persona windows_chrome145 scrape url1 url2
-obscura --persona windows_chrome145 mcp
 ```
 
 All product entry points always use the same baseline:

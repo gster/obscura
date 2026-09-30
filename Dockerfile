@@ -17,27 +17,25 @@ COPY crates/obscura-net/Cargo.toml       crates/obscura-net/Cargo.toml
 COPY crates/obscura-browser/Cargo.toml   crates/obscura-browser/Cargo.toml
 COPY crates/obscura-cdp/Cargo.toml       crates/obscura-cdp/Cargo.toml
 COPY crates/obscura-js/Cargo.toml        crates/obscura-js/Cargo.toml
-COPY crates/obscura-mcp/Cargo.toml       crates/obscura-mcp/Cargo.toml
 COPY crates/obscura-render/Cargo.toml    crates/obscura-render/Cargo.toml
 COPY crates/obscura-cli/Cargo.toml       crates/obscura-cli/Cargo.toml
 COPY crates/obscura/Cargo.toml           crates/obscura/Cargo.toml
 
 # Create stub src files so cargo can resolve the dependency graph
-RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js obscura-mcp obscura-render obscura; do \
+RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js obscura-render obscura; do \
         mkdir -p crates/$crate/src && echo "// stub" > crates/$crate/src/lib.rs; \
     done && \
     mkdir -p crates/obscura-cli/src && \
-    echo "fn main() {}" > crates/obscura-cli/src/main.rs && \
-    echo "fn main() {}" > crates/obscura-cli/src/worker.rs
+    echo "fn main() {}" > crates/obscura-cli/src/main.rs
 
-RUN cargo build --release --features render --bin obscura --bin obscura-worker 2>/dev/null || true
+RUN cargo build --release --features render --bin obscura 2>/dev/null || true
 
 ARG OBSCURA_VERSION
 
 # Copy real sources and build
 COPY crates/ crates/
 RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
-    touch crates/*/src/*.rs && cargo build --release --features render --bin obscura --bin obscura-worker
+    touch crates/*/src/*.rs && cargo build --release --features render --bin obscura
 
 # ---
 
@@ -56,7 +54,6 @@ RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /build/target/release/obscura /obscura
-COPY --from=builder /build/target/release/obscura-worker /obscura-worker
 
 EXPOSE 9222
 

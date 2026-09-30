@@ -16,7 +16,7 @@ body:
         - Screenshot, screencast, or PDF output
         - CDP or official Playwright Python compatibility
         - Networking, cookies, or proxies
-        - CLI or MCP
+        - CLI
         - Rust API
         - Build or packaging
         - Other

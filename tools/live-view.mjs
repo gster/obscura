@@ -2,7 +2,7 @@
 // Live view for obscura serve.
 //
 // Streams what a headless obscura browser sees to any local browser tab,
-// so you can watch an agent (MCP, Puppeteer, Playwright) work in real time.
+// so you can watch an agent (Playwright or raw CDP) work in real time.
 //
 // Usage:
 //   obscura serve --port 9222

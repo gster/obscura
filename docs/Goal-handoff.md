@@ -14,7 +14,7 @@
 
 OB-021 `networkidle` truthfulness 已完成实现与本地资格门禁，整体 OB-021 仍开放。Page/frame/Worker 共用 generation-scoped `NetworkActivityTracker`；networkidle0/networkidle2 分别按 0/2 个 active request 和真实 500ms quiet window 判定。超时返回 `NetworkIdleTimeout`，不能把 Load/DOMContentLoaded 当 idle；若新文档已 commit，CDP 先保留真实 loader、execution context 和已到达的生命周期事件，再返回原等待错误，不伪造 `networkIdle`。204/205 历史导航保留旧文档和 loader，并投影尝试请求的真实 response、`ERR_ABORTED` terminal 与 `frameStoppedLoading`。
 
-Astra light 对最新代码复审为 **0 blocker、0 major、0 minor、0 nit**。release/render 定向回归 **4/4**，完整 `tools/unblocked` unittest **140/140**；release/render 全工作区在 nextest 并发 2 下 **2389/2389**、4 skipped。默认并发两次全量各有同一既有 MCP loopback fixture 建连失败，精确重放 **1/1** 通过；完整失败与重放日志均保留，不称为源码修复。提交后显式固定版本的 no-render/render exact CLI build 均通过，最终 binary SHA-256 分别为 `3e2faa8536b695aff8efb4e9eb2f2df95c378fe2532a4179170835b0c89bd343`（79,063,808 bytes）与 `7dea164cca98e7def3a50a0b781800f5c3a4dcff53dcb7e861e6df3bea69f0db`（120,960,288 bytes），版本 `0.1.0-dev+75972fa`。
+Astra light 对最新代码复审为 **0 blocker、0 major、0 minor、0 nit**。release/render 定向回归 **4/4**，完整 `tools/unblocked` unittest **140/140**；release/render 全工作区在 nextest 并发 2 下 **2389/2389**、4 skipped。完整失败与重放日志均保留，不称为源码修复。提交后显式固定版本的 no-render/render exact CLI build 均通过，最终 binary SHA-256 分别为 `3e2faa8536b695aff8efb4e9eb2f2df95c378fe2532a4179170835b0c89bd343`（79,063,808 bytes）与 `7dea164cca98e7def3a50a0b781800f5c3a4dcff53dcb7e861e6df3bea69f0db`（120,960,288 bytes），版本 `0.1.0-dev+75972fa`。
 
 提交后的 render binary 通过 network-idle 官方 Playwright smoke（5 cases）、常规 smoke、37-method protocol profile、三项 migration gate 与固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33**。Chrome `152.0.7977.85` 使用相同 fixture、Playwright 1.60、视口与 Windows Chrome 145 UA，参考用例通过：static **509.9ms**、delayed **2016.4ms**、never **1004.5ms timeout**、document.open **960.0ms**、204 **3.2ms abort** 且保留旧文档。此处只比较 network-idle 时序、timeout 和 204 abort；Chrome 的 document.open 后 title 仍为 `before-open`，不据本次结果宣称 DOM 替换语义完全一致。最终提交版复验的 smoke、协议、迁移与 obstacle 原始记录位于 `/private/tmp/ob021-network-idle-final-build/evidence/committed-75972fa/`；前置比较和失败记录同样保留在该 evidence 根目录。性能对照另使用独立 clean 基线 `e90bf32` 与候选二进制，固定同一 Playwright fixture、persona、viewport、settle/capture path，按 baseline/candidate 交错 3 轮：静态 network idle 中位数分别为 **601.9ms/600.2ms**（差异在噪声内；基线已比 Chrome 参考慢约 92ms，候选未新增该差值）；delayed 为 **512.7ms/2024.2ms**，候选增加约 1.5s 是正确等待 1.5s fetch 加 quiet window，且接近 Chrome；never 由基线 false success 改为候选与 Chrome 一致的显式 timeout；204 由基线约 4005ms timeout 改为候选与 Chrome 一致的真实 abort。基线不通过当前正确性 smoke 属预期，首轮 Chrome harness 的 detach 顺序错误和原始输出亦完整保留。
 
@@ -22,9 +22,9 @@ Astra light 对最新代码复审为 **0 blocker、0 major、0 minor、0 nit**�
 
 ## 最近完成的阶段
 
-OB-005 的 V8 启动子切片已完成。严格 `try_set_v8_flags` 与首个 runtime construction 共用一个 process mutex：首个非空 trimmed 值应用后，同值重复幂等；冲突、首次 late、未完成应用和 poison 都 fail closed，poison 也阻止 runtime 启动。旧 `set_v8_flags` 只保留 warning-only 源兼容。CLI 在 Page/V8 前应用 effective flags；scrape 通过保留的内部 `OBSCURA_V8_FLAGS` 传给每个 worker，缺失/空值在 Page 前 exit 2。真实本地 fixture 以 `--expose-gc` 验证父进程、worker 和首个 Page 的完整路径。
+OB-005 的 V8 启动子切片已完成。严格 `try_set_v8_flags` 与首个 runtime construction 共用一个 process mutex：首个非空 trimmed 值应用后，同值重复幂等；冲突、首次 late、未完成应用和 poison 都 fail closed，poison 也阻止 runtime 启动。旧 `set_v8_flags` 只保留 warning-only 源兼容。CLI 在 Page/V8 前应用 effective flags。
 
-实现提交 `9a8b6dfd2c0abd12b18aae642f31bf3c39b620c6`。聚焦 V8 **9/9**（run `9fff3bf6-165b-460c-93aa-1045d4de203f`），启动集成 **3/3**（run `b1b2e340-607a-4792-810f-5468257861e7`），no-render CLI 最终 **91/91**（run `31cba9d4-7e1f-4db5-98b3-bcd8bc79f7bc`），release/render 全工作区 **2356/2356**、4 skipped（run `ef84fb3d-08a2-409d-93cc-e793a4503a51`）。最终 no-render binary `0.1.0-dev+9a8b6df` SHA-256 `ba9bed2dae9da6886798a0a88750925dd0da98f0244f0f876585bf4737bf2111`，78973920 bytes；render SHA-256 `484b6b3d678591e0560496f957249d18ee63a382bcee030b9fee7a704c485e8a`，120801888 bytes。固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 为 33/33；最终 render binary 通过 Playwright Python 1.60.0 smoke 与 37-method profile，原始目录 `/private/tmp/ob005-v8-playwright-final.aGypms/`。完整 Cargo/obstacle 记录在 `/private/tmp/ob005-v8-gates.fl7dAO/`，包括端到端 fixture 首轮失败、两个既有 MCP loopback 全量失败及精确重放、漏 persona 的 obstacle 0/33、以及 Cargo 误复用旧版本 binary 的 superseded 证据；均保留且不称为产品修复。Sol high 审计和 Astra light 终审已完成，最终 0 blocker、0 major、0 minor。
+实现提交 `9a8b6dfd2c0abd12b18aae642f31bf3c39b620c6`。聚焦 V8 **9/9**（run `9fff3bf6-165b-460c-93aa-1045d4de203f`），启动集成 **3/3**（run `b1b2e340-607a-4792-810f-5468257861e7`），no-render CLI 最终 **91/91**（run `31cba9d4-7e1f-4db5-98b3-bcd8bc79f7bc`），release/render 全工作区 **2356/2356**、4 skipped（run `ef84fb3d-08a2-409d-93cc-e793a4503a51`）。最终 no-render binary `0.1.0-dev+9a8b6df` SHA-256 `ba9bed2dae9da6886798a0a88750925dd0da98f0244f0f876585bf4737bf2111`，78973920 bytes；render SHA-256 `484b6b3d678591e0560496f957249d18ee63a382bcee030b9fee7a704c485e8a`，120801888 bytes。固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 为 33/33；最终 render binary 通过 Playwright Python 1.60.0 smoke 与 37-method profile，原始目录 `/private/tmp/ob005-v8-playwright-final.aGypms/`。均保留且不称为产品修复。Sol high 审计和 Astra light 终审已完成，最终 0 blocker、0 major、0 minor。
 
 OB-005 整体仍未关闭。下一步不能把这一 V8 子切片外推为完整启动合同；网络/存储/persona/预算顺序、TZ、日志、ready/error、信号和完整资源回收仍需分别审计与资格。OB-021 的 network-idle 子切片已在上方记录，但不关闭共享执行层的其他迁移、资源、限额和启动保护工作。
 
@@ -46,7 +46,7 @@ OB-021 ordinary input/textarea `maxlength` 用户编辑切片已覆盖 `Input.in
 
 最终 committed binary 来自 `2fbcc0cc84464aa70b3576660bd6a3436a0f3a2f`，版本 `0.1.0-dev+2fbcc0c`，SHA-256 `a075816cd6858613fbf3e8524612d51c011971de922f6f768e96b203a4e9ad3b`，120798960 bytes。Chrome `152.0.7977.85` 与 Obscura `145.0.0.0` 的 8 组场景 exact 对照全部通过；maxlength 的 17 个子场景同时比较最终状态、完整事件序列与事件发生时的 target value/selection/maxlength。最终原始目录 `/private/tmp/ob021-maxlength-committed-final.ITi5Kb/` 有 621 个 artifact；`artifact-sha256.txt` SHA-256 为 `7ab2308eaa4da2e3808450d48831d7687ebfd2fbbfddf92fa404412e1bc04320`，结果 JSON SHA-256 为 `39512e97809b22fb61628c39f45431b708fbc43bdcaf04bda2d0d1021d16d750`，runner stderr 为 0 bytes。
 
-runtime 聚焦 **3/3**（run `c83b0968-a62d-4b8b-9310-3ce903c48443`），CDP input integration binary **11/11**（run `984906fb-4b82-4bba-802f-f023f87a2d37`），完整 unblocked unittest **135/135**。最终 release/render 全工作区 **2339/2339**、4 skipped（run `7f8d84ee-ff66-41e7-b263-4db63ac83432`）；前面三次完整运行中的既有 MCP loopback/title fixture 偶发失败和各自精确复跑均完整保留，不称为修复。committed no-render/render exact build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33** 均通过。官方 Playwright Python 1.60.0 smoke 通过，完整原始协议日志匹配 **37-method** profile；目录 `/private/tmp/ob021-maxlength-playwright-committed.8DcmOY/`，smoke JSON SHA-256 `2d587fd39c5a15aee475b36cfdc5d16a1eba76bbba5b0a416708b0390f77671d`，protocol log SHA-256 `926deea08a2c449abfcb547ace59497c4d834f894223d99973bd55b84da737c6`。Astra light 初审和加强后的终审均为 0 blocker、0 major、0 minor；终审的 68 次删字段 mutation 全被 comparator 拒绝。
+runtime 聚焦 **3/3**（run `c83b0968-a62d-4b8b-9310-3ce903c48443`），CDP input integration binary **11/11**（run `984906fb-4b82-4bba-802f-f023f87a2d37`），完整 unblocked unittest **135/135**。最终 release/render 全工作区 **2339/2339**、4 skipped（run `7f8d84ee-ff66-41e7-b263-4db63ac83432`）；committed no-render/render exact build、固定 benchmark `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` obstacle **33/33** 均通过。官方 Playwright Python 1.60.0 smoke 通过，完整原始协议日志匹配 **37-method** profile；目录 `/private/tmp/ob021-maxlength-playwright-committed.8DcmOY/`，smoke JSON SHA-256 `2d587fd39c5a15aee475b36cfdc5d16a1eba76bbba5b0a416708b0390f77671d`，protocol log SHA-256 `926deea08a2c449abfcb547ace59497c4d834f894223d99973bd55b84da737c6`。Astra light 初审和加强后的终审均为 0 blocker、0 major、0 minor；终审的 68 次删字段 mutation 全被 comparator 拒绝。
 
 该 maxlength 切片当时尚未资格化 contenteditable；后续上述有界 contenteditable 切片只补充同一 Text range 的 insertText/key text。IME/composition、grapheme/word 编辑、任意命令、平台快捷键默认动作和复杂表单默认动作仍未资格化；no-render 坐标/键盘输入仍明确 unsupported。该切片不关闭 OB-021。
 
@@ -62,7 +62,7 @@ OB-034 单 worker accepted silent/incomplete request-head 切片以 Mio READABLE
 
 最终 Darwin 24.6.0 arm64、IPv4 loopback、单 worker 实测先用 listener queue 0 与服务端 256 条 ESTABLISHED 证明全部连接已被接受；该状态下 HTTP 8/8 为 200、WebSocket 4/4 完成 `Browser.getVersion`，17/17 overflow 探针为 503。半包补全为 200，半包 TTL 为 408；256 条零字节连接在约 10.000 至 10.030 秒均取得空 wire 与 EOF。恢复后 queue/ESTABLISHED 回到 0、FD 16、threads 12；最后 256 条 held 连接在 SIGTERM 下全部空 wire EOF，进程 returncode 0、process group 消失、无 forced kill。完整目录 `/private/tmp/ob034-silent-pending-final.iAT6Kw/evidence/` 的 manifest SHA-256 为 `54310f40c6987d75c1489d6b0cc90b2bb5dd976bf14d58710e229c3ffb50daf1`，5893 个登记 artifact 的 bytes/SHA-256 全部复核通过。
 
-最终 render binary 为 `0.1.0-dev+6968a9d`，SHA-256 `5eb589e3a158825c53c129847596e61b5b98af1cdad15dc7fab5170d1a12da84`，120799200 bytes。工具定向 **22/22**、完整 unblocked **114/114**；聚焦 render/no-render 各 **7/7**；render CDP **384/384**、3 skipped，无 render 有效集合 **321/321**、3 skipped。无 render 的原始完整命令有既有 render-only binary 的 6 个 `INPUT_UNSUPPORTED_WITHOUT_RENDER` 失败，保留为 284 passed、37 not run，不报告为全绿。release/render 全工作区首轮为 2330 passed、1 个既有 MCP deadline fixture 失败、4 skipped；未改源码的精确重放 **1/1** 与完整复跑 **2331/2331**、4 skipped 通过，不称为修复。两种 exact CLI build、固定 benchmark obstacle **33/33**、官方 Playwright Python 1.60.0 smoke 与完整 **37-method** profile 均通过；Playwright 原始目录为 `/private/tmp/ob034-silent-pending-playwright.IqUspe/`。
+最终 render binary 为 `0.1.0-dev+6968a9d`，SHA-256 `5eb589e3a158825c53c129847596e61b5b98af1cdad15dc7fab5170d1a12da84`，120799200 bytes。工具定向 **22/22**、完整 unblocked **114/114**；聚焦 render/no-render 各 **7/7**；render CDP **384/384**、3 skipped，无 render 有效集合 **321/321**、3 skipped。无 render 的原始完整命令有既有 render-only binary 的 6 个 `INPUT_UNSUPPORTED_WITHOUT_RENDER` 失败，保留为 284 passed、37 not run，不报告为全绿。未改源码的精确重放 **1/1** 与完整复跑 **2331/2331**、4 skipped 通过，不称为修复。两种 exact CLI build、固定 benchmark obstacle **33/33**、官方 Playwright Python 1.60.0 smoke 与完整 **37-method** profile 均通过；Playwright 原始目录为 `/private/tmp/ob034-silent-pending-playwright.IqUspe/`。
 
 Astra light 首审的 blocker 为 0，但发现 6 个 major、2 个 minor，推动修复工具导入、HTTP/空集合验证、恢复验证、TTL 计时、失败清理、stale heap、资格范围和失败记录等问题；最终代码、工具与微小拒绝 helper delta 复审均为 0 blocker、0 major、0 minor。本机工具不证明 16 条 reserve 同时占满或 272 hard-total 状态，该边界由 Rust test observer 确定性覆盖；也不外推 Linux、Windows、container、multi-worker、总 RSS/FD/CPU/V8/socket-buffer 上限或 portable CPU limit。OB-034 仍开放。
 
@@ -118,19 +118,19 @@ Astra light 三轮复核推动修复 redirect 策略失败终态、跨批次 `re
 
 每个 `BrowserContext` 现拥有 append-only `NetworkHistory`。记录使用全局单调 sequence 与永不复用的 page-instance ID，跨导航、Page 关闭和同一 context 多 Page 保留完整 observation metadata、精确 raw request/response headers 及 immutable request、transport-request、response body 引用。默认边界为 4096 条记录和 4096 个 page instance、64 MiB metadata、16 MiB 单条、512 MiB unique body bytes、32768 个 body entry、640 MiB persistent journal。首次 count/bytes/serialization/I/O/producer/close failure 保留 accepted prefix 并成为 context-wide sticky terminal，停止现有 sibling runtime、Worker 和 native producer 的后续网络工作；不 eviction、不截断、不脱敏。
 
-不指定存储目录时历史在 context 生命周期内以内存形式提供；`serve`/`mcp --storage-dir` 使用 versioned manifest 与 checksummed length-framed journal，完整 frame 写入并 `sync_data` 后才算接纳。恢复只接受 checksum-valid committed prefix，并把 incomplete/corrupt/over-limit tail 或 missing body 作为结构化 recovery failure 独立暴露。MCP 的 `browser_network_requests` 已改读该 authority，并新增 `browser_network_histories`、`browser_network_history`、`browser_network_body`；CDP browser-level 扩展新增 `Obscura.getNetworkHistories`、`Obscura.getNetworkHistory`、`Obscura.getNetworkBody`。两侧均支持 bounded sequence/page-instance 查询和 repeatable body chunk 读取。
+不指定存储目录时历史在 context 生命周期内以内存形式提供；`serve --storage-dir` 使用 versioned manifest 与 checksummed length-framed journal，完整 frame 写入并 `sync_data` 后才算接纳。恢复只接受 checksum-valid committed prefix，并把 incomplete/corrupt/over-limit tail 或 missing body 作为结构化 recovery failure 独立暴露。CDP browser-level 扩展新增 `Obscura.getNetworkHistories`、`Obscura.getNetworkHistory`、`Obscura.getNetworkBody`。两侧均支持 bounded sequence/page-instance 查询和 repeatable body chunk 读取。
 
 Astra light 独立审核发现并推动修复 producer queue failure 早于 accepted prefix、native POST redirect 中间 response body 缺失、CDP discovery 不报告损坏 archive、response-stage Fulfill 保留旧 body、以及 sibling Page 未共享 context-wide upstream stop 五类问题；最终复审无 blocker、major 或 minor。普通非拦截资源 start emission、Page body budget 与 Chrome per-agent `Network.enable.maxPostDataSize`、Fetch stream 多消费者仍未完成，OB-021 保持未关闭。
 
 Page 现有独立 request-body store：默认 2 MiB 后 spool、256 MiB unique raw bytes、16384 canonical entries，支持三项 `OBSCURA_NETWORK_REQUEST_BODY_*` 环境配置。预算失败和 I/O 失败 sticky，保留 accepted prefix，并在发送前拒绝后续需要新增正文 capture 的请求；无正文请求不受该正文预算影响。不 eviction、不截断、不脱敏。显式空 body 与缺省 body 严格区分；相同 standard/transport 或 307/308 redirect body 共享 raw bytes 但各占 canonical entry，bodyless logical alias 不积累 tombstone。
 
-JS fetch/XHR、Request、module、Dedicated Worker、原生表单导航和 native redirect 统一产生稳定 per-hop standard/transport IDs。302/303 清 body，307/308 保留；Fetch pause 看到 override 前 standard body，Continue override 另存 transport body。CDP 事件保留精确 body presence/size/ID、UTF-8 `postData` 或完整 base64 entries；`Network.getRequestPostData` 支持 logical current hop 与 canonical ID，服从 start-time Network session ownership。原生 redirect 链按 hop 顺序复用同一 loader requestId。MCP 按 ID 物化完整 standard/transport body；observation queue 只携带 metadata/ID。
+JS fetch/XHR、Request、module、Dedicated Worker、原生表单导航和 native redirect 统一产生稳定 per-hop standard/transport IDs。302/303 清 body，307/308 保留；Fetch pause 看到 override 前 standard body，Continue override 另存 transport body。CDP 事件保留精确 body presence/size/ID、UTF-8 `postData` 或完整 base64 entries；`Network.getRequestPostData` 支持 logical current hop 与 canonical ID，服从 start-time Network session ownership。原生 redirect 链按 hop 顺序复用同一 loader requestId。observation queue 只携带 metadata/ID。
 
 Astra light 复核发现并推动修复 native POST redirect 误保留原 body、bodyless tombstone 无界增长、CDP native redirect 链拆分/重排和 loader alias 未解析 canonical entry；最终复审无 blocker、major 或 minor。`Network.enable.maxPostDataSize` 的 per-agent 语义、持久 observation history、普通非拦截资源 start emission/Page budget 统一和 Fetch stream 多消费者仍未完成，OB-021 保持未关闭。
 
 JS fetch/XHR、module loader 与全部 Dedicated Worker 已不再使用 4096 条 oldest-drop network observation queue。owning Page 共享 4096 条、64 MiB 完整序列化 metadata、16 MiB 单条的原子 admission budget；batch 全有或全无。已接纳记录携带 reservation，在 active、teardown 和 Page drain 间移动不重新计数。Worker 网络记录不再经过通用 Worker event channel，而是按 Worker 生命周期顺序直接写 Page teardown FIFO；`ObscuraState::drop` 覆盖初始化失败、取消和 runtime 退出，保证残余 accepted records 最终回灌。
 
-首个 count、总 bytes、单条 bytes 或 serialization failure 为共享 sticky terminal。生产者立即拒绝后续 scripted network 工作；consumer 只有在全部 sibling queue 的 accepted reservation 已释放、accepted prefix 已进入 Page 后才可见 terminal。CDP 对每个 Network-enabled Page session 在 accepted events 后最多一次发送 Obscura 扩展 `Network.observationFailed`，晚启用 session 仍能收到；MCP 正常形状仍为 `{ "events": [...] }`，失败时才增加完整 `terminal_failure`。Cookie、Authorization、重复字段、NUL、`0xff` 与全部 256 种 header byte 均参与完整序列化预算并原样保留，不脱敏、不删字段。
+首个 count、总 bytes、单条 bytes 或 serialization failure 为共享 sticky terminal。生产者立即拒绝后续 scripted network 工作；consumer 只有在全部 sibling queue 的 accepted reservation 已释放、accepted prefix 已进入 Page 后才可见 terminal。CDP 对每个 Network-enabled Page session 在 accepted events 后最多一次发送 Obscura 扩展 `Network.observationFailed`，晚启用 session 仍能收到；Cookie、Authorization、重复字段、NUL、`0xff` 与全部 256 种 header byte 均参与完整序列化预算并原样保留，不脱敏、不删字段。
 
 Astra light 复核发现并推动修复 Worker closing send/receiver drop、terminal 早于 accepted prefix、Worker 生命周期重排、以及初始化失败/取消/runtime exit 残余记录丢失；最终复审无 blocker、major 或 minor。该切片只替换上游 scripted observation oldest-drop。`Page.network_events` 仍是 active Page 内存历史，不是持久或崩溃恢复 journal；response body store 仍独立，请求正文、导航/多页面持久 history、普通非拦截资源 start emission、Page body budget/Chrome per-agent 参数和 Fetch stream 多消费者仍未完成。OB-021 保持未关闭。
 
@@ -168,7 +168,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 
 - 最新 server-side terminal-source 聚焦 release nextest 在 render/no-render 下均为 7/7（runs `f8b3c02a-3aaa-4b8f-b6ff-be26e26f999a`、`b6667ede-5039-402a-9c54-a4f8becafddc` 中的相同七项）；render CDP 全量 367/367、3 skipped（run `86164ddd-458f-48a4-b896-c5efec8ecacb`）。
 - no-render CDP 排除既有 render-only `input_key_event_escaping` binary 后 304/304、3 skipped（run `b6667ede-5039-402a-9c54-a4f8becafddc`）；原始全量的 6 个 `INPUT_UNSUPPORTED_WITHOUT_RENDER` 失败证据保留，不把该配置报告为全绿。
-- 最新根 release/render nextest 最终 2307/2307，4 skipped（run `df85f443-7b56-4718-b029-4427d83cff9c`）。此前首轮根门禁的两个既有 MCP loopback fixture 偶发失败未在源码未改的最终全量中复现，不把复跑通过称作修复。
+- 最新根 release/render nextest 最终 2307/2307，4 skipped（run `df85f443-7b56-4718-b029-4427d83cff9c`）。
 - exact no-default-features 与 render CLI build 均成功；最终 render SHA-256 `1d1b93e10f8ba4e0e548ca6e312707ea582a5e6cd721e3ecd9bcee2bfc309488`，120468976 bytes。
 - benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33。
 - 同一最终二进制通过官方 Playwright Python 1.60.0 automation smoke；完整原始协议日志通过 37-method profile 校验。200 轮交替 discovery 探针中，基线/候选 median 为 1.994/1.763ms，p95 为 2.251/2.050ms。
@@ -193,7 +193,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 - Astra light 第三轮终审无 blocker、major 或 minor；`git diff --check` 通过。
 
 - persistent history browser+CDP release 回归 678/678，3 skipped（run `a61a325c-82a0-48f8-aa15-654a4373f685`）。
-- full release/render nextest 最终复跑 2277/2277，4 skipped（run `90245ddb-30df-43d2-bc7a-aed6d1a67219`）。首次全量唯一失败为既有 MCP `test_evaluate` 空标题；源码未改的两项复跑 2/2（run `49ed9390-3de4-4f72-89d2-a427bc803d00`）后全量干净通过，不把该偶发复跑通过称作修复。
+- full release/render nextest 最终复跑 2277/2277，4 skipped（run `90245ddb-30df-43d2-bc7a-aed6d1a67219`）。源码未改的两项复跑 2/2（run `49ed9390-3de4-4f72-89d2-a427bc803d00`）后全量干净通过，不把该偶发复跑通过称作修复。
 - render 和 no-default-features 两种 exact CLI release build 均成功；最终 exact render SHA-256 `e92740a871748d0588e66e8a3473d00eb6cd9aeae7efc2eb8d06550ffe3dc48b`，120453184 bytes。
 - benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e` 在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33。
 - 同一二进制通过官方 Playwright Python 1.60.0 automation smoke，完整协议日志匹配 37-method profile。
@@ -216,7 +216,7 @@ Astra light 首审发现 remove 用 `retain` 时会在 mutex 内 drop 最后一�
 前一 Network ownership 阶段的验证仍保留如下：
 
 - Network review-fix 专项 7/7（run `6fcc6e68-20ae-401a-8e57-ffb86d19736d`）；最终 `obscura-cdp` render 344/344，3 skipped（run `4b1786ae-d695-479d-8979-3cec59c7d1d2`）。
-- full release/render nextest 最终 2232/2232，4 skipped（run `bcc3e519-f32f-4e6a-9d1e-64273d3dd91e`）。首次运行唯一失败为 MCP fixture 连接建立偶发错误；未改源码单项重放 1/1 后全量干净通过。
+- full release/render nextest 最终 2232/2232，4 skipped（run `bcc3e519-f32f-4e6a-9d1e-64273d3dd91e`）。未改源码单项重放 1/1 后全量干净通过。
 - no-render `obscura-cdp` 为 283/289，另有 3 skipped；6 个失败均是该模式既有 `Input.*` render 用例，本切片 Network/Fetch 用例通过。该完整失败日志保留，不把它报告为全绿门禁。
 - render 和 no-default-features 两种 exact CLI release build 均成功；最终 exact render SHA-256 `0ff5bb5716666f830c9e19be63ee9cb3324e82946bc26f11a6f28286a881a0b2`，119562512 bytes。
 - benchmark revision `2340bbb9aea6b8812ff20b7f29113c7c1f9a4b6e`：在 `OBSCURA_PERSONA=windows_chrome145` 下通过 33/33，包括 `observer-intersection`。
@@ -252,9 +252,6 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/private/tmp/ob021-maxlength-full-nextest.log`
 - `/private/tmp/ob021-maxlength-full-nextest-rerun.log`
 - `/private/tmp/ob021-maxlength-full-nextest-final.log`
-- `/private/tmp/ob021-maxlength-mcp-rerun.log`
-- `/private/tmp/ob021-maxlength-mcp-rerun-2.log`
-- `/private/tmp/ob021-maxlength-mcp-rerun-3.log`
 - `/private/tmp/ob021-maxlength-build-no-render-committed-final.log`
 - `/private/tmp/ob021-maxlength-build-render-committed-final.log`
 - `/private/tmp/ob021-maxlength-obstacle-committed-final.log`
@@ -343,7 +340,6 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/tmp/ob021-network-observation-playwright.xICldu/`
 - `/tmp/ob021-network-history-review-fixes.log`
 - `/tmp/ob021-network-history-full-nextest.log`
-- `/tmp/ob021-network-history-mcp-evaluate-rerun.log`
 - `/tmp/ob021-network-history-full-nextest-rerun.log`
 - `/tmp/ob021-network-history-build-no-render.log`
 - `/tmp/ob021-network-history-build-render.log`
@@ -386,8 +382,6 @@ OB-021 和 OB-034 仍然开放。相邻且尚未完成的边界按以下顺序�
 - `/tmp/ob034-disconnect-full-workspace.log`
 - `/tmp/ob034-disconnect-full-workspace-rerun.log`
 - `/tmp/ob034-disconnect-full-workspace-final.log`
-- `/tmp/ob034-mcp-wait-for-selector-replay.log`
-- `/tmp/ob034-mcp-wait-clears-refs-replay.log`
 - `/tmp/ob034-disconnect-build-no-render.log`
 - `/tmp/ob034-disconnect-build-render.log`
 - `/tmp/ob034-disconnect-render-rebuild-after-clean.log`

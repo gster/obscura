@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::network_history::NetworkHistory;
-use obscura_net::{CookieJar, EffectivePersona, ObscuraHttpClient, RobotsCache};
+use obscura_net::{CookieJar, EffectivePersona, ObscuraHttpClient};
 
 #[derive(Clone, Debug)]
 pub struct BrowserContextOptions {
@@ -10,7 +10,6 @@ pub struct BrowserContextOptions {
     pub storage_dir: Option<PathBuf>,
     pub allow_file_access: bool,
     pub allow_private_network: bool,
-    pub obey_robots: bool,
     /// Explicit privacy policy. Enable when tracker blocking is desired.
     pub block_trackers: bool,
 }
@@ -18,7 +17,7 @@ pub struct BrowserContextOptions {
 impl Default for BrowserContextOptions {
     fn default() -> Self {
         Self { proxy_url: None, storage_dir: None, allow_file_access: false,
-            allow_private_network: false, obey_robots: false, block_trackers: false }
+            allow_private_network: false, block_trackers: false }
     }
 }
 
@@ -38,8 +37,6 @@ pub struct BrowserContext {
     pub http_client: Arc<ObscuraHttpClient>,
     persona: Arc<EffectivePersona>,
     pub proxy_url: Option<String>,
-    pub robots_cache: Arc<RobotsCache>,
-    pub obey_robots: bool,
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
     pub allow_private_network: bool,
@@ -95,7 +92,6 @@ impl BrowserContext {
                 storage_dir,
                 allow_file_access: false,
                 allow_private_network,
-                obey_robots: false,
                 block_trackers: false,
             },
         )
@@ -143,7 +139,6 @@ impl BrowserContext {
             storage_dir,
             allow_file_access,
             allow_private_network,
-            obey_robots,
             block_trackers,
         } = options;
         let cookie_jar = Arc::new(CookieJar::new());
@@ -195,8 +190,6 @@ impl BrowserContext {
             http_client: Arc::new(client),
             persona: Arc::new(persona),
             proxy_url,
-            robots_cache: Arc::new(RobotsCache::new()),
-            obey_robots,
             allow_file_access,
             storage_dir,
             allow_private_network,
@@ -305,8 +298,6 @@ impl BrowserContext {
             http_client: Arc::new(client),
             persona: Arc::new(persona),
             proxy_url: self.proxy_url.clone(),
-            robots_cache: Arc::new(RobotsCache::new()),
-            obey_robots: self.obey_robots,
             allow_file_access: self.allow_file_access,
             storage_dir,
             allow_private_network: self.allow_private_network,

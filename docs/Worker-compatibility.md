@@ -21,6 +21,6 @@
 cargo nextest run --locked --release --features render -p obscura-js -E 'test(worker)'
 ```
 
-涉及身份或传输的改动必须运行强制 primp 路径；单纯构建或普通 HTTP fixture 不证明 TLS 行为。Web Worker 与批量抓取的 `obscura-worker` 可执行文件是不同概念，产品裁剪不能混删。任务见 OB-038。
+涉及身份或传输的改动必须运行强制 primp 路径；单纯构建或普通 HTTP fixture 不证明 TLS 行为。页面 Web Worker 的行为仍需独立验证。任务见 OB-038。
 
 Southwest 固定输入回放和现场结果是不同验收；通用 Worker 测试通过不解释 shopping 403。历史实验的限制见 [Southwest 摘要](Southwest-handoff.md)。

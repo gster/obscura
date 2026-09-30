@@ -9,19 +9,14 @@ repository.workspace = true
 name = "obscura"
 path = "src/main.rs"
 
-[[bin]]
-name = "obscura-worker"
-path = "src/worker.rs"
-
 [features]
 default = []
 # Compatibility alias for existing build commands. Stealth is always enabled.
 stealth = []
-render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
+render = ["obscura-browser/render", "obscura-cdp/render"]
 
 [dependencies]
 obscura-browser = { workspace = true }
-obscura-mcp = { workspace = true }
 obscura-cdp = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }

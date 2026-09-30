@@ -7,7 +7,7 @@
 本次以 `07c7b8cb27922d5bb5245a03fa056e8060e876fa` 为最终实施基线，完成以下收敛：
 
 - `obscura-net` 成为唯一权威 persona 模块。版本化 `PersonaSpec`、内置预设和外部 JSON 经同一流程编译为私有、不可变、带稳定摘要的 `EffectivePersona`。
-- CLI、CDP、MCP、Rust facade、scrape worker、页面、frame、Worker、module loader 和网络入口均显式消费同一 persona 快照；缺失配置不再选隐式默认身份。
+- CLI、CDP、Rust facade、页面、frame、Worker、module loader 和网络入口均显式消费同一 persona 快照；缺失配置不再选隐式默认身份。
 - BrowserContext 创建后不能逐字段修改身份；UA 和身份 header override 继续 fail closed。CDP 新 context 可继承启动快照，也可通过 `obscuraPersona` 注入新快照，并由 `Browser.getPersona` 读取摘要。
 - 进程级时区与 ICU 主语言在首个产品入口启动前冻结；同进程冲突组合在 context 注册或 V8 启动前拒绝。其他 persona 字段仍可按 context 隔离。
 - proxy、SSRF、cookie/storage 持久化和 tracker blocking 保持在会话或隐私策略中，不混入 persona。旧 runtime/SDK 未新增功能，相关包装已按 OB-006 删除。
@@ -57,7 +57,7 @@
 | --- | --- | --- |
 | 传输基线 | 根产品路径已迁移到强制 primp；旧 stealth feature 为兼容用途 | 保留现有成果，禁止恢复可选传输分支 |
 | persona 构造 | 有 `with_persona_profile`，其余便捷构造器仍隐式使用默认 profile | 所有可用 context 构造要求完整 persona |
-| 根产品入口 | CLI/CDP/MCP/Rust facade 未接入 persona 构造器 | 统一必填、解析、校验与传递 |
+| 根产品入口 | CLI/CDP/Rust facade 未接入 persona 构造器 | 统一必填、解析、校验与传递 |
 | 独立 runtime（历史 C） | 已有独立 Persona 类型和生产调用，但构造后仍补写身份字段 | 历史迁移项；现行入口使用同一冻结快照 |
 | 旧 profile 表 | 根 crates 中 select_profile 无生产调用者 | 删除失效选择机制，不能重新作为第二个默认来源 |
 | 身份可变性 | UA/platform/language/WebGL 等字段公开可写 | 私有化 persona，移除重复可写字段 |
@@ -73,8 +73,6 @@
 - `crates/obscura-cli/src/main.rs:712`：fetch context。
 - `crates/obscura-cdp/src/server.rs:311`：serve 模板 context。
 - `crates/obscura-cdp/src/dispatch.rs:208`：独立 CdpContext 初始化。
-- `crates/obscura-cli/src/worker.rs:57`：scrape worker。
-- `crates/obscura-mcp/src/lib.rs:83`：MCP。
 - `crates/obscura/src/browser.rs:27,35`：Rust facade。
 - `runtime/src/browser.rs:6509`：历史独立 runtime 的 persona 生产调用（已删除路径）。
 
@@ -138,8 +136,6 @@ Context 私有持有不可变快照，各身份字段只读；初始化身份不
 | --- | --- |
 | CLI fetch / original / 辅助出站请求 | 共用已配置的 context 网络身份；无需 DOM 的请求不必创建 JS |
 | serve | persona 校验与模板 context 创建在对外就绪之前完成 |
-| scrape / 独立 worker | 初始化消息携带完整快照，worker 校验后才能接受任务；不按自己的环境再次选预设 |
-| MCP | context 初始化必配；所有 tab 继承 |
 | Rust facade / 嵌入 | 创建接口必须传 persona；无便捷默认旁路 |
 | 独立 runtime / 现有 Python 包装（历史） | 删除前通过共享协议适配；迁出已有校验和行为测试 |
 | frame / popup / 浏览器 worker / 新导航 | 使用所属 context 的冻结快照 |
@@ -179,7 +175,7 @@ Browser 级版本与不同 context persona 的兼容范围需要客户端实测�
 | P1 协议与校验 | 迁出历史独立 runtime 有价值逻辑，建立协议、预设、外部注入与能力检查；映射 OB-014/015 | 非内置名称 persona 通过同一流程；非法配置创建前拒绝 |
 | P2 核心收敛 | 必填构造器、私有快照、移除 net/JS 默认身份、取消构造后补写 | 不能无 persona 创建可用 context，不能分别写身份字段 |
 | P3 一致投影 | 网络、JS、frame/worker、时区、screen/字体/渲染；映射 OB-016 | 首个请求与脚本正确；并存 context 不互相污染 |
-| P4 入口和协议 | CLI/MCP/facade/worker/CDP 创建与诊断；映射 OB-003/004/005/006/031/044 | 每个存续入口必配，特殊请求路径与派生规则一致 |
+| P4 入口和协议 | CLI/facade/worker/CDP 创建与诊断；映射 OB-004/005/006/031/044 | 每个存续入口必配，特殊请求路径与派生规则一致 |
 | P5 清理与资格 | 删除失效选择器，迁移旧参数、示例和 harness；完成回归 | 文档与实际支持匹配，全部必要门禁通过 |
 
 本轮已按 P1 至 P5 接通共享协议、核心冻结、投影和存续入口。其他分支成果仅在确定范围并审核后复用，没有把未审查的 worktree 修改自动纳入；Python SDK/private runtime 删除已由 OB-006 单独完成。
@@ -190,7 +186,7 @@ Browser 级版本与不同 context persona 的兼容范围需要客户端实测�
 2. 注入：内置预设与非内置名称外部配置使用同一验证和投影；未知 schema/transport/capability 不静默降级。
 3. 冻结：创建后改变文件、注册表或环境变量，既有 context 不变化。已传入对象不能被外部引用修改。
 4. 隔离：A/B 不同 persona 交替导航、创建 frame/worker，输出不串用；进程不支持的组合在创建前拒绝或进入已验证隔离路径。
-5. 继承：新页面、popup、frame、worker、重导航、isolated_copy 与 scrape 子进程保持相同配置摘要及对应行为。
+5. 继承：新页面、popup、frame、worker、重导航与 isolated_copy保持相同配置摘要及对应行为。
 6. 网络实证：本地 HTTP 服务记录最终请求头，TLS fixture 检查所选档案；JS 同时采集 UA/UA-CH、locale/timezone、screen/DPR、WebGL 等。TLS 扩展集合相等不是完整指纹相同的证明。
 7. 禁止绕过：旧构造、UA/header 覆盖、拦截修改、CDP 设备模拟、original、历史独立 runtime 迁移路径和模块请求均覆盖。
 8. 浏览器行为回归：请求方法、跨域凭据与 CORS、session 隔离、输入、布局和绘制；对实际改动路径使用 C 的既有测试并补必要 fixture。其他分支的测试只有明确复用时才纳入，不能假定都已在 C。

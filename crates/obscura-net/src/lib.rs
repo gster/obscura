@@ -8,7 +8,6 @@ pub use headers::{HeaderCapture, RawHeader};
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
-pub mod robots;
 pub mod blocklist;
 pub mod network_activity;
 pub mod stealth_client;
@@ -26,7 +25,6 @@ pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,
     url_encode_query,
 };
-pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
 pub use network_activity::{NetworkActivityGuard, NetworkActivitySnapshot, NetworkActivityTracker};
 pub use stealth_client::{
