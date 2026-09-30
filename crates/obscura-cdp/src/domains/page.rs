@@ -995,6 +995,14 @@ fn network_request_value(
     Value::Object(request)
 }
 
+fn page_event_sessions(ctx: &CdpContext, page_id: &str, session_id: &Option<String>) -> Vec<Option<String>> {
+    let mut sessions = ctx.page_sessions_for_page(page_id).into_iter().map(Some).collect::<Vec<_>>();
+    if session_id.is_none() {
+        sessions.push(None);
+    }
+    sessions
+}
+
 pub fn emit_navigation_events(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
@@ -1032,6 +1040,7 @@ pub fn emit_navigation_events(
         .insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
     let es = session_id.clone();
+    let page_sessions = page_event_sessions(ctx, page_id, session_id);
     let lifecycle_sessions = ctx.lifecycle_sessions_for_page(page_id);
     let ts = timestamp();
 
@@ -1119,11 +1128,13 @@ pub fn emit_navigation_events(
             runtime_session.clone(),
         ));
     }
-    phase1.push(CdpEvent {
-        method: "Page.frameNavigated".into(),
-        params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
-        session_id: es.clone(),
-    });
+    for session in &page_sessions {
+        phase1.push(CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
+            session_id: session.clone(),
+        });
+    }
     for runtime_session in runtime_sessions {
         for context in &contexts {
             phase1.push(super::runtime::execution_context_created_event(
@@ -1226,11 +1237,13 @@ pub fn emit_navigation_events(
                 session.clone(),
             ));
         }
-        phase3.push(CdpEvent {
-            method: "Page.domContentEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        });
+        for session in &page_sessions {
+            phase3.push(CdpEvent {
+                method: "Page.domContentEventFired".into(),
+                params: json!({"timestamp": ts}),
+                session_id: session.clone(),
+            });
+        }
     }
     // DCL-returning navigations preserve the historical CDP completion
     // projection for clients that wait on the Page domain. A timeout while
@@ -1243,11 +1256,13 @@ pub fn emit_navigation_events(
                 session.clone(),
             ));
         }
-        phase3.push(CdpEvent {
-        method: "Page.loadEventFired".into(),
-        params: json!({"timestamp": ts}),
-        session_id: es.clone(),
-        });
+        for session in &page_sessions {
+            phase3.push(CdpEvent {
+                method: "Page.loadEventFired".into(),
+                params: json!({"timestamp": ts}),
+                session_id: session.clone(),
+            });
+        }
     }
     if lifecycle.is_network_almost_idle() {
         let idle_ts = timestamp();
@@ -1269,11 +1284,13 @@ pub fn emit_navigation_events(
             ));
         }
     }
-    phase3.push(CdpEvent {
-        method: "Page.frameStoppedLoading".into(),
-        params: json!({"frameId": frame_id}),
-        session_id: es,
-    });
+    for session in page_sessions {
+        phase3.push(CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame_id}),
+            session_id: session,
+        });
+    }
     ctx.pending_events.extend(phase3);
     register_network_idle_candidate(
         ctx,
@@ -1624,26 +1641,12 @@ pub(crate) fn emit_aborted_navigation_events(
         &projected,
         Some(loader_id),
     );
-    let mut stopped_sessions = ctx.lifecycle_sessions_for_page(page_id);
-    if let Some(session) = session_id {
-        if !stopped_sessions.contains(session) {
-            stopped_sessions.push(session.clone());
-        }
-    }
-    if stopped_sessions.is_empty() {
+    for session in page_event_sessions(ctx, page_id, session_id) {
         ctx.pending_events.push(CdpEvent {
             method: "Page.frameStoppedLoading".into(),
             params: json!({"frameId": frame_id}),
-            session_id: None,
+            session_id: session,
         });
-    } else {
-        for session in stopped_sessions {
-            ctx.pending_events.push(CdpEvent::with_session(
-                "Page.frameStoppedLoading",
-                json!({"frameId": frame_id}),
-                session,
-            ));
-        }
     }
 }
 
@@ -1655,9 +1658,11 @@ pub(crate) async fn emit_pending_action_navigation(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<bool, String> {
-    let (previous_document, outcome) = {
+    let (previous_document, same_document_navigation, outcome) = {
         let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
         let previous_document = page.document_identity();
+        let same_document_navigation = page.js.as_ref()
+            .and_then(|js| js.same_document_navigation_kind());
         let outcome = match page.process_pending_navigation().await {
             Ok(false) => return Ok(false),
             Ok(true) => None,
@@ -1666,7 +1671,7 @@ pub(crate) async fn emit_pending_action_navigation(
             }
             Err(error) => return Err(error.to_string()),
         };
-        (previous_document, outcome)
+        (previous_document, same_document_navigation, outcome)
     };
     let (frame_id, current_url, page_id, network_events, lifecycle, current_document) = {
         let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
@@ -1684,18 +1689,9 @@ pub(crate) async fn emit_pending_action_navigation(
         emit_runtime_network_events(
             ctx, session_id, &frame_id, &current_url, &page_id, &network_events,
         );
-        let loader_id = ctx.current_loader_ids.get(&page_id).cloned()
-            .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-        ctx.pending_events.push(CdpEvent {
-            method: "Page.frameNavigated".into(),
-            params: json!({
-                "frame": frame_value(
-                    &frame_id, None, &loader_id, &current_url, "text/html",
-                ),
-                "type": "Navigation",
-            }),
-            session_id: session_id.clone(),
-        });
+        if let Some(kind) = same_document_navigation {
+            emit_same_document_navigation(ctx, session_id, &page_id, &frame_id, &current_url, kind);
+        }
         return Ok(true);
     }
     let attempted_url = network_events.iter().rev().find_map(|event| {
@@ -1714,6 +1710,27 @@ pub(crate) async fn emit_pending_action_navigation(
         );
     }
     Ok(true)
+}
+
+fn emit_same_document_navigation(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    page_id: &str,
+    frame_id: &str,
+    url: &str,
+    kind: obscura_js::ops::SameDocumentNavigation,
+) {
+    let navigation_type = match kind {
+        obscura_js::ops::SameDocumentNavigation::Fragment => "fragment",
+        obscura_js::ops::SameDocumentNavigation::HistoryApi => "historyApi",
+    };
+    for session in page_event_sessions(ctx, page_id, session_id) {
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.navigatedWithinDocument".into(),
+            params: json!({"frameId": frame_id, "url": url, "navigationType": navigation_type}),
+            session_id: session,
+        });
+    }
 }
 
 fn network_response_value(event: &obscura_browser::NetworkEvent) -> Value {
@@ -1963,6 +1980,12 @@ pub async fn handle(
             {
                 return Err("Page.enable supports only empty params".to_string());
             }
+            if let Some(session) = session_id {
+                if !ctx.sessions.contains_key(session) {
+                    return Err("No page for session".to_string());
+                }
+                ctx.page_enabled_sessions.insert(session.clone());
+            }
             // Chrome loads a new target's initial about:blank right after
             // createTarget, so by the time a client attaches and calls
             // Page.enable the page has already produced its load events.
@@ -1999,6 +2022,18 @@ pub async fn handle(
                     CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id, "timestamp": ts}), session_id: es },
                 ];
                 ctx.pending_events.extend(events);
+            }
+            Ok(json!({}))
+        }
+        "disable" => {
+            if !(params.is_null()
+                || params.as_object().is_some_and(serde_json::Map::is_empty))
+            {
+                return Err("Page.disable supports only empty params".to_string());
+            }
+            if let Some(session) = session_id {
+                ctx.page_enabled_sessions.remove(session);
+                ctx.lifecycle_enabled_sessions.remove(session);
             }
             Ok(json!({}))
         }
@@ -2547,6 +2582,113 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_navigation_events_follow_page_session_subscriptions() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let other_page = ctx.create_page();
+        let owner = Some("owner".to_string());
+        let observer = Some("observer".to_string());
+        let lifecycle_only = Some("lifecycle-only".to_string());
+        let other = Some("other-page".to_string());
+        for session in [&owner, &observer, &lifecycle_only] {
+            ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        }
+        ctx.sessions.insert(other.clone().unwrap(), other_page);
+        for session in [&owner, &observer, &other] {
+            handle("enable", &json!({}), &mut ctx, session).await.unwrap();
+        }
+        handle("setLifecycleEventsEnabled", &json!({"enabled":true}), &mut ctx, &lifecycle_only).await.unwrap();
+        handle("setLifecycleEventsEnabled", &json!({"enabled":true}), &mut ctx, &observer).await.unwrap();
+        ctx.pending_events.clear();
+        let emit = |ctx: &mut CdpContext| {
+            emit_navigation_events(ctx, &owner, "main-frame", "document-loader", "https://example.test/",
+                &page_id, &[], LifecycleState::Loaded);
+        };
+        emit(&mut ctx);
+        let methods = ["Page.frameNavigated", "Page.domContentEventFired", "Page.loadEventFired", "Page.frameStoppedLoading"];
+        for session in [&owner, &observer] {
+            let events = ctx.pending_events.iter().filter(|event| event.session_id == *session
+                && methods.contains(&event.method.as_str())).collect::<Vec<_>>();
+            assert_eq!(events.iter().map(|event| event.method.as_str()).collect::<Vec<_>>(), methods);
+            assert_eq!(events[0].params["frame"]["loaderId"], "document-loader");
+        }
+        assert!(!ctx.pending_events.iter().any(|event| event.session_id == other));
+        assert!(!ctx.pending_events.iter().any(|event| event.session_id == lifecycle_only
+            && methods.contains(&event.method.as_str())));
+
+        handle("disable", &json!({}), &mut ctx, &observer).await.unwrap();
+        assert!(!ctx.lifecycle_enabled_sessions.contains("observer"));
+        ctx.pending_events.clear();
+        emit(&mut ctx);
+        assert!(!ctx.pending_events.iter().any(|event| event.session_id == observer));
+        handle("disable", &json!({}), &mut ctx, &owner).await.unwrap();
+        ctx.pending_events.clear();
+        emit(&mut ctx);
+        assert!(!ctx.pending_events.iter().any(|event| methods.contains(&event.method.as_str())));
+
+        handle("enable", &json!({}), &mut ctx, &observer).await.unwrap();
+        handle("enable", &json!({}), &mut ctx, &observer).await.unwrap();
+        ctx.pending_events.clear();
+        emit(&mut ctx);
+        assert_eq!(ctx.pending_events.iter().filter(|event| event.method == "Page.frameNavigated").count(), 1);
+        assert!(!ctx.pending_events.iter().any(|event| event.session_id == observer && event.method == "Page.lifecycleEvent"));
+        crate::domains::target::handle("detachFromTarget", &json!({"sessionId":"observer"}), &mut ctx, &None).await.unwrap();
+        assert!(!ctx.page_enabled_sessions.contains("observer"));
+        handle("enable", &json!({}), &mut ctx, &owner).await.unwrap();
+        assert!(ctx.page_enabled_sessions.contains("owner"));
+        ctx.remove_page(&page_id);
+        assert!(!ctx.page_enabled_sessions.contains("owner"));
+        assert_eq!(ctx.page_sessions_for_page(&page_id), Vec::<String>::new());
+        assert!(ctx.page_enabled_sessions.contains("other-page"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_navigation_stopped_events_reach_only_page_subscribers() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        let owner = Some("disabled-owner".to_string());
+        let observer = Some("page-observer".to_string());
+        let lifecycle_only = Some("lifecycle-only".to_string());
+        for session in [&owner, &observer, &lifecycle_only] {
+            ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        }
+        handle("enable", &json!({}), &mut ctx, &observer).await.unwrap();
+        handle("setLifecycleEventsEnabled", &json!({"enabled":true}), &mut ctx, &lifecycle_only).await.unwrap();
+        ctx.pending_events.clear();
+        emit_aborted_navigation_events(&mut ctx, &owner, "frame", "attempt", "https://example.test/no-content",
+            &page_id, &[], "net::ERR_ABORTED");
+        let events = ctx.pending_events.iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "Page.frameStoppedLoading");
+        assert_eq!(events[0].session_id, observer);
+    }
+
+    #[test]
+    fn direct_navigation_events_keep_the_unattached_embedder_projection() {
+        let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+            obscura_net::StealthProfile::WindowsChrome145,
+        ));
+        let page_id = ctx.create_page();
+        emit_navigation_events(&mut ctx, &None, "frame", "loader", "about:blank",
+            &page_id, &[], LifecycleState::Loaded);
+        let events = ctx.pending_events.iter().filter(|event| event.method.starts_with("Page.")).collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|event| event.session_id.is_none()));
+        ctx.pending_events.clear();
+        emit_same_document_navigation(&mut ctx, &None, &page_id, "frame", "about:blank#next",
+            obscura_js::ops::SameDocumentNavigation::Fragment);
+        let events = ctx.pending_events.iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "Page.navigatedWithinDocument");
+        assert_eq!(events[0].params["navigationType"], "fragment");
+        assert!(events[0].session_id.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn loaded_navigation_emits_network_idle_only_after_quiet_window() {
         let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
             obscura_net::StealthProfile::WindowsChrome145,
@@ -2818,6 +2960,8 @@ mod tests {
         let observer = format!("{page_id}-observer");
         ctx.sessions.insert(observer.clone(), page_id.clone());
         ctx.lifecycle_enabled_sessions.insert(observer.clone());
+        handle("enable", &json!({}), &mut ctx, &session).await.unwrap();
+        handle("enable", &json!({}), &mut ctx, &Some(observer.clone())).await.unwrap();
         enable_network(&mut ctx, &session);
         ctx.get_page_mut(&page_id).unwrap()
             .navigate("data:text/html,<title>old</title>")
@@ -2920,6 +3064,7 @@ mod tests {
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        handle("enable", &json!({}), &mut ctx, &session).await.unwrap();
         enable_network(&mut ctx, &session);
         let old_url = format!("http://{address}/old");
         let current_url = format!("http://{address}/current");
@@ -3001,6 +3146,7 @@ mod tests {
         let session = format!("{page_id}-session");
         ctx.sessions.insert(session.clone(), page_id.clone());
         ctx.runtime_enabled_sessions.insert(session.clone());
+        ctx.page_enabled_sessions.insert(session.clone());
         ctx.lifecycle_enabled_sessions.insert(session.clone());
         ctx.ensure_default_context(&page_id).unwrap();
         handle(
@@ -3562,6 +3708,8 @@ mod tests {
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        handle("enable", &json!({}), &mut ctx, &session).await.unwrap();
+        ctx.pending_events.clear();
         enable_network(&mut ctx, &session);
         ctx.current_loader_ids.insert(page_id.clone(), "loader-old".into());
         let page = ctx.get_page_mut(&page_id).unwrap();

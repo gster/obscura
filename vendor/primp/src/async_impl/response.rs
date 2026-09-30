@@ -72,6 +72,16 @@ impl Response {
         self.res.headers()
     }
 
+    /// Original parsed fields of a response carrying `Content-Encoding`, before
+    /// automatic decompression. This preserves the encoded `Content-Length` for
+    /// browser consumers while [`Response::headers`] keeps its decoded-body view.
+    /// Returns `None` for unencoded responses and externally constructed responses.
+    /// Field names are normalized; this is not a capture of wire ordering or bytes.
+    pub fn encoded_headers(&self) -> Option<&HeaderMap> {
+        self.res.extensions().get::<super::encoded_headers::EncodedHeaders>()
+            .map(|headers| &headers.0)
+    }
+
     /// Get a mutable reference to the `Headers` of this `Response`.
     #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {

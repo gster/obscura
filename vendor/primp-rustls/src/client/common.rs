@@ -37,6 +37,7 @@ impl<'a> ServerCertDetails<'a> {
 pub(super) struct ClientHelloDetails {
     pub(super) alpn_protocols: Vec<ProtocolName>,
     pub(super) sent_extensions: Vec<ExtensionType>,
+    pub(super) server_padding_request: Option<u16>,
     pub(super) extension_order_seed: u16,
     pub(super) offered_cert_compression: bool,
     pub(super) offered_cipher_suites: Vec<CipherSuite>,
@@ -47,6 +48,7 @@ impl ClientHelloDetails {
         Self {
             alpn_protocols,
             sent_extensions: Vec::new(),
+            server_padding_request: None,
             extension_order_seed,
             offered_cert_compression: false,
             offered_cipher_suites: Vec::new(),

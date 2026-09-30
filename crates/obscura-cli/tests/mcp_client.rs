@@ -46,6 +46,8 @@ impl TestPageServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // macOS can inherit the listener's nonblocking mode.
+                        stream.set_nonblocking(false).expect("blocking fixture stream");
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = Vec::new();
                         let mut chunk = [0u8; 2048];
@@ -91,6 +93,22 @@ impl Drop for TestPageServer {
     }
 }
 
+#[test]
+fn test_local_fixture_waits_for_delayed_request_headers() {
+    let server = TestPageServer::spawn();
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let mut bytes = [0; 4096];
+    let error = stream.read(&mut bytes).expect_err("fixture must not respond before request headers");
+    assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: fixture\r\n\r\n").unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with(TEST_PAGE));
+}
+
 struct SlowQueuedNavigationServer {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -110,6 +128,7 @@ impl SlowQueuedNavigationServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking fixture stream");
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = Vec::new();
                         let mut chunk = [0u8; 2048];
@@ -185,6 +204,7 @@ impl SameUrlReloadServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking fixture stream");
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = Vec::new();
                         let mut chunk = [0u8; 2048];
@@ -467,7 +487,8 @@ fn test_navigate_and_snapshot() {
 fn test_evaluate() {
     let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    let navigation = c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    assert!(navigation["result"]["isError"].is_null(), "navigate failed: {navigation}");
 
     let resp = c.tool(
         "browser_evaluate",
@@ -530,7 +551,8 @@ fn test_wait_drives_timer_and_queued_navigation() {
 fn test_wait_for_selector() {
     let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    let navigation = c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    assert!(navigation["result"]["isError"].is_null(), "navigate failed: {navigation}");
 
     let resp = c.tool(
         "browser_wait_for",

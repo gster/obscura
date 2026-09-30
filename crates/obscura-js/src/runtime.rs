@@ -1804,8 +1804,9 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 13] = [
+        const IDENTITY_GLOBALS: [&str; 14] = [
             "__obscura_ua",
+            "__obscura_ua_brands",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
@@ -2377,7 +2378,7 @@ impl ObscuraJsRuntime {
             .pending_navigation
             .as_ref()
             .map(|navigation| navigation.url.clone())
-            .or_else(|| state.same_document_navigation.then(|| state.url.clone()))
+            .or_else(|| state.same_document_navigation.map(|_| state.url.clone()))
     }
 
     pub fn resolve_blob(&mut self, url: &str) -> Option<(Vec<u8>, String)> {
@@ -2454,7 +2455,13 @@ impl ObscuraJsRuntime {
 
     pub fn take_same_document_navigation(&self) -> Option<String> {
         let mut state = self.state.borrow_mut();
-        std::mem::take(&mut state.same_document_navigation).then(|| state.url.clone())
+        state.same_document_navigation.take().map(|_| state.url.clone())
+    }
+
+    /// The native navigation source, before the browser adopts its URL.
+    /// A fragment in a pushState URL does not make it a fragment navigation.
+    pub fn same_document_navigation_kind(&self) -> Option<crate::ops::SameDocumentNavigation> {
+        self.state.borrow().same_document_navigation
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
@@ -2673,9 +2680,14 @@ impl ObscuraJsRuntime {
     }
 
     pub(crate) fn set_user_agent(&mut self, ua: &str) {
+        let major = ua.split_once("Chrome/").map(|(_, tail)| {
+            tail.chars().take_while(char::is_ascii_digit).collect::<String>()
+        }).and_then(|digits| digits.parse().ok()).unwrap_or(145);
+        let brands = self.state.borrow().persona.browser_flavor().brands(major);
         let _ = self.execute_runtime_script(
             "<set-ua>",
-            format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
+            format!("globalThis.__obscura_ua={};globalThis.__obscura_ua_brands={};",
+                js_string_literal(ua), serde_json::to_string(&brands).expect("persona brands")),
         );
     }
 
@@ -3794,7 +3806,7 @@ impl ObscuraJsRuntime {
 
     pub fn has_pending_navigation(&self) -> bool {
         let state = self.state.borrow();
-        state.pending_navigation.is_some() || state.same_document_navigation
+        state.pending_navigation.is_some() || state.same_document_navigation.is_some()
     }
 
     #[cfg(feature = "render")]
@@ -4461,7 +4473,7 @@ impl ObscuraJsRuntime {
                         state.pending_navigation = Some(crate::ops::PendingNavigation {
                             url, method: "GET".into(), body: String::new(), request, history: crate::ops::HistoryNavigation::Push,
                         });
-                        state.same_document_navigation = false;
+                        state.same_document_navigation = None;
                     }
                     self.native_input_checkpoint_with_epoch(input_document_epoch)?;
                     return Ok(allowed);
@@ -11555,7 +11567,7 @@ return {before,removed,reinsert,moved,cleared};
         // GREASE brand name/version and the brand order from the major version,
         // so navigator.userAgentData.brands must reproduce the same brands in
         // the same order. Chrome 146 is deliberately absent: that build ships
-        // only two brands, which this deriver does not model.
+        // only two brands; Chromium branding is covered separately below.
         let cases: [(u32, &[(&str, &str)]); 8] = [
             (145, &[("Not:A-Brand", "99"), ("Google Chrome", "145"), ("Chromium", "145")]),
             (147, &[("Google Chrome", "147"), ("Not.A/Brand", "8"), ("Chromium", "147")]),
@@ -11582,6 +11594,59 @@ return {before,removed,reinsert,moved,cleared};
             );
             assert_eq!(actual, expected, "brands mismatch for Chrome {major}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_flavor_brands_and_full_version_list_are_consistent() {
+        for flavor in [obscura_net::BrowserFlavor::Chrome, obscura_net::BrowserFlavor::Chromium] {
+            let mut spec = obscura_net::PersonaSpec::preset(obscura_net::StealthProfile::MacChrome153);
+            spec.browser_flavor = flavor;
+            let persona = spec.compile().unwrap();
+            let expected = serde_json::to_value(flavor.brands(153)).unwrap();
+            let mut rt = ObscuraJsRuntime::new(persona.clone());
+            rt.set_url("https://example.com/");
+            rt.set_dom(parse_html("<html><body></body></html>"));
+            rt.run_page_init();
+            assert_eq!(rt.evaluate("navigator.userAgentData.brands").unwrap(), expected);
+            assert_eq!(rt.evaluate("navigator.userAgentData.toJSON().brands").unwrap(), expected);
+            rt.execute_script("brand-copy", "var copy=navigator.userAgentData.brands;copy[0].brand='changed';copy.pop();globalThis.__entropy=null;navigator.userAgentData.getHighEntropyValues(['fullVersionList','uaFullVersion']).then(x=>__entropy=x);").unwrap();
+            rt.run_event_loop_bounded(100).await.unwrap();
+            assert_eq!(rt.evaluate("navigator.userAgentData.brands").unwrap(), expected);
+            let full = expected.as_array().unwrap().iter().map(|b| serde_json::json!({
+                "brand": b["brand"],
+                "version": if b["brand"] == "Chromium" || b["brand"] == "Google Chrome" { persona.full_version().to_string() } else { format!("{}.0.0.0", b["version"].as_str().unwrap()) },
+            })).collect::<Vec<_>>();
+            assert_eq!(rt.evaluate("__entropy.fullVersionList").unwrap(), serde_json::json!(full));
+            assert_eq!(rt.evaluate("__entropy.uaFullVersion").unwrap(), persona.full_version());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_flavor_worker_inherits_low_and_high_entropy_brands() {
+        let mut spec = obscura_net::PersonaSpec::preset(obscura_net::StealthProfile::MacChrome153);
+        spec.browser_flavor = obscura_net::BrowserFlavor::Chromium;
+        let persona = spec.compile().unwrap();
+        let mut rt = ObscuraJsRuntime::new(persona.clone());
+        rt.set_url("https://example.com/");
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+        rt.execute_script("worker-brands", r#"
+            globalThis.__workerIdentity=null;
+            const url=URL.createObjectURL(new Blob([
+                "navigator.userAgentData.getHighEntropyValues(['fullVersionList']).then(x=>postMessage(x));"
+            ],{type:'application/javascript'}));
+            const worker=new Worker(url);
+            worker.onmessage=e=>{__workerIdentity=e.data;worker.terminate();URL.revokeObjectURL(url);};
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("__workerIdentity.brands").unwrap(), serde_json::to_value(persona.browser_flavor().brands(153)).unwrap());
+        assert_eq!(rt.evaluate("__workerIdentity.fullVersionList").unwrap(), serde_json::json!([
+            {"brand":"Chromium","version":persona.full_version()},
+            {"brand":"Not_A Brand","version":"8.0.0.0"},
+        ]));
+        let chrome = obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::MacChrome153);
+        let client = std::sync::Arc::new(obscura_net::StealthHttpClient::new(std::sync::Arc::new(obscura_net::CookieJar::new()), &chrome));
+        assert!(rt.set_stealth_client(client).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -25401,6 +25466,188 @@ return {before,removed,reinsert,moved,cleared};
                 { "path": "/request-params-headers", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
             ])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic_script_priority_snapshots_dynamic_attributes_and_ordering() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const original = Deno.core.ops.op_fetch_url;
+            const calls = [];
+            try {
+                Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, options) => {
+                    calls.push(JSON.parse(options));
+                    return JSON.stringify({status:200,headers:{},body:'',url});
+                };
+                const values = [];
+                for (const ordered of [false,true]) {
+                    for (const hint of ['auto','HIGH','low']) {
+                        const script = document.createElement('script');
+                        script.async = !ordered;
+                        script.fetchPriority = hint;
+                        values.push(script.fetchPriority);
+                        script.src = '/ordinary-'+calls.length+'.js';
+                        document.head.appendChild(script);
+                        script.fetchPriority = 'low';
+                        script.setAttribute('blocking','render');
+                    }
+                }
+                for (const blocking of ['not-render','render\tunknown']) {
+                    const script = document.createElement('script');
+                    script.setAttribute('blocking',blocking);
+                    script.fetchPriority = 'low';
+                    script.src = '/blocking-'+calls.length+'.js';
+                    document.head.appendChild(script);
+                    script.removeAttribute('blocking');
+                }
+                await Promise.resolve();
+                return {values,calls};
+            } finally { Deno.core.ops.op_fetch_url = original; }
+        }"#, None, &[], true, true).await.unwrap();
+        let value = result.value.unwrap();
+        assert_eq!(value["values"], serde_json::json!(["auto","high","low","auto","high","low"]));
+        let calls = value["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 8);
+        for (index, call) in calls.iter().enumerate() {
+            assert_eq!(call["destination"], "script");
+            assert_eq!(call["scriptPriority"]["fetchPriority"], ["auto","HIGH","low","auto","HIGH","low","low","low"][index]);
+            assert_eq!(call["scriptPriority"]["renderBlocking"], index == 7);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_body_extraction_preserves_null_inheritance_and_mime() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const calls = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, options) => {
+                        const fields = JSON.parse(headers);
+                        const mime = Object.entries(fields).find(([name]) => name.toLowerCase() === 'content-type');
+                        calls.push({present: JSON.parse(options).bodyPresent, bytes: Array.from(body), mime: mime ? mime[1] : null});
+                        return JSON.stringify({status:200,headers:{},body:'ok',url});
+                    };
+                    const r = new Request('/fixture', {method:'POST',body:'é'});
+                    const requestMime = r.headers.get('content-type');
+                    await fetch(r, {body:null});
+                    await fetch(r, {body:null,headers:{}});
+                    await fetch(new Request(r, {body:null,headers:{}}));
+                    await fetch(r, {body:'',headers:{}});
+                    await fetch('/fixture', {method:'POST',body:'',headers:{'Content-Type':'application/custom'}});
+                    await fetch('/fixture', {method:'POST',body:null});
+                    const source = new Uint8Array([0,128,255]);
+                    const binary = new Request('/fixture', {method:'POST',body:source});
+                    source[0] = 99;
+                    await fetch(binary.clone());
+                    let getterReads = 0;
+                    const inherited = new Request('/fixture', {method:'POST'});
+                    const getter = new Request(inherited, {get body() {
+                        if (++getterReads > 1) throw new Error('body read twice');
+                        return 'ordinary';
+                    }});
+                    await fetch(getter);
+                    return {requestMime,getterReads,calls};
+                } finally { Deno.core.ops.op_fetch_url = originalFetchOp; }
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "requestMime":"text/plain;charset=UTF-8",
+            "getterReads":1,
+            "calls":[
+                {"present":true,"bytes":[195,169],"mime":"text/plain;charset=UTF-8"},
+                {"present":true,"bytes":[195,169],"mime":null},
+                {"present":true,"bytes":[195,169],"mime":null},
+                {"present":true,"bytes":[],"mime":"text/plain;charset=UTF-8"},
+                {"present":true,"bytes":[],"mime":"application/custom"},
+                {"present":false,"bytes":[],"mime":null},
+                {"present":true,"bytes":[0,128,255],"mime":null},
+                {"present":true,"bytes":[111,114,100,105,110,97,114,121],"mime":"text/plain;charset=UTF-8"},
+            ]
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_body_get_head_reject_fetch_but_xhr_discards() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const calls = [], errors = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, options) => {
+                        calls.push({method,present:JSON.parse(options).bodyPresent,size:body.byteLength});
+                        return JSON.stringify({status:200,headers:{},body:'ok',url});
+                    };
+                    for (const method of ['GET','HEAD','get','hEaD']) {
+                        for (const body of ['', 'ordinary']) {
+                            try { await fetch('/fixture',{method,body}); errors.push('sent'); } catch(e) { errors.push(e.name); }
+                            try { new Request('/fixture',{method,body}); errors.push('constructed'); } catch(e) { errors.push(e.name); }
+                        }
+                        await new Promise((resolve,reject) => {
+                            const x = new XMLHttpRequest(); x.open(method,'/fixture');
+                            x.onload=resolve; x.onerror=reject; x.send('ordinary');
+                        });
+                    }
+                    try { await fetch('/fixture',{method:'poſt',body:'ordinary'}); errors.push('sent'); } catch(e) { errors.push(e.name); }
+                    try { new Request('/fixture',{method:'poſt',body:'ordinary'}); errors.push('constructed'); } catch(e) { errors.push(e.name); }
+                    return {calls,errors};
+                } finally { Deno.core.ops.op_fetch_url = originalFetchOp; }
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "calls":[{"method":"GET","present":false,"size":0},{"method":"HEAD","present":false,"size":0},
+                {"method":"GET","present":false,"size":0},{"method":"HEAD","present":false,"size":0}],
+            "errors":["TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError",
+                "TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError",
+                "TypeError","TypeError"]
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_body_request_snapshot_preserves_formdata_boundary_and_header_overrides() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const calls = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method, headers, body) => {
+                        const fields = JSON.parse(headers), mime = Object.entries(fields).find(([name]) => name.toLowerCase() === 'content-type');
+                        calls.push({mime:mime ? mime[1] : null,bytes:Array.from(body)});
+                        return JSON.stringify({status:200,headers:{},body:'ok',url});
+                    };
+                    const fd = new FormData(); fd.append('key','original');
+                    const r = new Request('/fixture',{method:'POST',body:fd});
+                    const mime = r.headers.get('content-type'), bytes = Array.from(new Uint8Array(await r.arrayBuffer()));
+                    fd.set('key','changed');
+                    await fetch(r.clone());
+                    await fetch(new Request(r,{headers:{}}));
+                    const custom = new Request('/fixture',{method:'POST',body:fd,headers:[['Content-Type','application/custom']]});
+                    await fetch(custom);
+                    await fetch('/fixture',{method:'POST',body:'ordinary',headers:[['Content-Type','application/custom']]});
+                    const backing = new Uint8Array([9,0,128,255,8]);
+                    const view = new Request('/fixture',{method:'POST',body:new DataView(backing.buffer,1,3)});
+                    backing[2] = 99;
+                    const pairs = new Headers([['constructor','value'],['__proto__','kept'],['x-duplicate','one'],['X-Duplicate','two']]);
+                    return {
+                        boundaryMatches: new TextDecoder().decode(new Uint8Array(bytes)).startsWith('--'+mime.split('boundary=')[1]+'\r\n'),
+                        cloneSame: JSON.stringify(calls[0].bytes)===JSON.stringify(bytes) && calls[0].mime===mime,
+                        overrideSame: JSON.stringify(calls[1].bytes)===JSON.stringify(bytes) && calls[1].mime===null,
+                        customMimes: calls.slice(2).map(c=>c.mime),
+                        viewBytes: Array.from(new Uint8Array(await view.arrayBuffer())),
+                        readerSame: await r.text()===new TextDecoder().decode(new Uint8Array(bytes)),
+                        pairValues: [pairs.get('constructor'),pairs.get('__proto__'),pairs.get('x-duplicate')],
+                    };
+                } finally { Deno.core.ops.op_fetch_url = originalFetchOp; }
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "boundaryMatches":true,"cloneSame":true,"overrideSame":true,"readerSame":true,
+            "customMimes":["application/custom","application/custom"],"viewBytes":[0,128,255],
+            "pairValues":["value","kept","one, two"],
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]

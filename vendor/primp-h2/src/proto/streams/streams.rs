@@ -307,6 +307,8 @@ where
         use http::Method;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        let headers_weight = request.extensions_mut().remove::<crate::ext::HeadersWeight>();
+        let headers_priority_band = request.extensions_mut().remove::<crate::ext::HeadersPriority>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -349,6 +351,7 @@ where
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
+        stream.chrome_priority = headers_priority_band;
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
@@ -364,7 +367,10 @@ where
         )?;
 
         // Set PRIORITY flag for browser fingerprinting (Chrome/Firefox behavior)
-        if let Some((weight, _dep, excl)) = me.headers_priority {
+        let priority = headers_weight.map(|weight| (weight.encoded(),
+            me.headers_priority.map_or(true, |(_, _, excl)| excl)))
+            .or_else(|| me.headers_priority.map(|(weight, _, excl)| (weight, excl)));
+        if let Some((weight, excl)) = priority {
             use crate::frame::StreamDependency;
             headers.set_priority(StreamDependency::new(StreamId::zero(), weight, excl));
         }

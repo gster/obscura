@@ -231,9 +231,31 @@ fn potentially_trustworthy(url: &Url) -> bool {
     }
 }
 
+/// Initial priority for an ordinary classic script with a known loader context.
+/// Contextless scripts and module graphs intentionally retain their defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptPriority { High, Low }
+
+impl ScriptPriority {
+    pub fn classic(parser_blocking: bool, fetch_priority: &str, render_blocking: bool) -> Self {
+        if parser_blocking || render_blocking || fetch_priority.eq_ignore_ascii_case("high") {
+            Self::High
+        } else { Self::Low }
+    }
+
+    pub(crate) fn headers_weight(self) -> u16 {
+        match self { Self::High => 220, Self::Low => 147 }
+    }
+
+    pub(crate) fn urgency(self) -> u8 {
+        match self { Self::High => 1, Self::Low => 3 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequest {
     pub resource_type: ResourceType,
+    pub script_priority: Option<ScriptPriority>,
     /// Origin-bearing environment that owns the request. This controls CORS,
     /// credentials, and Sec-Fetch-Site and must remain the document/realm for
     /// every descendant in a module graph.
@@ -257,6 +279,7 @@ impl ResourceRequest {
     pub fn navigation() -> Self {
         Self {
             resource_type: ResourceType::Document,
+            script_priority: None,
             initiator: None,
             referrer: None,
             referrer_policy: ReferrerPolicy::default(),
@@ -288,6 +311,7 @@ impl ResourceRequest {
         };
         Self {
             resource_type,
+            script_priority: None,
             initiator: Some(initiator.clone()),
             referrer: Some(initiator.clone()),
             referrer_policy: ReferrerPolicy::default(),
@@ -312,6 +336,7 @@ impl ResourceRequest {
     pub fn module_script(initiator: &Url, referrer: &Url) -> Self {
         Self {
             resource_type: ResourceType::Script,
+            script_priority: None,
             initiator: Some(initiator.clone()),
             referrer: Some(referrer.clone()),
             referrer_policy: ReferrerPolicy::default(),
@@ -361,6 +386,7 @@ impl ResourceRequest {
     pub(crate) fn priority(&self) -> &'static str {
         match self.resource_type {
             ResourceType::Xhr | ResourceType::Fetch => "u=1, i",
+            ResourceType::Image => "i",
             _ => "u=0, i",
         }
     }

@@ -227,6 +227,7 @@ async fn cdp_click_no_content_form_preserves_document_and_aborts_loader() {
         let page_id = ctx.create_page();
         let session_id = format!("input-no-content-{status}");
         ctx.sessions.insert(session_id.clone(), page_id.clone());
+        cdp(&mut ctx, 0, "Page.enable", json!({}), &session_id).await;
         cdp(&mut ctx, 1, "Network.enable", json!({}), &session_id).await;
         cdp(
             &mut ctx,

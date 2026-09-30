@@ -341,6 +341,12 @@ impl SessionHistory {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SameDocumentNavigation {
+    Fragment,
+    HistoryApi,
+}
+
 pub struct PendingNavigation {
     pub history: HistoryNavigation,
     pub url: String,
@@ -393,7 +399,7 @@ pub struct ObscuraState {
     pub history_epoch: u64,
     pub restoring_history_scroll: bool,
     pub pending_navigation: Option<PendingNavigation>,
-    pub same_document_navigation: bool,
+    pub same_document_navigation: Option<SameDocumentNavigation>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: Arc<std::sync::atomic::AtomicU64>,
     pub intercept_enabled: bool,
@@ -668,7 +674,7 @@ impl ObscuraState {
             history_epoch: 0,
             restoring_history_scroll: false,
             pending_navigation: None,
-            same_document_navigation: false,
+            same_document_navigation: None,
             intercept_tx: None,
             intercept_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             intercept_enabled: false,
@@ -2251,7 +2257,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 if let Some(navigation) = navigation {
                     state.url = navigation.url.clone();
                     state.pending_navigation = Some(navigation);
-                    state.same_document_navigation = false;
+                    state.same_document_navigation = None;
                 }
                 "{}".into()
             }
@@ -2448,7 +2454,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                         dom.set_document_url(next.as_str());
                     }
                     state.url = next.to_string();
-                    state.same_document_navigation = true;
+                    state.same_document_navigation = Some(if update.fragment {
+                        SameDocumentNavigation::Fragment
+                    } else {
+                        SameDocumentNavigation::HistoryApi
+                    });
                     if update.fragment {
                         state.pending_navigation = None;
                     }
@@ -2477,7 +2487,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                             },
                         });
                         state.url = entry.url;
-                        state.same_document_navigation = false;
+                        state.same_document_navigation = None;
                         return Ok(serde_json::json!({"cross_document":true}));
                     }
                     #[cfg(feature = "render")]
@@ -2487,7 +2497,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                         dom.set_document_url(&entry.url);
                     }
                     state.url = entry.url;
-                    state.same_document_navigation = true;
+                    state.same_document_navigation = Some(SameDocumentNavigation::Fragment);
                     invalidate_input_render(&mut state);
                 }
                 _ => return Err("HISTORY_ACTION_INVALID"),
@@ -3691,7 +3701,7 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
-fn scripted_fetch_metadata(source: &str, target: &str, mode: &str, resource_type: ResourceType) -> Vec<(&'static str, &'static str)> {
+fn scripted_fetch_metadata(source: &str, target: &str, mode: &str, resource_type: ResourceType, script_priority: Option<obscura_net::ScriptPriority>) -> Vec<(&'static str, &'static str)> {
     let (Ok(source), Ok(target)) = (url::Url::parse(source), url::Url::parse(target)) else {
         return Vec::new();
     };
@@ -3705,7 +3715,9 @@ fn scripted_fetch_metadata(source: &str, target: &str, mode: &str, resource_type
     // Chromium marks fetch()/XHR as an incremental, urgency-1 request.  The
     // stealth transport has a navigation-safe `u=0, i` default, so this must
     // travel with the per-request metadata and replace that default.
-    headers.push(("priority", "u=1, i"));
+    if resource_type != ResourceType::Script || script_priority.is_none() {
+        headers.push(("priority", "u=1, i"));
+    }
     headers
 }
 
@@ -4179,6 +4191,12 @@ async fn op_fetch_url(
     } else if matches!(destination.as_deref(), Some("script" | "worker")) {
         ResourceType::Script
     } else { ResourceType::Fetch };
+    let script_priority = options_json.as_ref()
+        .filter(|_| destination.as_deref() == Some("script"))
+        .and_then(|options| options["scriptPriority"].as_object())
+        .map(|options| obscura_net::ScriptPriority::classic(false,
+            options.get("fetchPriority").and_then(|value| value.as_str()).unwrap_or("auto"),
+            options.get("renderBlocking").and_then(|value| value.as_bool()).unwrap_or(false)));
     let fields = serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default();
     let body = body.to_vec();
     let mut observation = NetworkRequest::new(shared.clone(), request_id, &url, &method,
@@ -4188,7 +4206,7 @@ async fn op_fetch_url(
     let mut cancel = shared.borrow().fetch_cancellations.get(&observation.id).map(|(sender, _)| sender.subscribe());
     let result = {
         let operation = fetch_url_inner(state.clone(), url, method, headers_json, body, body_present, origin,
-            mode, credentials, destination, resource_type, &mut observation);
+            mode, credentials, destination, resource_type, script_priority, &mut observation);
         tokio::pin!(operation);
         if let Some(cancel) = cancel.as_mut() {
             tokio::select! {
@@ -4221,6 +4239,7 @@ async fn op_fetch_url(
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String, body: Vec<u8>, body_present: bool,
     origin: String, mode: String, credentials: String, destination: Option<String>, resource_type: ResourceType,
+    script_priority: Option<obscura_net::ScriptPriority>,
     observation: &mut NetworkRequest,
 ) -> Result<String, deno_error::JsErrorBox> {
     crate::worker::refresh_policy(&state.borrow());
@@ -4502,7 +4521,7 @@ async fn fetch_url_inner(
     stealth_fetch_all(
         state.clone(), stealth_client, url, req_method.as_str().to_string(),
         custom_headers, body, transport_body_present, page_origin, mode, credentials, destination,
-        resource_type, callbacks, allow_private_network, referrer, referrer_policy, observation,
+        resource_type, script_priority, callbacks, allow_private_network, referrer, referrer_policy, observation,
     ).await
 }
 
@@ -4925,6 +4944,7 @@ async fn stealth_fetch_all(
     credentials: FetchCredentials,
     destination: Option<String>,
     resource_type: ResourceType,
+    script_priority: Option<obscura_net::ScriptPriority>,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     mut referrer: Option<url::Url>,
@@ -4954,7 +4974,7 @@ async fn stealth_fetch_all(
 
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         crossed_origin |= current_is_cross_origin;
-        let mut req_headers: HashMap<String, String> = scripted_fetch_metadata(&page_origin, &current_url, &mode, resource_type)
+        let mut req_headers: HashMap<String, String> = scripted_fetch_metadata(&page_origin, &current_url, &mode, resource_type, script_priority)
             .into_iter().map(|(name, value)| (name.into(), value.into())).collect();
         if destination.as_deref() == Some("worker") {
             req_headers.insert("sec-fetch-dest".into(), "worker".into());
@@ -4974,11 +4994,13 @@ async fn stealth_fetch_all(
         req_headers.extend(custom_headers.iter().cloned());
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let mut r = tokio::time::timeout(fetch_timeout(), stealth
-            .send_single_traced_fields(
+            .send_browser_prioritized_traced_fields(
                 &current_method,
                 &parsed_current,
                 &req_headers,
-                &current_body,
+                current_body_present.then_some(current_body.as_slice()),
+                resource_type,
+                script_priority,
                 credentials_allowed,
                 credentials_allowed,
                 fetch_max_body_bytes(),
@@ -5228,6 +5250,7 @@ mod tests {
             "https://example.com/api",
             "cors",
             obscura_net::ResourceType::Fetch,
+            None,
         );
         assert!(headers.contains(&("priority", "u=1, i")));
         assert!(headers.contains(&("sec-fetch-dest", "empty")));
@@ -5236,9 +5259,16 @@ mod tests {
             "https://example.com/script.js",
             "no-cors",
             obscura_net::ResourceType::Script,
+            None,
         );
         assert!(script_headers.contains(&("sec-fetch-dest", "script")));
         assert!(script_headers.contains(&("sec-fetch-mode", "no-cors")));
+        for priority in [obscura_net::ScriptPriority::High, obscura_net::ScriptPriority::Low] {
+            let headers = scripted_fetch_metadata("https://example.com", "https://example.com/script.js",
+                "no-cors", obscura_net::ResourceType::Script, Some(priority));
+            assert!(!headers.iter().any(|(name, _)| *name == "priority"));
+            assert!(headers.contains(&("sec-fetch-dest", "script")));
+        }
     }
 
     #[test]
@@ -6328,7 +6358,7 @@ fn op_navigate(
         body: body.to_string(),
         request,
     });
-    gs.same_document_navigation = false;
+    gs.same_document_navigation = None;
 }
 
 pub(crate) fn frame_message_queue_entry_limit() -> usize {

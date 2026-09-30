@@ -84,10 +84,16 @@ async fn attached_session(ctx: &mut CdpContext) -> String {
     .await
     .result
     .expect("Target.attachToTarget produced no result");
-    attached["sessionId"]
+    let session = attached["sessionId"]
         .as_str()
         .expect("no sessionId")
-        .to_string()
+        .to_string();
+    let page_sessions = ctx.sessions.iter().filter(|(_, page)| **page == target_id)
+        .map(|(session, _)| session.clone()).collect::<Vec<_>>();
+    for page_session in page_sessions {
+        cdp(ctx, 902, "Page.enable", json!({}), &page_session).await;
+    }
+    session
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -205,6 +211,7 @@ async fn isolated_worlds_are_owned_by_their_exact_frame() {
     ).await.result.unwrap();
     let second_session = attached["sessionId"].as_str().unwrap().to_string();
     for runtime_session in [&session, &second_session] {
+        cdp(&mut ctx, 3, "Page.enable", json!({}), runtime_session).await;
         cdp(&mut ctx, 3, "Runtime.enable", json!({}), runtime_session).await;
     }
     let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;

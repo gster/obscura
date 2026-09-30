@@ -79,6 +79,26 @@ is the shortest valid input; a JSON file can override optional fields such as
 timezone, geolocation, viewport and WebGL metadata while retaining a supported
 transport profile:
 
+`browser_flavor` optionally selects `"chrome"` (the unchanged default) or
+`"chromium"`. It controls product branding in `Sec-CH-UA` and JavaScript's
+`userAgentData` together, including frame and worker inheritance. Chromium
+branding uses the two-brand version-seeded order; it is not obtained by deleting
+Google Chrome from the three-brand list. This field does not change the selected
+profile's TLS behavior, User-Agent text, full version or platform version, and
+does not by itself certify parity with a particular Chromium distribution.
+Unknown flavor values are rejected. Omitting the field and explicitly selecting
+Chrome have the same effective identity and digest as before.
+
+`tls_server_padding_request` is an optional unsigned 16-bit integer for the
+experimental TLS server handshake padding extension (0x12e0). Omitting it or
+using null leaves it disabled; zero explicitly sends a two-byte zero request.
+Enable it only to reproduce a measured experimental browser configuration,
+not merely because a Chrome version is selected. A server may ignore the
+request. Responses must appear in TLS 1.3 EncryptedExtensions with exactly the
+requested length. Certificate and hostname verification remain unchanged.
+The option is frozen with the persona, changes its digest but not its device
+seed, and survives frame/worker transport rebinding.
+
 `screen_width`, `screen_height`, `screen_avail_width`, `screen_avail_height`,
 `outer_width`, `outer_height`, and `screen_color_depth` (24, 30, or 32) are
 separate persona fields. Set them together when matching a measured Chrome

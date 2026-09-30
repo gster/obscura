@@ -732,6 +732,8 @@ mod tests {
             let page_id = ctx.create_page();
             let session = Some(format!("{page_id}-session"));
             ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+            crate::domains::page::handle("enable", &json!({}), &mut ctx, &session)
+                .await.unwrap();
             crate::domains::network::handle("enable", &json!({}), &mut ctx, &session)
                 .await.unwrap();
             ctx.lifecycle_enabled_sessions.insert(session.clone().unwrap());

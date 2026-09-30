@@ -2589,6 +2589,7 @@ impl Page {
             inline: String,
             is_defer: bool,
             is_async: bool,
+            priority: obscura_net::ScriptPriority,
             kind: ScriptKind,
             nid: u32,
             /// Document base URL at this element's parser encounter point.
@@ -2665,6 +2666,12 @@ impl Page {
                                     inline: inline_code,
                                     is_defer,
                                     is_async,
+                                    priority: obscura_net::ScriptPriority::classic(
+                                        !is_async && !is_defer,
+                                        node.get_attribute("fetchpriority").unwrap_or("auto"),
+                                        node.get_attribute("blocking").unwrap_or("")
+                                            .split_ascii_whitespace().any(|token| token == "render"),
+                                    ),
                                     kind,
                                     nid: sid.raw(),
                                     base_url: bases_at_script
@@ -2699,7 +2706,7 @@ impl Page {
         }
 
         tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
-        let mut fetch_tasks: Vec<(usize, String, obscura_net::observation::RequestTrace)> = Vec::new();
+        let mut fetch_tasks: Vec<(usize, String, obscura_net::observation::RequestTrace, obscura_net::ScriptPriority)> = Vec::new();
 
         for (i, script) in all_scripts.iter().enumerate() {
             if !matches!(script.kind, ScriptKind::Classic) {
@@ -2744,7 +2751,7 @@ impl Page {
                     u64::MAX,
                     String::new(),
                 ) {
-                    Ok(trace) => fetch_tasks.push((i, full_url, trace)),
+                    Ok(trace) => fetch_tasks.push((i, full_url, trace, script.priority)),
                     Err(error) => {
                         tracing::warn!(%error, "Skipping script after history admission failure");
                         break;
@@ -2760,10 +2767,10 @@ impl Page {
             .url
             .clone()
             .unwrap_or_else(|| Url::parse("about:blank").unwrap());
-        let fetch_indices = fetch_tasks.iter().map(|(index, _, _)| *index).collect();
+        let fetch_indices = fetch_tasks.iter().map(|(index, _, _, _)| *index).collect();
         let fetch_futures: Vec<_> = fetch_tasks
             .into_iter()
-            .map(|(idx, url, trace)| {
+            .map(|(idx, url, trace, priority)| {
                 let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
@@ -2803,6 +2810,7 @@ impl Page {
                         return (idx, Some((url, resp)));
                     }
                     let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    request.script_priority = Some(priority);
                     request.referrer_policy = referrer_policy;
                     let response = stealth_client
                         .fetch_resource_traced(&parsed, request, Some(&cbs), &trace)

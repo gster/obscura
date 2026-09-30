@@ -1980,4 +1980,82 @@ mod tests {
         // An ordinary DATA frame is forbidden in application settings.
         assert!(connection.apply_peer_application_settings(&[0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
     }
+
+    async fn chrome_priority_scenario(reset_parent: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_frame(io: &mut tokio::io::DuplexStream) -> (u8, u8, u32, Vec<u8>) {
+            let mut head = [0; 9];
+            io.read_exact(&mut head).await.unwrap();
+            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let sid = u32::from_be_bytes(head[5..9].try_into().unwrap()) & 0x7fffffff;
+            let mut payload = vec![0; len];
+            io.read_exact(&mut payload).await.unwrap();
+            (head[3], head[4], sid, payload)
+        }
+
+        let (client_io, mut server_io) = tokio::io::duplex(65536);
+        let (mut sender, mut connection) = Builder::new()
+            .headers_priority(Some((255, 0, true)))
+            .handshake::<_, Bytes>(client_io).await.unwrap();
+        // ALPS delivers peer max-concurrency before any request is opened.
+        let setting = [0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1];
+        connection.apply_peer_application_settings(&setting).unwrap();
+        assert_eq!(sender.current_max_send_streams(), 1);
+        let connection_task = tokio::spawn(async move { connection.await });
+        let (a_seen_tx, a_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_a_tx, release_a_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut preface = [0; 24];
+            server_io.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            server_io.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+            let first = loop {
+                let (kind, flags, id, payload) = read_frame(&mut server_io).await;
+                if kind == 1 {
+                    assert_ne!(flags & 32, 0);
+                    break (id, u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fffffff);
+                }
+            };
+            a_seen_tx.send(()).unwrap();
+            release_a_rx.await.unwrap();
+            // The second stream has been requested but cannot open yet.
+            if reset_parent {
+                server_io.write_all(&[0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8]).await.unwrap();
+            } else {
+                server_io.write_all(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88]).await.unwrap();
+            }
+            let second = loop {
+                let (kind, flags, id, payload) = read_frame(&mut server_io).await;
+                if kind == 1 {
+                    assert_ne!(flags & 32, 0);
+                    break (id, u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fffffff);
+                }
+            };
+            server_io.write_all(&[0, 0, 1, 1, 5, 0, 0, 0, 3, 0x88]).await.unwrap();
+            (first, second)
+        });
+        let mut first = http::Request::builder().uri("https://example.test/first")
+            .body(()).unwrap();
+        first.extensions_mut().insert(crate::ext::HeadersPriority::new(0).unwrap());
+        let (first_response, _) = sender.send_request(first, true).unwrap();
+        a_seen_rx.await.unwrap();
+        let mut second = http::Request::builder().uri("https://example.test/second")
+            .body(()).unwrap();
+        second.extensions_mut().insert(crate::ext::HeadersPriority::new(1).unwrap());
+        let (second_response, _) = sender.send_request(second, true).unwrap();
+        release_a_tx.send(()).unwrap();
+        let first = first_response.await;
+        if reset_parent { assert!(first.is_err()); }
+        else { assert_eq!(first.unwrap().status(), http::StatusCode::OK); }
+        assert_eq!(second_response.await.unwrap().status(), http::StatusCode::OK);
+        assert_eq!(server_task.await.unwrap(), ((1, 0), (3, 0)));
+        connection_task.abort();
+    }
+
+    #[tokio::test]
+    async fn chrome_priority_uses_live_parent_after_pending_open() {
+        chrome_priority_scenario(false).await;
+        chrome_priority_scenario(true).await;
+    }
 }

@@ -295,6 +295,43 @@ impl RequestBuilder {
         self
     }
 
+    /// Sets this request's initial HTTP/2 HEADERS weight (1 through 256).
+    /// Keeps the client's exclusive-root setting, or uses an exclusive root
+    /// if the client has no configured HEADERS priority. H1/H3 are unchanged.
+    pub fn http2_headers_weight(mut self, weight: u16) -> RequestBuilder {
+        if let Ok(ref mut request) = self.request {
+            match h2::ext::HeadersWeight::new(weight) {
+                Some(weight) => { request.extensions_mut().insert(weight); }
+                None => { self.request = Err(crate::error::builder("HTTP/2 weight must be between 1 and 256")); }
+            }
+        }
+        self
+    }
+
+    /// Opt into Chromium's per-connection HEADERS dependency tree. H1/H3 are
+    /// unchanged; this is independent of both weight and RFC 9218 priority.
+    pub fn http2_headers_priority_band(mut self, priority: u8) -> RequestBuilder {
+        if let Ok(ref mut request) = self.request {
+            match h2::ext::HeadersPriority::new(priority) {
+                Some(priority) => { request.extensions_mut().insert(priority); }
+                None => { self.request = Err(crate::error::builder("HTTP/2 priority band must be between 0 and 7")); }
+            }
+        }
+        self
+    }
+
+    /// Generates an RFC 9218 field for H2 only, unless explicitly supplied.
+    /// H1/H3 and the initial HEADERS weight are unchanged.
+    pub fn http2_extensible_priority(mut self, urgency: u8, incremental: bool) -> RequestBuilder {
+        if let Ok(ref mut request) = self.request {
+            match h2::ext::ExtensiblePriority::new(urgency, incremental) {
+                Some(priority) => { request.extensions_mut().insert(priority); }
+                None => { self.request = Err(crate::error::builder("HTTP urgency must be between 0 and 7")); }
+            }
+        }
+        self
+    }
+
     /// Sets a timeout for this request, from connection start until the response
     /// body finishes. Overrides `ClientBuilder::timeout()`.
     pub fn timeout(mut self, timeout: Duration) -> RequestBuilder {

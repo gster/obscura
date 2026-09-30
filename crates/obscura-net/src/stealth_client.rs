@@ -103,11 +103,10 @@ async fn read_stealth_body_limited(
     url: &Url,
     limit: usize,
 ) -> Result<Vec<u8>, ObscuraNetError> {
+    // Browser-visible Content-Length describes the encoded representation.
+    // Enforce the decoded-body bound with the decoder's size hint and stream.
     if response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
+        .content_length()
         .is_some_and(|length| length > limit as u64)
     {
         return Err(response_too_large(url, limit));
@@ -200,6 +199,8 @@ impl StealthProfile {
 #[derive(Clone, Debug)]
 pub struct TransportParams {
     pub profile: StealthProfile,
+    pub browser_flavor: crate::BrowserFlavor,
+    pub tls_server_padding_request: Option<u16>,
     pub proxy_url: Option<String>,
     pub accept_language: Option<String>,
     pub do_not_track: Option<String>,
@@ -257,9 +258,11 @@ impl StealthHttpClient {
         persona: &crate::EffectivePersona,
     ) -> Self {
         let allow_private_network = policy.allow_private_network;
-        let client = transport::Client::new(
+        let client = transport::Client::with_tls_options(
             persona.profile(), proxy_url, allow_private_network,
             Some(persona.accept_language()), persona.do_not_track(),
+            persona.browser_flavor(),
+            persona.tls_server_padding_request(),
         );
         StealthHttpClient {
             client,
@@ -272,6 +275,8 @@ impl StealthHttpClient {
             policy: Some(policy),
             transport: TransportParams {
                 profile: persona.profile(),
+                browser_flavor: persona.browser_flavor(),
+                tls_server_padding_request: persona.tls_server_padding_request(),
                 proxy_url: proxy_url.map(str::to_owned),
                 accept_language: Some(persona.accept_language().to_owned()),
                 do_not_track: persona.do_not_track().map(str::to_owned),
@@ -286,9 +291,11 @@ impl StealthHttpClient {
         allow_private_network: bool,
         persona: &crate::EffectivePersona,
     ) -> Self {
-        let client = transport::Client::new(
+        let client = transport::Client::with_tls_options(
             persona.profile(), proxy_url, allow_private_network,
             Some(persona.accept_language()), persona.do_not_track(),
+            persona.browser_flavor(),
+            persona.tls_server_padding_request(),
         );
         StealthHttpClient {
             client,
@@ -301,6 +308,8 @@ impl StealthHttpClient {
             policy,
             transport: TransportParams {
                 profile: persona.profile(),
+                browser_flavor: persona.browser_flavor(),
+                tls_server_padding_request: persona.tls_server_padding_request(),
                 proxy_url: proxy_url.map(str::to_owned),
                 accept_language: Some(persona.accept_language().to_owned()),
                 do_not_track: persona.do_not_track().map(str::to_owned),
@@ -316,6 +325,8 @@ impl StealthHttpClient {
     /// the runtime's compiled persona.
     pub fn matches_persona(&self, persona: &crate::EffectivePersona) -> bool {
         self.transport.profile == persona.profile()
+            && self.transport.browser_flavor == persona.browser_flavor()
+            && self.transport.tls_server_padding_request == persona.tls_server_padding_request()
             && self.transport.accept_language.as_deref() == Some(persona.accept_language())
             && self.transport.do_not_track.as_deref() == persona.do_not_track()
     }
@@ -351,9 +362,11 @@ impl StealthHttpClient {
         let mut transport = self.transport.clone();
         transport.proxy_url = policy.proxy_url().map(str::to_owned);
         StealthHttpClient {
-            client: transport::Client::new(
+            client: transport::Client::with_tls_options(
                 transport.profile, transport.proxy_url.as_deref(), policy.allow_private_network,
                 transport.accept_language.as_deref(), transport.do_not_track.as_deref(),
+                transport.browser_flavor,
+                transport.tls_server_padding_request,
             ),
             allow_private_network: policy.allow_private_network,
             cookie_jar,
@@ -379,12 +392,14 @@ impl StealthHttpClient {
     pub fn detached(&self) -> Self {
         let params = &self.transport;
         StealthHttpClient {
-            client: transport::Client::new(
+            client: transport::Client::with_tls_options(
                 params.profile,
                 params.proxy_url.as_deref(),
                 self.allow_private_network,
                 params.accept_language.as_deref(),
                 params.do_not_track.as_deref(),
+                params.browser_flavor,
+                params.tls_server_padding_request,
             ),
             allow_private_network: self.allow_private_network,
             cookie_jar: self.cookie_jar.clone(),
@@ -753,7 +768,9 @@ impl StealthHttpClient {
             header(&mut headers, "sec-fetch-site", request_fetch_site(&request, &current_url))?;
             header(&mut headers, "sec-fetch-mode", request.mode.header_value())?;
             header(&mut headers, "sec-fetch-dest", request.destination())?;
-            header(&mut headers, "priority", request.priority())?;
+            if request.resource_type != crate::ResourceType::Script || request.script_priority.is_none() {
+                header(&mut headers, "priority", request.priority())?;
+            }
             if request.mode == RequestMode::Navigate {
                 header(&mut headers, "upgrade-insecure-requests", "1")?;
                 header(&mut headers, "sec-fetch-user", "?1")?;
@@ -791,7 +808,7 @@ impl StealthHttpClient {
                 header(&mut headers, "content-type", "application/x-www-form-urlencoded")?;
             }
 
-            let (transport, prepared) = self.client.request(method.clone(), &current_url, headers, &request_body, std::time::Duration::from_secs(30))?;
+            let (transport, prepared) = self.client.resource_request(method.clone(), &current_url, headers, &request_body, request.resource_type, request.script_priority, std::time::Duration::from_secs(30))?;
             request_info.raw_headers = Some(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()));
             if let Some(trace) = trace {
                 trace.prepared(request_info.raw_headers.clone().unwrap(), &request_body)
@@ -985,6 +1002,44 @@ impl StealthHttpClient {
         observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
         trace: Option<&RequestTrace>,
     ) -> Result<Response, ObscuraNetError> {
+        self.send_single_traced_fields_inner(method, url, fields, body, None, send_cookies, store_cookies,
+            max_response_bytes, timeout, observation, trace).await
+    }
+
+    /// Browser body extraction preserves absent versus present-empty. Native
+    /// byte-slice entry points retain their historical empty-body convention.
+    pub async fn send_browser_traced_fields(
+        &self, method: &str, url: &Url, fields: &[(String, String)], body: Option<&[u8]>,
+        resource_type: crate::ResourceType,
+        send_cookies: bool, store_cookies: bool, max_response_bytes: usize,
+        timeout: std::time::Duration,
+        observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
+        trace: Option<&RequestTrace>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.send_browser_prioritized_traced_fields(method, url, fields, body, resource_type, None,
+            send_cookies, store_cookies, max_response_bytes, timeout, observation, trace).await
+    }
+
+    /// Known classic loader metadata is independent of callbacks and history.
+    pub async fn send_browser_prioritized_traced_fields(
+        &self, method: &str, url: &Url, fields: &[(String, String)], body: Option<&[u8]>,
+        resource_type: crate::ResourceType, script_priority: Option<crate::ScriptPriority>,
+        send_cookies: bool, store_cookies: bool, max_response_bytes: usize,
+        timeout: std::time::Duration,
+        observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
+        trace: Option<&RequestTrace>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.send_single_traced_fields_inner(method, url, fields, body.unwrap_or_default(), Some((body.is_some(), resource_type, script_priority)),
+            send_cookies, store_cookies, max_response_bytes, timeout, observation, trace).await
+    }
+
+    async fn send_single_traced_fields_inner(
+        &self, method: &str, url: &Url, fields: &[(String, String)], body: &[u8], browser_metadata: Option<(bool, crate::ResourceType, Option<crate::ScriptPriority>)>,
+        send_cookies: bool, store_cookies: bool, max_response_bytes: usize,
+        timeout: std::time::Duration,
+        observation: Option<(&CallbackRegistry, crate::client::ResourceType)>,
+        trace: Option<&RequestTrace>,
+    ) -> Result<Response, ObscuraNetError> {
         let in_flight = StealthInFlightGuard::new(
             &self.in_flight,
             &self.network_activity,
@@ -1031,7 +1086,10 @@ impl StealthHttpClient {
         let request_referrer = request_fields.iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
             .and_then(|(_, value)| Url::parse(value).ok());
-        let (transport, prepared) = self.client.request(req_method, url, headers, body, timeout)?;
+        let (transport, prepared) = match browser_metadata {
+            Some((present, resource_type, script_priority)) => self.client.browser_prioritized_request(req_method, url, headers, present.then_some(body), resource_type, script_priority, timeout)?,
+            None => self.client.request(req_method, url, headers, body, timeout)?,
+        };
         if let Some(trace) = trace {
             trace.prepared(crate::HeaderCapture::from_headers("transportRequest", prepared.headers()), body)
                 ?;
@@ -1390,6 +1448,59 @@ mod tests {
 
     fn default_persona() -> crate::EffectivePersona {
         crate::EffectivePersona::builtin(super::StealthProfile::WindowsChrome145)
+    }
+
+    #[test]
+    fn server_padding_survives_transport_rebinding_and_rejects_mismatch() {
+        let default = crate::EffectivePersona::builtin(super::StealthProfile::MacChrome153);
+        for bytes in [0, 32, u16::MAX] {
+            let mut spec = default.to_spec();
+            spec.tls_server_padding_request = Some(bytes);
+            let padded = spec.compile().unwrap();
+            let jar = Arc::new(crate::CookieJar::new());
+            let policy = Arc::new(crate::ObscuraHttpClient::with_full_options(jar.clone(), None, true));
+            let original = super::StealthHttpClient::with_policy_persona(jar.clone(), None, policy.clone(), &padded);
+            let siblings = [
+                super::StealthHttpClient::new(jar.clone(), &padded),
+                super::StealthHttpClient::with_proxy(jar.clone(), None, true, &padded),
+                super::StealthHttpClient::with_policy(jar.clone(), None, policy.clone(), &padded),
+                original.detached(),
+                original.with_cookie_binding(Arc::new(crate::CookieJar::new())),
+                original.with_policy_binding(jar.clone(), policy),
+            ];
+            for client in std::iter::once(&original).chain(siblings.iter()) {
+                assert!(client.matches_persona(&padded));
+                assert!(!client.matches_persona(&default));
+                assert_eq!(client.transport_params().tls_server_padding_request, Some(bytes));
+            }
+        }
+    }
+
+    #[test]
+    fn browser_flavor_survives_transport_rebinding_and_rejects_mismatch() {
+        let chrome = crate::EffectivePersona::builtin(super::StealthProfile::MacChrome153);
+        let mut spec = chrome.to_spec();
+        spec.browser_flavor = crate::BrowserFlavor::Chromium;
+        let chromium = spec.compile().unwrap();
+        let jar = Arc::new(crate::CookieJar::new());
+        let policy = Arc::new(crate::ObscuraHttpClient::with_full_options(jar.clone(), None, true));
+        let original = super::StealthHttpClient::with_policy_persona(jar.clone(), None, policy.clone(), &chromium);
+        let siblings = [
+            super::StealthHttpClient::with_proxy(jar.clone(), None, true, &chromium),
+            super::StealthHttpClient::with_policy(jar.clone(), None, policy.clone(), &chromium),
+            original.detached(),
+            original.with_cookie_binding(Arc::new(crate::CookieJar::new())),
+            original.with_policy_binding(jar.clone(), policy),
+        ];
+        let url = Url::parse("http://127.0.0.1:1/").unwrap();
+        for client in std::iter::once(&original).chain(siblings.iter()) {
+            assert!(client.matches_persona(&chromium));
+            assert!(!client.matches_persona(&chrome));
+            assert_eq!(client.transport_params().browser_flavor, crate::BrowserFlavor::Chromium);
+            let (_, request) = client.client.request(http::Method::GET, &url, http::HeaderMap::new(), &[], std::time::Duration::from_secs(1)).unwrap();
+            assert_eq!(request.headers()["sec-ch-ua"], r#""Chromium";v="153", "Not_A Brand";v="8""#);
+            assert_eq!(request.headers()["user-agent"], chrome.user_agent());
+        }
     }
 
     fn persona(
@@ -2082,6 +2193,8 @@ mod tests {
             policy: None,
             transport: super::TransportParams {
                 profile: super::StealthProfile::WindowsChrome145,
+                browser_flavor: crate::BrowserFlavor::Chrome,
+                tls_server_padding_request: None,
                 proxy_url: None,
                 accept_language: None,
                 do_not_track: None,
@@ -2106,20 +2219,27 @@ mod tests {
 
     /// Serve one `Content-Encoding: gzip` response on an ephemeral port.
     async fn gzip_fixture() -> u16 {
+        compressed_fixture("gzip", GZIP_BODY.to_vec()).await
+    }
+
+    async fn compressed_fixture(encoding: &str, body: Vec<u8>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let encoding = encoding.to_owned();
 
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let encoding = encoding.clone();
+                let body = body.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     let _ = stream.read(&mut buf).await;
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        GZIP_BODY.len()
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-encoding: {encoding}\r\ncontent-length: {}\r\nx-repeated: first\r\nx-repeated: second\r\nconnection: close\r\n\r\n",
+                        body.len()
                     );
                     let _ = stream.write_all(head.as_bytes()).await;
-                    let _ = stream.write_all(GZIP_BODY).await;
+                    let _ = stream.write_all(&body).await;
                     let _ = stream.shutdown().await;
                 });
             }
@@ -2143,6 +2263,56 @@ mod tests {
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+        assert_eq!(resp.headers.get("content-encoding").map(String::as_str), Some("gzip"));
+        assert_eq!(resp.headers.get("content-length"), Some(&GZIP_BODY.len().to_string()));
+        let raw = resp.raw_headers.unwrap().text_headers();
+        assert_eq!(raw.get("content-encoding").map(String::as_str), Some("gzip"));
+    }
+
+    #[tokio::test]
+    async fn compressed_responses_preserve_encoded_headers_and_decoded_limits() {
+        use base64::Engine;
+        use crate::client::{ResourceRequest, ResourceType};
+        // Fixed encodings of the same ordinary body, independent of the decoder.
+        let expected = "ordinary compression fixture body ".repeat(8);
+        for (encoding, encoded) in [
+            ("gzip", "H4sIAAAAAAACE8svSsnMSyyqVEjOzy0oSi0uzszPU0jLrCgpLUpVSMpPqVTIH1EqACP3pdkQAQAA"),
+            ("deflate", "eJzLL0rJzEssqlRIzs8tKEotLs7Mz1NIy6woKS1KVUjKT6lUyB9RKgD82Gp5"),
+            ("br", "Hw8BAETdlupyvV5hwQ+Ggq+BFiwro5yscGPqDEdRhc1/nxeGsqEA"),
+            ("zstd", "KLUv/QRYXQEAJAJvcmRpbmFyeSBjb21wcmVzc2lvbiBmaXh0dXJlIGJvZHkgAQBaF0o9AfprMR4="),
+        ] {
+            let body = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+            let encoded_length = body.len().to_string();
+            let port = compressed_fixture(encoding, body).await;
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+            let jar = Arc::new(CookieJar::new());
+            let policy = Arc::new(crate::client::ObscuraHttpClient::with_full_options(jar.clone(), None, true));
+            let client = StealthHttpClient::with_policy(jar, None, policy, &default_persona());
+            let request = ResourceRequest::subresource(ResourceType::Fetch, &url)
+                .with_max_response_bytes(expected.len());
+            let response = client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap();
+            assert_eq!(response.text(), expected);
+            assert_eq!(response.headers.get("content-encoding").map(String::as_str), Some(encoding));
+            assert_eq!(response.headers.get("content-length"), Some(&encoded_length));
+            let raw = response.raw_headers.unwrap();
+            assert_eq!(raw.fields.iter().filter(|field| field.name == b"x-repeated").count(), 2);
+            assert_eq!(raw.text_headers().get("content-length"), Some(&encoded_length));
+            let error = client.fetch_resource_with_callbacks(&url, request.with_max_response_bytes(64), None)
+                .await.unwrap_err();
+            assert!(matches!(error, ObscuraNetError::ResponseTooLarge { limit: 64, .. }));
+            assert_eq!(client.active_requests(), 0);
+        }
+
+        // Encoded overhead may exceed the decoded limit without exceeding it.
+        let body = base64::engine::general_purpose::STANDARD.decode("H4sIAAAAAAACE6sAAIMW3IwBAAAA").unwrap();
+        let port = compressed_fixture("gzip", body).await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let jar = Arc::new(CookieJar::new());
+        let client = StealthHttpClient::with_proxy(jar, None, true, &default_persona());
+        let request = ResourceRequest::subresource(ResourceType::Fetch, &url).with_max_response_bytes(1);
+        let response = client.fetch_resource_with_callbacks(&url, request, None).await.unwrap();
+        assert_eq!(response.body, b"x");
+        assert_eq!(response.headers.get("content-length").map(String::as_str), Some("21"));
     }
 
     // #793: the opt-in must reach the DNS resolver. `validate_url` already

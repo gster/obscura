@@ -120,6 +120,8 @@ pub struct CdpContext {
     pub(crate) pending_fetch_policy_cleanup: HashSet<String>,
     pub(crate) navigating_document_loader: Option<(u64, String)>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
+    /// Ordinary Page events are subscribed independently of lifecycle events.
+    pub page_enabled_sessions: HashSet<String>,
     /// Attached sessions that explicitly enabled Page lifecycle events.
     /// Subscriptions are independent: disabling or detaching one session must
     /// not suppress a sibling session's current-document events.
@@ -361,6 +363,7 @@ impl CdpContext {
             pending_fetch_policy_cleanup: HashSet::new(),
             navigating_document_loader: None,
             sessions: HashMap::new(),
+            page_enabled_sessions: HashSet::new(),
             lifecycle_enabled_sessions: HashSet::new(),
             input_ignored_sessions: HashSet::new(),
             current_loader_ids: HashMap::new(),
@@ -626,6 +629,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.input_ignored_sessions.remove(session_id);
+            self.page_enabled_sessions.remove(session_id);
             self.lifecycle_enabled_sessions.remove(session_id);
             self.runtime_enabled_sessions.remove(session_id);
             self.disable_network_session(session_id);
@@ -775,6 +779,15 @@ impl CdpContext {
             self.valid_context_ids.remove(&id);
             self.execution_contexts.remove(&id)
         }).collect()
+    }
+
+    pub(crate) fn page_sessions_for_page(&self, page_id: &str) -> Vec<String> {
+        let mut sessions = self.page_enabled_sessions.iter()
+            .filter(|session| self.sessions.get(*session).is_some_and(|owner| owner == page_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions
     }
 
     pub(crate) fn runtime_sessions_for_page(&self, page_id: &str) -> Vec<String> {
@@ -1692,6 +1705,9 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
                 continue;
             }
             for session_id in session_ids {
+                if !ctx.page_enabled_sessions.contains(session_id) {
+                    continue;
+                }
                 // Attach before navigate: a client builds its frame from the
                 // attach event and treats a navigation of a frame it has never
                 // seen as a protocol error.
@@ -1743,6 +1759,9 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             }
         }
         for session_id in page_sessions {
+            if !ctx.page_enabled_sessions.contains(&session_id) {
+                continue;
+            }
             events.push(CdpEvent {
                 method: "Page.frameDetached".into(),
                 params: json!({ "frameId": frame_id, "reason": "remove" }),

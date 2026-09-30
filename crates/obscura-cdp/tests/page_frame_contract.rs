@@ -136,6 +136,7 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
     assert_eq!(initial_frame["loaderId"], format!("loader-blank-{page_id}"));
     assert_eq!(initial_frame["secureContextType"], "Secure");
 
+    cdp(&mut ctx, 30, "Page.enable", json!({}), Some(&session_id)).await;
     let navigation_event_start = ctx.pending_events.len();
     let navigated = cdp(
         &mut ctx,
@@ -200,15 +201,20 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
                 Some(&session_id),
             ).await;
         }
-        let route_frame = &ctx.pending_events[route_event_start..]
+        let route_event = &ctx.pending_events[route_event_start..]
             .iter()
             .find(|event| {
-                event.method == "Page.frameNavigated" && event.params["frame"]["id"] == page_id
+                event.method == "Page.navigatedWithinDocument" && event.params["frameId"] == page_id
             })
             .expect("same-document navigation event was not emitted")
-            .params["frame"];
-        assert_frame_contract(route_frame);
-        assert_eq!(route_frame["loaderId"], loader_id);
-        assert!(route_frame["url"].as_str().unwrap().ends_with("/next"));
+            .params;
+        assert_eq!(route_event["navigationType"], "historyApi");
+        assert!(route_event["url"].as_str().unwrap().ends_with("/next"));
+        assert!(ctx.pending_events[route_event_start..].iter()
+            .all(|event| event.method != "Page.frameNavigated"));
+        let route_tree = cdp(&mut ctx, 10, "Page.getFrameTree", json!({}), Some(&session_id)).await;
+        assert_frame_contract(&route_tree["frameTree"]["frame"]);
+        assert_eq!(route_tree["frameTree"]["frame"]["loaderId"], loader_id);
+        assert_eq!(route_tree["frameTree"]["childFrames"], loaded_tree["frameTree"]["childFrames"]);
     }
 }

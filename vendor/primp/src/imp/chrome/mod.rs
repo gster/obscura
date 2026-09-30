@@ -274,6 +274,9 @@ fn new_chrome_emulator(major: u16) -> BrowserEmulator {
     } else {
         emulation::signature_algorithms::CHROME.to_vec()
     });
+    // Verified against Chromium 153's default kTlsGreaseSigalgs setting.
+    // Earlier profiles retain their existing behavior until separately verified.
+    emulator.grease_signature_algorithms = major == 153;
     emulator.named_groups = Some(emulation::named_groups::CHROME.to_vec());
     emulator.extension_order_seed = Some(emulation::extension_order::CHROME);
     emulator

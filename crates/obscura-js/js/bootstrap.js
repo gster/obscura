@@ -27,7 +27,7 @@ function _relativeTimeNow() {
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_ua_full_version', '__obscura_ua_architecture',
+    '__obscura_ua_full_version', '__obscura_ua_architecture', '__obscura_ua_brands',
     '__obscura_do_not_track', '__obscura_language', '__obscura_languages',
     '__obscura_webgl_vendor', '__obscura_webgl_renderer',
     '__obscura_markTrusted', '__obscura_core_handoff',
@@ -409,7 +409,8 @@ async function __fetchDynClassicScript(task) {
     }
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, task.mode, task.credentials, "script"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, task.mode, task.credentials,
+      JSON.stringify({ destination: "script", scriptPriority: task.scriptPriority })
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -2080,6 +2081,10 @@ function __prepareInsertedScript(script) {
       mode: crossOrigin === null ? "no-cors" : "cors",
       credentials: crossOrigin === null || crossOrigin.toLowerCase() === 'use-credentials'
         ? "include" : "same-origin",
+      scriptPriority: {
+        fetchPriority: script.getAttribute('fetchpriority') || 'auto',
+        renderBlocking: (script.getAttribute('blocking') || '').split(/[\t\n\f\r ]+/).includes('render'),
+      },
       dispatchEvent: (ev) => { try { script.dispatchEvent(ev); } catch(e) {} },
     };
     // Non-parser-inserted external scripts are async by default, but scripts
@@ -7179,6 +7184,16 @@ var _GREASE_VER = ['8', '99', '24'];
 // (vendor/primp/src/imp/chrome/mod.rs), which is the authority here.
 var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[2,0,1],[1,2,0],[2,1,0]];
 function _uaBrands() {
+  if (Array.isArray(globalThis.__obscura_ua_brands)) {
+    // A frame inherits the parent's source list. Allocate in this realm,
+    // rather than using the foreign array's map/species constructor.
+    var brands = [];
+    var source = globalThis.__obscura_ua_brands;
+    for (var index = 0; index < source.length; index++) {
+      brands.push({brand: source[index].brand, version: source[index].version});
+    }
+    return brands;
+  }
   var seed = _chromeMajor();
   var grease = {
     brand: 'Not' + _GREASE_CHARS[seed % 11] + 'A' + _GREASE_CHARS[(seed + 1) % 11] + 'Brand',
@@ -7814,12 +7829,14 @@ function _formDataToMultipart(fd) {
 }
 
 // Coerce a fetch()/XHR body into the bytes op_fetch_url expects, attaching a
-// Content-Type header for body types that need one (FormData, URLSearchParams).
+// Content-Type header for body types that need one.
 function _serializeBody(initBody, headers, synthesizeContentType = true) {
-  if (initBody == null || initBody === '') return new Uint8Array(0);
+  if (initBody == null) return new Uint8Array(0);
   if (_isFormData(initBody)) {
     const mp = _formDataToMultipart(initBody);
-    if (synthesizeContentType) headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    if (synthesizeContentType && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    }
     return mp.body;
   }
   if (initBody instanceof URLSearchParams) {
@@ -7840,7 +7857,29 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(initBody) && initBody.buffer instanceof ArrayBuffer) {
     return new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
   }
+  if (synthesizeContentType && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    headers['Content-Type'] = 'text/plain;charset=UTF-8';
+  }
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
+}
+
+// Request extraction happens once. Inheritance reuses bytes without inferring
+// MIME from the public body shim or observing later mutations of its source.
+const _requestBodyRecords = new WeakMap();
+const _getRequestBodyRecord = _requestBodyRecords.get.bind(_requestBodyRecords);
+const _setRequestBodyRecord = _requestBodyRecords.set.bind(_requestBodyRecords);
+function _normalizeFetchMethod(value) {
+  const method = String(value), upper = method.replace(/[a-z]/g, ch => ch.toUpperCase());
+  switch (upper) {
+    case 'DELETE': case 'GET': case 'HEAD': case 'OPTIONS': case 'POST': case 'PUT': return upper;
+    default: return method;
+  }
+}
+function _snapshotRequestBody(source, headers) {
+  let bytes = _serializeBody(source, headers);
+  if ((typeof ArrayBuffer !== 'undefined' && (source instanceof ArrayBuffer || ArrayBuffer.isView(source)))
+      || (typeof Blob !== 'undefined' && source instanceof Blob)) bytes = bytes.slice();
+  return { present: source != null, bytes };
 }
 
 // Worker metadata is a one-shot mark on an ordinary init object. Capture the
@@ -7865,6 +7904,20 @@ globalThis.fetch = async (input, init = {}) => {
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
+  const method = _normalizeFetchMethod(init.method || (request ? request.method : "GET"));
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) throw new TypeError('Invalid HTTP method');
+  const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
+  const _h = headers instanceof Headers || (headers != null && typeof headers[Symbol.iterator] === 'function')
+    ? Object.fromEntries(new Headers(headers).entries()) : { ...(headers || {}) };
+  const source = init.body;
+  const inheritsRequestBody = source == null && request !== null;
+  const record = inheritsRequestBody ? _getRequestBodyRecord(request) : null;
+  const initBody = inheritsRequestBody ? request.body : source;
+  const bodyPresent = record ? record.present : initBody != null;
+  if (bodyPresent && (method.toUpperCase() === 'GET' || method.toUpperCase() === 'HEAD')) {
+    throw new TypeError('Request with GET/HEAD method cannot have body');
+  }
+  const body = record ? record.bytes : _serializeBody(initBody, _h, !inheritsRequestBody);
   if (url.startsWith('blob:')) {
     const store = globalThis.__blobStore || {};
     const meta = globalThis.__blobMeta || {};
@@ -7881,16 +7934,6 @@ globalThis.fetch = async (input, init = {}) => {
       });
     }
   }
-  const method = String(init.method || (request ? request.method : "GET"));
-  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)) throw new TypeError('Invalid HTTP method');
-  const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
-  let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
-  const inheritsRequestBody = init.body === undefined && request !== null;
-  const initBody = init.body !== undefined
-    ? init.body
-    : (request ? request.body : undefined);
-  const bodyPresent = initBody !== undefined && initBody !== null;
-  const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
   const fetchMode = String(init.mode || (request ? request.mode : "cors"));
   if (!['cors', 'no-cors', 'same-origin'].includes(fetchMode)) throw new TypeError('Invalid RequestMode');
@@ -7956,7 +7999,19 @@ globalThis.fetch = async (input, init = {}) => {
 
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
-    constructor(init={}) { this._h={}; if(init) { if(init instanceof Headers) { init.forEach((v,k)=>{this._h[k]=v;}); } else if(typeof init==="object") { for(const[k,v]of Object.entries(init)) this._h[k.toLowerCase()]=String(v); } } }
+    constructor(init={}) {
+      this._h=Object.create(null);
+      if(init instanceof Headers) { init.forEach((v,k)=>{this._h[k]=v;}); }
+      else if(init != null && typeof init[Symbol.iterator] === 'function') {
+        for(const pair of init) {
+          if(pair == null || typeof pair === 'string' || typeof pair[Symbol.iterator] !== 'function') throw new TypeError('Invalid header pair');
+          const values = Array.from(pair);
+          if(values.length !== 2) throw new TypeError('Header pair must have two values');
+          const name = String(values[0]).toLowerCase(), value = String(values[1]);
+          this._h[name] = this._h[name] === undefined ? value : this._h[name] + ', ' + value;
+        }
+      } else if(init && typeof init==="object") { for(const[k,v]of Object.entries(init)) this._h[k.toLowerCase()]=String(v); }
+    }
     get(n) { return this._h[n.toLowerCase()]??null; } set(n,v) { this._h[n.toLowerCase()]=String(v); }
     has(n) { return n.toLowerCase() in this._h; } delete(n) { delete this._h[n.toLowerCase()]; }
     append(n,v) { this._h[n.toLowerCase()]=String(v); }
@@ -8048,7 +8103,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this._timeoutId = null;
     if (this._fetchController) this._fetchController.abort();
     this._fetchController = null;
-    this._method = method;
+    this._method = _normalizeFetchMethod(method);
     this._url = url;
     this._headers = {};
     this._responseHeaders = {};
@@ -8099,7 +8154,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       signal: controller.signal,
       method: this._method,
       headers: this._headers,
-      body: body == null ? undefined : body,
+      body: this._method === 'GET' || this._method === 'HEAD' || body == null ? undefined : body,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
     };
@@ -8354,14 +8409,37 @@ _markNative(globalThis.cancelIdleCallback);
 if (typeof Request === 'undefined') {
   globalThis.Request = class Request {
     constructor(input, init = {}) {
+      init = init || {};
       const inputRequest = input instanceof Request ? input : null;
+      const source = init.body;
+      const inheritsBody = source == null && inputRequest !== null;
+      const bodySource = inheritsBody ? inputRequest.body : source;
       if (typeof input === 'string') { this.url = input; }
-      else if (inputRequest) { this.url = inputRequest.url; init = { ...inputRequest, ...init }; }
+      else if (inputRequest) {
+        this.url = inputRequest.url;
+        const overrides = init;
+        init = { ...inputRequest };
+        // body was already read above; spreading init would invoke its getter
+        // again. Body inheritance/extraction uses the captured source instead.
+        for (const key of Object.keys(overrides)) {
+          if (key !== 'body') init[key] = overrides[key];
+        }
+      }
       else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
       else { this.url = input?.url || input?.href || String(input); }
-      this.method = (init.method || 'GET').toUpperCase();
+      this.method = _normalizeFetchMethod(init.method || 'GET');
+      if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(this.method)) throw new TypeError('Invalid HTTP method');
       this.headers = new Headers(init.headers);
-      this.body = init.body ?? null;
+      const inheritedBody = inheritsBody ? _getRequestBodyRecord(inputRequest) : null;
+      if ((inheritedBody ? inheritedBody.present : bodySource != null)
+          && (this.method === 'GET' || this.method === 'HEAD')) {
+        throw new TypeError('Request with GET/HEAD method cannot have body');
+      }
+      const fields = Object.fromEntries(this.headers.entries());
+      const extracted = inheritedBody || _snapshotRequestBody(bodySource, fields);
+      if (!inheritedBody) this.headers = new Headers(fields);
+      _setRequestBodyRecord(this, extracted);
+      this.body = bodySource ?? null;
       this.mode = init.mode || 'cors';
       this.credentials = init.credentials !== undefined
         ? String(init.credentials)
@@ -8375,24 +8453,14 @@ if (typeof Request === 'undefined') {
       this.cache = init.cache || 'default';
     }
     clone() {
-      return new Request(this.url, {
-        method: this.method,
-        headers: this.headers,
-        body: this.body,
-        mode: this.mode,
-        credentials: this.credentials,
-        redirect: this.redirect,
-        referrer: this.referrer,
-        signal: this.signal,
-        cache: this.cache,
-      });
+      return new Request(this);
     }
-    async text() { return this.body ? String(this.body) : ''; }
+    async text() { return new TextDecoder().decode(_getRequestBodyRecord(this).bytes); }
     async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
+    async arrayBuffer() { return _arrayBufferFromBytes(_getRequestBodyRecord(this).bytes); }
     async blob() {
       const ct = this.headers && this.headers.get ? (this.headers.get('content-type') || '') : '';
-      return new Blob(this.body != null ? [this.body] : [], { type: ct });
+      return new Blob([_getRequestBodyRecord(this).bytes], { type: ct });
     }
   };
 }
@@ -19624,6 +19692,15 @@ for (const [name, members] of Object.entries({
     if (descriptor && !Object.hasOwn(prototype, member)) Object.defineProperty(prototype, member, descriptor);
   }
 }
+
+Object.defineProperty(HTMLScriptElement.prototype, 'fetchPriority', {
+  enumerable: true, configurable: true,
+  get() {
+    const value = (this.getAttribute('fetchpriority') || '').toLowerCase();
+    return value === 'high' || value === 'low' ? value : 'auto';
+  },
+  set(value) { this.setAttribute('fetchpriority', String(value)); },
+});
 
 // Install standard prototype event handler accessors for all audited interfaces
 const _auditedEvents = {"window": ["onanimationend", "onanimationiteration", "onanimationstart", "onsearch", "ontransitionend", "onwebkitanimationend", "onwebkitanimationiteration", "onwebkitanimationstart", "onwebkittransitionend", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange", "onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpageshow", "onpopstate", "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload", "onappinstalled", "onbeforeinstallprompt", "ondevicemotion", "ondeviceorientation", "ondeviceorientationabsolute"], "XMLHttpRequest": ["onreadystatechange"], "Document": ["onreadystatechange", "onpointerlockchange", "onpointerlockerror", "onbeforecopy", "onbeforecut", "onbeforepaste", "onsearch", "onvisibilitychange", "oncopy", "oncut", "onpaste", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange", "onfullscreenchange", "onfullscreenerror", "onwebkitfullscreenchange", "onwebkitfullscreenerror", "onfreeze", "onresume"], "Element": ["onbeforecopy", "onbeforecut", "onbeforepaste", "onsearch", "onfullscreenchange", "onfullscreenerror", "onwebkitfullscreenchange", "onwebkitfullscreenerror"], "SVGElement": ["oncopy", "oncut", "onpaste", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange"], "Navigator": ["onLine"], "HTMLElement": ["oncopy", "oncut", "onpaste", "onabort", "onblur", "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick", "onclose", "oncontextmenu", "oncuechange", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "oninput", "oninvalid", "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onmousewheel", "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle", "onvolumechange", "onwaiting", "onwheel", "onauxclick", "ongotpointercapture", "onlostpointercapture", "onpointerdown", "onpointermove", "onpointerup", "onpointercancel", "onpointerover", "onpointerout", "onpointerenter", "onpointerleave", "onselectstart", "onselectionchange"], "HTMLMediaElement": ["onencrypted", "onwaitingforkey"], "HTMLVideoElement": ["onenterpictureinpicture", "onleavepictureinpicture"], "RTCPeerConnection": ["onnegotiationneeded", "onicecandidate", "onsignalingstatechange", "oniceconnectionstatechange", "onconnectionstatechange", "onicegatheringstatechange", "ontrack", "ondatachannel", "onaddstream", "onremovestream"], "MediaStream": ["onaddtrack", "onremovetrack", "onactive", "oninactive"], "WebSocket": ["onopen", "onerror", "onclose", "onmessage"], "SourceBufferList": ["onaddsourcebuffer", "onremovesourcebuffer"], "SourceBuffer": ["onupdatestart", "onupdate", "onupdateend", "onerror", "onabort"], "ScriptProcessorNode": ["onaudioprocess"], "ScreenOrientation": ["onchange"], "RTCDataChannel": ["onopen", "onbufferedamountlow", "onerror", "onclose", "onmessage"], "RTCDTMFSender": ["ontonechange"], "AudioScheduledSourceNode": ["onended"], "BaseAudioContext": ["onstatechange"], "OfflineAudioContext": ["oncomplete"], "NetworkInformation": ["onchange"], "MediaStreamTrack": ["onmute", "onunmute", "onended"], "MediaSource": ["onsourceopen", "onsourceended", "onsourceclose"], "MediaRecorder": ["onstart", "onstop", "ondataavailable", "onpause", "onresume", "onerror"], "MIDIPort": ["onstatechange"], "MIDIInput": ["onmidimessage"], "MIDIAccess": ["onstatechange"], "IDBTransaction": ["onabort", "oncomplete", "onerror"], "IDBRequest": ["onsuccess", "onerror"], "IDBOpenDBRequest": ["onblocked", "onupgradeneeded"], "IDBDatabase": ["onabort", "onclose", "onerror", "onversionchange"], "EventSource": ["onopen", "onmessage", "onerror"], "BroadcastChannel": ["onmessage", "onmessageerror"], "BatteryManager": ["onchargingchange", "onchargingtimechange", "ondischargingtimechange", "onlevelchange"], "AudioWorkletNode": ["onprocessorerror"], "XMLHttpRequestEventTarget": ["onloadstart", "onprogress", "onabort", "onerror", "onload", "ontimeout", "onloadend"], "Worker": ["onmessage", "onerror"], "VisualViewport": ["onresize", "onscroll"], "TextTrackCue": ["onenter", "onexit"], "TextTrackList": ["onchange", "onaddtrack", "onremovetrack"], "TextTrack": ["oncuechange"], "SVGAnimationElement": ["onbegin", "onend", "onrepeat"], "Performance": ["onresourcetimingbufferfull"], "MessagePort": ["onmessage", "onmessageerror"], "MediaQueryList": ["onchange"], "HTMLFrameSetElement": ["onblur", "onerror", "onfocus", "onload", "onresize", "onscroll", "onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpageshow", "onpopstate", "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload"], "HTMLBodyElement": ["onblur", "onerror", "onfocus", "onload", "onresize", "onscroll", "onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpageshow", "onpopstate", "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload"], "FileReader": ["onloadstart", "onprogress", "onload", "onabort", "onerror", "onloadend"], "Animation": ["onfinish", "oncancel"], "AbortSignal": ["onabort"], "SharedWorker": ["onerror"], "BackgroundFetchRegistration": ["onprogress"], "Notification": ["onclick", "onshow", "onerror", "onclose"], "PermissionStatus": ["onchange"], "PictureInPictureWindow": ["onresize"], "RTCDtlsTransport": ["onstatechange", "onerror"], "RemotePlayback": ["onconnecting", "onconnect", "ondisconnect"], "SpeechRecognition": ["onaudiostart", "onsoundstart", "onspeechstart", "onspeechend", "onsoundend", "onaudioend", "onresult", "onnomatch", "onerror", "onstart", "onend"], "SpeechSynthesisUtterance": ["onstart", "onend", "onerror", "onpause", "onresume", "onmark", "onboundary"], "ApplicationCache": ["oncached", "onchecking", "ondownloading", "onerror", "onnoupdate", "onobsolete", "onprogress", "onupdateready"], "MediaDevices": ["ondevicechange"], "Geolocation": [""], "MediaKeySession": ["onkeystatuseschange", "onmessage"], "RTCIceTransport": ["ongatheringstatechange", "onselectedcandidatepairchange", "onstatechange"], "ServiceWorker": ["onerror", "onstatechange"], "ServiceWorkerContainer": ["oncontrollerchange", "onmessage"], "ServiceWorkerRegistration": ["onupdatefound"], "PaymentRequest": ["onshippingaddresschange", "onshippingoptionchange"], "PresentationAvailability": ["onchange"], "PresentationConnection": ["onclose", "onconnect", "onmessage", "onterminate"], "PresentationConnectionList": ["onconnectionavailable"], "PresentationRequest": ["onconnectionavailable"], "Sensor": ["onactivate", "onerror", "onreading"], "USB": ["onconnect", "ondisconnect"], "CookieStore": ["onchange"]};

@@ -527,6 +527,32 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_flavor_frame_inherits_chromium_brand_list() {
+        let mut spec = obscura_net::PersonaSpec::preset(obscura_net::StealthProfile::MacChrome153);
+        spec.browser_flavor = obscura_net::BrowserFlavor::Chromium;
+        let persona = spec.compile().unwrap();
+        let mut parent = ObscuraJsRuntime::new(persona);
+        parent.set_dom(parse_html("<html><body></body></html>"));
+        parent.set_url("https://parent.example/");
+        parent.run_page_init();
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/", "<html><body></body></html>").unwrap();
+        let expected = serde_json::json!([
+            {"brand":"Chromium","version":"153"},
+            {"brand":"Not_A Brand","version":"8"},
+        ]);
+        assert_eq!(parent.evaluate("navigator.userAgentData.brands").unwrap(), expected);
+        assert_eq!(frame.evaluate(&mut parent, "navigator.userAgentData.brands").unwrap(), expected);
+        frame.evaluate(&mut parent, "(function(){var copy=navigator.userAgentData.brands;copy[0].brand='changed';copy.pop();return true;})()").unwrap();
+        assert_eq!(parent.evaluate("navigator.userAgentData.brands").unwrap(), expected);
+        assert_eq!(frame.evaluate(&mut parent, "navigator.userAgentData.toJSON().brands").unwrap(), expected);
+        assert_eq!(frame.evaluate(&mut parent, "(function(){var b=navigator.userAgentData.brands;var j=navigator.userAgentData.toJSON().brands;return [Object.getPrototypeOf(b)===Array.prototype,Object.getPrototypeOf(b[0])===Object.prototype,Object.getPrototypeOf(j)===Array.prototype,Object.getPrototypeOf(j[0])===Object.prototype];})()").unwrap(), serde_json::json!([true,true,true,true]));
+        frame.execute_script(&mut parent, "globalThis.__entropy=null;navigator.userAgentData.getHighEntropyValues(['fullVersionList']).then(x=>__entropy=x);").unwrap();
+        parent.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "__entropy.brands").unwrap(), expected);
+        assert_eq!(frame.evaluate(&mut parent, "(function(){var b=__entropy.brands;var f=__entropy.fullVersionList;return [Object.getPrototypeOf(b)===Array.prototype,Object.getPrototypeOf(b[0])===Object.prototype,Object.getPrototypeOf(f)===Array.prototype,Object.getPrototypeOf(f[0])===Object.prototype];})()").unwrap(), serde_json::json!([true,true,true,true]));
+    }
+
     /// The capability the frame realm exists for: scripts that arrived with the
     /// frame's document run, in order, against the frame's own DOM.
     #[test]

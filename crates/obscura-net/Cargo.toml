@@ -31,6 +31,7 @@ http = "1"
 psl = "2"
 
 [dev-dependencies]
+tls-fixture-rustls = { package = "primp-rustls", version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12", "impersonate"] }
 socket2 = "0.6"
 # TLS fixtures for the configured-roots tests: rcgen mints a throwaway CA + leaf,
 # tokio-rustls serves one HTTPS response with them. Pinned to the ring

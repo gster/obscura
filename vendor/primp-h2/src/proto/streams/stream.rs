@@ -31,6 +31,9 @@ pub(super) struct Stream {
     /// Number of outstanding handles pointing to this stream
     pub ref_count: usize,
 
+    /// Consumed when the initial HEADERS actually leaves the pending queue.
+    pub chrome_priority: Option<crate::ext::HeadersPriority>,
+
     // ===== Fields related to sending =====
     /// Next node in the accept linked list
     pub next_pending_send: Option<store::Key>,
@@ -162,6 +165,7 @@ impl Stream {
             id,
             state: State::default(),
             ref_count: 0,
+            chrome_priority: None,
             is_counted: false,
 
             // ===== Fields related to sending =====

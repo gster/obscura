@@ -371,6 +371,10 @@ impl Headers {
         self.stream_dep = Some(dependency);
     }
 
+    pub(crate) fn priority(&self) -> Option<&StreamDependency> {
+        self.stream_dep.as_ref()
+    }
+
     pub fn set_header_order(&mut self, order: Vec<HeaderName>) {
         self.header_block.header_order = Some(order);
     }

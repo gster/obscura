@@ -3888,6 +3888,7 @@ pub(crate) mod tests {
             let session_id = format!("{page_id}-session");
             ctx.sessions.insert(session_id.clone(), page_id.clone());
             ctx.runtime_enabled_sessions.insert(session_id.clone());
+            ctx.page_enabled_sessions.insert(session_id.clone());
             ctx.lifecycle_enabled_sessions.insert(session_id.clone());
             ctx.ensure_default_context(&page_id).unwrap();
             ctx.current_loader_ids.insert(page_id.clone(), "loader-before".into());
@@ -4001,6 +4002,7 @@ pub(crate) mod tests {
             let session_id = format!("{page_id}-session");
             ctx.sessions.insert(session_id.clone(), page_id.clone());
             ctx.runtime_enabled_sessions.insert(session_id.clone());
+            ctx.page_enabled_sessions.insert(session_id.clone());
             ctx.lifecycle_enabled_sessions.insert(session_id.clone());
             ctx.ensure_default_context(&page_id).unwrap();
             ctx.current_loader_ids.insert(page_id.clone(), "loader-before".into());

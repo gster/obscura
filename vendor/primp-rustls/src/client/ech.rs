@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::size_of;
 
 use pki_types::{DnsName, EchConfigListBytes, ServerName};
 use subtle::ConstantTimeEq;
@@ -213,6 +214,7 @@ impl EchGreaseConfig {
         secure_random: &'static dyn SecureRandom,
         inner_name: ServerName<'static>,
         _outer_hello: &ClientHelloPayload,
+        chrome153_length_buckets: bool,
     ) -> Result<EncryptedClientHello, Error> {
         trace!("Preparing GREASE ECH extension");
 
@@ -245,8 +247,8 @@ impl EchGreaseConfig {
             false, // Does not matter if we enable/disable SNI here. Inner hello is not used.
         )?;
 
-        // Generate a payload of random data. BoringSSL uses a random length of
-        // 128-224+tag bytes for GREASE ECH payload.
+        // Generate a payload of random data. Chrome 153 uses one of four
+        // 32-byte-spaced base lengths from 128 through 224, plus the AEAD tag.
         let tag_len = suite
             .sym
             .aead_id
@@ -254,9 +256,15 @@ impl EchGreaseConfig {
             // Safety: we have confirmed the AEAD is supported when building the config. All
             //  supported AEADs have a tag length.
             .unwrap();
-        let mut random_len = [0u8; 2];
-        secure_random.fill(&mut random_len)?;
-        let payload_len = 128 + (u16::from_be_bytes(random_len) % 97) as usize + tag_len;
+        let payload_len = if chrome153_length_buckets {
+            let mut random_len = [0u8; size_of::<usize>()];
+            secure_random.fill(&mut random_len)?;
+            128 + 32 * (usize::from_ne_bytes(random_len) % 4) + tag_len
+        } else {
+            let mut random_len = [0u8; 2];
+            secure_random.fill(&mut random_len)?;
+            128 + (u16::from_be_bytes(random_len) % 97) as usize + tag_len
+        };
         let mut payload = vec![0; payload_len];
         secure_random.fill(&mut payload)?;
 

@@ -9,6 +9,7 @@ pub(crate) type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, cra
 
 pub mod body;
 pub mod client;
+pub(crate) mod encoded_headers;
 pub(crate) mod h1_client;
 pub(crate) mod h2_client;
 pub mod h3_client;

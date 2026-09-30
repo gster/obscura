@@ -163,6 +163,8 @@ pub enum InvalidMessage {
     InvalidKeyUpdate,
     /// A peer's server name could not be decoded
     InvalidServerName,
+    /// The server padding extension does not match the requested length.
+    InvalidServerPadding,
     /// A TLS message payload was larger then allowed by the specification.
     MessageTooLarge,
     /// Message is shorter than the expected length

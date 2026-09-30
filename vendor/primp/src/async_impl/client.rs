@@ -23,6 +23,7 @@ use crate::async_impl::h3_client::connect::{
 #[cfg(feature = "http3")]
 use crate::async_impl::h3_client::H3Client;
 use crate::async_impl::negotiate::NegotiatingConnection;
+use crate::async_impl::encoded_headers::CaptureEncodedHeaders;
 use crate::async_impl::range_guard::{self, RangeGuard};
 use crate::config::{ReadTimeout, RequestConfig, TotalTimeout};
 #[cfg(unix)]
@@ -305,6 +306,7 @@ pub(crate) struct Config {
     windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
     impersonate: Option<crate::imp::Impersonate>,
     os_type: Option<crate::imp::ImpersonateOS>,
+    server_padding_request: Option<u16>,
 }
 
 fn h2_client_config_from(config: &Config) -> H2ClientConfig {
@@ -451,6 +453,7 @@ impl ClientBuilder {
                 windows_named_pipe: None,
                 impersonate: None,
                 os_type: None,
+                server_padding_request: None,
             },
         }
     }
@@ -484,6 +487,7 @@ impl ClientBuilder {
                     tls_sslkeylogfile: self.config.tls_sslkeylogfile,
                     min_tls_version: self.config.min_tls_version,
                     max_tls_version: self.config.max_tls_version,
+                    server_padding_request: self.config.server_padding_request,
                 };
                 let settings = crate::imp::get_browser_settings(imp, Some(os));
                 return crate::impersonation::apply_impersonation(self, settings, &root_certs, tls);
@@ -491,6 +495,9 @@ impl ClientBuilder {
         }
 
         let config = self.config;
+        if config.server_padding_request.is_some() {
+            return Err(crate::error::builder("TLS server padding request requires impersonation"));
+        }
 
         // Capture the legacy HTTP/1.1 client settings before `config` is
         // partially moved during the rest of client construction.
@@ -1124,6 +1131,7 @@ impl ClientBuilder {
         let base = tower::retry::Retry::new(retry_policy.clone(), connection);
         #[cfg(feature = "cookies")]
         let base = CookieService::new(base, config.cookie_store.clone());
+        let base = CaptureEncodedHeaders::new(base);
         #[cfg(any(
             feature = "gzip",
             feature = "brotli",
@@ -1167,6 +1175,7 @@ impl ClientBuilder {
                         let base = tower::retry::Retry::new(retry_policy.clone(), h3_service);
                         #[cfg(feature = "cookies")]
                         let base = CookieService::new(base, config.cookie_store.clone());
+                        let base = CaptureEncodedHeaders::new(base);
                         #[cfg(any(
                             feature = "gzip",
                             feature = "brotli",
@@ -1233,11 +1242,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Request experimental TLS server handshake padding (0x12e0).
+    /// Requires impersonation. None omits the extension; Some(0) sends it.
+    /// Servers may decline; responses are only accepted in TLS 1.3 and
+    /// must contain exactly the requested number of bytes.
+    pub fn tls_server_padding_request(mut self, bytes: Option<u16>) -> Self {
+        self.config.server_padding_request = bytes;
+        self
+    }
+
     /// Clears impersonation fields so that `build()` takes the normal path.
     /// Called internally after impersonation settings have been applied.
     pub(crate) fn clear_impersonation(mut self) -> Self {
         self.config.impersonate = None;
         self.config.os_type = None;
+        self.config.server_padding_request = None;
         self
     }
 
@@ -2889,6 +2908,16 @@ impl Client {
         };
         *req.headers_mut() = headers.clone();
 
+        if let Some(weight) = extensions.get::<h2::ext::HeadersWeight>().copied() {
+            req.extensions_mut().insert(weight);
+        }
+        if let Some(priority) = extensions.get::<h2::ext::HeadersPriority>().copied() {
+            req.extensions_mut().insert(priority);
+        }
+        if let Some(priority) = extensions.get::<h2::ext::ExtensiblePriority>().copied() {
+            req.extensions_mut().insert(priority);
+        }
+
         // Carry the per-request redirect override onto the wire request so the
         // redirect policy can read it from the first request of the chain.
         if let Some(override_policy) = extensions
@@ -3272,7 +3301,7 @@ type MaybeCookieService<T> = CookieService<T>;
     feature = "zstd",
     feature = "deflate"
 )))]
-type MaybeDecompression<T> = RangeGuard<T>;
+type MaybeDecompression<T> = RangeGuard<CaptureEncodedHeaders<T>>;
 
 #[cfg(any(
     feature = "gzip",
@@ -3280,7 +3309,7 @@ type MaybeDecompression<T> = RangeGuard<T>;
     feature = "zstd",
     feature = "deflate"
 ))]
-type MaybeDecompression<T> = RangeGuard<Decompression<T>>;
+type MaybeDecompression<T> = RangeGuard<Decompression<CaptureEncodedHeaders<T>>>;
 
 type LayeredService<T> = FollowRedirect<
     MaybeDecompression<MaybeCookieService<tower::retry::Retry<crate::retry::Policy, T>>>,

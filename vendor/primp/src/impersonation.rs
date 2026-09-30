@@ -14,6 +14,7 @@ pub(crate) struct ImpersonationTls {
     pub(crate) tls_sslkeylogfile: bool,
     pub(crate) min_tls_version: Option<crate::tls::Version>,
     pub(crate) max_tls_version: Option<crate::tls::Version>,
+    pub(crate) server_padding_request: Option<u16>,
 }
 
 /// Apply impersonation settings to a primp ClientBuilder.
@@ -153,6 +154,7 @@ pub(crate) fn build_impersonate_tls_config(
     }
 
     config.browser_emulation = Some((*settings.browser_emulator).clone());
+    config.browser_emulation.as_mut().unwrap().server_padding_request = tls.server_padding_request;
     config.alpn_protocols = vec!["h2".into(), "http/1.1".into()];
 
     if settings.browser_emulator.is_chrome_based() {
@@ -312,6 +314,7 @@ mod cert_compression_tests {
             tls_sslkeylogfile: false,
             min_tls_version: None,
             max_tls_version: None,
+            server_padding_request: None,
         };
         let config = build_impersonate_tls_config(&settings, &[], &tls)
             .expect("build impersonate tls config");
@@ -375,6 +378,7 @@ mod cert_compression_tests {
             tls_sslkeylogfile: false,
             min_tls_version: None,
             max_tls_version: None,
+            server_padding_request: None,
         };
         let config = build_impersonate_tls_config(&settings, &[], &tls)
             .expect("build impersonate tls config");
@@ -503,6 +507,7 @@ mod cert_compression_tests {
             tls_sslkeylogfile: false,
             min_tls_version: min,
             max_tls_version: max,
+            server_padding_request: None,
         };
         let config = build_impersonate_tls_config(&settings, &[], &tls)
             .expect("build impersonate tls config");

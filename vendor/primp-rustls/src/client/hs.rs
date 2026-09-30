@@ -602,6 +602,76 @@ fn generate_distinct_grease(random: &[u8; 32]) -> (u16, u16, u16, u16, u16) {
     )
 }
 
+#[cfg(feature = "impersonate")]
+#[derive(Clone, Copy)]
+struct Chrome153Grease {
+    cipher: u16,
+    group: u16,
+    extension_first: u16,
+    extension_last: u16,
+    version: u16,
+    signature: u16,
+}
+
+#[cfg(feature = "impersonate")]
+impl Chrome153Grease {
+    fn from_seed(seed: [u8; 8]) -> Self {
+        let value = |index: usize| {
+            let byte = (seed[index] & 0xf0) | 0x0a;
+            u16::from_be_bytes([byte, byte])
+        };
+        let extension_first = value(2);
+        let mut extension_last = value(3);
+        if extension_last == extension_first { extension_last ^= 0x1010; }
+        Self {
+            cipher: value(0), group: value(1), extension_first, extension_last,
+            version: value(4), signature: value(7),
+        }
+    }
+
+    fn draw(config: &ClientConfig) -> Result<Option<Self>, Error> {
+        if !config.browser_emulation.as_ref().is_some_and(|be|
+            be.browser_type == BrowserType::Chrome && be.version.major == 153) {
+            return Ok(None);
+        }
+        // Pinned BoringSSL draws eight independent bytes once per handshake.
+        // Slots 5/6 are reserved for ticket/ECH GREASE, unchanged in this repair.
+        let mut seed = [0u8; 8];
+        config.provider.secure_random.fill(&mut seed)?;
+        Ok(Some(Self::from_seed(seed)))
+    }
+
+    fn wire_categories(self) -> (u16, u16, u16, u16, u16) {
+        (self.cipher, self.group, self.extension_first, self.extension_last, self.version)
+    }
+}
+
+#[cfg(feature = "impersonate")]
+fn wire_signature_schemes(config: &ClientConfig, random: &[u8; 32], grease: Option<Chrome153Grease>) -> Vec<SignatureScheme> {
+    let mut schemes = config
+        .browser_emulation
+        .as_ref()
+        .and_then(|be| be.signature_algorithms.as_ref())
+        .map(|schemes| {
+            if config.provider.fips() {
+                let allowed = config.verifier.supported_verify_schemes();
+                intersect_sig_schemes_fips(schemes, &allowed)
+            } else {
+                schemes.to_vec()
+            }
+        })
+        .unwrap_or_else(|| config.verifier.supported_verify_schemes());
+    if config.browser_emulation.as_ref().is_some_and(|be| be.grease_signature_algorithms) {
+        // Only the verified Chrome153 path uses independent handshake entropy;
+        // other profiles retain their existing wire behavior. Add to the staged
+        // list after FIPS/verifier selection, never to verification capabilities.
+        let byte = (random[20] & 0xf0) | 0x0a;
+        let value = grease.map(|values| values.signature).unwrap_or(u16::from_be_bytes([byte, byte]));
+        schemes.insert(0, SignatureScheme::Unknown(value));
+    }
+    schemes
+}
+
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
 pub(super) type ClientContext<'a> = crate::common_state::Context<'a, ClientConnectionData>;
@@ -629,6 +699,8 @@ pub(super) struct ClientHelloInput {
     pub(super) config: Arc<ClientConfig>,
     pub(super) resuming: Option<persist::Retrieved<ClientSessionValue>>,
     pub(super) random: Random,
+    #[cfg(feature = "impersonate")]
+    chrome153_grease: Option<Chrome153Grease>,
     pub(super) sent_tls13_fake_ccs: bool,
     pub(super) hello: ClientHelloDetails,
     pub(super) session_id: SessionId,
@@ -782,9 +854,14 @@ impl ClientHelloInput {
             extension_order_seed,
         );
 
+        #[cfg(feature = "impersonate")]
+        let chrome153_grease = Chrome153Grease::draw(&config)?;
+
         Ok(Self {
             resuming,
             random: Random::new(config.provider.secure_random)?,
+            #[cfg(feature = "impersonate")]
+            chrome153_grease,
             sent_tls13_fake_ccs: false,
             hello,
             session_id,
@@ -1034,17 +1111,18 @@ fn emit_client_hello_for_retry(
         supported_versions_grease: None,
     };
 
-    // Generate all 5 distinct GREASE values (matching real Chrome behavior:
-    // cipher suites, named groups, extension bookends, supported_versions)
+    // Chrome153 permits equal categories and all sixteen values. Only its
+    // extension bookends must differ. Unverified profiles retain the old path.
     #[cfg(feature = "impersonate")]
     let grease_vals: Option<(u16, u16, u16, u16, u16)> = if config.browser_emulation.is_some() {
-        Some(generate_distinct_grease(&input.random.0))
+        Some(input.chrome153_grease.map(Chrome153Grease::wire_categories)
+            .unwrap_or_else(|| generate_distinct_grease(&input.random.0)))
     } else {
         None
     };
 
     // Add GREASE to supported_versions only for Chrome-based browsers,
-    // with a per-connection value derived from the client random.
+    // with per-handshake entropy in the verified Chrome153 path.
     // Firefox doesn't send GREASE in supported_versions.
     #[cfg(feature = "impersonate")]
     if let Some(be) = config.browser_emulation.as_ref() {
@@ -1167,24 +1245,7 @@ fn emit_client_hello_for_retry(
         named_groups: Some(named_groups_vec),
         supported_versions: Some(supported_versions),
         #[cfg(feature = "impersonate")]
-        signature_schemes: Some(
-            config
-                .browser_emulation
-                .as_ref()
-                .and_then(|be| be.signature_algorithms.as_ref())
-                .map(|schemes| {
-                    if config.provider.fips() {
-                        // Intersect impersonated list with FIPS-approved verifier
-                        // schemes; otherwise we'd advertise ML-DSA etc. that we
-                        // then refuse to verify. Never empty (see helper).
-                        let allowed = config.verifier.supported_verify_schemes();
-                        intersect_sig_schemes_fips(schemes, &allowed)
-                    } else {
-                        schemes.to_vec()
-                    }
-                })
-                .unwrap_or_else(|| config.verifier.supported_verify_schemes()),
-        ),
+        signature_schemes: Some(wire_signature_schemes(config, &input.random.0, input.chrome153_grease)),
         #[cfg(not(feature = "impersonate"))]
         signature_schemes: Some(config.verifier.supported_verify_schemes()),
         extended_master_secret_request: Some(()),
@@ -1196,6 +1257,7 @@ fn emit_client_hello_for_retry(
     // Add browser-specific extensions for browser emulation
     #[cfg(feature = "impersonate")]
     if let Some(be) = config.browser_emulation.as_ref() {
+        exts.server_padding_request = be.server_padding_request;
         match be.browser_type {
             BrowserType::Chrome | BrowserType::Edge | BrowserType::Opera => {
                 // Signed certificate timestamp extension for Chrome fingerprinting
@@ -1227,7 +1289,7 @@ fn emit_client_hello_for_retry(
                 ));
                 exts.unknown_extensions.push((
                     ExtensionType::Unknown(GREASE_EXT_LAST_PLACEHOLDER),
-                    Payload::empty(),
+                    if input.chrome153_grease.is_some() { Payload::new(vec![0]) } else { Payload::empty() },
                 ));
 
                 // Note: contiguous_extensions is set after all extensions are added (see below)
@@ -1590,6 +1652,10 @@ fn emit_client_hello_for_retry(
     #[cfg(feature = "impersonate")]
     if let Some(be) = config.browser_emulation.as_ref() {
         if let Some(mut order) = emulator_extension_order(be) {
+            if exts.server_padding_request.is_some() {
+                // Padding is order-insensitive, unlike the two GREASE bookends.
+                order.insert(1, ExtensionType::ServerPadding);
+            }
             // OBSCURA PATCH: do not emit one captured order forever - real
             // Chrome permutes the order-insensitive extensions per connection.
             let seed = crate::rand::random_u16(config.provider.secure_random).unwrap_or(0);
@@ -1640,11 +1706,16 @@ fn emit_client_hello_for_retry(
         extensions: exts,
     };
 
+    #[cfg(feature = "impersonate")]
+    let chrome153_ech_length_buckets = input.chrome153_grease.is_some();
+    #[cfg(not(feature = "impersonate"))]
+    let chrome153_ech_length_buckets = false;
     let ech_grease_ext = config.ech_mode.as_ref().and_then(|mode| match mode {
         EchMode::Grease(cfg) => Some(cfg.grease_ext(
             config.provider.secure_random,
             input.server_name.clone(),
             &chp_payload,
+            chrome153_ech_length_buckets,
         )),
         _ => None,
     });
@@ -1683,6 +1754,7 @@ fn emit_client_hello_for_retry(
         sent_extensions.push(*ext_type);
     }
     input.hello.sent_extensions = sent_extensions;
+    input.hello.server_padding_request = chp_payload.server_padding_request;
     input.hello.offered_cipher_suites = chp_payload.cipher_suites.clone();
 
     let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
@@ -2003,6 +2075,14 @@ impl State<ClientConnectionData> for ExpectServerHello {
         }
 
         cx.common.negotiated_version = Some(version);
+        // This extension is only valid in TLS 1.3 EncryptedExtensions,
+        // never in a TLS 1.2 or TLS 1.3 plaintext ServerHello.
+        if server_hello.server_padding.is_some() {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::UnsupportedExtension,
+                PeerMisbehaved::UnsolicitedServerHelloExtension,
+            ));
+        }
 
         // Extract ALPN protocol
         if !cx.common.is_tls13() {
@@ -3233,10 +3313,8 @@ mod tests {
         assert_eq!(choose_extension_order_seed(&config), 0x9a7c);
     }
 
-    /// GREASE values must be per-connection (derived from the client random),
-    /// valid (0x?A?A), distinct per position, and vary with the random.
-    /// The supported_versions GREASE must NOT reuse the cipher-suite GREASE:
-    /// real browsers draw them independently (equal in only 1/14 captures).
+    /// Preserve the legacy strategy for profiles not qualified for the new
+    /// Chrome153 entropy path. These constraints are not Chrome153's rules.
     #[test]
     fn grease_values_vary_per_random_and_are_distinct() {
         use super::generate_distinct_grease;

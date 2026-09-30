@@ -963,7 +963,16 @@ impl PoolClient {
         // server. The request body is replayed from a clone when available.
         const MAX_REFUSED_RETRIES: usize = 32;
 
-        let (parts, mut body) = req.into_parts();
+        let (mut parts, mut body) = req.into_parts();
+        // Modify only this H2 send's headers, not the redirect source snapshot.
+        // Explicit fields win, and automatic fields never leak onto H1 hops.
+        if !parts.headers.contains_key("priority") {
+            if let Some(value) = parts.extensions.get::<h2::ext::ExtensiblePriority>()
+                .copied().and_then(h2::ext::ExtensiblePriority::field_value) {
+                parts.headers.insert("priority", http::HeaderValue::from_str(&value)
+                    .expect("validated HTTP priority"));
+            }
+        }
         // Immutable source used to replay a replayable body. It is never
         // streamed itself; each retry clones a *fresh* copy so a body is never
         // sent empty after a previous (refused) attempt already drained a

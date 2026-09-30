@@ -539,8 +539,22 @@ impl Prioritize {
             }
 
             match self.pop_frame(buffer, store, max_frame_len, counts) {
-                Some(frame) => {
+                Some(mut frame) => {
                     tracing::trace!(?frame, "writing");
+
+                    // The stream may have waited in pending_open while its
+                    // prospective parent finished. Resolve the dependency at
+                    // the actual HEADERS serialization boundary.
+                    if let Frame::Headers(ref mut headers) = frame {
+                        let id = headers.stream_id();
+                        if let Some(priority) = store.take_chrome_priority(id) {
+                            let (weight, exclusive) = headers.priority()
+                                .map(|dep| (dep.weight(), dep.is_exclusive()))
+                                .unwrap_or((255, true));
+                            let parent = store.register_chrome_priority(priority, id);
+                            headers.set_priority(frame::StreamDependency::new(parent, weight, exclusive));
+                        }
+                    }
 
                     debug_assert_eq!(self.in_flight_data_frame, InFlightData::Nothing);
                     if let Frame::Data(ref frame) = frame {

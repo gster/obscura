@@ -923,6 +923,10 @@ extension_struct! {
         ExtensionType::SignatureAlgorithms =>
             pub(crate) signature_schemes: Option<Vec<SignatureScheme>>,
 
+        /// Experimental TLS server handshake padding request.
+        ExtensionType::ServerPadding =>
+            pub(crate) server_padding_request: Option<u16>,
+
         /// Offered ALPN protocols (RFC6066)
         ExtensionType::ALProtocolNegotiation =>
             pub(crate) protocols: Option<Vec<ProtocolName>>,
@@ -1042,6 +1046,7 @@ impl ClientExtensions<'_> {
             named_groups,
             ec_point_formats,
             signature_schemes,
+            server_padding_request,
             protocols,
             client_certificate_types,
             server_certificate_types,
@@ -1079,6 +1084,7 @@ impl ClientExtensions<'_> {
             named_groups,
             ec_point_formats,
             signature_schemes,
+            server_padding_request,
             protocols,
             client_certificate_types,
             server_certificate_types,
@@ -1384,6 +1390,9 @@ extension_struct! {
         /// Peer ALPS data in TLS 1.3 EncryptedExtensions.
         ExtensionType::ApplicationSettingsNew =>
             pub(crate) application_settings_new: Option<Payload<'a>>,
+        /// Requested padding in TLS 1.3 EncryptedExtensions.
+        ExtensionType::ServerPadding =>
+            pub(crate) server_padding: Option<Payload<'a>>,
     } + {
         pub(crate) unknown_extensions: BTreeSet<u16>,
     }
@@ -1411,6 +1420,7 @@ impl ServerExtensions<'_> {
             encrypted_client_hello_ack,
             application_settings_new,
             unknown_extensions,
+            server_padding,
         } = self;
         ServerExtensions {
             ec_point_formats,
@@ -1431,6 +1441,7 @@ impl ServerExtensions<'_> {
             ticket_request,
             encrypted_client_hello_ack,
             application_settings_new: application_settings_new.map(|x| x.into_owned()),
+            server_padding: server_padding.map(|x| x.into_owned()),
             unknown_extensions,
         }
     }
@@ -1881,7 +1892,15 @@ impl<'a> Codec<'a> for CertificateExtensions<'a> {
             // ClientExtensions, ServerExtensions, and NewSessionTicketExtensions.
             // See: https://datatracker.ietf.org/doc/html/rfc8446#section-4.4.2
             // See: https://www.iana.org/assignments/tls-extensiontype-values
-            out.read_one(&mut sub, |_unk| Ok(()))?;
+            out.read_one(&mut sub, |unknown| {
+                // Server padding is negotiated in EncryptedExtensions, not
+                // Certificate. Preserve unrelated unknown-extension handling.
+                if unknown == ExtensionType::ServerPadding {
+                    Err(InvalidMessage::UnknownCertificateExtension)
+                } else {
+                    Ok(())
+                }
+            })?;
         }
 
         Ok(out)

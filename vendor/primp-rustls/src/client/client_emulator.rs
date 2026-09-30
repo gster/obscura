@@ -81,6 +81,12 @@ pub struct BrowserEmulator {
     pub cipher_suites: Option<Vec<CipherSuite>>,
     /// Optional signature algorithms to use (instead of verifier defaults)
     pub signature_algorithms: Option<Vec<SignatureScheme>>,
+    /// Whether to prepend a wire-only GREASE value to signature_algorithms.
+    /// This does not add a signature verification capability.
+    pub grease_signature_algorithms: bool,
+    /// Experimental TLS server handshake padding request (0x12e0).
+    /// None omits the extension; Some(0) still sends a request.
+    pub server_padding_request: Option<u16>,
     /// Optional named groups to use (instead of provider defaults)
     pub named_groups: Option<Vec<NamedGroup>>,
     /// Optional OS type for platform-specific fingerprinting
@@ -115,6 +121,8 @@ impl BrowserEmulator {
             extension_order_seed: None,
             cipher_suites: None,
             signature_algorithms: None,
+            grease_signature_algorithms: false,
+            server_padding_request: None,
             named_groups: None,
             os_type: None,
             include_status_request_v2: false,
@@ -200,6 +208,8 @@ impl Default for BrowserEmulator {
             extension_order_seed: None,
             cipher_suites: None,
             signature_algorithms: None,
+            grease_signature_algorithms: false,
+            server_padding_request: None,
             named_groups: None,
             os_type: None,
             include_status_request_v2: false,

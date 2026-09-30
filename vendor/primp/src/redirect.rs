@@ -261,6 +261,9 @@ pub(crate) struct TowerRedirectPolicy {
     /// Per-request override from the first `on_request` call; lives on the
     /// per-request policy clone, never on the shared client.
     override_policy: Option<crate::config::RedirectOverride>,
+    headers_weight: Option<h2::ext::HeadersWeight>,
+    headers_priority: Option<h2::ext::HeadersPriority>,
+    extensible_priority: Option<h2::ext::ExtensiblePriority>,
     /// Set once a cross-host hop strips sensitive headers. tower-http
     /// rebuilds later hops from the original hop-0 snapshot (which still
     /// carries the creds), so they must be re-stripped unconditionally.
@@ -281,6 +284,9 @@ impl TowerRedirectPolicy {
             https_only: false,
             redirect_enabled: Arc::new(AtomicBool::new(enabled)),
             override_policy: None,
+            headers_weight: None,
+            headers_priority: None,
+            extensible_priority: None,
             sensitive_stripped: false,
             proxies: Arc::new(RwLock::new(Vec::new())),
         }
@@ -437,6 +443,17 @@ impl TowerPolicy<async_impl::body::Body, crate::Error> for TowerRedirectPolicy {
     }
 
     fn on_request(&mut self, req: &mut http::Request<async_impl::body::Body>) {
+        {
+            self.headers_weight = self.headers_weight.or(req.extensions()
+                .get::<h2::ext::HeadersWeight>().copied());
+            if let Some(weight) = self.headers_weight { req.extensions_mut().insert(weight); }
+            self.headers_priority = self.headers_priority.or(req.extensions()
+                .get::<h2::ext::HeadersPriority>().copied());
+            if let Some(priority) = self.headers_priority { req.extensions_mut().insert(priority); }
+            self.extensible_priority = self.extensible_priority.or(req.extensions()
+                .get::<h2::ext::ExtensiblePriority>().copied());
+            if let Some(priority) = self.extensible_priority { req.extensions_mut().insert(priority); }
+        }
         // Capture the per-request override from the request extensions; the
         // ORIGINAL request is the only one in the chain carrying them.
         // `or()` is REQUIRED: tower-http rebuilds follow-up requests WITHOUT

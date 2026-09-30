@@ -13,10 +13,13 @@ pub mod blocklist;
 pub mod network_activity;
 pub mod stealth_client;
 
+#[cfg(test)]
+mod tls_signature_tests;
+
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
-    ReferrerPolicy, ResourceRequest, ResourceType, Response, ResponseCallback, SsrfGuardResolver,
+    ReferrerPolicy, ResourceRequest, ResourceType, ScriptPriority, Response, ResponseCallback, SsrfGuardResolver,
 };
 pub use cookies::{canonical_domain, default_cookie_path, CookieInfo, CookieJar};
 pub use encoding::{
@@ -31,6 +34,6 @@ pub use stealth_client::{
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
 };
 pub use persona::{
-    activate_process_persona, EffectivePersona, GeolocationSpec, PersonaError, PersonaSpec, ViewportSpec,
+    activate_process_persona, BrowserBrand, BrowserFlavor, EffectivePersona, GeolocationSpec, PersonaError, PersonaSpec, ViewportSpec,
     PERSONA_SCHEMA_VERSION,
 };

@@ -143,6 +143,7 @@ enum_builder! {
         KeyShare => 0x0033,
         TransportParameters => 0x0039,
         TicketRequest => 0x003a,
+        ServerPadding => 0x12e0,
         ApplicationSettings => 0x4469,
         ApplicationSettingsNew => 0x44cd,
         NextProtocolNegotiation => 0x3374,

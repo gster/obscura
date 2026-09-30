@@ -641,6 +641,7 @@ async fn insert_text_processes_same_document_navigation_and_emits_frame_event() 
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
+    cdp(&mut ctx, 0, "Page.enable", json!({}), session_id).await;
     cdp(
         &mut ctx,
         1,
@@ -679,13 +680,13 @@ async fn insert_text_processes_same_document_navigation_and_emits_frame_event() 
     let frame = ctx
         .pending_events
         .iter()
-        .find(|event| event.method == "Page.frameNavigated")
-        .expect("input-triggered same-document navigation must emit Page.frameNavigated");
+        .find(|event| event.method == "Page.navigatedWithinDocument")
+        .expect("input-triggered same-document navigation must emit Page.navigatedWithinDocument");
     assert_eq!(frame.session_id.as_deref(), Some(session_id));
-    assert_eq!(frame.params["frame"]["id"], page_id);
-    assert_eq!(frame.params["frame"]["loaderId"], loader_id);
+    assert_eq!(frame.params["frameId"], page_id);
+    assert_eq!(frame.params["navigationType"], "fragment");
     assert!(
-        frame.params["frame"]["url"]
+        frame.params["url"]
             .as_str()
             .is_some_and(|url| url.ends_with("#typed")),
         "unexpected frame event: {frame:?}"
@@ -693,6 +694,7 @@ async fn insert_text_processes_same_document_navigation_and_emits_frame_event() 
     assert_eq!(ctx.current_loader_ids[&page_id], loader_id);
     assert!(ctx.pending_events.iter().all(|event| {
         event.method != "Runtime.executionContextsCleared"
+            && event.method != "Page.frameNavigated"
             && event.method != "Page.lifecycleEvent"
     }));
 }

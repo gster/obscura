@@ -508,6 +508,15 @@ fn validate_encrypted_extensions(
         ));
     }
 
+    if let Some(padding) = &exts.server_padding {
+        if hello.server_padding_request.map(usize::from) != Some(padding.bytes().len()) {
+            return Err(common.send_fatal_alert(
+                AlertDescription::DecodeError,
+                InvalidMessage::InvalidServerPadding,
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -520,6 +529,60 @@ struct ExpectEncryptedExtensions {
     transcript: HandshakeHash,
     key_schedule: KeyScheduleHandshake,
     hello: ClientHelloDetails,
+}
+
+#[cfg(test)]
+mod server_padding_tests {
+    use super::*;
+
+    #[test]
+    fn padding_requires_an_offer_and_exact_length_but_not_zero_contents() {
+        for request in [None, Some(0), Some(1), Some(32), Some(u16::MAX)] {
+            for length in [None, Some(0), Some(1), Some(32), Some(u16::MAX as usize)] {
+                let mut hello = ClientHelloDetails::new(Vec::new(), 0);
+                hello.server_padding_request = request;
+                if request.is_some() { hello.sent_extensions.push(ExtensionType::ServerPadding); }
+                let mut exts = ServerExtensions::default();
+                exts.server_padding = length.map(|len| Payload::new(vec![0xa5; len]));
+                let mut common = CommonState::new(Side::Client);
+                common.negotiated_version = Some(ProtocolVersion::TLSv1_3);
+                let result = validate_encrypted_extensions(&mut common, &hello, &exts);
+                if length.is_none() || request.map(usize::from) == length {
+                    result.unwrap();
+                } else if request.is_none() {
+                    assert!(matches!(result, Err(Error::PeerMisbehaved(PeerMisbehaved::UnsolicitedEncryptedExtension))));
+                } else {
+                    assert_eq!(result.unwrap_err(), Error::InvalidMessage(InvalidMessage::InvalidServerPadding));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn padding_extension_codec_rejects_duplicates_and_bad_client_length() {
+        let duplicate = [0, 8, 0x12, 0xe0, 0, 0, 0x12, 0xe0, 0, 0];
+        assert!(matches!(ServerExtensions::read(&mut Reader::init(&duplicate)),
+            Err(InvalidMessage::DuplicateExtension(0x12e0))));
+        for bytes in [&[0, 4, 0x12, 0xe0, 0, 0][..], &[0, 7, 0x12, 0xe0, 0, 3, 0, 0, 0][..]] {
+            assert!(ClientExtensions::read(&mut Reader::init(bytes)).is_err());
+        }
+        let request = [0, 6, 0x12, 0xe0, 0, 2, 0, 0];
+        assert_eq!(ClientExtensions::read(&mut Reader::init(&request)).unwrap().server_padding_request, Some(0));
+    }
+
+    #[test]
+    fn padding_follows_message_specific_unknown_extension_rules() {
+        use crate::msgs::handshake::{CertificateExtensions, CertificateRequestExtensions, NewSessionTicketExtensions};
+        let padding = [0, 4, 0x12, 0xe0, 0, 0];
+        assert!(matches!(CertificateExtensions::read(&mut Reader::init(&padding)),
+            Err(InvalidMessage::UnknownCertificateExtension)));
+        // The pinned Chrome/BoringSSL parser ignores this code point in these
+        // two messages, rather than treating it as a padding negotiation.
+        CertificateRequestExtensions::read(&mut Reader::init(&padding)).unwrap();
+        NewSessionTicketExtensions::read(&mut Reader::init(&padding)).unwrap();
+        let unknown = [0, 4, 0xaa, 0xbb, 0, 0];
+        CertificateExtensions::read(&mut Reader::init(&unknown)).unwrap();
+    }
 }
 
 impl State<ClientConnectionData> for ExpectEncryptedExtensions {

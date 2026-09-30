@@ -2,6 +2,7 @@ use super::*;
 
 use foldhash::fast::RandomState;
 use indexmap::{self, IndexMap};
+use std::collections::{BTreeSet, HashMap};
 
 use std::convert::Infallible;
 use std::fmt;
@@ -13,6 +14,105 @@ use std::ops;
 pub(super) struct Store {
     slab: slab::Slab<Stream>,
     ids: IndexMap<StreamId, SlabIndex, RandomState>,
+    chrome_priority: ChromePriorityDependencies,
+}
+
+/// Creation order is stream-id order until a separate reprioritization API is
+/// introduced. Each active band therefore needs only its greatest stream ID.
+#[derive(Debug)]
+struct ChromePriorityDependencies {
+    bands: [BTreeSet<StreamId>; 8],
+    band_by_id: HashMap<StreamId, usize>,
+}
+
+impl ChromePriorityDependencies {
+    fn new() -> Self {
+        Self { bands: std::array::from_fn(|_| BTreeSet::new()), band_by_id: HashMap::new() }
+    }
+
+    fn parent_and_register(&mut self, priority: crate::ext::HeadersPriority, id: StreamId,
+        mut active: impl FnMut(StreamId) -> bool) -> StreamId {
+        let mut parent = StreamId::zero();
+        for band in (0..=priority.band()).rev() {
+            while let Some(candidate) = self.bands[band].last().copied() {
+                if active(candidate) { parent = candidate; break; }
+                self.remove(candidate);
+            }
+            if !parent.is_zero() { break; }
+        }
+        self.bands[priority.band()].insert(id);
+        self.band_by_id.insert(id, priority.band());
+        parent
+    }
+
+    fn remove(&mut self, id: StreamId) {
+        if let Some(band) = self.band_by_id.remove(&id) {
+            self.bands[band].remove(&id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod chrome_priority_dependency_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn active_bands_are_connection_local_and_prune_closed_streams() {
+        let mut dependencies = ChromePriorityDependencies::new();
+        let mut active = HashSet::new();
+        let mut add = |id: u32, band: u8, expected: u32| {
+            let id = StreamId::from(id);
+            let parent = dependencies.parent_and_register(
+                crate::ext::HeadersPriority::new(band).unwrap(), id,
+                |candidate| active.contains(&candidate),
+            );
+            assert_eq!(parent, StreamId::from(expected));
+            active.insert(id);
+        };
+        add(1, 0, 0);
+        add(3, 1, 1);
+        add(5, 1, 3);
+        add(7, 3, 5);
+        add(9, 0, 1);
+        drop(add);
+        active.remove(&StreamId::from(5));
+        active.remove(&StreamId::from(7));
+        let parent = dependencies.parent_and_register(
+            crate::ext::HeadersPriority::new(3).unwrap(), StreamId::from(11),
+            |candidate| active.contains(&candidate),
+        );
+        assert_eq!(parent, StreamId::from(3));
+        active.remove(&StreamId::from(3));
+        let parent = dependencies.parent_and_register(
+            crate::ext::HeadersPriority::new(1).unwrap(), StreamId::from(13),
+            |candidate| active.contains(&candidate),
+        );
+        assert_eq!(parent, StreamId::from(9));
+
+        let mut other_connection = ChromePriorityDependencies::new();
+        assert_eq!(other_connection.parent_and_register(
+            crate::ext::HeadersPriority::new(3).unwrap(), StreamId::from(1), |_| true,
+        ), StreamId::zero());
+    }
+
+    #[test]
+    fn thousands_of_active_streams_use_indexed_cleanup() {
+        let mut dependencies = ChromePriorityDependencies::new();
+        let mut active = HashSet::new();
+        let priority = crate::ext::HeadersPriority::new(3).unwrap();
+        let mut previous = StreamId::zero();
+        for index in 0..4096 {
+            let id = StreamId::from(index * 2 + 1);
+            assert_eq!(dependencies.parent_and_register(priority, id,
+                |candidate| active.contains(&candidate)), previous);
+            active.insert(id);
+            previous = id;
+        }
+        for id in active { dependencies.remove(id); }
+        assert!(dependencies.band_by_id.is_empty());
+        assert!(dependencies.bands.iter().all(BTreeSet::is_empty));
+    }
 }
 
 /// "Pointer" to an entry in the store
@@ -84,7 +184,21 @@ impl Store {
         Store {
             slab: slab::Slab::new(),
             ids: IndexMap::default(),
+            chrome_priority: ChromePriorityDependencies::new(),
         }
+    }
+
+    pub fn take_chrome_priority(&mut self, id: StreamId) -> Option<crate::ext::HeadersPriority> {
+        self.find_mut(&id)?.chrome_priority.take()
+    }
+
+    pub fn register_chrome_priority(&mut self, priority: crate::ext::HeadersPriority,
+        id: StreamId) -> StreamId {
+        let (dependencies, ids, slab) = (&mut self.chrome_priority, &self.ids, &self.slab);
+        dependencies.parent_and_register(priority, id, |candidate| {
+            ids.get(&candidate).and_then(|index| slab.get(index.0 as usize))
+                .is_some_and(|stream| !stream.is_closed())
+        })
     }
 
     pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
@@ -415,6 +529,7 @@ impl Ptr<'_> {
         // Remove the stream state
         let stream = self.store.slab.remove(self.key.index.0 as usize);
         assert_eq!(stream.id, self.key.stream_id);
+        self.store.chrome_priority.remove(stream.id);
         stream.id
     }
 
@@ -425,6 +540,7 @@ impl Ptr<'_> {
     pub fn unlink(&mut self) {
         let id = self.key.stream_id;
         self.store.ids.swap_remove(&id);
+        self.store.chrome_priority.remove(id);
     }
 }
 

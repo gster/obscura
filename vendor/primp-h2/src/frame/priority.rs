@@ -71,6 +71,10 @@ impl StreamDependency {
         self.dependency_id
     }
 
+    pub(crate) fn weight(&self) -> u8 { self.weight }
+
+    pub(crate) fn is_exclusive(&self) -> bool { self.is_exclusive }
+
     pub fn encode<B: bytes::BufMut>(&self, dst: &mut B) {
         let mut dependency_id = u32::from(self.dependency_id);
 

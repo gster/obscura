@@ -185,6 +185,7 @@ async fn navigation_context_events_preserve_order_for_every_runtime_attachment()
         json!({"targetId": target, "flatten": true}), None,
     ).await;
     let second = attached.result.unwrap()["sessionId"].as_str().unwrap().to_string();
+    cdp(&mut ctx, 9, "Page.enable", json!({}), Some(&first)).await;
     for (id, session) in [(10, &first), (11, &second)] {
         cdp(&mut ctx, id, "Runtime.enable", json!({}), Some(session)).await;
     }

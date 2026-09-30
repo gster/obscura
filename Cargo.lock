@@ -2020,6 +2020,7 @@ dependencies = [
  "futures-util",
  "http",
  "primp",
+ "primp-rustls",
  "psl",
  "rcgen",
  "serde",

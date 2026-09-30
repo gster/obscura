@@ -7,6 +7,57 @@ use crate::StealthProfile;
 
 pub const PERSONA_SCHEMA_VERSION: &str = "1";
 
+/// Product branding, independent of the profile's version and transport.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserFlavor {
+    #[default]
+    Chrome,
+    Chromium,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BrowserBrand {
+    pub brand: String,
+    pub version: String,
+}
+
+impl BrowserFlavor {
+    fn is_chrome(&self) -> bool { *self == Self::Chrome }
+
+    /// Low-entropy brands in Chromium's version-seeded destination order.
+    /// Both the transport and JS runtime consume this list.
+    pub fn brands(self, major: u32) -> Vec<BrowserBrand> {
+        const CHARS: [&str; 11] = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
+        const VERSIONS: [&str; 3] = ["8", "99", "24"];
+        const ORDERS: [[usize; 3]; 6] = [[0,1,2], [0,2,1], [1,0,2], [1,2,0], [2,0,1], [2,1,0]];
+        let seed = major as usize;
+        let mut brands = vec![
+            BrowserBrand {
+                brand: format!("Not{}A{}Brand", CHARS[seed % 11], CHARS[(seed % 11 + 1) % 11]),
+                version: VERSIONS[seed % 3].to_string(),
+            },
+            BrowserBrand { brand: "Chromium".to_string(), version: major.to_string() },
+        ];
+        if self == Self::Chrome {
+            brands.push(BrowserBrand { brand: "Google Chrome".to_string(), version: major.to_string() });
+        }
+        let two = [seed % 2, (seed % 2 + 1) % 2];
+        let order: &[usize] = if self == Self::Chrome { &ORDERS[seed % 6] } else { &two };
+        let mut shuffled = brands.clone();
+        for (brand, &destination) in brands.into_iter().zip(order) {
+            shuffled[destination] = brand;
+        }
+        shuffled
+    }
+
+    pub fn sec_ch_ua(self, major: u32) -> String {
+        self.brands(major).into_iter()
+            .map(|brand| format!("\"{}\";v=\"{}\"", brand.brand, brand.version))
+            .collect::<Vec<_>>().join(", ")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessPersonaClaim {
     timezone: String,
@@ -78,6 +129,11 @@ pub struct PersonaSpec {
     pub revision: String,
     #[serde(alias = "preset")]
     pub profile: String,
+    #[serde(default, skip_serializing_if = "BrowserFlavor::is_chrome")]
+    pub browser_flavor: BrowserFlavor,
+    /// Opt-in experimental TLS padding request. Zero is not absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_padding_request: Option<u16>,
     #[serde(default)]
     pub viewport: Option<ViewportSpec>,
     #[serde(default)]
@@ -133,6 +189,8 @@ impl PersonaSpec {
             persona_id: profile.name().to_string(),
             revision: "builtin-1".to_string(),
             profile: profile.name().to_string(),
+            browser_flavor: BrowserFlavor::Chrome,
+            tls_server_padding_request: None,
             viewport: None,
             language: None,
             languages: None,
@@ -382,6 +440,8 @@ impl PersonaSpec {
             persona_id: self.persona_id,
             revision: self.revision,
             profile,
+            browser_flavor: self.browser_flavor,
+            tls_server_padding_request: self.tls_server_padding_request,
             user_agent: profile.user_agent().to_string(),
             full_version: profile.full_version().to_string(),
             platform: profile.platform().0.to_string(),
@@ -425,6 +485,10 @@ pub struct EffectivePersona {
     persona_id: String,
     revision: String,
     profile: StealthProfile,
+    #[serde(skip_serializing_if = "BrowserFlavor::is_chrome")]
+    browser_flavor: BrowserFlavor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_server_padding_request: Option<u16>,
     user_agent: String,
     full_version: String,
     platform: String,
@@ -476,6 +540,12 @@ impl EffectivePersona {
     }
     pub fn profile(&self) -> StealthProfile {
         self.profile
+    }
+    pub fn browser_flavor(&self) -> BrowserFlavor {
+        self.browser_flavor
+    }
+    pub fn tls_server_padding_request(&self) -> Option<u16> {
+        self.tls_server_padding_request
     }
     pub fn user_agent(&self) -> &str {
         &self.user_agent
@@ -577,6 +647,8 @@ impl EffectivePersona {
             persona_id: self.persona_id.clone(),
             revision: self.revision.clone(),
             profile: self.profile.name().to_string(),
+            browser_flavor: self.browser_flavor,
+            tls_server_padding_request: self.tls_server_padding_request,
             viewport: Some(self.viewport.clone()),
             language: Some(self.language.clone()),
             languages: Some(self.languages.clone()),
@@ -861,6 +933,87 @@ fn stable_seed(persona_id: &str, revision: &str, profile: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_flavor_default_preserves_legacy_serialization_and_digest() {
+        for (profile, digest) in [
+            (StealthProfile::WindowsChrome145, "f16a5cfffbe41af8a7c34584439d42c9dab670ada61034a11ee2cb923dc44bc6"),
+            (StealthProfile::MacChrome152, "7b6c000db23f0e65c95265ef1875e3fff5102046027da0976f0671074efdd069"),
+            (StealthProfile::MacChrome153, "9ecacf12e2770ddd7da91cbacb7a9dd5c4e5a9a314ec4e22d66802fe05ff20b4"),
+        ] {
+            let spec = PersonaSpec::preset(profile);
+            let serialized = serde_json::to_value(&spec).unwrap();
+            assert!(serialized.get("browser_flavor").is_none());
+            let omitted = spec.compile().unwrap();
+            assert_eq!(omitted.browser_flavor(), BrowserFlavor::Chrome);
+            assert_eq!(omitted.digest(), digest);
+            assert!(serde_json::to_value(&omitted).unwrap().get("browser_flavor").is_none());
+            let mut explicit = serialized;
+            explicit["browser_flavor"] = serde_json::json!("chrome");
+            assert_eq!(serde_json::from_value::<PersonaSpec>(explicit).unwrap().compile().unwrap(), omitted);
+            assert_eq!(omitted.to_spec().compile().unwrap(), omitted);
+        }
+    }
+
+    #[test]
+    fn server_padding_is_optional_typed_and_digest_relevant() {
+        let default = EffectivePersona::builtin(StealthProfile::MacChrome153);
+        assert_eq!(default.tls_server_padding_request(), None);
+        assert!(serde_json::to_value(default.to_spec()).unwrap().get("tls_server_padding_request").is_none());
+        assert!(serde_json::to_value(&default).unwrap().get("tls_server_padding_request").is_none());
+        for bytes in [0u16, 1, 16384, 16385, u16::MAX] {
+            let mut spec = default.to_spec();
+            spec.tls_server_padding_request = Some(bytes);
+            let persona = spec.compile().unwrap();
+            assert_eq!(persona.tls_server_padding_request(), Some(bytes));
+            assert_ne!(persona.digest(), default.digest());
+            assert_eq!(persona.seed(), default.seed());
+            assert_eq!(persona.to_spec().compile().unwrap(), persona);
+            let json = serde_json::to_string(&persona.to_spec()).unwrap();
+            assert_eq!(PersonaSpec::from_json(&json).unwrap().compile().unwrap(), persona);
+        }
+        let mut spec = serde_json::to_value(default.to_spec()).unwrap();
+        spec["tls_server_padding_request"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<PersonaSpec>(spec.clone()).unwrap().compile().unwrap(), default);
+        for invalid in [serde_json::json!(-1), serde_json::json!(65536), serde_json::json!(0.5),
+            serde_json::json!("0"), serde_json::json!(true)] {
+            spec["tls_server_padding_request"] = invalid;
+            assert!(serde_json::from_value::<PersonaSpec>(spec.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn browser_flavor_is_typed_round_tripped_and_digest_relevant() {
+        let default = EffectivePersona::builtin(StealthProfile::MacChrome153);
+        let mut spec = default.to_spec();
+        spec.browser_flavor = BrowserFlavor::Chromium;
+        let chromium = spec.compile().unwrap();
+        assert_ne!(chromium.digest(), default.digest());
+        assert_eq!(chromium.seed(), default.seed());
+        assert_eq!(chromium.user_agent(), default.user_agent());
+        assert_eq!(chromium.full_version(), default.full_version());
+        assert_eq!(chromium.to_spec().compile().unwrap(), chromium);
+        let serialized = serde_json::to_string(&chromium.to_spec()).unwrap();
+        assert_eq!(PersonaSpec::from_json(&serialized).unwrap().compile().unwrap(), chromium);
+        assert_eq!(serde_json::to_value(&chromium).unwrap()["browser_flavor"], "chromium");
+        for invalid in [serde_json::json!("unknown"), serde_json::json!(null), serde_json::json!(false)] {
+            let mut spec = serde_json::to_value(default.to_spec()).unwrap();
+            spec["browser_flavor"] = invalid;
+            assert!(serde_json::from_value::<PersonaSpec>(spec).is_err());
+        }
+    }
+
+    #[test]
+    fn browser_flavor_brands_follow_two_and_three_brand_destination_order() {
+        for (major, chrome, chromium) in [
+            (145, r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#, r#""Chromium";v="145", "Not:A-Brand";v="99""#),
+            (152, r#""Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152""#, r#""Not?A_Brand";v="24", "Chromium";v="152""#),
+            (153, r#""Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153""#, r#""Chromium";v="153", "Not_A Brand";v="8""#),
+        ] {
+            assert_eq!(BrowserFlavor::Chrome.sec_ch_ua(major), chrome);
+            assert_eq!(BrowserFlavor::Chromium.sec_ch_ua(major), chromium);
+        }
+    }
 
     #[test]
     fn builtins_are_complete_and_stable() {
