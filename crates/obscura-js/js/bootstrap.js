@@ -391,7 +391,7 @@ function _decodeDataScriptUrl(url) {
 // native per-document state so it survives wrapper churn, fragment parsing,
 // moves, and cloneNode().
 globalThis.__markParserScripts = function(nids) {
-  for (const nid of nids || []) Deno.core.ops.op_script_mark_started(+nid);
+  for (const nid of nids || []) Deno.core.ops.op_script_mark_started(+nid, _realmFrameId);
 };
 async function __fetchDynClassicScript(task) {
   let body;
@@ -421,6 +421,9 @@ async function __fetchDynClassicScript(task) {
       throw new Error('HTTP ' + (parsed.status || 0));
     }
     body = parsed.body;
+    // Classic scripts use the response URL as their import() base, including
+    // redirects. The originally requested URL still identifies the fetch.
+    task.executionUrl = parsed.url || task.url;
   }
   return body;
 }
@@ -447,10 +450,11 @@ async function __runDynScriptTask(task) {
         // collector deadline can observe the response but miss the callback.
         // Adding another zero-delay timer here put execution behind already
         // queued timers, unlike Chromium's networking/script task ordering.
+        const previousScriptNid = globalThis.__currentScriptNid;
         globalThis.__currentScriptNid = task.nid;
-        try { (0, eval)(body); }
+        try { Deno.core.ops.op_script_execute_classic(task.executionUrl || task.url, body, _realmFrameId); }
         catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-        finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+        finally { globalThis.__currentScriptNid = previousScriptNid || 0; }
       }
     }
     // Fire load via dispatchEvent only: it invokes the element's onload
@@ -1023,7 +1027,7 @@ const _coerceTimerFn = (fn) => {
     // `new Function(fn)` wrapper kept them local); deferring to fire time also
     // surfaces a SyntaxError when the timer elapses, matching a real browser,
     // instead of swallowing it eagerly at scheduling. The dynamic-script path
-    // uses the same indirect eval for the same reason.
+    // is compiled as a Script by its own native execution path instead.
     const src = fn;
     return () => { (0, eval)(src); };
   }
@@ -1990,7 +1994,7 @@ function _eventTargetDispatch(target, event) {
 const _customElementConstructionStack = [];
 
 function __prepareInsertedScript(script) {
-  if (!Deno.core.ops.op_script_try_start(script._nid)) return;
+  if (!Deno.core.ops.op_script_try_start(script._nid, _realmFrameId)) return;
   let scriptBlockType = 'text/javascript';
   const rawType = script.getAttribute('type');
   const hasType = rawType !== null && rawType !== undefined;
@@ -2131,7 +2135,7 @@ function __prepareInsertedScript(script) {
     __processDynScriptQueue();
   } else {
     globalThis.__currentScriptNid = script._nid;
-    try { (0, eval)(code); }
+    try { Deno.core.ops.op_script_execute_classic('', code, _realmFrameId); }
     catch(e) { console.error('Dynamic inline script error:', e.message); }
     finally { globalThis.__currentScriptNid = prevNid || 0; }
   }
@@ -13881,6 +13885,9 @@ _markNative(globalThis.Selection);
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
+// Use startup references for the constructor's create/append/query operations.
+const _iframeCreateElement = Document.prototype.createElement;
+const _iframeQuerySelector = Element.prototype.querySelector;
 class _IframeDocument {
   constructor(html, url, iframeEl) {
     this._url = url;
@@ -13893,11 +13900,11 @@ class _IframeDocument {
     this.visibilityState = 'visible';
     this.hidden = false;
 
-    this._root = document.createElement('html');
-    this._head = document.createElement('head');
-    this._body = document.createElement('body');
-    this._root.appendChild(this._head);
-    this._root.appendChild(this._body);
+    this._root = _iframeCreateElement.call(document, 'html');
+    this._head = _iframeCreateElement.call(document, 'head');
+    this._body = _iframeCreateElement.call(document, 'body');
+    _nodeAppendChild.call(this._root, this._head);
+    _nodeAppendChild.call(this._root, this._body);
     var bodyContent = html
       .replace(/^<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
@@ -13910,7 +13917,7 @@ class _IframeDocument {
 
     this._title = '';
     if (this._head) {
-      const titleEl = this._head.querySelector('title');
+      const titleEl = _iframeQuerySelector.call(this._head, 'title');
       if (titleEl) this._title = titleEl.textContent;
     }
   }
