@@ -8386,6 +8386,57 @@ impl ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mutation_observer_attribute_filter_is_per_target_and_preserves_child_lists() {
+        let mut rt = setup_runtime("<html><body><div id='root'><span id='child'></span></div></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const root = document.getElementById('root');
+            const child = document.getElementById('child');
+            const filtered = new MutationObserver(() => {});
+            filtered.observe(root, {attributes: true, attributeFilter: ['data-state'], subtree: true, childList: true});
+            filtered.observe(child, {attributes: true, attributeFilter: ['title']});
+            const empty = new MutationObserver(() => {});
+            empty.observe(root, {attributes: true, attributeFilter: [], subtree: true, childList: true});
+            const all = new MutationObserver(() => {});
+            all.observe(root, {attributes: true, subtree: true});
+            root.style.setProperty('--indicator', '1px');
+            root.setAttribute('data-state', 'active');
+            child.setAttribute('data-state', 'active');
+            child.setAttribute('title', 'selected');
+            child.setAttribute('class', 'selected');
+            root.appendChild(document.createElement('i'));
+            const names = observer => observer.takeRecords().map(record => record.attributeName || record.type);
+            const result = {filtered: names(filtered), empty: names(empty), all: names(all)};
+            for (const observer of [filtered, empty, all]) observer.disconnect();
+            return result;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "filtered": ["data-state", "data-state", "title", "childList"],
+            "empty": ["childList"],
+            "all": ["style", "data-state", "data-state", "title", "class"]
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_observer_attribute_filter_does_not_feed_back_style_writes() {
+        let mut rt = setup_runtime("<html><body><div id='tabs'><span id='tab'></span></div></body></html>");
+        rt.evaluate(r#"(() => {
+            const tabs = document.getElementById('tabs');
+            globalThis.indicatorUpdates = 0;
+            const observer = new MutationObserver(() => {
+                indicatorUpdates++;
+                // Bound the broken implementation so the regression cannot hang V8.
+                if (indicatorUpdates === 4) observer.disconnect();
+                tabs.style.setProperty('--indicator', '1px');
+            });
+            observer.observe(tabs, {attributes: true, attributeFilter: ['data-state'], subtree: true});
+            document.getElementById('tab').setAttribute('data-state', 'active');
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+        assert_eq!(rt.evaluate("indicatorUpdates").unwrap().as_f64(), Some(1.0));
+    }
+
+
     use super::*;
     use obscura_dom::parse_html;
 

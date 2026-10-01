@@ -10093,6 +10093,8 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
+      if (type === 'attributes' && t.options.attributeFilter !== undefined
+          && !t.options.attributeFilter.includes(attributeName)) continue;
       if (root._nid === target_nid) { matched = true; break; }
       if (t.options.subtree) {
         // Walk parents until we hit the observed root or run off the tree.
