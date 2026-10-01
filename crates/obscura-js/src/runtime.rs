@@ -10438,6 +10438,49 @@ mod tests {
     }
 
     #[test]
+    fn initial_iframe_document_does_not_reenter_page_dom_wrappers() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            const disconnected = frame.contentWindow === null && frame.contentDocument === null;
+            document.body.appendChild(frame);
+            let calls = 0;
+            let depth = 0;
+            const create = Document.prototype.createElement;
+            document.createElement = Document.prototype.createElement = new Proxy(create, {
+                apply(target, receiver, args) {
+                    calls++;
+                    if (++depth > 8) throw new Error('fixture reentry limit');
+                    try { window[0]; return Reflect.apply(target, receiver, args); }
+                    finally { depth--; }
+                }
+            });
+            const append = Node.prototype.appendChild;
+            const query = Element.prototype.querySelector;
+            Node.prototype.appendChild = Element.prototype.querySelector = function () {
+                calls++;
+                throw new Error('internal iframe construction invoked a page wrapper');
+            };
+            let result;
+            try {
+                const win = frame.contentWindow;
+                const doc = frame.contentDocument;
+                result = {disconnected, calls, stable: win === frame.contentWindow && win === window[0],
+                    document: win.document === doc && doc.defaultView === win,
+                    structure: doc.documentElement.localName === 'html' &&
+                        doc.head.parentNode === doc.documentElement && doc.body.parentNode === doc.documentElement};
+            } finally {
+                delete document.createElement;
+                Document.prototype.createElement = create;
+                Node.prototype.appendChild = append;
+                Element.prototype.querySelector = query;
+            }
+            return result;
+        })()"#).unwrap(), serde_json::json!({"disconnected": true, "calls": 0,
+            "stable": true, "document": true, "structure": true}));
+    }
+
+    #[test]
     fn iframe_context_is_discarded_on_removal_and_recreated_on_insertion() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"
@@ -26520,6 +26563,107 @@ return {before,removed,reinsert,moved,cleared};
         );
     }
 
+    #[test]
+    fn dynamic_classic_inline_scripts_share_global_lexicals_and_emit_diagnostics() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.state.borrow_mut().diagnostic_events_enabled = true;
+        rt.execute_script("https://example.com/loader.js", r#"
+            globalThis.__dynamicLexicalResult = null;
+            for (const source of [
+                "'use strict'; let dynamicShared = 41; const dynamicConstant = 1; var dynamicVar = 40; function dynamicFn() { return 2; }",
+                "globalThis.__dynamicLexicalResult = [dynamicShared + dynamicConstant, Object.hasOwn(globalThis, 'dynamicShared')];"
+            ]) {
+                const script = document.createElement('script');
+                script.textContent = source;
+                document.head.appendChild(script);
+            }
+        "#).unwrap();
+        assert_eq!(rt.evaluate("__dynamicLexicalResult").unwrap(), serde_json::json!([42, false]));
+        assert_eq!(rt.evaluate("[dynamicVar + dynamicFn(), Object.hasOwn(globalThis, 'dynamicVar')]").unwrap(),
+            serde_json::json!([42, true]));
+        let executions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event { RuntimeEvent::Script(script) => Some(script), _ => None })
+            .collect();
+        assert_eq!(executions.len(), 3, "both inserted scripts and their loader must be observed");
+        assert!(executions.iter().all(|script| script.outcome == "ok"));
+        rt.execute_script("https://example.com/utf16-loader.js", r#"
+            Deno.core.ops.op_script_execute_classic('https://example.com/utf16-script.js',
+                "globalThis.__dynamicUTF16 = '" + String.fromCharCode(0xd800) + "';", 0);
+        "#).unwrap();
+        assert_eq!(rt.evaluate("__dynamicUTF16.charCodeAt(0)").unwrap().as_f64(), Some(0xd800 as f64));
+        rt.execute_script("https://example.com/throw-loader.js", r#"
+            globalThis.__classicThrownSentinel = {message: 'sentinel'};
+            try {
+                Deno.core.ops.op_script_execute_classic('https://example.com/throw-script.js',
+                    'throw __classicThrownSentinel;', 0);
+            } catch (error) {
+                globalThis.__classicThrowIdentity = error === __classicThrownSentinel;
+            }
+        "#).unwrap();
+        assert_eq!(rt.evaluate("__classicThrowIdentity").unwrap(), serde_json::json!(true));
+        rt.execute_script("https://example.com/redeclare.js", r#"
+            const script = document.createElement('script');
+            script.textContent = 'let dynamicShared = 99; globalThis.__redeclareRan = true;';
+            document.head.appendChild(script);
+        "#).unwrap();
+        assert_eq!(rt.evaluate("[dynamicShared, typeof __redeclareRan]").unwrap(), serde_json::json!([41, "undefined"]));
+        assert!(rt.take_pending_runtime_events().iter().any(|event|
+            matches!(event, RuntimeEvent::Script(script) if script.outcome == "runtime_error")));
+        rt.execute_script("https://example.com/syntax-loader.js", r#"
+            const syntaxScript = document.createElement('script');
+            syntaxScript.textContent = 'const = ;';
+            document.head.appendChild(syntaxScript);
+        "#).unwrap();
+        assert!(rt.take_pending_runtime_events().iter().any(|event|
+            matches!(event, RuntimeEvent::Script(script) if script.outcome == "compile_error")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_classic_nested_watchdog_preserves_termination_and_reuses_isolate() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.state.borrow_mut().diagnostic_events_enabled = true;
+        let started = std::time::Instant::now();
+        let error = rt.evaluate_with_timeout(r#"(function() {
+            const loopingScript = document.createElement('script');
+            loopingScript.textContent = 'while (true) {}';
+            document.head.appendChild(loopingScript);
+            return 'unreachable';
+        })()"#, std::time::Duration::from_millis(100)).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(rt.take_pending_runtime_events().iter().any(|event|
+            matches!(event, RuntimeEvent::Script(script) if script.outcome == "terminated")));
+        assert_eq!(rt.evaluate("40 + 2").unwrap().as_f64(), Some(42.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_classic_external_scripts_share_global_lexicals_and_emit_diagnostics() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.state.borrow_mut().diagnostic_events_enabled = true;
+        rt.execute_script("https://example.com/loader.js", r#"
+            globalThis.__externalLexicalResult = null;
+            for (const source of [
+                'let externalShared = 41; const externalConstant = 1;',
+                'globalThis.__externalLexicalResult = externalShared + externalConstant;'
+            ]) {
+                const script = document.createElement('script');
+                script.async = false;
+                script.src = 'data:text/javascript,' + encodeURIComponent(source);
+                document.head.appendChild(script);
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[__externalLexicalResult]").unwrap(), serde_json::json!([42]));
+        let executions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event { RuntimeEvent::Script(script) => Some(script), _ => None })
+            .collect();
+        assert_eq!(executions.len(), 3);
+        assert_eq!(executions.iter().filter(|script| script.url.starts_with("data:text/javascript,")).count(), 2);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_classic_script_runs_after_post_insertion_callback_assignment() {
         let mut rt = setup_runtime("<html><head><script></script></head><body></body></html>");
@@ -26565,6 +26709,145 @@ return {before,removed,reinsert,moved,cleared};
             .unwrap();
 
         assert_eq!(result.value.unwrap(), serde_json::json!(["ipv6-proof", "ipv6-proof", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_classic_script_can_reenter_fetch_start_abort_and_cleanup() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.execute_script("fetch-loader", r#"
+            const fetchScript = document.createElement('script');
+            fetchScript.textContent = `
+                const dynamicController = new AbortController();
+                globalThis.__dynamicFetchDone = fetch('http://127.0.0.1:9/no-request', {signal: dynamicController.signal})
+                    .then(() => 'unexpected response', reason => String(reason));
+                dynamicController.abort('fixture-abort');
+            `;
+            document.head.appendChild(fetchScript);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.call_function_on_for_cdp("async () => await __dynamicFetchDone", None, &[], true, true)
+            .await.unwrap();
+        let reason = result.value.unwrap();
+        let reason = reason.as_str().unwrap();
+        assert!(reason == "fixture-abort" || reason.starts_with("AbortError:"), "{reason}");
+        assert_eq!(rt.evaluate("dynamicController.signal.aborted").unwrap(), serde_json::json!(true));
+        assert!(rt.state.borrow().fetch_cancellations.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parent_inserted_child_classics_use_child_lexicals_dom_and_page_diagnostics() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.state.borrow_mut().diagnostic_events_enabled = true;
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0, "http://example.com/child",
+            "<html><head></head><body></body></html>").unwrap();
+        rt.execute_script("http://example.com/parent-loader.js", r#"
+            let childShared = -1;
+            // Native frame publication supplies the same foreign-realm objects
+            // exposed by a same-origin iframe's contentDocument/contentWindow.
+            const childDoc = globalThis.__obscura_frameObjects[1].document;
+            for (const source of [
+                'let childShared = 40; const childConstant = 2;',
+                'document.body.dataset.value = childShared + childConstant; globalThis.__childClassicRan = true;'
+            ]) {
+                const script = childDoc.createElement('script');
+                script.textContent = source;
+                childDoc.head.appendChild(script);
+            }
+            for (const source of [
+                'let childExternal = 41;',
+                'globalThis.__childExternalValue = childExternal + 1;'
+            ]) {
+                const script = childDoc.createElement('script');
+                script.async = false;
+                script.src = 'data:text/javascript,' + encodeURIComponent(source);
+                childDoc.head.appendChild(script);
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(frame.evaluate(&mut rt,
+            "[childShared, document.body.dataset.value, __childClassicRan, __childExternalValue]").unwrap(),
+            serde_json::json!([40, "42", true, 42]));
+        assert_eq!(rt.evaluate("[childShared, document.body.dataset.value, typeof __childClassicRan, typeof childExternal]").unwrap(),
+            serde_json::json!([-1, null, "undefined", "undefined"]));
+        let events = rt.take_pending_runtime_events();
+        assert_eq!(events.iter().filter(|event| matches!(event, RuntimeEvent::Script(script)
+            if script.url == "http://example.com/child" && script.outcome == "ok")).count(), 2);
+        assert_eq!(events.iter().filter(|event| matches!(event, RuntimeEvent::Script(script)
+            if script.url.starts_with("data:text/javascript,") && script.outcome == "ok")).count(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_external_classic_restores_current_script_at_execution_boundary() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.execute_script("nested-script-loader", r#"
+            globalThis.__currentScripts = [];
+            const outerScript = document.createElement('script');
+            outerScript.id = 'outer';
+            outerScript.textContent = `
+                __currentScripts.push(document.currentScript.id);
+                const nestedScript = document.createElement('script');
+                nestedScript.id = 'nested';
+                nestedScript.src = 'data:text/javascript,' + encodeURIComponent('__currentScripts.push(document.currentScript.id);');
+                nestedScript.onload = () => __currentScripts.push(document.currentScript === null ? 'load-null' : 'load-stale');
+                document.head.appendChild(nestedScript);
+                __currentScripts.push(document.currentScript.id);
+            `;
+            document.head.appendChild(outerScript);
+            __currentScripts.push(document.currentScript === null ? 'parent-null' : 'parent-stale');
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__currentScripts").unwrap(),
+            serde_json::json!(["outer", "outer", "parent-null", "nested", "load-null"]));
+        assert_eq!(rt.evaluate("document.currentScript === null").unwrap(), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirected_dynamic_classic_uses_response_url_for_relative_import() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let path = request.lines().next().unwrap().split_ascii_whitespace().nth(1).unwrap();
+                tx.send(path.to_string()).unwrap();
+                let (status, headers, body) = match path {
+                    "/loader.js" => ("302 Found", "Location: /assets/v2/entry.js\r\n", ""),
+                    "/assets/v2/entry.js" => ("200 OK", "",
+                        "globalThis.__redirectClassicImport = import('./chunk.js').then(m => m.value, e => String(e));"),
+                    "/assets/v2/chunk.js" => ("200 OK", "", "export const value = 'response-relative';"),
+                    _ => ("404 Not Found", "", "not found"),
+                };
+                write!(stream, "HTTP/1.1 {status}\r\n{headers}Access-Control-Allow-Origin: *\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.set_url(&format!("{base}/page"));
+        bind_module_test_network(&mut rt, std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        ))).await;
+        rt.execute_script("redirect-loader", r#"
+            const redirectScript = document.createElement('script');
+            redirectScript.src = '/loader.js';
+            document.head.appendChild(redirectScript);
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        let result = rt.call_function_on_for_cdp("async () => await __redirectClassicImport", None, &[], true, true)
+            .await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("response-relative"));
+        let paths: Vec<_> = (0..3).map(|_| requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap()).collect();
+        assert_eq!(paths, ["/loader.js", "/assets/v2/entry.js", "/assets/v2/chunk.js"]);
     }
 
     #[tokio::test(flavor = "current_thread")]

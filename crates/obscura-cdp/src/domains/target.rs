@@ -199,7 +199,9 @@ pub async fn handle(
             // Playwright calls this on connect to obtain a session for the
             // implicit "browser" target. Returning Unknown method aborts
             // the connect handshake before any user code runs.
-            let session_id = "browser-session".to_string();
+            // Independent browser attachments must not replace each other's
+            // flattened-session routing in clients such as Playwright.
+            let session_id = ctx.next_target_session("browser");
             ctx.sessions
                 .insert(session_id.clone(), "browser".to_string());
 
@@ -578,13 +580,13 @@ mod tests {
             .await
             .expect("attachToBrowserTarget should succeed");
 
-        assert_eq!(result["sessionId"], "browser-session");
+        let session_id = result["sessionId"].as_str().unwrap();
         assert_eq!(
-            ctx.sessions.get("browser-session").map(String::as_str),
+            ctx.sessions.get(session_id).map(String::as_str),
             Some("browser")
         );
 
-        // Playwright/Puppeteer expect a Target.attachedToTarget event before
+        // Playwright expects a Target.attachedToTarget event before
         // they finish wiring up the session — without it the connect promise
         // hangs.
         let attached_evt = ctx
@@ -592,7 +594,7 @@ mod tests {
             .iter()
             .find(|e| e.method == "Target.attachedToTarget")
             .expect("attachedToTarget event must be emitted");
-        assert_eq!(attached_evt.params["sessionId"], "browser-session");
+        assert_eq!(attached_evt.params["sessionId"], session_id);
         assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
     }
 

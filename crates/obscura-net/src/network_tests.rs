@@ -397,7 +397,7 @@ async fn primp_sends_cookies_in_path_and_creation_order_after_restore() {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("cookie").then(|| value.trim())
     });
-    assert_eq!(cookie, Some("first=updated; session=scoped; session=root"));
+    assert_eq!(cookie, Some("session=scoped; first=updated; session=root"));
 }
 
 // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be

@@ -1596,8 +1596,8 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
 }
 
 #[op2(fast)]
-fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_mark_started(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    let Some(shared) = frame_state(state, frame_id) else { return false; };
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1613,8 +1613,8 @@ fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
 /// Atomically claim an executable script.  A false result means the node was
 /// created inert by an HTML-string API or has already been prepared once.
 #[op2(fast)]
-fn op_script_try_start(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    let Some(shared) = frame_state(state, frame_id) else { return false; };
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1625,6 +1625,101 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
     }
     let newly_started = state.already_started_scripts.borrow_mut().insert(node_id);
     newly_started
+}
+
+/// Execute an inserted classic as a Script, not eval code. Global lexical
+/// declarations must remain available to later scripts in the same realm.
+#[op2(reentrant)]
+fn op_script_execute_classic<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    state: Rc<RefCell<OpState>>,
+    name: v8::Local<'s, v8::String>,
+    source: v8::Local<'s, v8::String>,
+    frame_id: u32,
+) -> v8::Local<'s, v8::Value> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (shared, context, owner) = {
+            let state = state.borrow();
+            // Runtime event subscribers belong to the page, including events
+            // from child documents. Do not rely on child-local enable flags.
+            let shared = state.borrow::<SharedState>().clone();
+            let context = if frame_id == 0 {
+                scope.get_current_context()
+            } else {
+                let Some(registry) = state.try_borrow::<Rc<RefCell<RealmStates>>>() else { return; };
+                let registry = registry.borrow();
+                let Some((context, _, _)) = registry.entries.iter().find(|(_, id, _)| *id == frame_id) else { return; };
+                v8::Local::new(scope, context)
+            };
+            let Some(owner) = frame_state(&state, frame_id) else { return; };
+            (shared, context, owner)
+        };
+        let trace = {
+            let gs = shared.borrow();
+            gs.runtime_events_enabled && gs.diagnostic_events_enabled
+        };
+        let started = trace.then(|| (
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64() * 1_000.0,
+            std::time::Instant::now(),
+        ));
+        // Inline scripts use their document's base without a second DOM op
+        // and JSON round trip. Snapshot it before executing user code.
+        let name = if name.length() == 0 {
+            let base = {
+                let gs = owner.borrow();
+                document_base_url_memoized(&gs).unwrap_or_else(|| gs.url.clone())
+            };
+            let base = if base.is_empty() { "about:blank" } else { &base };
+            let Some(name) = v8::String::new(scope, base) else { return; };
+            name
+        } else { name };
+        // Ops are shared main-context functions. The receiver bootstrap knows
+        // its document even when a parent inserts a script into a child DOM.
+        // Enter that active realm without retaining OpState borrows across JS.
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        // The source already is a V8 string. Preserve its UTF-16 contents and
+        // avoid copying through Rust UTF-8 on the ordinary execution path.
+        let mut compiled = false;
+        let origin = v8::ScriptOrigin::new(
+            scope, name.into(), 0, 0, false, 0, None, false, false, false, None,
+        );
+        let success = if let Some(script) = v8::Script::compile(scope, source, Some(&origin)) {
+            compiled = true;
+            script.run(scope).is_some()
+        } else { false };
+        // Never clear isolate termination here: the outer task's watchdog
+        // owns cancellation and must be able to terminate nested scripts.
+        let outcome = if success { "ok" }
+            else if scope.has_terminated() { "terminated" }
+            else if !compiled { "compile_error" }
+            else { "runtime_error" };
+        if let Some((started_at, started)) = started {
+            use sha2::Digest as _;
+            let name = name.to_rust_string_lossy(scope);
+            let source = source.to_rust_string_lossy(scope);
+            let event = RuntimeScriptEvent {
+                url: name,
+                source_bytes: source.len(),
+                source_sha256: format!("{:x}", sha2::Sha256::digest(source.as_bytes())),
+                started_at,
+                finished_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64() * 1_000.0,
+                duration_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                outcome: outcome.to_string(),
+            };
+            let mut gs = shared.borrow_mut();
+            if gs.pending_runtime_events.len() >= 1_024 { gs.pending_runtime_events.pop_front(); }
+            gs.pending_runtime_events.push_back(RuntimeEvent::Script(event));
+        }
+        if scope.has_caught() || scope.has_terminated() { scope.rethrow(); }
+    }));
+    if result.is_err() {
+        tracing::error!("op_script_execute_classic panicked");
+        return v8::null(scope).into();
+    }
+    v8::undefined(scope).into()
 }
 
 /// Attach one native shadow-tree scope without making it part of the light
@@ -7341,6 +7436,7 @@ pub fn build_extension() -> Extension {
         op_dom(),
         op_script_mark_started(),
         op_script_try_start(),
+        op_script_execute_classic(),
         op_shadow_attach(),
         op_shadow_root_info(),
         op_runtime_events_enabled(),

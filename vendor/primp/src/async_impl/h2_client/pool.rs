@@ -1052,6 +1052,9 @@ impl PoolClient {
                 };
                 while let Some(frame) = streaming_body.frame().await {
                     let frame = frame.map_err(error::request)?;
+                    // A drained reusable body knows its EOF now. Unknown streams
+                    // retain the terminal empty DATA fallback without lookahead.
+                    let is_end_stream = http_body::Body::is_end_stream(&streaming_body);
                     match frame.into_data() {
                         Ok(data) => {
                             if !data.is_empty() {
@@ -1061,7 +1064,7 @@ impl PoolClient {
                                         // bound memory; small bodies use direct send.
                                         if data.len() <= 1024 {
                                             stream
-                                                .send_data(data, false)
+                                                .send_data(data, is_end_stream)
                                                 .map_err(error::request)?;
                                         } else {
                                             let mut remaining = data;
@@ -1091,7 +1094,7 @@ impl PoolClient {
                                                     std::cmp::min(capacity, remaining.len());
                                                 let chunk = remaining.split_to(to_send);
                                                 stream
-                                                    .send_data(chunk, false)
+                                                    .send_data(chunk, is_end_stream && remaining.is_empty())
                                                     .map_err(error::request)?;
                                             }
                                         }
@@ -1101,6 +1104,7 @@ impl PoolClient {
                                         return Err(error::request("data frame after trailers"));
                                     }
                                 }
+                                if is_end_stream { send_stream.take(); }
                             }
                         }
                         Err(frame) => {
