@@ -93,7 +93,7 @@ fn native_persona_seed_and_frame_identity_are_stable() {
     assert_eq!(macos.do_not_track(), None);
     assert_eq!((macos.screen_width(), macos.screen_height()), (2560, 1440));
     assert_eq!((macos.screen_avail_width(), macos.screen_avail_height()), (2560, 1320));
-    assert_eq!((macos.outer_width(), macos.outer_height()), (640, 480));
+    assert_eq!((macos.outer_width(), macos.outer_height()), (640, 567));
     assert_eq!(macos.device_scale_factor(), 2.0);
     assert_eq!((macos.battery_charging(), macos.battery_level()), (true, 0.8));
     assert_eq!(macos.network_rtt(), 100);

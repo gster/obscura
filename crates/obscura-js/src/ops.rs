@@ -7345,6 +7345,32 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     true
 }
 
+/// Encode the JS-owned RGBA pixels without uncompressed scanline copies.
+#[op2]
+#[string]
+fn op_canvas_encode_png(width: u32, height: u32, #[buffer] pixels: &[u8]) -> Result<String, deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    if width == 0 || height == 0 || width > 32_767 || height > 32_767
+        || u64::from(width) * u64::from(height) > 67_108_864
+        || u64::from(width) * u64::from(height) * 4 != pixels.len() as u64
+    {
+        return Err(JsErrorBox::range_error("Invalid canvas pixel buffer"));
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            let mut writer = encoder.write_header().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            writer.write_image_data(pixels).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+            writer.finish().map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        }
+        Ok(format!("data:image/png;base64,{}", BASE64.encode(encoded)))
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Canvas PNG encoding failed")))
+}
+
 /// Retain the JavaScript-owned Canvas2D pixel buffer without copying it. A
 /// canvas resize supplies a new fixed backing store and atomically replaces
 /// the previous surface for the same DOM node.
@@ -7472,6 +7498,7 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_canvas_encode_png(),
         crate::worker::op_worker_serialize(),
         crate::worker::op_worker_deserialize(),
         crate::worker::op_worker_create(),

@@ -1980,6 +1980,7 @@ dependencies = [
  "obscura-render",
  "pbkdf2",
  "percent-encoding",
+ "png",
  "psl",
  "serde",
  "serde_json",

@@ -10404,6 +10404,90 @@ mod tests {
     }
 
     #[test]
+    fn table_collections_and_indexed_mutations_follow_dom_changes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const table = document.createElement('table'); document.body.appendChild(table);
+            const rows = table.rows, bodies = table.tBodies;
+            const a = table.insertRow(-1); a.id = 'a';
+            const cells = a.cells; a.insertCell(-1).id = 'c'; a.insertCell(-1).id = 'd';
+            const b = table.insertRow(0); b.id = 'b';
+            const head = document.createElement('thead'); table.appendChild(head);
+            head.insertRow().id = 'head';
+            const foot = document.createElement('tfoot'); table.insertBefore(foot, table.firstChild);
+            foot.insertRow().id = 'foot';
+            const order = Array.from(rows, row => row.id);
+            const appended = table.insertRow();
+            const placement = [b.parentNode.localName, appended.parentNode.localName, bodies.length];
+            const errors = [];
+            for (const fn of [() => table.insertRow(-2), () => table.insertRow(99),
+                () => a.insertCell(-2), () => a.deleteCell(-2), () => table.deleteRow(99)]) {
+                try { fn(); errors.push('none'); } catch(e) { errors.push(e.name); }
+            }
+            a.deleteCell(-1);
+            const cellIds = Array.from(cells, cell => cell.id);
+            const empty = document.createElement('tbody'); empty.deleteRow(-1);
+            const emptyRow = document.createElement('tr'); emptyRow.deleteCell(-1);
+            table.deleteRow(-1);
+            const spanCell = a.cells[0]; spanCell.rowSpan = 0; spanCell.colSpan = 9000;
+            return {order, placement, errors, cellIds,
+                stable: rows === table.rows && bodies === table.tBodies && cells === a.cells,
+                rowIndex: a.rowIndex, sectionRowIndex: a.sectionRowIndex,
+                length: rows.length, span: [spanCell.rowSpan, spanCell.colSpan],
+                brands: [Object.prototype.toString.call(a), Object.prototype.toString.call(spanCell)]};
+        })()"#).unwrap(), serde_json::json!({
+            "order": ["head", "b", "a", "foot"], "placement": ["tbody", "tfoot", 1],
+            "errors": ["IndexSizeError", "IndexSizeError", "IndexSizeError", "IndexSizeError", "IndexSizeError"],
+            "cellIds": ["c"], "stable": true, "rowIndex": 2, "sectionRowIndex": 1,
+            "length": 4, "span": [0, 1000],
+            "brands": ["[object HTMLTableRowElement]", "[object HTMLTableCellElement]"]
+        }));
+    }
+
+    #[test]
+    fn browser_identity_descriptors_preserve_application_properties() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const el = document.createElement('div'); el.id = 'app-probe'; document.body.appendChild(el);
+            const hidden = !Object.getOwnPropertyNames(window).includes(el.id) && window[el.id] === el;
+            Object.defineProperty(window, el.id, {value: 42, configurable: true, enumerable: true});
+            const visible = Object.keys(window).includes(el.id) && Reflect.ownKeys(window).includes(el.id)
+                && Object.getOwnPropertyDescriptors(window)[el.id].value === 42;
+            el.remove();
+            const getter = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get;
+            const setter = Object.getOwnPropertyDescriptor(window, 'innerWidth').set;
+            return [hidden, visible, window['app-probe'], Object.getOwnPropertyNames(navigator),
+                Object.getOwnPropertyNames(screen), getter.toString(), setter.toString(), typeof SharedArrayBuffer,
+                getter.name, setter.name, Object.getOwnPropertyDescriptor(Screen.prototype, 'colorDepth').enumerable,
+                Object.getOwnPropertyDescriptor(HTMLTableRowElement.prototype, 'cells').get.toString()];
+        })()"#).unwrap(), serde_json::json!([
+            true, true, 42, [], [], "function get userAgent() { [native code] }",
+            "function set innerWidth() { [native code] }", "undefined", "get userAgent", "set innerWidth", true,
+            "function get cells() { [native code] }"
+        ]));
+    }
+
+    #[test]
+    fn canvas_png_compression_preserves_rgba_pixels() {
+        use base64::Engine as _;
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt.evaluate(r#"(() => {
+            const c = document.createElement('canvas'); c.width = 400; c.height = 200;
+            const ctx = c.getContext('2d'); ctx.fillStyle = '#123456'; ctx.fillRect(0, 0, 400, 200);
+            return c.toDataURL();
+        })()"#).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(
+            value.as_str().unwrap().strip_prefix("data:image/png;base64,").unwrap()).unwrap();
+        assert!(bytes.len() < 10_000, "a uniform canvas must not produce an uncompressed payload");
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height, info.color_type), (400, 200, png::ColorType::Rgba));
+        assert!(pixels[..info.buffer_size()].chunks_exact(4).all(|pixel| pixel == [0x12, 0x34, 0x56, 255]));
+    }
+
+    #[test]
     fn function_to_string_has_native_function_shape() {
         let mut rt = setup_runtime("<html><body></body></html>");
 
@@ -17155,7 +17239,7 @@ return {before,removed,reinsert,moved,cleared};
                     window.addEventListener('scroll', () => win++);
                     document.addEventListener('scroll', () => doc++);
                     window.scrollBy(0, 400);
-                    setTimeout(() => resolve([win, doc, window.scrollY]), 5);
+                    requestAnimationFrame(() => resolve([win, doc, window.scrollY]));
                 })
                 "#,
                 true,

@@ -56,6 +56,51 @@ manifest 模板中的 unknown/null 要按实际环境补全，无法确认时保
 Chrome 基线使用自己的 endpoint、label、`role=baseline` manifest 和新输出目录。
 截图、原始指纹、运行报告和代理凭证不进入 Git。
 
+## 控制链：裸 CDP 可用
+
+Obscura 本体不依赖 Playwright。当被测目标是 Obscura（或任何 CDP 服务端）时，
+用裸 CDP over WebSocket（例如 Python `websockets`）驱动候选与 Chrome 基线，
+可以让两侧走**完全同一条**控制链，避免官方驱动在附着时应用的默认 context 覆盖。
+采集器脚本仍然只用官方 Playwright；两者不要混在同一轮对照里。
+
+## 本地测试环境排查
+
+以下现象来自一次 WorkBuddy 的 macOS 沙箱运行，复跑时先核对当前环境：
+
+1. shell 若注入回环 HTTP 代理，CDP 本地连接可能返回 502。为客户端设置
+   `NO_PROXY='localhost,127.0.0.1,::1'` 和相同的 `no_proxy`，仅绕过本地连接。
+2. 测试服务必须由宿主支持的长驻进程会话启动；确认进程存活后再连接。
+3. Chrome 若因沙箱初始化失败退出，记录错误和实际启动参数；只有当前环境
+   确实需要时才使用 `--no-sandbox`，并在 baseline manifest 中写明。
+4. 无头 Chrome 的 UA 含 `HeadlessChrome` 时，站点级判定不可直接与普通
+   Chrome persona 比较。跨版本字段也要单独标为不可比。
+5. Chrome 对照必须成功新建匿名 `BrowserContext`，失败则停止，不能退回
+   默认 profile。裸 CDP 使用 `Target.createBrowserContext` 后显式传入 context ID。
+
+## 改 bootstrap.js 前必须知道
+
+`crates/obscura-js/build.rs` 在**构建期**执行 `bootstrap.js` 生成 V8 snapshot，
+页面 realm 从该 snapshot 恢复。由此产生三条硬约束：
+
+1. 对 V8 惰性全局执行的一次 `delete` **可能不会**存活到页面：V8 从 snapshot 恢复 context
+   时会重建惰性全局（`SharedArrayBuffer` 就是实例）。需要 per-page 生效的改动要放进
+   `__obscura_init`。
+2. 需要向 Rust 暴露的全局钩子必须加进
+   `_preHideInternals` 的 `_names` 列表；IIFE 内部 helper 保持闭包私有，否则改动本身就成了 `unusualWindowProperties`。
+3. 改完 `bootstrap.js` 必须重建 release 二进制再测。先跑
+   `node --check crates/obscura-js/js/bootstrap.js` 做语法校验，比等 V8 快得多。
+   `nextest` 也能在构建期就抓住 bootstrap 抛错（build.rs 会 panic 并给出 JS 堆栈）。
+
+## 回归口径
+
+```bash
+cargo nextest run --release -p obscura-net            # 无 render 特性
+cargo nextest run --release --features render -p obscura-js
+```
+
+persona 内容变化会让 `persona.rs` 里的 golden digest 失效；`stable_seed` 只哈希
+persona_id/revision/profile，所以指纹种子不受影响。更新 golden 时要确认这一点。
+
 ## 解释能力缺口
 
 Obscura 的 utility-world ID 当前不证明真正独立的执行全局。Rebrowser isolated 轮

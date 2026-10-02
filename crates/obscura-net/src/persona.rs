@@ -358,8 +358,10 @@ impl PersonaSpec {
         let outer_width =
             self.outer_width
                 .unwrap_or(if macos { viewport.width } else { screen_width });
+        // Default macOS window chrome allowance, based on the audit control.
+        // An explicit outer_height remains authoritative.
         let outer_height = self.outer_height.unwrap_or(if macos {
-            viewport.height
+            viewport.height.saturating_add(87)
         } else {
             screen_avail_height
         });
@@ -681,7 +683,7 @@ impl EffectivePersona {
              globalThis.__obscura_battery_level={};\
              globalThis.__obscura_network_rtt={};\
              globalThis.__obscura_storage_quota={};\
-             if(globalThis.screen){{globalThis.screen._availW={};globalThis.screen._availH={};}}\
+             if(globalThis.__obscura_set_screen_avail){{globalThis.__obscura_set_screen_avail({},{});}}\
              globalThis.outerWidth={};globalThis.outerHeight={};\
              globalThis.devicePixelRatio={};",
             self.battery_charging,
@@ -938,8 +940,8 @@ mod tests {
     fn browser_flavor_default_preserves_legacy_serialization_and_digest() {
         for (profile, digest) in [
             (StealthProfile::WindowsChrome145, "f16a5cfffbe41af8a7c34584439d42c9dab670ada61034a11ee2cb923dc44bc6"),
-            (StealthProfile::MacChrome152, "7b6c000db23f0e65c95265ef1875e3fff5102046027da0976f0671074efdd069"),
-            (StealthProfile::MacChrome153, "9ecacf12e2770ddd7da91cbacb7a9dd5c4e5a9a314ec4e22d66802fe05ff20b4"),
+            (StealthProfile::MacChrome152, "26a6db2b46c114e7438a02587fb73fe192500643909bd51ccd8d8f3f381db10a"),
+            (StealthProfile::MacChrome153, "10ddce8c88a063443eed8d8630dfad88e466e05a2d5b1cb9b34d57d7e93907dc"),
         ] {
             let spec = PersonaSpec::preset(profile);
             let serialized = serde_json::to_value(&spec).unwrap();

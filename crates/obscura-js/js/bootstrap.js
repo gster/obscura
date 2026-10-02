@@ -38,6 +38,10 @@ function _relativeTimeNow() {
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
+    '__obscura_gate_shared_array_buffer', '_defNavigatorMember',
+    '_markNativeGetter', '_markNativeSetter',
+    '_tableElementChildren', '_tableRowsOf', '_tableInsertIndex', '_tableDeleteAt', '_tableCollection',
+    '_setScreenColorDepth', '__obscura_set_screen_avail',
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_deviceOrientationScheduled',
     '__obscura_hw', '__obscura_mem',
@@ -238,6 +242,18 @@ Function.prototype.toString = _functionToString;
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
+// Accessors must stringify exactly like Chromium's: `function get x() { [native
+// code] }`. A plain _markNative call emits `function () { [native code] }`,
+// which loses the `get` keyword and the property name and is trivially
+// distinguishable from a real native accessor.
+function _markNativeGetter(fn, key) {
+  Object.defineProperty(fn, 'name', {value: 'get ' + key, configurable: true});
+  return _markNativeAs(fn, 'function get ' + key + '() { [native code] }');
+}
+function _markNativeSetter(fn, key) {
+  Object.defineProperty(fn, 'name', {value: 'set ' + key, configurable: true});
+  return _markNativeAs(fn, 'function set ' + key + '() { [native code] }');
+}
 _nativeFns.add(_functionToString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
@@ -261,14 +277,28 @@ _nativeFns.add(_functionToString);
     return _cache;
   }
   function _isGlobal(t) { return t === globalThis; }
+  // Element-id named properties are own properties of this global (a real
+  // Window object has no WindowProxy layer to hide them behind), so they must
+  // be filtered out of reflection too: Chromium reports zero hyphenated names
+  // from Object.getOwnPropertyNames(window) on a page full of ids.
+  function _named() {
+    try { return _windowNamedPropertyNames || null; } catch (e) { return null; }
+  }
   function _filter(t, names) {
     if (!_isGlobal(t)) { return names; }
     var set = _set();
-    if (!set) { return names; }
+    var named = _named();
+    if (!set && !named) { return names; }
     var out = [];
-    for (var i = 0; i < names.length; i++) { if (!set.has(names[i])) { out.push(names[i]); } }
+    for (var i = 0; i < names.length; i++) {
+      var n = names[i];
+      if (set && set.has(n)) { continue; }
+      if (named && named.has(n) && _windowNamedPropertyGetters.get(n) === _oGOPD(t, n)?.get) { continue; }
+      out.push(n);
+    }
     return out;
   }
+  var _oGOPD = Object.getOwnPropertyDescriptor;
   var _oGOPN = Object.getOwnPropertyNames;
   var _oOwnKeys = Reflect.ownKeys;
   var _oKeys = Object.keys;
@@ -283,7 +313,11 @@ _nativeFns.add(_functionToString);
     var all = _oGOPDs(t);
     if (_isGlobal(t)) {
       var set = _set();
-      if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+      var named = _named();
+      var ks = _oGOPN(all);
+      for (var i = 0; i < ks.length; i++) {
+        if ((set && set.has(ks[i])) || (named && named.has(ks[i]) && _windowNamedPropertyGetters.get(ks[i]) === all[ks[i]].get)) { delete all[ks[i]]; }
+      }
     }
     return all;
   });
@@ -7412,7 +7446,7 @@ globalThis.cookieStore = new CookieStore();
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
-globalThis.navigator = {
+var _navigatorSeed = {
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
   vendor: "Google Inc.", vendorSub: "", product: "Gecko", productSub: "20030107",
@@ -7488,18 +7522,51 @@ globalThis.navigator = {
   webkitPersistentStorage: { queryUsageAndQuota(success) { if (success) success(0, globalThis.__obscura_storage_quota ?? 10738064711); }, requestQuota(bytes, success) { if (success) success(bytes); } },
 };
 
-// Put spoofed navigator props on a thin prototype above Navigator.prototype
-// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
-// Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
+// Navigator members belong on Navigator.prototype. A real navigator has no own
+// properties at all, and a production detector checks exactly that
+// (rebrowser bot-detector: `navigatorWebdriver`, "Object.getOwnPropertyNames
+// (navigator) should return empty array"). Leaving them on the instance listed
+// every spoofed member by name.
 (function() {
-  var _navProto = Object.create(Navigator.prototype);
+  var _navProto = Navigator.prototype;
 
+  // Data members become getter-only accessors, matching the accessor shape
+  // Chromium uses for navigator attributes.
+  function _makeValueGetter(value) { return function() { return value; }; }
   function defGetter(key, fn) {
-    _markNative(fn);
+    _markNativeGetter(fn, key);
     Object.defineProperty(_navProto, key, {
       get: fn, set: undefined, enumerable: true, configurable: true,
     });
   }
+
+  (function _transplantNavigatorMembers() {
+    var keys = Object.getOwnPropertyNames(_navigatorSeed);
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var desc = Object.getOwnPropertyDescriptor(_navigatorSeed, key);
+      if (!desc) { continue; }
+      if (typeof desc.get === 'function' || typeof desc.set === 'function') {
+        if (typeof desc.get === 'function') _markNativeGetter(desc.get, key);
+        if (typeof desc.set === 'function') _markNativeSetter(desc.set, key);
+        Object.defineProperty(_navProto, key, {
+          get: desc.get, set: desc.set, enumerable: true, configurable: true,
+        });
+        continue;
+      }
+      if (typeof desc.value === 'function') {
+        // WebIDL operations stay data properties on the prototype; only
+        // attributes are accessors. Chromium reports
+        // getOwnPropertyDescriptor(Navigator.prototype, 'getBattery').value.
+        _markNative(desc.value);
+        Object.defineProperty(_navProto, key, {
+          value: desc.value, writable: true, enumerable: true, configurable: true,
+        });
+        continue;
+      }
+      defGetter(key, _makeValueGetter(desc.value));
+    }
+  })();
 
   defGetter('webdriver', function() { return false; });
   defGetter('appCodeName', function() { return 'Mozilla'; });
@@ -7528,9 +7595,15 @@ globalThis.navigator = {
       : ["en-US", "en"];
   });
 
-  Navigator.prototype.sendBeacon = _markNative(function sendBeacon() { return true; });
+  // Method members are data properties on the prototype (like every other
+  // WebIDL operation); the seed already installed this key as a getter-only
+  // accessor, so it has to be replaced with defineProperty rather than assigned.
+  Object.defineProperty(Navigator.prototype, 'sendBeacon', {
+    value: _markNative(function sendBeacon() { return true; }),
+    writable: true, enumerable: true, configurable: true,
+  });
   Object.defineProperty(Navigator.prototype, 'onLine', {
-    get: _markNative(function onLine() { return true; }),
+    get: _markNativeGetter(function() { return true; }, 'onLine'),
     enumerable: true,
     configurable: true,
   });
@@ -7571,9 +7644,21 @@ globalThis.navigator = {
   _navProto.unregisterProtocolHandler = _markNative(function unregisterProtocolHandler() {});
   _navProto.vibrate = _markNative(function vibrate() { return true; });
 
-  Object.setPrototypeOf(globalThis.navigator, _navProto);
+  // A bare instance of Navigator: the members above are all on the prototype,
+  // so Object.getOwnPropertyNames(navigator) is empty as in Chromium.
+  globalThis.navigator = Object.create(Navigator.prototype);
   globalThis.clientInformation = globalThis.navigator;
 })();
+
+// Later bootstrap sections add navigator members. They must land on
+// Navigator.prototype for the same reason as the members above: an assignment
+// on the instance re-creates exactly the own-property list the detector reads.
+function _defNavigatorMember(key, value) {
+  Object.defineProperty(Navigator.prototype, key, {
+    get: _markNativeGetter(function() { return value; }, key),
+    enumerable: true, configurable: true,
+  });
+}
 
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
@@ -7647,35 +7732,69 @@ _markNative(ScreenOrientation.prototype.lock);
 _markNative(ScreenOrientation.prototype.unlock);
 globalThis.ScreenOrientation = ScreenOrientation;
 
+// Screen state lives in a side table, not in own properties of the instance: a
+// real Screen has no own properties, and `Object.getOwnPropertyNames(screen)`
+// listing _w/_h/_availW/_availH is a one-line difference from Chromium. The
+// public members are prototype accessors for the same reason.
+const _screenSlots = new WeakMap();
 class Screen {
   constructor(w, h, availW, availH) {
-    this._w = w; this._h = h;
-    this._availW = availW === undefined ? w : availW;
-    this._availH = availH === undefined ? h - 40 : availH;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = new ScreenOrientation();
+    _screenSlots.set(this, {
+      w: w, h: h,
+      availW: availW === undefined ? w : availW,
+      availH: availH === undefined ? h - 40 : availH,
+      colorDepth: 24,
+      orientation: new ScreenOrientation(),
+    });
   }
-  get width() { return this._w; }
-  get height() { return this._h; }
-  get availWidth() { return this._availW; }
-  get availHeight() { return this._availH; }
+  get width() { return _screenSlots.get(this).w; }
+  get height() { return _screenSlots.get(this).h; }
+  get availWidth() { return _screenSlots.get(this).availW; }
+  get availHeight() { return _screenSlots.get(this).availH; }
+  get colorDepth() { return _screenSlots.get(this).colorDepth; }
+  get pixelDepth() { return _screenSlots.get(this).colorDepth; }
+  get availTop() { return 0; }
+  get availLeft() { return 0; }
+  get isExtended() { return false; }
+  get orientation() { return _screenSlots.get(this).orientation; }
 }
-['width','height','availWidth','availHeight'].forEach(function(k) {
-  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
-  if (d && d.get) _markNative(d.get);
+Object.defineProperty(Screen.prototype, 'onchange', {
+  value: null, writable: true, configurable: true, enumerable: true,
 });
+['width','height','availWidth','availHeight','colorDepth','pixelDepth','availTop','availLeft','isExtended','orientation'].forEach(function(k) {
+  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
+  if (d && d.get) {
+    _markNativeGetter(d.get, k);
+    Object.defineProperty(Screen.prototype, k, { ...d, enumerable: true });
+  }
+});
+_markNative(Screen);
 globalThis.Screen = Screen;
 globalThis.screen = new Screen(1920, 1080);
 function _applyScreenSize(w, h, emulated) {
-  if (globalThis.screen instanceof Screen) {
-    globalThis.screen._w = w;
-    globalThis.screen._h = h;
-    globalThis.screen._availW = w;
-    globalThis.screen._availH = emulated ? h : h - 40;
+  const slots = globalThis.screen instanceof Screen ? _screenSlots.get(globalThis.screen) : null;
+  if (slots) {
+    slots.w = w;
+    slots.h = h;
+    slots.availW = w;
+    slots.availH = emulated ? h : h - 40;
   } else {
     globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
   }
 }
+function _setScreenColorDepth(depth) {
+  const slots = globalThis.screen instanceof Screen ? _screenSlots.get(globalThis.screen) : null;
+  if (slots) slots.colorDepth = depth;
+}
+// Persona application sets the available screen area after the page realm is
+// built. It goes through a hook rather than assigning `screen._availW`, which
+// would create own properties on the instance and bypass the accessors.
+globalThis.__obscura_set_screen_avail = function(w, h) {
+  const slots = globalThis.screen instanceof Screen ? _screenSlots.get(globalThis.screen) : null;
+  if (!slots) return;
+  if (Number.isFinite(w) && w > 0) slots.availW = w;
+  if (Number.isFinite(h) && h > 0) slots.availH = h;
+};
 globalThis.__obscura_set_screen_override = function(w, h, emulated) {
   globalThis.__obscura_screen_emulated = !!emulated;
   if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
@@ -7716,9 +7835,34 @@ Object.defineProperty(VisualViewport.prototype, Symbol.toStringTag, { value: 'Vi
 _markNative(VisualViewport);
 globalThis.VisualViewport = VisualViewport;
 globalThis.visualViewport = new VisualViewport(1920, 1000);
-globalThis.devicePixelRatio = 1;
-globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
-globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
+// Viewport metrics are accessors on the Window object in Chromium, not data
+// properties: Object.getOwnPropertyDescriptor(window, 'innerWidth') reports a
+// getter and a setter. Assigning them here left plain data properties, which is
+// a descriptor read away from looking synthetic. Keep the same writable
+// behaviour the rest of the bootstrap relies on (it assigns these to resize the
+// viewport) by backing them with per-property slots.
+(function _installViewportAccessors() {
+  var initial = {
+    devicePixelRatio: 1,
+    innerWidth: 1920, innerHeight: 1000,
+    outerWidth: 1920, outerHeight: 1080,
+  };
+  var keys = Object.keys(initial);
+  for (var i = 0; i < keys.length; i++) {
+    (function (key) {
+      var value = initial[key];
+      Object.defineProperty(globalThis, key, {
+        get: _markNativeGetter(function () { return value; }, key),
+        set: _markNativeSetter(function (next) {
+          var n = Number(next);
+          if (Number.isFinite(n)) value = n;
+        }, key),
+        enumerable: true,
+        configurable: true,
+      });
+    })(keys[i]);
+  }
+})();
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 
@@ -11754,6 +11898,14 @@ globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
 // the challenge never completes (issue #389). Clone buffers, typed arrays,
 // maps/sets, dates, errors, and plain objects recursively; CryptoKey and other
 // types that register a clone hook (see crypto.subtle below) are routed there.
+// The page realm hides SharedArrayBuffer when the document is not
+// cross-origin isolated (see __obscura_gate_shared_array_buffer), but the
+// structured clone algorithm still has to recognise a shared buffer. Keep an
+// internal alias captured before the global is removed.
+const _SharedArrayBufferCtor = typeof globalThis.SharedArrayBuffer === "function"
+  ? globalThis.SharedArrayBuffer
+  : null;
+
 function _structuredClone(value, seen) {
   // Functions and symbols are not structured-cloneable (HTML structured clone,
   // DataCloneError). This must run before the primitive early-return below,
@@ -11782,7 +11934,7 @@ function _structuredClone(value, seen) {
     seen.set(value, copy);
     return copy;
   }
-  if (value instanceof SharedArrayBuffer) {
+  if (_SharedArrayBufferCtor && value instanceof _SharedArrayBufferCtor) {
     return value; // transferable, not copyable
   }
   if (value instanceof Date) return new Date(value.getTime());
@@ -12771,6 +12923,221 @@ Object.defineProperty(globalThis.HTMLInputElement.prototype, 'onsearch', {
   configurable: true, enumerable: true, writable: true, value: null,
 });
 for (const tag of ['H2','H3','H4','H5','H6']) _htmlElementClasses[tag] = _htmlElementClasses.H1;
+
+// Table interfaces. Chromium gives every table part its own interface, and the
+// row/cell accessors are load-bearing: a detector that renders its report with
+// `tbody.insertRow()` threw here and never published its result (rebrowser's
+// bot-detector), and `Object.prototype.toString.call(tr)` reported
+// "[object HTMLElement]" instead of "[object HTMLTableRowElement]".
+function _tableElementChildren(el) {
+  const ids = _domParse('element_children', el._nid) || [];
+  const out = [];
+  for (let i = 0; i < ids.length; i++) { const w = _wrapEl(ids[i]); if (w) out.push(w); }
+  return out;
+}
+// Rows of a table section, or of a <table> across its row groups. The HTML
+// algorithm only walks the table's own children and one level of thead/tbody/
+// tfoot, which is what nested tables rely on to stay invisible to the outer one.
+function _tableRowsOf(el, descendTags) {
+  const out = [];
+  const children = _tableElementChildren(el);
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    if (child.localName === 'tr') { out.push(child); continue; }
+    if (descendTags && descendTags.indexOf(child.localName) !== -1) {
+      const inner = _tableElementChildren(child);
+      for (let j = 0; j < inner.length; j++) if (inner[j].localName === 'tr') out.push(inner[j]);
+    }
+  }
+  if (descendTags) {
+    const rank = row => row.parentNode.localName === 'thead' ? 0 : row.parentNode.localName === 'tfoot' ? 2 : 1;
+    out.sort((a, b) => rank(a) - rank(b));
+  }
+  return out;
+}
+const _tableCollections = new WeakMap();
+function _tableCollection(el, key, source) {
+  let slots = _tableCollections.get(el);
+  if (!slots) { slots = {}; _tableCollections.set(el, slots); }
+  if (!slots[key]) slots[key] = HTMLCollection._live(source);
+  return slots[key];
+}
+function _tableInsertIndex(index, length) {
+  const i = index === undefined ? -1 : (+index >> 0);
+  if (i < -1 || i > length) throw new DOMException('Index size error', 'IndexSizeError');
+  return i === -1 ? length : i;
+}
+function _tableDeleteAt(items, index, argc) {
+  if (!argc) throw new TypeError('An index is required');
+  const i = +index >> 0;
+  if (i < -1 || i >= items.length) throw new DOMException('Index size error', 'IndexSizeError');
+  const item = items[i === -1 ? items.length - 1 : i];
+  if (item) item.remove();
+}
+
+globalThis.HTMLTableRowElement = class HTMLTableRowElement extends HTMLElement {
+  get cells() {
+    return _tableCollection(this, 'cells', () => _tableElementChildren(this).filter(
+      child => child.localName === 'td' || child.localName === 'th'));
+  }
+  get rowIndex() {
+    const parent = this.parentNode;
+    const table = parent?.localName === 'table' ? parent
+      : ['thead', 'tbody', 'tfoot'].includes(parent?.localName) && parent.parentNode?.localName === 'table' ? parent.parentNode : null;
+    if (!table) return -1;
+    const rows = _tableRowsOf(table, ['thead', 'tbody', 'tfoot']);
+    for (let i = 0; i < rows.length; i++) if (rows[i] === this) return i;
+    return -1;
+  }
+  get sectionRowIndex() {
+    const section = this.parentNode;
+    if (!['table', 'thead', 'tbody', 'tfoot'].includes(section?.localName)) return -1;
+    const rows = _tableRowsOf(section, section.localName === 'table' ? ['thead', 'tbody', 'tfoot'] : null);
+    for (let i = 0; i < rows.length; i++) if (rows[i] === this) return i;
+    return -1;
+  }
+  insertCell(index) {
+    const cells = this.cells;
+    const at = _tableInsertIndex(index, cells.length);
+    const td = document.createElement('td');
+    const ref = at < cells.length ? cells[at] : null;
+    if (ref) this.insertBefore(td, ref); else this.appendChild(td);
+    return td;
+  }
+  deleteCell(index) {
+    _tableDeleteAt(this.cells, index, arguments.length);
+  }
+};
+Object.defineProperty(globalThis.HTMLTableRowElement.prototype, Symbol.toStringTag, {
+  value: 'HTMLTableRowElement', configurable: true
+});
+
+globalThis.HTMLTableCellElement = class HTMLTableCellElement extends HTMLElement {
+  get cellIndex() {
+    const row = this.parentNode;
+    if (row?.localName !== 'tr') return -1;
+    const cells = _tableElementChildren(row).filter(child => child.localName === 'td' || child.localName === 'th');
+    for (let i = 0; i < cells.length; i++) if (cells[i] === this) return i;
+    return -1;
+  }
+  get colSpan() {
+    const v = parseInt(this.getAttribute('colspan'), 10);
+    return Number.isFinite(v) && v > 0 ? Math.min(v, 1000) : 1;
+  }
+  set colSpan(v) { this.setAttribute('colspan', String(+v >>> 0)); }
+  get rowSpan() {
+    const v = parseInt(this.getAttribute('rowspan'), 10);
+    return Number.isFinite(v) && v >= 0 ? Math.min(v, 65534) : 1;
+  }
+  set rowSpan(v) { this.setAttribute('rowspan', String(+v >>> 0)); }
+};
+Object.defineProperty(globalThis.HTMLTableCellElement.prototype, Symbol.toStringTag, {
+  value: 'HTMLTableCellElement', configurable: true
+});
+
+globalThis.HTMLTableSectionElement = class HTMLTableSectionElement extends HTMLElement {
+  get rows() { return _tableCollection(this, 'rows', () => _tableRowsOf(this, null)); }
+  insertRow(index) {
+    const rows = this.rows;
+    const at = _tableInsertIndex(index, rows.length);
+    const tr = document.createElement('tr');
+    const ref = at < rows.length ? rows[at] : null;
+    if (ref) this.insertBefore(tr, ref); else this.appendChild(tr);
+    return tr;
+  }
+  deleteRow(index) {
+    _tableDeleteAt(this.rows, index, arguments.length);
+  }
+};
+Object.defineProperty(globalThis.HTMLTableSectionElement.prototype, Symbol.toStringTag, {
+  value: 'HTMLTableSectionElement', configurable: true
+});
+
+globalThis.HTMLTableCaptionElement = class HTMLTableCaptionElement extends HTMLElement {};
+Object.defineProperty(globalThis.HTMLTableCaptionElement.prototype, Symbol.toStringTag, {
+  value: 'HTMLTableCaptionElement', configurable: true
+});
+
+globalThis.HTMLTableColElement = class HTMLTableColElement extends HTMLElement {
+  get span() {
+    const v = parseInt(this.getAttribute('span'), 10);
+    return Number.isFinite(v) && v > 0 ? Math.min(v, 1000) : 1;
+  }
+  set span(v) { this.setAttribute('span', String(+v >>> 0)); }
+};
+Object.defineProperty(globalThis.HTMLTableColElement.prototype, Symbol.toStringTag, {
+  value: 'HTMLTableColElement', configurable: true
+});
+
+// <table> keeps its own row/cell surface on top of the generic interface the
+// tag loop installed.
+(function _installTableSurface() {
+  const _sectionTags = ['thead', 'tbody', 'tfoot'];
+  const sectionClass = { thead: globalThis.HTMLTableSectionElement,
+                         tbody: globalThis.HTMLTableSectionElement,
+                         tfoot: globalThis.HTMLTableSectionElement };
+  for (const tag of _sectionTags) _htmlElementClasses[tag.toUpperCase()] = sectionClass[tag];
+  _htmlElementClasses.TD = globalThis.HTMLTableCellElement;
+  _htmlElementClasses.TH = globalThis.HTMLTableCellElement;
+  _htmlElementClasses.TR = globalThis.HTMLTableRowElement;
+  _htmlElementClasses.CAPTION = globalThis.HTMLTableCaptionElement;
+  _htmlElementClasses.COL = globalThis.HTMLTableColElement;
+  _htmlElementClasses.COLGROUP = globalThis.HTMLTableColElement;
+
+  Object.defineProperties(globalThis.HTMLTableElement.prototype, {
+    rows: {
+      configurable: true, enumerable: true,
+      get() { return _tableCollection(this, 'rows', () => _tableRowsOf(this, _sectionTags)); },
+    },
+    tBodies: {
+      configurable: true, enumerable: true,
+      get() {
+        return _tableCollection(this, 'tBodies', () => _tableElementChildren(this).filter(child => child.localName === 'tbody'));
+      },
+    },
+    insertRow: {
+      configurable: true, enumerable: true, writable: true,
+      value: _markNative(function insertRow(index) {
+        const rows = this.rows;
+        const at = _tableInsertIndex(index, rows.length);
+        const tr = document.createElement('tr');
+        const ref = at < rows.length ? rows[at] : null;
+        if (ref) { ref.parentNode.insertBefore(tr, ref); return tr; }
+        if (rows.length) { rows[rows.length - 1].parentNode.appendChild(tr); return tr; }
+        const groups = this.tBodies;
+        let group = groups.length ? groups[groups.length - 1] : null;
+        if (!group) { group = document.createElement('tbody'); this.appendChild(group); }
+        group.appendChild(tr);
+        return tr;
+      }),
+    },
+    deleteRow: {
+      configurable: true, enumerable: true, writable: true,
+      value: _markNative(function deleteRow(index) {
+        _tableDeleteAt(this.rows, index, arguments.length);
+      }),
+    },
+  });
+  for (const cls of [globalThis.HTMLTableRowElement, globalThis.HTMLTableCellElement,
+                     globalThis.HTMLTableSectionElement, globalThis.HTMLTableElement,
+                     globalThis.HTMLTableCaptionElement, globalThis.HTMLTableColElement]) {
+    _markNative(cls);
+    for (const key of Object.getOwnPropertyNames(cls.prototype)) {
+      if (key === 'constructor') continue;
+      const desc = Object.getOwnPropertyDescriptor(cls.prototype, key);
+      if (desc.get) _markNativeGetter(desc.get, key);
+      if (desc.set) _markNativeSetter(desc.set, key);
+      Object.defineProperty(cls.prototype, key, { ...desc, enumerable: true });
+    }
+  }
+  for (const name of ['insertRow', 'deleteRow', 'insertCell', 'deleteCell']) {
+    for (const cls of [globalThis.HTMLTableRowElement, globalThis.HTMLTableSectionElement, globalThis.HTMLTableElement]) {
+      const d = Object.getOwnPropertyDescriptor(cls.prototype, name);
+      if (d && d.value) _markNative(d.value);
+    }
+  }
+})();
+
 globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLFormElement = class HTMLFormElement extends HTMLElement {
   get elements() { return HTMLCollection._from((_domParse('form_controls',this._nid)||[]).map(_wrap)); }
@@ -13402,6 +13769,7 @@ globalThis.HTMLAllCollection = HTMLAllCollection;
 // (or an iframe's Window), while duplicates return a live-shaped
 // HTMLCollection in tree order.
 const _windowNamedPropertyNames = new Set();
+const _windowNamedPropertyGetters = new Map();
 const _windowNamedNameTags = new Set(["embed", "form", "iframe", "img", "object"]);
 const _documentNamedProperties = new WeakMap();
 
@@ -13507,12 +13875,19 @@ function _ensureWindowNamedProperty(name) {
   // Existing own Window properties win over named elements.
   if (Object.prototype.hasOwnProperty.call(globalThis, name)) return;
   try {
+    const getter = function() { return _windowNamedValue(name); };
     Object.defineProperty(globalThis, name, {
-      get() { return _windowNamedValue(name); },
+      get: getter,
       configurable: true,
-      enumerable: true,
+      // Window named properties are not own enumerable properties of the
+      // global: they live on the WindowProxy's named-property object, so
+      // `Object.keys(window)` never lists them. Defining them enumerable made
+      // every element id show up in `Object.keys(window)` and in
+      // `for (const k in window)`, which no Chromium build does.
+      enumerable: false,
     });
     _windowNamedPropertyNames.add(name);
+    _windowNamedPropertyGetters.set(name, getter);
   } catch (_error) {}
 }
 
@@ -13520,7 +13895,10 @@ function _reconcileWindowNamedProperty(name) {
   _reconcileDocumentNamedProperties([name]);
   if (!_windowNamedPropertyNames.has(name)) return;
   if (_windowNamedCandidates(name).length !== 0) return;
-  try { delete globalThis[name]; } catch (_error) {}
+  if (Object.getOwnPropertyDescriptor(globalThis, name)?.get === _windowNamedPropertyGetters.get(name)) {
+    try { delete globalThis[name]; } catch (_error) {}
+  }
+  _windowNamedPropertyGetters.delete(name);
   _windowNamedPropertyNames.delete(name);
 }
 
@@ -13573,7 +13951,10 @@ function _reconcileWindowNamedProperties(names) {
   }
   for (const name of names) {
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
-      try { delete globalThis[name]; } catch (_error) {}
+      if (Object.getOwnPropertyDescriptor(globalThis, name)?.get === _windowNamedPropertyGetters.get(name)) {
+        try { delete globalThis[name]; } catch (_error) {}
+      }
+      _windowNamedPropertyGetters.delete(name);
       _windowNamedPropertyNames.delete(name);
     }
   }
@@ -14486,75 +14867,29 @@ class _IframeWindow {
   blur() {}
 }
 
-// Encode an RGBA pixel buffer into a valid PNG data URL.
-// Uses stored-block DEFLATE (no compression) wrapped in zlib.
-// This produces a larger file than a real browser but the hash is unique
-// per session (from _fpNoise) and valid, so it does not match the known
-// headless stub.
-function _encodePNG(w, h, rgba) {
-  // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
-  var rowLen = 1 + w * 4;
-  var raw = new Uint8Array(h * rowLen);
-  for (var y = 0; y < h; y++) {
-    var base = y * rowLen;
-    raw[base] = 0;
-    for (var x = 0; x < w; x++) {
-      var s = (y * w + x) << 2, d = base + 1 + x * 4;
-      raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2]; raw[d+3] = rgba[s+3];
+// A frame's browsing context is a Window, and every detector reads it as one:
+// `iframe.contentWindow.constructor.name` reported "_IframeWindow" and
+// `Object.prototype.toString.call(contentWindow)` reported "[object Object]".
+// Both are one-line automation tells. Rebrand the class in place, and put it
+// under Window.prototype so instanceof/toStringTag agree with a real frame.
+(function _brandIframeWindow() {
+  var proto = _IframeWindow.prototype;
+  try {
+    if (typeof globalThis.Window === 'function' && globalThis.Window.prototype) {
+      Object.setPrototypeOf(proto, globalThis.Window.prototype);
+      Object.defineProperty(proto, 'constructor', {
+        value: globalThis.Window, writable: true, enumerable: false, configurable: true,
+      });
     }
-  }
-  // Adler32 of raw
-  var s1 = 1, s2 = 0, M = 65521;
-  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
-  var adler = ((s2 << 16) | s1) >>> 0;
-  // Stored DEFLATE blocks (zlib level 0)
-  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
-  var dlen = 2 + nb * 5 + raw.length + 4;
-  var def = new Uint8Array(dlen), dp = 0;
-  def[dp++] = 0x78; def[dp++] = 0x01;
-  for (var bi = 0; bi < nb; bi++) {
-    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
-    def[dp++] = bi === nb-1 ? 1 : 0;
-    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
-    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
-    def.set(raw.subarray(bs, be), dp); dp += bl;
-  }
-  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
-  // CRC32 (lazy table)
-  if (!_encodePNG._t) {
-    var t = new Uint32Array(256);
-    for (var n = 0; n < 256; n++) { var c = n; for (var k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):(c>>>1); t[n]=c; }
-    _encodePNG._t = t;
-  }
-  var T = _encodePNG._t;
-  function crc32(a, st, ln) { var c=0xFFFFFFFF; for(var i=st,e=st+ln;i<e;i++) c=T[(c^a[i])&0xff]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
-  function putChunk(out, off, type, data) {
-    var dl = data.length;
-    out[off]=(dl>>24)&0xff; out[off+1]=(dl>>16)&0xff; out[off+2]=(dl>>8)&0xff; out[off+3]=dl&0xff;
-    out[off+4]=type.charCodeAt(0); out[off+5]=type.charCodeAt(1); out[off+6]=type.charCodeAt(2); out[off+7]=type.charCodeAt(3);
-    out.set(data, off+8);
-    var cr = crc32(out, off+4, 4+dl);
-    out[off+8+dl]=(cr>>24)&0xff; out[off+9+dl]=(cr>>16)&0xff; out[off+10+dl]=(cr>>8)&0xff; out[off+11+dl]=cr&0xff;
-    return off+12+dl;
-  }
-  var ihd = new Uint8Array(13);
-  ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
-  ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
-  ihd[8]=8; ihd[9]=6; // 8-bit RGBA
-  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
-  png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
-  var p = 8;
-  p = putChunk(png, p, 'IHDR', ihd);
-  p = putChunk(png, p, 'IDAT', def);
-  putChunk(png, p, 'IEND', new Uint8Array(0));
-  // Base64 encode
-  var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  var b64 = 'data:image/png;base64,';
-  for (var i = 0; i < png.length; i += 3) {
-    var a=png[i], b=i+1<png.length?png[i+1]:0, c=i+2<png.length?png[i+2]:0;
-    b64 += C[a>>2] + C[((a&3)<<4)|(b>>4)] + (i+1<png.length?C[((b&15)<<2)|(c>>6)]:'=') + (i+2<png.length?C[c&63]:'=');
-  }
-  return b64;
+    Object.defineProperty(proto, Symbol.toStringTag, { value: 'Window', configurable: true });
+    _markNativeAs(_IframeWindow, 'function Window() { [native code] }');
+  } catch (_error) {}
+})();
+
+// Native PNG encoding keeps canvas payloads compressed in both build modes.
+function _encodePNG(w, h, rgba) {
+  return Deno.core.ops.op_canvas_encode_png(w, h,
+    new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength));
 }
 
 globalThis.__ariaQuerySelector = function(root, selector) { return null; };
@@ -16194,7 +16529,7 @@ if (typeof PointerEvent === 'undefined') {
 }
 
 if (typeof navigator.credentials === 'undefined') {
-  navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
+  _defNavigatorMember('credentials', { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} });
 }
 
 globalThis.SpeechRecognition = globalThis.webkitSpeechRecognition = class SpeechRecognition {
@@ -16205,29 +16540,29 @@ globalThis.SpeechRecognition = globalThis.webkitSpeechRecognition = class Speech
 };
 _markNative(globalThis.SpeechRecognition);
 
-navigator.mediaCapabilities = {
+_defNavigatorMember('mediaCapabilities', {
   decodingInfo(cfg) {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
   },
   encodingInfo(cfg) {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg });
   },
-};
-navigator.locks = {
+});
+_defNavigatorMember('locks', {
   request(name, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
     if (typeof cb === 'function') return Promise.resolve(cb({ name, mode: (opts && opts.mode) || 'exclusive' }));
     return Promise.resolve(null);
   },
   query() { return Promise.resolve({ held: [], pending: [] }); },
-};
-navigator.keyboard = {
+});
+_defNavigatorMember('keyboard', {
   getLayoutMap() { return Promise.resolve(new Map()); },
   lock() { return Promise.resolve(); },
   unlock() {},
-};
-navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
-navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+});
+_defNavigatorMember('gpu', { requestAdapter() { return Promise.resolve(null); } });
+_defNavigatorMember('wakeLock', { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } });
 
 globalThis.opener = null;
 
@@ -18301,8 +18636,7 @@ globalThis.__obscura_init = function() {
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _deviceIdentity = _domParse("device_identity");
   if (_deviceIdentity) {
-    globalThis.screen.colorDepth = _deviceIdentity.screen_color_depth;
-    globalThis.screen.pixelDepth = _deviceIdentity.screen_color_depth;
+    _setScreenColorDepth(_deviceIdentity.screen_color_depth);
   }
   _fpSeed = _deviceIdentity ? _deviceIdentity.seed >>> 0 : Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
@@ -18311,6 +18645,7 @@ globalThis.__obscura_init = function() {
   // location.href again, including any redirect target.
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
+  globalThis.__obscura_gate_shared_array_buffer();
 
   const documentNid = +_dom("document_node_id");
   globalThis.document = new HTMLDocument(documentNid);
@@ -18874,6 +19209,9 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   const nativeMutationScheduledAdd = Function.call.bind(WeakSet.prototype.add, nativeMutationScheduled);
   const nativeMutationScheduledDelete = Function.call.bind(WeakSet.prototype.delete, nativeMutationScheduled);
   const nativeSetDelete = Function.call.bind(Set.prototype.delete);
+  const nativeMapGet = Function.call.bind(Map.prototype.get);
+  const nativeMapDelete = Function.call.bind(Map.prototype.delete);
+  const nativeOwnDescriptor = Object.getOwnPropertyDescriptor;
 
   function nativeMutation(type, target, added, removed, oldValue = null,
       previousSibling = null, nextSibling = null) {
@@ -18956,8 +19294,11 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
             && _domParse('get_attribute',id,'name') === removedId) { present=true; break; }
       }
       if (!present) {
-        try { delete globalThis[removedId]; }
-        catch (_error) {}
+        if (nativeOwnDescriptor(globalThis, removedId)?.get === nativeMapGet(_windowNamedPropertyGetters, removedId)) {
+          try { delete globalThis[removedId]; }
+          catch (_error) {}
+        }
+        nativeMapDelete(_windowNamedPropertyGetters, removedId);
         nativeSetDelete(_windowNamedPropertyNames,removedId);
       }
     }
@@ -19801,6 +20142,27 @@ for (const [name, evList] of Object.entries(_auditedEvents)) {
 //
 // Fix it centrally rather than at each definition site: the tag is derived
 // from the constructor's own name, which is already correct.
+// SharedArrayBuffer is gated on cross-origin isolation in Chromium: a document
+// that is not crossOriginIsolated has no `SharedArrayBuffer` global at all.
+// Exposing it unconditionally contradicts the crossOriginIsolated value this
+// same realm reports, and detectors compare the two.
+//
+// This runs from __obscura_init rather than once at bootstrap time: the
+// bootstrap executes while the realm snapshot is built, and V8 re-instantiates
+// lazily created globals when a context is restored from that snapshot, so a
+// one-time delete did not survive into the page realm.
+globalThis.__obscura_gate_shared_array_buffer = function() {
+  try {
+    if (globalThis.crossOriginIsolated) { return; }
+    if (typeof globalThis.SharedArrayBuffer === 'undefined') { return; }
+    if (!delete globalThis.SharedArrayBuffer) {
+      Object.defineProperty(globalThis, 'SharedArrayBuffer', {
+        value: undefined, writable: true, enumerable: false, configurable: true,
+      });
+    }
+  } catch (_error) {}
+};
+
 (function _installInterfaceBrands() {
   var ifaceNames = [
     'AbortController', 'AbortSignal', 'AnimationEvent', 'Attr', 'AudioContext',
@@ -19881,6 +20243,30 @@ for (const [name, evList] of Object.entries(_auditedEvents)) {
     // otherwise produce a lie that disagrees with the function's own name.
     if (_fn.name === _member) {
       _markNativeAs(_fn, 'function ' + _member + '() { [native code] }');
+    }
+  }
+
+  // Native accessors stringify with their `get`/`set` keyword and the property
+  // name. Accessors marked through the plain _markNative path emitted
+  // `function () { [native code] }`, which no Chromium build produces and which
+  // one Function.prototype.toString call exposes.
+  var _accessorProtos = [];
+  for (var _ap = 0; _ap < ifaceNames.length; _ap++) {
+    var _ac;
+    try { _ac = globalThis[ifaceNames[_ap]]; } catch (e) { continue; }
+    if (_ac && typeof _ac === 'function' && _ac.prototype) _accessorProtos.push(_ac.prototype);
+  }
+  for (var _p = 0; _p < _accessorProtos.length; _p++) {
+    var _proto = _accessorProtos[_p];
+    var _pnames;
+    try { _pnames = Object.getOwnPropertyNames(_proto); } catch (e) { continue; }
+    for (var _q = 0; _q < _pnames.length; _q++) {
+      var _pn = _pnames[_q];
+      var _pd;
+      try { _pd = Object.getOwnPropertyDescriptor(_proto, _pn); } catch (e) { continue; }
+      if (!_pd) { continue; }
+      if (typeof _pd.get === 'function' && _nativeFns.has(_pd.get)) _markNativeGetter(_pd.get, _pn);
+      if (typeof _pd.set === 'function' && _nativeFns.has(_pd.set)) _markNativeSetter(_pd.set, _pn);
     }
   }
 })();

@@ -895,7 +895,7 @@ async fn history_rejects_bad_state_and_url_without_partial_changes() {
             r#"(() => {
         history.replaceState({ok:1},'', 'next?q=1#base');
         window.errors=[];const fail=fn=>{try{fn()}catch(e){errors.push(e.name)}};
-        for(const state of [()=>{},Symbol('x'),new Proxy({},{}),new SharedArrayBuffer(8),new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))]) fail(()=>history.pushState(state,'','/bad'));
+        for(const state of [()=>{},Symbol('x'),new Proxy({},{}),new WebAssembly.Memory({initial:1,maximum:1,shared:true}).buffer,new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))]) fail(()=>history.pushState(state,'','/bad'));
         const thrown={marker:1};try{history.pushState({get value(){throw thrown}},'','/bad')}catch(e){errors.push(e===thrown)}
         fail(()=>history.pushState({},'','https://forbidden.invalid/'));
         fail(()=>history.pushState({},'','http://user@127.0.0.1/'));
