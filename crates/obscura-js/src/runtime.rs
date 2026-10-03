@@ -8386,6 +8386,19 @@ impl ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn style_set_property_converts_stateful_values_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            let conversions = 0;
+            const value = { toString() { return `${++conversions}px`; } };
+            document.body.style.setProperty('top', value);
+            return { conversions, top: document.body.style.top };
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({ "conversions": 1, "top": "1px" }));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn response_constructor_validates_public_init_without_forging_network_metadata() {
         let mut rt = setup_runtime("<html><body></body></html>");
