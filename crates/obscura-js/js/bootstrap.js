@@ -1849,8 +1849,9 @@ class CSSStyleDeclaration {
       if (old === undefined) return;
       delete this._props[k];
     } else {
-      if (old === String(value)) return;
-      this._props[k] = String(value);
+      value = String(value);
+      if (old === value) return;
+      this._props[k] = value;
     }
     this._push();
   }
@@ -8091,7 +8092,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (store[url] !== undefined || bytesStore[url] !== undefined) {
       const type = (meta[url] && meta[url].type) || 'text/html';
       const bodyBytes = bytesStore[url] || (store[url] !== undefined ? new TextEncoder().encode(store[url]) : new Uint8Array(0));
-      return new Response(bodyBytes, {
+      return _createInternalResponse(bodyBytes, {
         status: 200,
         statusText: "OK",
         headers: { 'content-type': type },
@@ -8146,7 +8147,7 @@ globalThis.fetch = async (input, init = {}) => {
   const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
   const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
-  const response = new Response(responseBody, {
+  const response = _createInternalResponse(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
@@ -8648,19 +8649,43 @@ function _decodeBodyWithCharset(bytes, headers) {
   catch (e) { return new TextDecoder().decode(bytes); }
 }
 
+let _createInternalResponse;
 if (typeof Response === 'undefined') {
-  globalThis.Response = class Response {
-    constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status || 200; this.statusText = init.statusText || '';
+  const internalResponseInit = {};
+  const _Response = globalThis.Response = class Response {
+    constructor(body, init = {}, internalInit) {
+      if (init == null) init = {};
+      if (typeof init !== 'object' && typeof init !== 'function') {
+        throw new TypeError('Response init must be a dictionary');
+      }
+      const internal = internalInit === internalResponseInit;
+      const headers = init.headers;
+      const status = init.status;
+      const statusText = init.statusText;
+      this.status = status === undefined ? 200 : (internal ? status : (+status & 0xffff));
+      this.statusText = statusText === undefined ? '' : `${statusText}`;
+      if (!internal) {
+        if (this.status < 200 || this.status > 599) throw new RangeError('Invalid response status');
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(this.statusText)) throw new TypeError('Invalid response statusText');
+        if (body != null && (this.status === 204 || this.status === 205 || this.status === 304)) {
+          throw new TypeError('Response status cannot have a body');
+        }
+      } else if (this.status === 204 || this.status === 205 || this.status === 304) {
+        body = null;
+      }
+      this._bodyBytes = _bodyToUint8Array(body);
       this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(init.headers);
-      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      this.headers = new Headers(headers);
+      this.type = internal ? (init.type || 'default') : 'default';
+      this.url = internal ? (init.url || '') : '';
+      this.redirected = internal && !!init.redirected;
       // #818: body/bodyUsed. A null-body response (null or no body passed)
       // has body === null; every other body is a one-chunk stream, created
       // lazily so merely touching .body does not copy the bytes.
       this._bodyNull = body === null || body === undefined;
       this._bodyStream = null;
       this._bodyUsed = false;
+      this._fetchBody = null;
     }
     _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
@@ -8698,11 +8723,26 @@ if (typeof Response === 'undefined') {
     async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
     async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
     async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
-    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
-    static error() { return new Response(null, { status: 0 }); }
-    static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
-    static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
+    clone() { return _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
+    static error() { return _createInternalResponse(null, { status: 0, type: 'error' }); }
+    static redirect(url, status = 302) {
+      url = `${url}`;
+      status = +status & 0xffff;
+      const parsed = new URL(url, document.baseURI);
+      if (![301,302,303,307,308].includes(status)) throw new RangeError('Invalid redirect status');
+      return new Response(null, { status, headers: { Location: parsed.href } });
+    }
+    static json(data, init) {
+      const json = JSON.stringify(data);
+      if (json === undefined) throw new TypeError('Value is not JSON serializable');
+      const response = new Response(new TextEncoder().encode(json), init);
+      if (!response.headers.has('content-type')) response.headers.set('content-type', 'application/json');
+      return response;
+    }
   };
+  _createInternalResponse = (body, init) => new _Response(body, init, internalResponseInit);
+} else {
+  _createInternalResponse = (body, init) => new Response(body, init);
 }
 
 if (!Element.prototype.replaceWith) {
