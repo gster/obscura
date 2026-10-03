@@ -27052,6 +27052,47 @@ return {before,removed,reinsert,moved,cleared};
         assert_eq!(result.value.unwrap(), serde_json::json!(true));
     }
 
+    // An unchanged style.setProperty rewrote the style attribute and queued a
+    // mutation record, so an observer that re-applies the same style (pinning
+    // body `top: 0`) re-triggered itself forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_style_set_property_without_change_queues_no_mutation() {
+        let mut rt = setup_runtime("<html><body><p>x</p></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const body = document.body;
+                let calls = 0, records = 0;
+                const observer = new MutationObserver((mutations) => {
+                    calls++;
+                    records += mutations.length;
+                    if (calls < 50) body.style.setProperty("top", "0px", "important");
+                });
+                observer.observe(document.documentElement, {
+                    subtree: true, attributes: true, attributeFilter: ["style"],
+                });
+                body.style.setProperty("top", "0px", "important");
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                body.style.removeProperty("left");
+                body.style.top = "0px";
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                observer.disconnect();
+                return { calls, records, style: body.getAttribute("style") };
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({"calls": 1, "records": 1, "style": "top: 0px;"})
+        );
+    }
+
     #[test]
     fn test_text_decoder_respects_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");

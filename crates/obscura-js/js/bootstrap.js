@@ -1837,14 +1837,32 @@ class CSSStyleDeclaration {
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
+  // CSSOM: the style attribute is only rewritten when the declaration
+  // changed. Rewriting it on a no-op set queued a mutation record, so a
+  // MutationObserver that re-applies the same style re-triggered itself
+  // forever (a page pinning body `top: 0` spun at 100% CPU).
   setProperty(name, value) {
     this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) delete this._props[k];
-    else this._props[k] = String(value);
+    const old = this._props[k];
+    if (value === "" || value == null) {
+      if (old === undefined) return;
+      delete this._props[k];
+    } else {
+      if (old === String(value)) return;
+      this._props[k] = String(value);
+    }
     this._push();
   }
-  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  removeProperty(name) {
+    this._pull();
+    const k = _cssCamelToKebab(String(name));
+    const old = this._props[k];
+    if (old === undefined) return "";
+    delete this._props[k];
+    this._push();
+    return old;
+  }
   getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
   get cssText() { this._pull(); return _serializeCss(this._props); }
