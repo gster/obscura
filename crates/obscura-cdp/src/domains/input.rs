@@ -95,7 +95,7 @@ fn coordinate_input(params: &Value) -> Result<CoordinateInput, String> {
     }
 }
 
-fn keyboard_input(params: &Value) -> Result<obscura_browser::KeyboardInput, String> {
+pub(crate) fn keyboard_input(params: &Value) -> Result<obscura_browser::KeyboardInput, String> {
     use obscura_browser::{KeyboardInput, KeyboardInputPhase};
     let phase = match params.get("type").and_then(Value::as_str) {
         Some("keyDown") => KeyboardInputPhase::KeyDown,
@@ -212,13 +212,24 @@ pub async fn handle(
             Ok(json!({}))
         }
         "dispatchKeyEvent" => {
-            let input = keyboard_input(params)?;
+            let (input, ticket) = match ctx.admitted_keyboard.take() {
+                Some(admitted) => (admitted.input, Some(admitted.ticket)),
+                None => (keyboard_input(params)?, None),
+            };
+            input.validate()?;
             if ctx.mouse_and_key_input_ignored(session_id)? {
                 return Ok(json!({}));
             }
+            let admission_required = ctx.input_admission.is_some() && cfg!(feature = "render");
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or_else(|| "Input requires an attached page session".to_string())?;
+            if let Some(ticket) = ticket {
+                let owner = page.scheduling_owner().ok_or("INPUT_OWNER_RETIRED")?;
+                if !ticket.begin_dispatch(owner.id()) { return Err("INPUT_ADMISSION_RETIRED".into()); }
+            } else if admission_required {
+                return Err("INPUT_NOT_ADMITTED".into());
+            }
             page.dispatch_keyboard_input(input)?;
             process_input_navigation(ctx, session_id).await?;
             Ok(json!({}))

@@ -211,7 +211,6 @@ pub use obscura_render::ImageRequestProfile;
 /// reference to the ArrayBuffer backing store, so the pixels stay valid while
 /// the canvas wrapper and native page state share it. Paint only borrows these
 /// bytes synchronously while JavaScript is not executing.
-#[cfg(feature = "render")]
 pub(crate) struct CanvasBackingSurface {
     pub width: u32,
     pub height: u32,
@@ -371,6 +370,8 @@ pub type SharedWebStorage = Arc<std::sync::Mutex<HashMap<String, Vec<(String, St
 pub struct ObscuraState {
     pub persona: obscura_net::EffectivePersona,
     pub dom: Option<DomTree>,
+    pub(crate) canvas_document: Option<Rc<CanvasDocumentLease>>,
+    pub(crate) original_document: Option<Rc<image_dimensions_ops::OriginalDocumentStorage>>,
     pub url: String,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
@@ -381,11 +382,24 @@ pub struct ObscuraState {
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
     pub referrer: String,
+    pub(crate) document_referrer_record: Option<Rc<()>>,
+    // Issued by the host before author code, never by a metadata getter/op.
+    pub(crate) speech_owner: Option<crate::speech_owner::NativeSpeechOwnerCapability>,
     pub referrer_policy: ReferrerPolicy,
+    pub script_policy: crate::csp::ScriptPolicy,
+    pub(crate) websocket_policy_known: bool,
+    pub(crate) websocket_dynamic_policy: crate::csp::ScriptPolicy,
+    pub(crate) websocket_meta_nodes: HashSet<(u32,u64)>,
+    pub(crate) websocket_site: Option<String>,
+    pub(crate) websocket_origin: Option<String>,
+    pub(crate) websocket_owner: Arc<obscura_net::websocket::session::Owner>,
+    pub(crate) websocket_responses: HashMap<String, (String, crate::csp::ScriptPolicy)>,
+    pub(crate) websocket_frame_policies: HashMap<u32, crate::csp::ScriptPolicy>,
     pub device_identity: Option<DeviceIdentity>,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub local_storage: SharedWebStorage,
+    pub indexed_db: Arc<crate::indexed_db::Store>,
     pub session_storage: SharedWebStorage,
     pub opaque_storage: SharedWebStorage,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
@@ -399,6 +413,7 @@ pub struct ObscuraState {
     pub history_epoch: u64,
     pub restoring_history_scroll: bool,
     pub pending_navigation: Option<PendingNavigation>,
+    pub scheduling_owner: crate::pending_input::InputOwner,
     pub same_document_navigation: Option<SameDocumentNavigation>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: Arc<std::sync::atomic::AtomicU64>,
@@ -468,6 +483,7 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    pub(crate) javascript_task_clock: Arc<std::sync::atomic::AtomicU64>,
     /// Input-local document identity. Unlike `document_generation`, this also
     /// advances for `document.open()`, whose replacement reuses the same
     /// document object and may reuse DOM node ids.
@@ -476,6 +492,7 @@ pub struct ObscuraState {
     /// Readiness observers created after a synchronous `document.open()` use
     /// this to require the replacement's complete quiet window.
     pub input_document_changed_at: Cell<std::time::Instant>,
+    pub(crate) performance_timeline: crate::timing::Timeline,
     pub document_lifecycle: u8,
     /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
     /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
@@ -660,11 +677,19 @@ impl ObscuraState {
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
+            document_referrer_record: None,
+            speech_owner: None,
             referrer_policy: ReferrerPolicy::default(),
+            script_policy: crate::csp::ScriptPolicy::default(),
+            websocket_policy_known: false, websocket_site: None, websocket_origin: None,
+            websocket_dynamic_policy: crate::csp::ScriptPolicy::default(), websocket_meta_nodes: HashSet::new(),
+            websocket_owner: Arc::new(obscura_net::websocket::session::Owner::new(Arc::new(Default::default()))),
+            websocket_responses: HashMap::new(), websocket_frame_policies: HashMap::new(),
             device_identity: None,
             blocked_urls: Vec::new(),
             cookie_jar: None,
             local_storage: Default::default(),
+            indexed_db: Default::default(),
             session_storage: Default::default(),
             opaque_storage: Default::default(),
             http_client: None,
@@ -674,6 +699,7 @@ impl ObscuraState {
             history_epoch: 0,
             restoring_history_scroll: false,
             pending_navigation: None,
+            scheduling_owner: crate::pending_input::InputOwner::default(),
             same_document_navigation: None,
             intercept_tx: None,
             intercept_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -706,8 +732,10 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            javascript_task_clock: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             input_document_epoch: Cell::new(0),
             input_document_changed_at: Cell::new(std::time::Instant::now()),
+            performance_timeline: crate::timing::Timeline::default(),
             document_lifecycle: 0,
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
@@ -754,6 +782,8 @@ impl ObscuraState {
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
+            canvas_document: None,
+            original_document: None,
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
@@ -777,6 +807,11 @@ impl ObscuraState {
 
 impl Drop for ObscuraState {
     fn drop(&mut self) {
+        self.scheduling_owner.retire();
+        self.websocket_owner.retire();
+        // Retained generic DOM bindings own State until their realm is released.
+        // Move the original tree only now for weak-State image/Canvas handles.
+        retire_canvas_document(self);
         let records = self.js_network_events.take_records();
         if records.is_empty() {
             return;
@@ -991,6 +1026,10 @@ impl RealmStates {
         self.entries.push((context, frame_id, state));
     }
 
+    pub(crate) fn context_for_frame(&self, frame_id: u32) -> Option<v8::Global<v8::Context>> {
+        self.entries.iter().find(|(_, id, _)| *id == frame_id).map(|(context, _, _)| context.clone())
+    }
+
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
         self.retired_documents.retain(|_, state| state.strong_count() > 0);
         for (known, id, state) in &self.entries {
@@ -1007,7 +1046,7 @@ impl RealmStates {
         })
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
@@ -1625,6 +1664,17 @@ fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
     }
     let newly_started = state.already_started_scripts.borrow_mut().insert(node_id);
     newly_started
+}
+
+/// The document owns policy state; JavaScript cannot relax it by removing a meta.
+#[op2(fast)]
+fn op_csp_script_allowed(state: &OpState, #[string] source: String,
+    #[string] nonce: String, #[string] inline: String, redirected: bool, frame_id: u32) -> bool {
+    let Some(shared) = frame_state(state, frame_id) else { return false; };
+    let state = shared.borrow();
+    state.script_policy.allows(&state.url,
+        if source.is_empty() { None } else { Some(source.as_str()) },
+        &nonce, &inline, false, redirected)
 }
 
 /// Execute an inserted classic as a Script, not eval code. Global lexical
@@ -2351,6 +2401,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             Ok(navigation) => {
                 if let Some(navigation) = navigation {
                     state.url = navigation.url.clone();
+                    state.scheduling_owner.navigation_pending(true);
                     state.pending_navigation = Some(navigation);
                     state.same_document_navigation = None;
                 }
@@ -2556,6 +2607,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     });
                     if update.fragment {
                         state.pending_navigation = None;
+                        state.scheduling_owner.navigation_pending(false);
                     }
                     invalidate_input_render(&mut state);
                 }
@@ -2570,6 +2622,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                         if entry.post {
                             return Err("HISTORY_POST_REQUIRES_AUTHORIZATION");
                         }
+                        state.scheduling_owner.navigation_pending(true);
                         state.pending_navigation = Some(PendingNavigation {
                             url: entry.url.clone(),
                             method: "GET".into(),
@@ -3215,6 +3268,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 } else {
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                 }
+                #[cfg(feature = "render")]
+                image_dimensions_ops::attribute_changed(&gs, node_id, name);
                 if name == "href" && dom.refresh_base_href(node_id) {
                     drop(gs);
                     invalidate_input_render(&mut shared.borrow_mut());
@@ -3294,6 +3349,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             if arg2 == "id" {
                 dom.update_id_index(node_id, old_id.as_deref(), None);
             }
+            #[cfg(feature = "render")]
+            image_dimensions_ops::attribute_changed(&gs, NodeId::new(nid), &arg2);
             "true".into()
         }
         // Namespace-aware attribute ops. arg2 packs the pieces with a NUL:
@@ -3332,6 +3389,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                         n.set_attribute_ns(ns, qualified, value.to_string())
                     });
                 }
+                #[cfg(feature = "render")]
+                if ns.is_empty() { image_dimensions_ops::attribute_changed(&gs, node_id, local); }
                 if ns.is_empty() && local == "href" && dom.refresh_base_href(node_id) {
                     drop(gs);
                     invalidate_input_render(&mut shared.borrow_mut());
@@ -3351,6 +3410,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 dom.update_id_index(node_id, old_id.as_deref(), None);
             } else {
                 dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
+            }
+            #[cfg(feature = "render")]
+            if let Some((namespace, rest)) = arg2.split_once('\0') {
+                if namespace.is_empty() {
+                    image_dimensions_ops::attribute_changed(&gs, node_id, rest.split('\0').next().unwrap_or(""));
+                }
             }
             "true".into()
         }
@@ -3479,6 +3544,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             dom.template_contents(NodeId::new(nid))
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
+        }
+        // Initial about:blank frames have independent document roots in this
+        // realm's arena. Fragments use the same NodeData but stay disconnected.
+        "create_iframe_document" => {
+            let id = dom.new_node(NodeData::Document);
+            dom.with_node_mut(id, |node| node.connected = true);
+            id.index().to_string()
         }
         "create_document_fragment" => dom.new_node(NodeData::Document).index().to_string(),
         "clone_node" => {
@@ -4272,25 +4344,60 @@ fn op_fetch_cleanup(state: &mut OpState, #[string] id: String) {
     state.borrow::<SharedState>().borrow_mut().fetch_cancellations.remove(&id);
 }
 
-#[op2(async)]
+#[op2(async, reentrant)]
 #[string]
-async fn op_fetch_url(
+fn op_fetch_url(
+    scope: &mut v8::HandleScope,
     state: Rc<RefCell<OpState>>,
     #[string] url: String,
     #[string] method: String,
     #[string] headers_json: String,
     #[buffer] body: JsBuffer,
-    #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
-    #[string] options: Option<String>,
-) -> Result<String, deno_error::JsErrorBox> {
+    options_and_owner: v8::Local<v8::Array>,
+) -> impl std::future::Future<Output = Result<String, deno_error::JsErrorBox>> + use<> {
+    // Package the private token with existing options/origin to stay within the
+    // async op argument limit. Read V8 properties before borrowing OpState:
+    // even an accessor supplied by an internal test can reenter safely.
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let invalid = || deno_error::JsErrorBox::type_error("Invalid private fetch arguments");
+        let value = options_and_owner.get_index(scope, 0).ok_or_else(invalid)?;
+        let options = if value.is_null_or_undefined() { None } else {
+            Some(v8::Local::<v8::String>::try_from(value).map_err(|_| invalid())?.to_rust_string_lossy(scope))
+        };
+        let value = options_and_owner.get_index(scope, 1).ok_or_else(invalid)?;
+        let token = v8::Local::<v8::Object>::try_from(value).map_err(|_| invalid())?;
+        let value = options_and_owner.get_index(scope, 2).ok_or_else(invalid)?;
+        let origin = v8::Local::<v8::String>::try_from(value)
+            .map_err(|_| invalid())?.to_rust_string_lossy(scope);
+        let owner = timing_state_for_receiver(scope, &state.borrow(), token)
+            .ok_or_else(|| deno_error::JsErrorBox::generic("Document is no longer active"))?;
+        let active = timing_owner_is_active(&state.borrow(), &owner);
+        // Match the host's page_origin/origin_of rule. Neither loader arguments
+        // nor the public URL constructor are authorities. Non-tuple documents
+        // remain opaque; no parent/base/target-origin inference is made.
+        let (generation, timing_origin) = {
+            let owner = owner.borrow();
+            (owner.document_generation, request_origin(&owner.url).unwrap_or_else(|| "null".to_string()))
+        };
+        Ok::<_, deno_error::JsErrorBox>((options, Some(owner), Some(generation), active, timing_origin, origin))
+    })).unwrap_or_else(|_| Err(deno_error::JsErrorBox::generic("Private fetch state is unavailable")));
+    // All values captured by the future are owned; no V8 handle or borrow lives
+    // across an await boundary.
+    async move {
+    let (options, timing_owner, timing_generation, timing_active, timing_origin, origin) = prepared?;
+    if !timing_active || !timing_owner.as_ref().is_some_and(|owner|
+        timing_owner_is_active(&state.borrow(), owner) && Some(owner.borrow().document_generation) == timing_generation) {
+        return Err(deno_error::JsErrorBox::generic("Document is no longer active"));
+    }
     let options_json = options.as_deref().and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
     let destination = options_json.as_ref().and_then(|value| value["destination"].as_str()).map(str::to_owned)
         .or_else(|| options.filter(|value| !value.starts_with('{')));
     let request_id = options_json.as_ref().and_then(|value| value["requestId"].as_str()).map(str::to_owned);
     let body_present = options_json.as_ref().and_then(|value| value["bodyPresent"].as_bool()).unwrap_or(false);
     let shared = state.borrow().borrow::<SharedState>().clone();
+    let timing_name = url.clone();
     if let Some(failure) = shared.borrow().js_network_events.failure() {
         return Err(deno_error::JsErrorBox::generic(failure.to_string()));
     }
@@ -4299,6 +4406,11 @@ async fn op_fetch_url(
     } else if matches!(destination.as_deref(), Some("script" | "worker")) {
         ResourceType::Script
     } else { ResourceType::Fetch };
+    // The linked stylesheet loader shares this transport op, but is not a
+    // script fetch() call. Leave its timing unsupported until link/css
+    // initiators are recorded, without changing its existing network policy.
+    let timing_eligible = matches!(resource_type, ResourceType::Fetch | ResourceType::Xhr)
+        && destination.as_deref() != Some("style");
     let script_priority = options_json.as_ref()
         .filter(|_| destination.as_deref() == Some("script"))
         .and_then(|options| options["scriptPriority"].as_object())
@@ -4312,6 +4424,7 @@ async fn op_fetch_url(
         .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     observation.interception_id = shared.borrow().fetch_cancellations.get(&observation.id).and_then(|(_, id)| id.clone());
     let mut cancel = shared.borrow().fetch_cancellations.get(&observation.id).map(|(sender, _)| sender.subscribe());
+    let capture_owner_policy=matches!(destination.as_deref(),Some("worker"|"iframe"));
     let result = {
         let operation = fetch_url_inner(state.clone(), url, method, headers_json, body, body_present, origin,
             mode, credentials, destination, resource_type, script_priority, &mut observation);
@@ -4329,19 +4442,48 @@ async fn op_fetch_url(
             }
         } else { operation.await }
     };
-    let error = match &result {
-        Err(error) => Some(error.to_string()),
-        Ok(result) => serde_json::from_str::<serde_json::Value>(result).ok().and_then(|value| {
-            if value["blocked"] == true || value["corsBlocked"] == true || value["status"] == 0 {
-                Some(value["error"].as_str().or(value["corsError"].as_str()).unwrap_or("Blocked").to_string())
-            } else { None }
-        }),
+    let (error, timing_excluded) = match &result {
+        Err(error) => { let message=error.to_string(); let cors=message.contains("CORS"); (Some(message), cors) },
+        Ok(result) => match serde_json::from_str::<serde_json::Value>(result) {
+            Ok(value) => {
+                if capture_owner_policy && value["status"].as_u64().is_some_and(|status|(200..300).contains(&status)) {
+                if let (Some(id), Some(url), Some(headers)) = (value["requestId"].as_str(), value["url"].as_str(), value["headers"].as_object()) {
+                    let mut policy = crate::csp::ScriptPolicy::default();
+                    for (name, value) in headers { if name.eq_ignore_ascii_case("content-security-policy") {
+                        if let Some(value) = value.as_str() { policy.append(value); }
+                    }}
+                    let mut host = shared.borrow_mut();
+                    if host.websocket_responses.len() >= 64 { host.websocket_responses.clear(); }
+                    host.websocket_responses.insert(id.into(), (url.into(), policy));
+                }
+                }
+                let blocked=value["blocked"]==true || value["corsBlocked"]==true || value["status"]==0;
+                let error=blocked.then(|| value["error"].as_str().or(value["corsError"].as_str()).unwrap_or("Blocked").to_string());
+                (error, blocked)
+            },
+            Err(_) => (None, true),
+        },
     };
+    let facts = observation.trace.timing();
+    // Resource timing ownership is independent of the existing fetch policy
+    // route. Never publish a child's request in its parent's timeline.
+    let timing_owner = timing_owner.filter(|owner| timing_owner_is_active(&state.borrow(), owner));
+    if !timing_excluded && facts.transport_attempted && timing_eligible {
+        if let Some(timing_owner) = timing_owner.as_ref() {
+            let mut owner = timing_owner.borrow_mut();
+            if Some(owner.document_generation) == timing_generation {
+                owner.performance_timeline.resource(&facts, &timing_name,
+                    if resource_type == ResourceType::Xhr { "xmlhttprequest" } else { "fetch" },
+                    &timing_origin, error.is_some());
+            }
+        }
+    }
     let observation_result = observation.finish(error);
     shared.borrow_mut().fetch_cancellations.remove(&observation.id);
     crate::worker::flush_observations(&state.borrow());
     observation_result.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     result
+}
 }
 
 async fn fetch_url_inner(
@@ -6397,9 +6539,22 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
 
 struct HistorySerializer<'s> {
     error: v8::Local<'s, v8::Function>,
+    host_brand: Option<v8::Local<'s,v8::Function>>,
 }
 
 impl v8::ValueSerializerImpl for HistorySerializer<'_> {
+    fn has_custom_host_object(&self,_isolate:&mut v8::Isolate)->bool {self.host_brand.is_some()}
+    fn is_host_object<'s>(&self,scope:&mut v8::HandleScope<'s>,object:v8::Local<'s,v8::Object>)->Option<bool> {
+        let scope=&mut v8::TryCatch::new(scope);let undefined=v8::undefined(scope).into();
+        let result=self.host_brand?.call(scope,undefined,&[object.into()]);
+        if scope.has_caught()||scope.has_terminated() {scope.rethrow();return None;}
+        result.map(|value|value.is_true())
+    }
+    fn write_host_object<'s>(&self,scope:&mut v8::HandleScope<'s>,_object:v8::Local<'s,v8::Object>,
+        _serializer:&dyn v8::ValueSerializerHelper)->Option<bool> {
+        let message=v8::String::new(scope,"Interface object cannot be stored")?;
+        self.throw_data_clone_error(scope,message);None
+    }
     fn throw_data_clone_error<'s>(
         &self,
         scope: &mut v8::HandleScope<'s>,
@@ -6442,9 +6597,10 @@ fn op_history_serialize(
     scope: &mut v8::HandleScope,
     value: v8::Local<v8::Value>,
     error: v8::Local<v8::Function>,
+    host_brand: Option<v8::Local<v8::Function>>,
 ) -> Vec<u8> {
     use v8::ValueSerializerHelper;
-    let serializer = v8::ValueSerializer::new(scope, Box::new(HistorySerializer { error }));
+    let serializer = v8::ValueSerializer::new(scope, Box::new(HistorySerializer { error,host_brand }));
     serializer.write_header();
     let scope = &mut v8::TryCatch::new(scope);
     let result = serializer.write_value(scope.get_current_context(), value);
@@ -6456,7 +6612,7 @@ fn op_history_serialize(
     } else {
         let message = v8::String::new(scope, "Value cannot be stored").unwrap();
         v8::ValueSerializerImpl::throw_data_clone_error(
-            &HistorySerializer { error },
+            &HistorySerializer { error,host_brand },
             scope,
             message,
         );
@@ -6492,6 +6648,7 @@ fn op_navigate(
     request.referrer_policy = gs.referrer_policy;
     request.referrer = source.clone();
     request.initiator = source;
+    gs.scheduling_owner.navigation_pending(true);
     gs.pending_navigation = Some(PendingNavigation {
         history: match behavior {
             "replace" => HistoryNavigation::Replace,
@@ -6583,7 +6740,7 @@ const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 // Hands a fetched frame document to the host and returns the id the frame will
 // have. The realm itself is built later, by whoever owns the runtime. A zero
 // id means the bounded native queue refused the document.
-#[op2(fast)]
+#[op2]
 fn op_frame_document_ready(
     scope: &mut v8::HandleScope,
     state: &OpState,
@@ -6591,6 +6748,7 @@ fn op_frame_document_ready(
     #[string] html: &str,
     #[number] viewport_width: u64,
     #[number] viewport_height: u64,
+    #[string] response_id: Option<String>,
 ) -> u32 {
     // Whoever called this is the new frame's parent, which is how a frame
     // nested two deep gets `parent` pointing at the frame above it rather than
@@ -6614,10 +6772,13 @@ fn op_frame_document_ready(
         return 0;
     };
     gs.frame_id_counter = frame_id;
+    let response = response_id.and_then(|id| gs.websocket_responses.remove(&id));
+    let final_url = response.as_ref().map(|(url,_)|url.clone()).unwrap_or_else(||url.to_string());
+    if let Some((_, policy)) = response { gs.websocket_frame_policies.insert(frame_id, policy); }
     gs.pending_frame_bytes = gs.pending_frame_bytes.saturating_add(bytes);
     gs.pending_frames.push(PendingFrame {
         frame_id,
-        url: url.to_string(),
+        url: final_url,
         html: html.to_string(),
         viewport_width,
         viewport_height,
@@ -6643,11 +6804,12 @@ fn op_async_runtime_available() -> bool {
 /// loop without Tokio's timer-wheel floor or another async-op registration.
 #[op2]
 fn op_posted_task(
+    scope: &mut v8::HandleScope,
     state: &OpState,
-    frame_id: u32,
     #[global] callback: v8::Global<v8::Function>,
 ) -> f64 {
-    let Some(owner) = posted_task_owner(state, frame_id) else {
+    let receiver = v8::Local::new(scope, &callback);
+    let Some(owner) = posted_task_owner(scope, state, receiver) else {
         return INVALID_POSTED_TASK_GENERATION;
     };
     let Ok(owner_state) = owner.try_borrow() else {
@@ -6701,8 +6863,12 @@ fn posted_task_owner_status(
 }
 
 #[op2(fast)]
-fn op_posted_task_generation(state: &OpState, frame_id: u32) -> f64 {
-    let Some(owner) = posted_task_owner(state, frame_id) else {
+fn op_posted_task_generation(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    callback: v8::Local<v8::Function>,
+) -> f64 {
+    let Some(owner) = posted_task_owner(scope, state, callback) else {
         return INVALID_POSTED_TASK_GENERATION;
     };
     let generation = owner
@@ -6712,13 +6878,20 @@ fn op_posted_task_generation(state: &OpState, frame_id: u32) -> f64 {
     generation
 }
 
-fn posted_task_owner(state: &OpState, frame_id: u32) -> Option<SharedState> {
-    if frame_id == 0 {
-        return Some(state.borrow::<SharedState>().clone());
+fn posted_task_owner(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    callback: v8::Local<v8::Function>,
+) -> Option<SharedState> {
+    let context = callback.get_creation_context(scope)?;
+    let owner = context.get_slot::<RefCell<ObscuraState>>()?;
+    if Rc::ptr_eq(state.try_borrow::<SharedState>()?, &owner) {
+        return Some(owner);
     }
-    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.clone();
-    let owner = registry.try_borrow().ok()?.by_frame_id(frame_id);
-    owner
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?;
+    let active = registry.try_borrow().ok()?.entries.iter().any(|(known, _, current)|
+        *known == context && Rc::ptr_eq(current, &owner));
+    active.then_some(owner)
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -7408,6 +7581,144 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     true
 }
 
+#[derive(serde::Deserialize)]
+struct CanvasTextRequest {
+    font: String,
+    text: String,
+    align: String,
+    baseline: String,
+    rtl: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CanvasTextPaintRequest {
+    #[serde(flatten)]
+    text: CanvasTextRequest,
+    x: f32,
+    y: f32,
+    color: [u8; 4],
+    alpha: f32,
+    stroke_width: Option<f32>,
+    max_width: Option<f32>,
+}
+
+impl CanvasTextRequest {
+    fn reference(&self) -> obscura_render::text::TextReference<'_> {
+        obscura_render::text::TextReference { align: &self.align, baseline: &self.baseline, rtl: self.rtl }
+    }
+}
+
+// Audio jobs use a bounded worker pool and their own deadline, since synchronous
+// native DSP cannot be interrupted by the V8 termination watchdog.
+static AUDIO_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct AudioJobPermit;
+struct AudioJobCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for AudioJobCancellation {
+    fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+}
+impl Drop for AudioJobPermit {
+    fn drop(&mut self) { AUDIO_JOBS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+}
+
+#[op2(async)]
+#[string]
+async fn op_audio_render(#[string] request: String) -> Result<String, deno_error::JsErrorBox> {
+    use std::sync::atomic::Ordering;
+    if request.len() > 1_048_576 || AUDIO_JOBS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |n| (n < 2).then_some(n + 1)).is_err() {
+        return Err(deno_error::JsErrorBox::generic("NotSupportedError: audio job budget exceeded"));
+    }
+    let permit = AudioJobPermit;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancellation = AudioJobCancellation(cancelled.clone());
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        std::panic::catch_unwind(|| crate::audio::render_cancellable(&request, &cancelled))
+            .unwrap_or_else(|_| Err("OperationError: audio rendering failed".into()))
+    }).await.map_err(|_| deno_error::JsErrorBox::generic("OperationError: audio worker failed"))?
+        .map_err(deno_error::JsErrorBox::generic)
+}
+
+#[op2]
+#[string]
+fn op_audio_biquad_response(#[string] request: &str, #[buffer] input: &[u8]) -> Result<String, deno_error::JsErrorBox> {
+    std::panic::catch_unwind(|| crate::audio::biquad_response(request, input))
+        .unwrap_or_else(|_| Err("OperationError: biquad response failed".into()))
+        .map_err(deno_error::JsErrorBox::generic)
+}
+
+#[op2]
+#[string]
+fn op_audio_analyse(#[buffer] input: &[u8]) -> Result<String, deno_error::JsErrorBox> {
+    std::panic::catch_unwind(|| crate::audio::analyse_bytes(input))
+        .unwrap_or_else(|_| Err("OperationError: audio analysis failed".into()))
+        .map_err(deno_error::JsErrorBox::generic)
+}
+
+#[op2]
+#[string]
+fn op_canvas_parse_color(#[string] color: &str) -> Result<String, deno_error::JsErrorBox> {
+    std::panic::catch_unwind(|| {
+        let Some(rgba) = obscura_render::canvas_color::parse(color) else { return String::new(); };
+        let css = obscura_render::canvas_color::serialize(rgba);
+        serde_json::json!({"css": css, "rgba": rgba}).to_string()
+    }).map_err(|_| deno_error::JsErrorBox::generic("Canvas color parsing failed"))
+}
+
+#[op2]
+#[string]
+fn op_canvas_parse_font(#[string] font: &str) -> Result<String, deno_error::JsErrorBox> {
+    std::panic::catch_unwind(|| {
+        obscura_render::text::CanvasFont::parse(font).map(|font| font.css()).unwrap_or_default()
+    }).map_err(|_| deno_error::JsErrorBox::generic("Canvas font parsing failed"))
+}
+
+#[op2]
+#[string]
+fn op_canvas_measure_text(#[cppgc] handle: &CanvasHandle, #[string] request: &str) -> Result<String, deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let request: CanvasTextRequest = serde_json::from_str(request).map_err(|_| JsErrorBox::type_error("Invalid Canvas text request"))?;
+        let font = obscura_render::text::CanvasFont::parse(&request.font).ok_or_else(|| JsErrorBox::type_error("Invalid Canvas font"))?;
+        let mut text = handle.document.canvas_text.try_borrow_mut()
+            .map_err(|_| JsErrorBox::type_error("Canvas text engine unavailable"))?;
+        let engine = text.get_or_insert_with(obscura_render::text::CanvasTextEngine::new);
+        let metrics = engine.measure(&font, &request.text, request.reference()).map_err(JsErrorBox::generic)?;
+        Ok(serde_json::json!({
+            "width": metrics.width,
+            "actualBoundingBoxLeft": metrics.left,
+            "actualBoundingBoxRight": metrics.right,
+            "actualBoundingBoxAscent": metrics.ascent,
+            "actualBoundingBoxDescent": metrics.descent,
+            "fontBoundingBoxAscent": metrics.font_ascent,
+            "fontBoundingBoxDescent": metrics.font_descent,
+        }).to_string())
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Canvas text measurement failed")))
+}
+
+#[op2(fast)]
+fn op_canvas_draw_text(#[cppgc] handle: &CanvasHandle, width: u32, height: u32, #[buffer] pixels: &mut [u8], #[string] request: &str) -> Result<(), deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    if width > 32_767 || height > 32_767 || u64::from(width) * u64::from(height) > 67_108_864
+        || u64::from(width) * u64::from(height) * 4 != pixels.len() as u64 {
+        return Err(JsErrorBox::range_error("Invalid Canvas text surface"));
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let request: CanvasTextPaintRequest = serde_json::from_str(request).map_err(|_| JsErrorBox::type_error("Invalid Canvas text request"))?;
+        let font = obscura_render::text::CanvasFont::parse(&request.text.font).ok_or_else(|| JsErrorBox::type_error("Invalid Canvas font"))?;
+        if !request.x.is_finite() || !request.y.is_finite() || width == 0 || height == 0 { return Ok(()); }
+        if !request.alpha.is_finite() || !(0.0..=1.0).contains(&request.alpha) { return Err(JsErrorBox::range_error("Invalid Canvas text alpha")); }
+        let mut text = handle.document.canvas_text.try_borrow_mut()
+            .map_err(|_| JsErrorBox::type_error("Canvas text engine unavailable"))?;
+        let engine = text.get_or_insert_with(obscura_render::text::CanvasTextEngine::new);
+        engine.draw(&font, &request.text.text, obscura_render::text::TextPaint {
+            reference: request.text.reference(), x: request.x, y: request.y, color: request.color, alpha: request.alpha,
+            stroke_width: request.stroke_width, max_width: request.max_width,
+        }, pixels, width, height).map_err(JsErrorBox::generic)
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Canvas text drawing failed")))
+}
+
 /// Encode the JS-owned RGBA pixels without uncompressed scanline copies.
 #[op2]
 #[string]
@@ -7434,102 +7745,531 @@ fn op_canvas_encode_png(width: u32, height: u32, #[buffer] pixels: &[u8]) -> Res
     })).unwrap_or_else(|_| Err(JsErrorBox::generic("Canvas PNG encoding failed")))
 }
 
-/// Retain the JavaScript-owned Canvas2D pixel buffer without copying it. A
-/// canvas resize supplies a new fixed backing store and atomically replaces
-/// the previous surface for the same DOM node.
-#[cfg(feature = "render")]
-#[op2]
-fn op_canvas_register_surface(
-    state: &OpState,
-    nid: u32,
-    width: u32,
-    height: u32,
-    #[buffer] pixels: JsBuffer,
-) -> bool {
-    const MAX_CANVAS_DIMENSION: u32 = 32_767;
-    const MAX_CANVAS_PIXELS: usize = 67_108_864;
-    const MAX_CANVAS_SURFACE_BYTES: usize = 256 * 1024 * 1024;
-    let Some(expected) = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-    else {
-        return false;
-    };
-    if width > MAX_CANVAS_DIMENSION
-        || height > MAX_CANVAS_DIMENSION
-        || expected / 4 > MAX_CANVAS_PIXELS
-        || pixels.len() != expected
-    {
-        return false;
-    }
-
-    let shared = state.borrow::<SharedState>().clone();
-    let mut state = shared.borrow_mut();
-    let node = NodeId::new(nid);
-    let is_canvas = state
-        .dom
-        .as_ref()
-        .and_then(|dom| dom.get_node(node))
-        .is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|name| name.local.as_ref() == "canvas")
-        });
-    if !is_canvas {
-        return false;
-    }
-    let replacing = state.canvas_surfaces.get(&node).map(|surface| surface.pixels.len());
-    let retained_bytes = state
-        .canvas_surfaces
-        .values()
-        .try_fold(0usize, |total, surface| total.checked_add(surface.pixels.len()))
-        .and_then(|total| total.checked_sub(replacing.unwrap_or(0)))
-        .and_then(|total| total.checked_add(expected));
-    if retained_bytes.is_none_or(|bytes| bytes > MAX_CANVAS_SURFACE_BYTES) {
-        return false;
-    }
-    state.canvas_surfaces.insert(
-        node,
-        CanvasBackingSurface {
-            width,
-            height,
-            pixels,
-        },
-    );
-    true
+// One document lease is shared by all of its Canvas handles. A navigation
+// moves the old tree once, rather than cloning a DOM for each retained canvas.
+pub(crate) struct CanvasDocumentLease {
+    owner: std::rc::Weak<RefCell<ObscuraState>>,
+    original: Rc<image_dimensions_ops::OriginalDocumentStorage>,
+    canvas_text: RefCell<Option<obscura_render::text::CanvasTextEngine>>,
+    surfaces: RefCell<HashMap<u64, CanvasBackingSurface>>,
+    next_surface: std::cell::Cell<u64>,
+    attributes: RefCell<HashMap<u64, (NodeId, u64, std::rc::Weak<RefCell<[Option<String>; 2]>>)>>,
 }
 
-/// Report one coalesced Canvas2D paint at the JavaScript task boundary. Pixel
-/// bytes are already live through the retained backing store, so damage wakes
-/// screencast/readiness without throwing away otherwise-valid layout.
+pub(crate) fn detach_canvas_document(state: &mut ObscuraState) {
+    if let Some(lease) = state.canvas_document.take() {
+        if let Some(dom) = state.dom.as_ref() {
+            for (node, generation, attributes) in lease.attributes.borrow().values() {
+                if dom.node_generation(*node) == Some(*generation) {
+                    if let (Some(node), Some(attributes)) = (dom.get_node(*node), attributes.upgrade()) {
+                        *attributes.borrow_mut() = [node.get_attribute("width").map(str::to_owned),
+                            node.get_attribute("height").map(str::to_owned)];
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn retire_canvas_document(state: &mut ObscuraState) {
+    image_dimensions_ops::retire_original_document(state);
+}
+
+struct CanvasHandle {
+    document: Rc<CanvasDocumentLease>,
+    node: Option<(NodeId, u64)>,
+    surface_id: u64,
+    attributes: Rc<RefCell<[Option<String>; 2]>>,
+}
+impl Drop for CanvasHandle {
+    fn drop(&mut self) {
+        // A DOM-less canvas is not retained by the renderer. Release its backing
+        // store when its wrapper/context cycle is collected, not at navigation.
+        if let Ok(mut surfaces) = self.document.surfaces.try_borrow_mut() {
+            surfaces.remove(&self.surface_id);
+        }
+        if let Ok(mut attributes) = self.document.attributes.try_borrow_mut() {
+            attributes.remove(&self.surface_id);
+        }
+    }
+}
+impl CanvasDocumentLease {
+    #[cfg(test)]
+    pub(crate) fn retained_surface_stats(&self) -> (usize, usize) {
+        let surfaces = self.surfaces.borrow();
+        (surfaces.len(), surfaces.values().map(|surface| surface.pixels.len()).sum())
+    }
+    #[cfg(test)]
+    pub(crate) fn has_text_engine(&self) -> bool {
+        self.canvas_text.borrow().is_some()
+    }
+}
+impl deno_core::cppgc::GarbageCollected for CanvasHandle {
+    fn get_name(&self) -> &'static std::ffi::CStr { c"CanvasHandle" }
+}
+impl CanvasHandle {
+    fn live_owner(&self) -> Option<SharedState> {
+        let owner = self.document.owner.upgrade()?;
+        let current = owner.try_borrow().ok()?.canvas_document.as_ref()
+            .is_some_and(|document| Rc::ptr_eq(document, &self.document));
+        current.then_some(owner)
+    }
+    fn node_is_current(&self, dom: &DomTree) -> bool {
+        self.node.is_some_and(|(node, generation)| dom.node_generation(node) == Some(generation))
+    }
+}
+
+fn canvas_handle_for(scope: &mut v8::HandleScope,
+    owner: v8::Local<v8::Function>, node: Option<NodeId>,
+) -> Result<CanvasHandle, deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let owner = owner.get_creation_context(scope)
+            .and_then(|context| context.get_slot::<RefCell<ObscuraState>>())
+            .ok_or_else(|| JsErrorBox::type_error("Canvas owner unavailable"))?;
+        let original = image_dimensions_ops::original_document(&owner);
+        let mut state = owner.try_borrow_mut()
+            .map_err(|_| JsErrorBox::type_error("Canvas owner unavailable"))?;
+        let (identity, attributes) = if let Some(node) = node {
+            let dom = state.dom.as_ref().ok_or_else(|| JsErrorBox::type_error("Canvas document unavailable"))?;
+            let element = dom.get_node(node).ok_or_else(|| JsErrorBox::type_error("Illegal invocation"))?;
+            if !element.as_element().is_some_and(|name|
+                name.local.as_ref() == "canvas" && name.ns.as_ref() == "http://www.w3.org/1999/xhtml") {
+                return Err(JsErrorBox::type_error("Illegal invocation"));
+            }
+            (Some((node, dom.node_generation(node).ok_or_else(|| JsErrorBox::type_error("Illegal invocation"))?)),
+                [element.get_attribute("width").map(str::to_owned), element.get_attribute("height").map(str::to_owned)])
+        } else { (None, [None, None]) };
+        let document = state.canvas_document.get_or_insert_with(|| Rc::new(CanvasDocumentLease {
+            owner: Rc::downgrade(&owner), original,
+            canvas_text: RefCell::new(None), surfaces: RefCell::new(HashMap::new()),
+            next_surface: std::cell::Cell::new(0), attributes: RefCell::new(HashMap::new()),
+        })).clone();
+        let surface_id = document.next_surface.get();
+        document.next_surface.set(surface_id.checked_add(1)
+            .ok_or_else(|| JsErrorBox::range_error("Canvas identity limit exceeded"))?);
+        let attributes = Rc::new(RefCell::new(attributes));
+        if let Some((node, generation)) = identity {
+            document.attributes.borrow_mut().insert(surface_id, (node, generation, Rc::downgrade(&attributes)));
+        }
+        Ok(CanvasHandle {document, node: identity, surface_id, attributes})
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Canvas creation failed")))
+}
+#[op2]
+#[cppgc]
+fn op_canvas_create_handle(scope: &mut v8::HandleScope,
+    owner: v8::Local<v8::Function>, nid: u32,
+) -> Result<CanvasHandle, deno_error::JsErrorBox> {
+    canvas_handle_for(scope, owner, Some(NodeId::new(nid)))
+}
+#[op2]
+#[cppgc]
+fn op_canvas_create_offscreen_handle(scope: &mut v8::HandleScope,
+    owner: v8::Local<v8::Function>,
+) -> Result<CanvasHandle, deno_error::JsErrorBox> {
+    canvas_handle_for(scope, owner, None)
+}
+
+#[op2]
+#[string]
+fn op_canvas_attribute(#[cppgc] handle: &CanvasHandle,
+    #[string] command: &str, #[string] name: &str, #[string] value: &str,
+) -> Result<String, deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (node, _) = handle.node.ok_or_else(|| JsErrorBox::type_error("Not an HTML canvas"))?;
+        let index = match name { "width" => 0, "height" => 1,
+            _ => return Err(JsErrorBox::type_error("Invalid canvas attribute")) };
+        if !matches!(command, "get_attribute" | "set_attribute" | "remove_attribute") {
+            return Err(JsErrorBox::type_error("Invalid canvas operation"));
+        }
+        if command == "get_attribute" {
+            // The DOM stays authoritative until take_dom transfers it out. This
+            // also observes embedding mutations made through with_dom.
+            let mut current = None;
+            if let Some(owner) = handle.live_owner() {
+                let state = owner.try_borrow().map_err(|_| JsErrorBox::type_error("Canvas document unavailable"))?;
+                if let Some(dom) = state.dom.as_ref().filter(|dom| handle.node_is_current(dom)) {
+                    current = Some(dom.get_node(node).and_then(|node| node.get_attribute(name).map(str::to_owned)));
+                }
+            } else {
+                let retired = handle.document.original.retired_dom.try_borrow()
+                    .map_err(|_| JsErrorBox::type_error("Canvas document unavailable"))?;
+                if let Some(dom) = retired.as_ref().filter(|dom| handle.node_is_current(dom)) {
+                    current = Some(dom.get_node(node).and_then(|node| node.get_attribute(name).map(str::to_owned)));
+                }
+            }
+            if let Some(value) = current {
+                handle.attributes.try_borrow_mut()
+                    .map_err(|_| JsErrorBox::type_error("Canvas attribute unavailable"))?[index] = value;
+            }
+            return serde_json::to_string(&handle.attributes.try_borrow()
+                .map_err(|_| JsErrorBox::type_error("Canvas attribute unavailable"))?[index])
+                .map_err(|_| JsErrorBox::generic("Canvas attribute unavailable"));
+        }
+        let next = (command == "set_attribute").then(|| value.to_owned());
+        if let Some(owner) = handle.live_owner() {
+            let current = owner.try_borrow().map_err(|_| JsErrorBox::type_error("Canvas document unavailable"))?
+                .dom.as_ref().is_some_and(|dom| handle.node_is_current(dom));
+            if current {
+                let arg = if command == "set_attribute" { format!("{name}\0{value}") } else { name.to_owned() };
+                op_dom_inner(owner, command.to_owned(), node.raw().to_string(), arg);
+            }
+        } else {
+            let retired = handle.document.original.retired_dom.try_borrow()
+                .map_err(|_| JsErrorBox::type_error("Canvas document unavailable"))?;
+            if let Some(dom) = retired.as_ref().filter(|dom| handle.node_is_current(dom)) {
+                dom.with_node_mut(node, |node| {
+                    if command == "set_attribute" { node.set_attribute(name, value.to_owned()); }
+                    else { node.remove_attribute_ns("", name); }
+                });
+            }
+        }
+        handle.attributes.try_borrow_mut()
+            .map_err(|_| JsErrorBox::type_error("Canvas attribute unavailable"))?[index] = next;
+        Ok("true".into())
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Canvas attribute operation failed")))
+}
+
+/// Retain the exact backing store under the handle's document and node identity.
+#[op2]
+fn op_canvas_register_surface(#[cppgc] handle: &CanvasHandle,
+    width: u32, height: u32, #[buffer] pixels: JsBuffer,
+) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(expected) = (width as usize).checked_mul(height as usize)
+            .and_then(|count| count.checked_mul(4)) else { return false; };
+        if width > 32_767 || height > 32_767 || expected / 4 > 67_108_864 || pixels.len() != expected { return false; }
+        let Ok(mut surfaces) = handle.document.surfaces.try_borrow_mut() else { return false; };
+        let key = handle.surface_id;
+        if surfaces.len() >= 16_384 && !surfaces.contains_key(&key) { return false; }
+        let replacing = surfaces.get(&key).map_or(0, |surface| surface.pixels.len());
+        let retained = surfaces.values().try_fold(0usize, |total, surface| total.checked_add(surface.pixels.len()))
+            .and_then(|total| total.checked_sub(replacing)).and_then(|total| total.checked_add(expected));
+        if retained.is_none_or(|bytes| bytes > 256 * 1024 * 1024) { return false; }
+        #[cfg(feature = "render")]
+        if let (Some(owner), Some((node, _))) = (handle.live_owner(), handle.node) {
+            let Ok(mut state) = owner.try_borrow_mut() else { return false; };
+            if state.websocket_owner.active()
+                && state.dom.as_ref().is_some_and(|dom| handle.node_is_current(dom)) {
+                state.canvas_surfaces.insert(node, CanvasBackingSurface {width, height, pixels: pixels.clone()});
+            }
+        }
+        surfaces.insert(key, CanvasBackingSurface {width, height, pixels});
+        true
+    })).unwrap_or(false)
+}
+
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
-    let mut state = shared.borrow_mut();
-    let node = NodeId::new(nid);
-    if !state.canvas_surfaces.contains_key(&node) {
-        return false;
-    }
-    let connected = state
-        .dom
-        .as_ref()
-        .is_some_and(|dom| node_is_connected(dom, node));
-    if connected {
-        state.activity_generation = state.activity_generation.wrapping_add(1);
-    }
-    connected
+fn op_canvas_paint_damage(scope: &mut v8::HandleScope, state: &OpState,
+    owner: v8::Local<v8::Function>, #[cppgc] handle: &CanvasHandle,
+) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some((node, _)) = handle.node else { return false; };
+        let Some(active) = posted_task_owner(scope, state, owner) else { return false; };
+        let Some(actual) = handle.live_owner() else { return false; };
+        if !Rc::ptr_eq(&actual, &active) { return false; }
+        let Ok(mut state) = actual.try_borrow_mut() else { return false; };
+        if !state.canvas_surfaces.contains_key(&node) { return false; }
+        let connected = state.dom.as_ref().is_some_and(|dom|
+            handle.node_is_current(dom) && node_is_connected(dom, node));
+        if connected { state.activity_generation = state.activity_generation.wrapping_add(1); }
+        connected
+    })).unwrap_or(false)
 }
+
+// The private token is created by each bootstrap closure in its real realm.
+// Retained frame contexts own their old state in a V8 slot; numeric frame ids
+// can be reused and must never select a successor document here.
+fn timing_state_for_receiver(
+    scope: &mut v8::HandleScope,
+    _state: &OpState,
+    receiver: v8::Local<v8::Object>,
+) -> Option<SharedState> {
+    // Context::set_slot takes Rc<T>, not T: the stored TypeId is the inner
+    // RefCell<ObscuraState>. Both root and real frame contexts are host-bound.
+    // An unbound context never falls back to the native op's current context.
+    receiver.get_creation_context(scope)?.get_slot::<RefCell<ObscuraState>>()
+}
+
+fn timing_owner_is_active(state: &OpState, owner: &SharedState) -> bool {
+    if Rc::ptr_eq(state.borrow::<SharedState>(), owner) { return true; }
+    state.try_borrow::<Rc<RefCell<RealmStates>>>().is_some_and(|registry|
+        registry.borrow().entries.iter().any(|(_, _, current)| Rc::ptr_eq(current, owner)))
+}
+#[op2(fast)]
+fn op_indexed_db_task_epoch(scope:&mut v8::HandleScope,state:&OpState,token:v8::Local<v8::Object>)->f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope,state,token).and_then(|owner|owner.try_borrow().ok()
+            .map(|owner|owner.javascript_task_clock.load(std::sync::atomic::Ordering::Relaxed) as f64)).unwrap_or(-1.0)
+    })).unwrap_or(-1.0)
+}
+// Root and child documents share one event-loop task epoch. A task in a
+// different realm must also deactivate borrowed transactions from its sibling.
+#[op2(fast)]
+fn op_indexed_db_begin_task(scope:&mut v8::HandleScope,state:&OpState,token:v8::Local<v8::Object>) {
+    let _=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(owner)=timing_state_for_receiver(scope,state,token) {
+            if let Ok(owner)=owner.try_borrow() {
+                owner.javascript_task_clock.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }));
+}
+fn indexed_db_origin(owner: &ObscuraState) -> String {
+    let Some(url)=url::Url::parse(&owner.url).ok() else {return "null".into();};
+    let origin=url.origin().ascii_serialization();
+    if origin!="null" {return origin;}
+    if url.scheme()=="about" && matches!(url.path(),"blank"|"srcdoc") {
+        return owner.websocket_origin.as_ref().and_then(|origin|url::Url::parse(origin).ok())
+            .map(|url|url.origin().ascii_serialization()).unwrap_or_else(||"null".into());
+    }
+    "null".into()
+}
+#[op2]
+#[string]
+fn op_indexed_db(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>,
+    #[string] action: &str, #[string] name: &str, #[string] lease: &str, version: f64,
+    #[buffer] payload: &[u8]) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(owner)=timing_state_for_receiver(scope,state,owner_token) else {return "{\"error\":\"SecurityError\"}".into();};
+        if !version.is_finite() || version<0.0 || version>9_007_199_254_740_991.0 || version.fract()!=0.0 {
+            return "{\"error\":\"TypeError\"}".into();
+        }
+        let owner=owner.borrow();
+        owner.indexed_db.request(&indexed_db_origin(&owner),&owner.websocket_owner,action,name,lease,version as u64,payload).to_string()
+    })).unwrap_or_else(|_|"{\"error\":\"AbortError\"}".into())
+}
+struct IndexedDbOwner {store:Arc<crate::indexed_db::Store>,origin:String,owner:Arc<obscura_net::websocket::session::Owner>}
+impl deno_core::cppgc::GarbageCollected for IndexedDbOwner {fn get_name(&self)->&'static std::ffi::CStr {c"IndexedDbOwner"}}
+#[op2]
+#[cppgc]
+fn op_indexed_db_owner(scope:&mut v8::HandleScope,state:&OpState,token:v8::Local<v8::Object>)->Result<IndexedDbOwner,deno_error::JsErrorBox> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let owner=timing_state_for_receiver(scope,state,token).ok_or_else(||deno_error::JsErrorBox::generic("IndexedDB owner unavailable"))?;
+        let owner=owner.borrow();Ok(IndexedDbOwner{store:owner.indexed_db.clone(),origin:indexed_db_origin(&owner),owner:owner.websocket_owner.clone()})
+    })).unwrap_or_else(|_|Err(deno_error::JsErrorBox::generic("IndexedDB owner unavailable")))
+}
+#[op2(async)]
+#[string]
+async fn op_indexed_db_watch(#[cppgc] handle:&IndexedDbOwner)->Option<String> {
+    let mut cancel=handle.owner.subscribe();
+    loop {
+        if !handle.owner.active() {return None;}
+        let notified=handle.store.notify.notified();tokio::pin!(notified);notified.as_mut().enable();
+        let notices=handle.store.notices(&handle.origin,&handle.owner);
+        if notices.as_array().is_some_and(|rows|!rows.is_empty()) {return Some(notices.to_string());}
+        tokio::select!{_=notified=>{},_=cancel.changed()=>{return None;}}
+    }
+}
+
+// A timing delivery validates the actual creating context and owner again at
+// execution, independently of the general timer/posted-task implementation.
+#[op2(fast)]
+fn op_timing_owner_generation(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let context = owner_token.get_creation_context(scope)?;
+        let owner = context.get_slot::<RefCell<ObscuraState>>()?;
+        let active = if Rc::ptr_eq(state.try_borrow::<SharedState>()?, &owner) { true } else {
+            let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?;
+            let active = registry.try_borrow().ok()?.entries.iter().any(|(known, _, current)|
+                *known == context && Rc::ptr_eq(current, &owner));
+            active
+        };
+        if !active { return None; }
+        let generation = owner.try_borrow().ok()?.document_generation as f64;
+        Some(generation)
+    })).ok().flatten().unwrap_or(-1.0)
+}
+
+#[op2(fast)]
+fn op_timing_now(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope, state, owner_token).map_or(0.0, |owner| owner.borrow().performance_timeline.elapsed())
+    })).unwrap_or_else(|_| 0.0)
+}
+#[op2(fast)]
+fn op_timing_origin(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope, state, owner_token).map_or(0.0, |owner|
+        obscura_net::timing::epoch_at(owner.borrow().performance_timeline.origin))
+    })).unwrap_or_else(|_| 0.0)
+}
+#[op2]
+#[string]
+fn op_timing_user(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>,
+    #[string] name: &str, measure: bool, start: f64, duration: f64) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope, state, owner_token).and_then(|owner|
+            owner.borrow_mut().performance_timeline.user(name, measure, start, duration))
+            .map_or_else(|| "null".into(), |entry| serde_json::to_string(&entry).unwrap_or_else(|_| "null".into()))
+    })).unwrap_or_else(|_| "null".into())
+}
+#[op2]
+fn op_timing_clear_user(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>,
+    measure: bool, #[string] name: Option<String>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(owner) = timing_state_for_receiver(scope, state, owner_token) {
+            owner.borrow_mut().performance_timeline.clear_user(measure, name.as_deref());
+        }
+    }));
+}
+#[op2]
+#[string]
+fn op_timing_entries(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope, state, owner_token).map_or_else(|| "{\"entries\":[],\"dropped\":0}".into(), |owner|
+        owner.borrow().performance_timeline.snapshot().to_string())
+    })).unwrap_or_else(|_| "{\"entries\":[],\"dropped\":0}".into())
+}
+#[op2]
+#[string]
+fn op_timing_navigation(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope, state, owner_token).map_or_else(|| "{\"entries\":[],\"dropped\":0}".into(), |owner|
+        owner.borrow().performance_timeline.navigation_snapshot().to_string())
+    })).unwrap_or_else(|_| "{\"entries\":[],\"dropped\":0}".into())
+}
+#[op2(fast)]
+fn op_timing_clear(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>) {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(owner) = timing_state_for_receiver(scope, state, owner_token) { owner.borrow_mut().performance_timeline.clear_resources(); }
+    })).unwrap_or_else(|_| ())
+}
+#[op2(fast)]
+fn op_timing_limit(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>, limit: u32) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope, state, owner_token).is_some_and(|owner| owner.borrow_mut().performance_timeline.set_limit(limit as usize))
+    })).unwrap_or_else(|_| false)
+}
+#[op2(fast)]
+fn op_timing_lifecycle(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>, phase: u32, end: bool) {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(owner) = timing_state_for_receiver(scope, state, owner_token) { owner.borrow_mut().performance_timeline.lifecycle(phase as u8, end); }
+    })).unwrap_or_else(|_| ())
+}
+
+#[op2(fast)]
+fn op_timing_observe(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>, types: u32) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(owner) = timing_state_for_receiver(scope, state, owner_token) {
+            owner.borrow_mut().performance_timeline.observe(types as u8);
+        }
+    }));
+}
+#[op2]
+#[string]
+fn op_timing_take_observer_records(scope: &mut v8::HandleScope, state: &OpState, owner_token: v8::Local<v8::Object>) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timing_state_for_receiver(scope, state, owner_token).map_or_else(|| "{\"entries\":[],\"dropped\":0}".into(), |owner|
+            owner.borrow_mut().performance_timeline.take_observer_records().to_string())
+    })).unwrap_or_else(|_| "{\"entries\":[],\"dropped\":0}".into())
+}
+
+// A Document getter follows its actual loader identity, never a reused frame id.
+// Once the loader retires, referrer is empty even when its DOM is retained.
+struct DocumentReferrerHandle {
+    owner: std::rc::Weak<RefCell<ObscuraState>>,
+    identity: Rc<()>,
+}
+impl deno_core::cppgc::GarbageCollected for DocumentReferrerHandle {
+    fn get_name(&self) -> &'static std::ffi::CStr { c"DocumentReferrerHandle" }
+}
+pub(crate) fn retire_document_referrer(state: &mut ObscuraState) {
+    state.websocket_owner.retire();
+    state.document_referrer_record = None;
+}
+#[op2]
+#[cppgc]
+fn op_document_create_referrer_handle(scope: &mut v8::HandleScope,
+    owner: v8::Local<v8::Function>,
+) -> Result<DocumentReferrerHandle, deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let owner = owner.get_creation_context(scope)
+            .and_then(|context| context.get_slot::<RefCell<ObscuraState>>())
+            .ok_or_else(|| JsErrorBox::type_error("Document owner unavailable"))?;
+        let mut state = owner.try_borrow_mut()
+            .map_err(|_| JsErrorBox::type_error("Document owner unavailable"))?;
+        let identity = state.document_referrer_record.get_or_insert_with(|| Rc::new(())).clone();
+        Ok(DocumentReferrerHandle { owner: Rc::downgrade(&owner), identity })
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Document metadata unavailable")))
+}
+#[op2]
+#[string]
+fn op_document_referrer_value(#[cppgc] handle: &DocumentReferrerHandle) -> Result<String, deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(owner) = handle.owner.upgrade() {
+            let state = owner.try_borrow().map_err(|_| JsErrorBox::type_error("Document owner unavailable"))?;
+            if state.document_referrer_record.as_ref().is_some_and(|value| Rc::ptr_eq(value, &handle.identity)) {
+                return Ok(state.referrer.clone());
+            }
+        }
+        Ok(String::new())
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Document metadata unavailable")))
+}
+
+#[op2(fast)]
+fn op_document_referrer_retire(#[cppgc] handle: &DocumentReferrerHandle) -> Result<(), deno_error::JsErrorBox> {
+    use deno_error::JsErrorBox;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(owner) = handle.owner.upgrade() {
+            let mut state = owner.try_borrow_mut().map_err(|_| JsErrorBox::type_error("Document owner unavailable"))?;
+            if state.document_referrer_record.as_ref().is_some_and(|value| Rc::ptr_eq(value, &handle.identity)) {
+                retire_document_referrer(&mut state);
+            }
+        }
+        Ok(())
+    })).unwrap_or_else(|_| Err(JsErrorBox::generic("Document metadata unavailable")))
+}
+
+#[op2(fast)]
+fn op_document_referrer_is_current(#[cppgc] handle: &DocumentReferrerHandle) -> bool {
+    let Some(owner) = handle.owner.upgrade() else { return false; };
+    let current = owner.try_borrow().ok().is_some_and(|state| state.document_referrer_record.as_ref()
+        .is_some_and(|value| Rc::ptr_eq(value, &handle.identity)));
+    current
+}
+
+#[path="image_dimensions_ops.rs"]
+pub(crate) mod image_dimensions_ops;
+
+#[path="websocket_ops.rs"]
+mod websocket_ops;
 
 pub fn build_extension() -> Extension {
     let mut ops = vec![
+        crate::speech_inventory::op_speech_request_inventory(),
         op_dom(),
+        image_dimensions_ops::op_image_bind_handle(),
+        image_dimensions_ops::op_popover_document_current(), image_dimensions_ops::op_popover_bind_handle(), image_dimensions_ops::op_popover_open_interface(), image_dimensions_ops::op_popover_open_value(), image_dimensions_ops::op_popover_state(), image_dimensions_ops::op_popover_set(), image_dimensions_ops::op_popover_attribute(), image_dimensions_ops::op_dialog_attribute(), image_dimensions_ops::op_details_attribute(),
+        image_dimensions_ops::op_image_same_document(),
+        image_dimensions_ops::op_image_cache_node(),
+        image_dimensions_ops::op_image_idl_dimension(),
+        image_dimensions_ops::op_image_attribute(),
+        image_dimensions_ops::op_image_active(),
+        image_dimensions_ops::op_image_handle_metadata(),
+        websocket_ops::op_websocket_create(), websocket_ops::op_websocket_connect(),
+        websocket_ops::op_websocket_next(), websocket_ops::op_websocket_send(),
+        websocket_ops::op_websocket_close(), websocket_ops::op_websocket_buffered(),
+        websocket_ops::op_websocket_active(), websocket_ops::op_websocket_ack(), websocket_ops::op_websocket_payload(),
+        websocket_ops::op_websocket_blank_owner(), websocket_ops::op_websocket_blank_retire(),
+        websocket_ops::op_websocket_blank_base(), websocket_ops::op_websocket_blank_meta(), websocket_ops::op_websocket_meta(),
+        op_document_create_referrer_handle(), op_document_referrer_value(), op_document_referrer_is_current(), op_document_referrer_retire(),
         op_script_mark_started(),
         op_script_try_start(),
+        op_csp_script_allowed(),
         op_script_execute_classic(),
         op_shadow_attach(),
         op_shadow_root_info(),
         op_runtime_events_enabled(),
         op_console_msg(),
+        op_timing_now(), op_timing_origin(), op_timing_entries(), op_timing_navigation(),
+        op_timing_user(), op_timing_clear_user(), op_indexed_db(), op_indexed_db_owner(), op_indexed_db_watch(), op_indexed_db_task_epoch(), op_indexed_db_begin_task(),
+        op_timing_clear(), op_timing_limit(), op_timing_lifecycle(),
+        op_timing_observe(), op_timing_take_observer_records(), op_timing_owner_generation(),
         op_fetch_url(),
         op_fetch_start(),
         op_fetch_abort(),
@@ -7561,7 +8301,18 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_audio_render(),
+        op_audio_analyse(),
+        op_audio_biquad_response(),
+        op_canvas_create_handle(),
+        op_canvas_create_offscreen_handle(),
+        op_canvas_register_surface(),
+        op_canvas_attribute(),
         op_canvas_encode_png(),
+        op_canvas_parse_color(),
+        op_canvas_parse_font(),
+        op_canvas_measure_text(),
+        op_canvas_draw_text(),
         crate::worker::op_worker_serialize(),
         crate::worker::op_worker_deserialize(),
         crate::worker::op_worker_create(),
@@ -7580,7 +8331,6 @@ pub fn build_extension() -> Extension {
     {
         ops.push(op_begin_render_task());
         ops.push(op_set_dynamic_fonts());
-        ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
@@ -7919,6 +8669,7 @@ pub(crate) fn ensure_prepared_render(
                 .retain_nodes(|node| connected.contains(&node));
         }
         state.prepared_render = Some(prepared);
+        image_dimensions_ops::publish_cached_images(state);
         state.resolved_scroll = None;
     }
     state.prepared_render.as_ref()
@@ -8090,16 +8841,8 @@ fn image_metadata_json(
 
 #[cfg(feature = "render")]
 fn image_request_profile(dom: &DomTree, node_id: NodeId) -> ImageRequestProfile {
-    match dom
-        .get_node(node_id)
-        .and_then(|node| node.get_attribute("crossorigin").map(str::to_owned))
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("use-credentials") => ImageRequestProfile::CorsInclude,
-        Some(_) => ImageRequestProfile::CorsSameOrigin,
-        None => ImageRequestProfile::NoCorsInclude,
-    }
+    dom.with_node(node_id, |node| ImageRequestProfile::from_crossorigin_attribute(node.get_attribute("crossorigin")))
+        .unwrap_or(ImageRequestProfile::NoCorsInclude)
 }
 
 #[cfg(feature = "render")]
@@ -8182,18 +8925,22 @@ fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: No
     if dimensions.is_some() && dimensions != previous_dimensions {
         invalidate_render_resource_geometry(gs);
     }
+    image_dimensions_ops::publish_cached_images(gs);
     image_metadata_json(current_src, density, true, dimensions)
 }
 
 #[cfg(feature = "render")]
 fn finish_async_image_metadata(
+    handle: &image_dimensions_ops::NativeImageHandle,
     shared: &SharedState,
     node_id: NodeId,
     document_generation: u64,
     expected_url: &str,
     request_profile: ImageRequestProfile,
 ) -> String {
+    if handle.active_state().is_none() { return "{\"state\":\"retired\"}".into(); }
     let gs = shared.borrow();
+    image_dimensions_ops::publish_cached_images(&gs);
     if gs.document_generation != document_generation {
         return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
             .to_string();
@@ -8218,6 +8965,47 @@ fn finish_async_image_metadata(
     image_metadata_json(current_src, density, known, dimensions)
 }
 
+#[cfg(feature = "render")]
+fn publish_async_image_response(
+    handle: &image_dimensions_ops::NativeImageHandle, shared: &SharedState,
+    request_key: &(u64, String, ImageRequestProfile), bytes: Option<Vec<u8>>,
+) {
+    let publish = handle.active_document_state().is_some_and(|active| Rc::ptr_eq(&active, shared));
+    let waiters = {
+        let mut gs = shared.borrow_mut();
+        if publish && gs.document_generation == request_key.0 {
+            match bytes {
+                Some(bytes) => {
+                    if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
+                        gs.render_resources.seed_image(
+                            request_key.1.clone(),
+                            request_key.2,
+                            bytes,
+                        );
+                        // The leader owns the unknown-to-known cache
+                        // transition. Followers only observe this result and
+                        // must not invalidate the retained render again.
+                        invalidate_render_resource_geometry(&mut gs);
+                    } else {
+                        gs.render_resources
+                            .seed_image_missing(request_key.1.clone(), request_key.2);
+                    }
+                }
+                None => {
+                    gs.render_resources
+                        .seed_image_missing(request_key.1.clone(), request_key.2);
+                }
+            }
+        }
+        gs.render_image_in_flight
+            .remove(request_key)
+            .unwrap_or_default()
+    };
+    for waiter in waiters {
+        let _ = waiter.send(());
+    }
+}
+
 /// Load HTMLImageElement bytes through the owning page's async transport.
 /// Network runs after every RefCell borrow is released, requests for the same
 /// navigation/URL/profile share one fetch, and completion revalidates both the
@@ -8225,12 +9013,9 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2(async)]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
-    let shared = {
-        let state = state.borrow();
-        state.borrow::<SharedState>().clone()
-    };
-    let node_id = NodeId::new(nid);
+async fn op_load_image_metadata(#[cppgc] handle: &image_dimensions_ops::NativeImageHandle) -> String {
+    let Some(shared) = handle.active_state() else { return "{\"state\":\"retired\"}".into(); };
+    let node_id = handle.node();
     let (
         document_generation,
         selected_url,
@@ -8258,6 +9043,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 .to_string();
         };
         if known {
+            image_dimensions_ops::publish_cached_images(&gs);
             return cached_image_metadata_for_node(&gs, node_id);
         }
         let initiator = url::Url::parse(&gs.url)
@@ -8290,6 +9076,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         )
     };
 
+    handle.begin_request();
     if shared.borrow().render_resources.sync_loading_enabled() {
         return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
     }
@@ -8311,6 +9098,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     if let Some(receiver) = follower {
         let _ = receiver.await;
         return finish_async_image_metadata(
+            handle,
             &shared,
             node_id,
             document_generation,
@@ -8334,40 +9122,9 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .contains(&response.status)
             .then_some(response.body)
     });
-    let waiters = {
-        let mut gs = shared.borrow_mut();
-        if gs.document_generation == document_generation {
-            match bytes {
-                Some(bytes) => {
-                    if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
-                        gs.render_resources.seed_image(
-                            selected_url.clone(),
-                            request_profile,
-                            bytes,
-                        );
-                        // The leader owns the unknown-to-known cache
-                        // transition. Followers only observe this result and
-                        // must not invalidate the retained render again.
-                        invalidate_render_resource_geometry(&mut gs);
-                    } else {
-                        gs.render_resources
-                            .seed_image_missing(selected_url.clone(), request_profile);
-                    }
-                }
-                None => {
-                    gs.render_resources
-                        .seed_image_missing(selected_url.clone(), request_profile);
-                }
-            }
-        }
-        gs.render_image_in_flight
-            .remove(&request_key)
-            .unwrap_or_default()
-    };
-    for waiter in waiters {
-        let _ = waiter.send(());
-    }
+    publish_async_image_response(handle, &shared, &request_key, bytes);
     finish_async_image_metadata(
+        handle,
         &shared,
         node_id,
         document_generation,
@@ -8422,10 +9179,59 @@ fn clamp_scroll_offset_for_consumer(
 /// retains every inline continuation, and the top-level rect is their visual
 /// viewport-relative bounding union. Feature-gated.
 #[cfg(feature = "render")]
+fn render_state_for_receiver(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+) -> Option<SharedState> {
+    // Geometry follows the node's wrapper, not the caller's realm. In
+    // particular, parent.getComputedStyle(childNode) enters the parent realm.
+    let owner = receiver.get_creation_context(scope)?;
+    if owner == scope.get_current_context() {
+        return Some(state.borrow::<SharedState>().clone());
+    }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?;
+    // Unlike DOM reads, layout is unavailable after the browsing context is
+    // retired. Never reuse its frame id or fall back to the parent's node id.
+    registry.borrow().entries.iter()
+        .find(|(context, _, _)| *context == owner)
+        .map(|(_, _, state)| state.clone())
+}
+
+#[cfg(feature = "render")]
+fn render_receiver_groups(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receivers: v8::Local<v8::Array>,
+    nids: &[u32],
+) -> Vec<(SharedState, Vec<(usize, u32)>)> {
+    let mut groups: Vec<(SharedState, Vec<(usize, u32)>)> = Vec::new();
+    if receivers.length() as usize != nids.len() { return groups; }
+    for (index, &nid) in nids.iter().enumerate() {
+        let Some(value) = receivers.get_index(scope, index as u32) else { continue; };
+        let Ok(receiver) = v8::Local::<v8::Object>::try_from(value) else { continue; };
+        let Some(shared) = render_state_for_receiver(scope, state, receiver) else { continue; };
+        if let Some((_, nodes)) = groups.iter_mut().find(|(owner, _)| Rc::ptr_eq(owner, &shared)) {
+            nodes.push((index, nid));
+        } else {
+            groups.push((shared, vec![(index, nid)]));
+        }
+    }
+    groups
+}
+
+#[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_geometry(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    #[string] nid_str: String,
+) -> String {
+    let Some(shared) = render_state_for_receiver(scope, state, receiver) else {
+        return String::new();
+    };
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -8486,58 +9292,66 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+fn op_resize_observer_measurements(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receivers: v8::Local<v8::Array>,
+    #[string] nids_json: String,
+) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
-    let mut gs = shared.borrow_mut();
-    sample_live_document_animations(&mut gs);
-    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
-        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
-            .unwrap_or_else(|_| "[]".to_string());
-    }
-    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
-        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
-            .unwrap_or_else(|_| "[]".to_string());
-    };
-    let Some(prepared) = gs.prepared_render.as_ref() else {
-        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
-            .unwrap_or_else(|_| "[]".to_string());
-    };
-
-    let style_value =
-        |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
-            snapshot.get(name).cloned().unwrap_or_default()
+    let groups = render_receiver_groups(scope, state, receivers, &nids);
+    let mut all_measurements = vec![serde_json::Value::Null; nids.len()];
+    for (shared, nodes) in groups {
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
+            continue;
+        }
+        let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+            continue;
         };
-    let measurements = nids
-        .into_iter()
-        .map(|nid| {
-            let nid = obscura_dom::tree::NodeId::new(nid);
-            let rect = prepared.viewport_rect_with_scroll(nid, scroll)?;
-            let (client_width, client_height) = prepared.client_size(nid)?;
-            let snapshot = prepared.computed_style(nid)?;
-            Some(serde_json::json!({
-                "x": rect.x,
-                "y": rect.y,
-                "clientWidth": client_width,
-                "clientHeight": client_height,
-                "paddingTop": style_value(&snapshot, "padding-top"),
-                "paddingRight": style_value(&snapshot, "padding-right"),
-                "paddingBottom": style_value(&snapshot, "padding-bottom"),
-                "paddingLeft": style_value(&snapshot, "padding-left"),
-                "borderTopWidth": style_value(&snapshot, "border-top-width"),
-                "borderRightWidth": style_value(&snapshot, "border-right-width"),
-                "borderBottomWidth": style_value(&snapshot, "border-bottom-width"),
-                "borderLeftWidth": style_value(&snapshot, "border-left-width"),
-                "writingMode": style_value(&snapshot, "writing-mode"),
-                "display": style_value(&snapshot, "display"),
-            }))
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
+        let Some(prepared) = gs.prepared_render.as_ref() else {
+            continue;
+        };
+
+        let style_value =
+            |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
+                snapshot.get(name).cloned().unwrap_or_default()
+            };
+        let measurements = nodes
+            .iter()
+            .map(|(_, nid)| {
+                let nid = obscura_dom::tree::NodeId::new(*nid);
+                let rect = prepared.viewport_rect_with_scroll(nid, scroll)?;
+                let (client_width, client_height) = prepared.client_size(nid)?;
+                let snapshot = prepared.computed_style(nid)?;
+                Some(serde_json::json!({
+                    "x": rect.x,
+                    "y": rect.y,
+                    "clientWidth": client_width,
+                    "clientHeight": client_height,
+                    "paddingTop": style_value(&snapshot, "padding-top"),
+                    "paddingRight": style_value(&snapshot, "padding-right"),
+                    "paddingBottom": style_value(&snapshot, "padding-bottom"),
+                    "paddingLeft": style_value(&snapshot, "padding-left"),
+                    "borderTopWidth": style_value(&snapshot, "border-top-width"),
+                    "borderRightWidth": style_value(&snapshot, "border-right-width"),
+                    "borderBottomWidth": style_value(&snapshot, "border-bottom-width"),
+                    "borderLeftWidth": style_value(&snapshot, "border-left-width"),
+                    "writingMode": style_value(&snapshot, "writing-mode"),
+                    "display": style_value(&snapshot, "display"),
+                }))
+            })
+            .collect::<Vec<_>>();
+        for ((index, _), measurement) in nodes.into_iter().zip(measurements) {
+            all_measurements[index] = measurement.unwrap_or(serde_json::Value::Null);
+        }
+    }
+    serde_json::to_string(&all_measurements).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Measure the complete IntersectionObserver clip graph in one rendering
@@ -8552,7 +9366,9 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
 #[op2]
 #[string]
 fn op_intersection_observer_measurements(
+    scope: &mut v8::HandleScope,
     state: &OpState,
+    receivers: v8::Local<v8::Array>,
     #[string] nids_json: String,
 ) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
@@ -8560,48 +9376,51 @@ fn op_intersection_observer_measurements(
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
-    let mut gs = shared.borrow_mut();
-    sample_live_document_animations(&mut gs);
-    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
-        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
-            .unwrap_or_else(|_| "[]".to_string());
-    }
-    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
-        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
-            .unwrap_or_else(|_| "[]".to_string());
-    };
-    let Some(prepared) = gs.prepared_render.as_ref() else {
-        return serde_json::to_string(&vec![serde_json::Value::Null; nids.len()])
-            .unwrap_or_else(|_| "[]".to_string());
-    };
-
-    let style_value =
-        |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
-            snapshot.get(name).cloned().unwrap_or_default()
+    let groups = render_receiver_groups(scope, state, receivers, &nids);
+    let mut all_measurements = vec![serde_json::Value::Null; nids.len()];
+    for (shared, nodes) in groups {
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
+            continue;
+        }
+        let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+            continue;
         };
-    let measurements = nids
-        .into_iter()
-        .map(|nid| {
-            let nid = obscura_dom::tree::NodeId::new(nid);
-            let rect = prepared.viewport_rect_with_scroll(nid, scroll)?;
-            let (client_width, client_height) = prepared.client_size(nid)?;
-            let snapshot = prepared.computed_style(nid)?;
-            Some(serde_json::json!({
-                "x": rect.x,
-                "y": rect.y,
-                "width": rect.width,
-                "height": rect.height,
-                "clientWidth": client_width,
-                "clientHeight": client_height,
-                "borderTopWidth": style_value(&snapshot, "border-top-width"),
-                "borderLeftWidth": style_value(&snapshot, "border-left-width"),
-                "overflowX": style_value(&snapshot, "overflow-x"),
-                "overflowY": style_value(&snapshot, "overflow-y"),
-            }))
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
+        let Some(prepared) = gs.prepared_render.as_ref() else {
+            continue;
+        };
+
+        let style_value =
+            |snapshot: &std::collections::HashMap<&'static str, String>, name: &'static str| {
+                snapshot.get(name).cloned().unwrap_or_default()
+            };
+        let measurements = nodes
+            .iter()
+            .map(|(_, nid)| {
+                let nid = obscura_dom::tree::NodeId::new(*nid);
+                let rect = prepared.viewport_rect_with_scroll(nid, scroll)?;
+                let (client_width, client_height) = prepared.client_size(nid)?;
+                let snapshot = prepared.computed_style(nid)?;
+                Some(serde_json::json!({
+                    "x": rect.x,
+                    "y": rect.y,
+                    "width": rect.width,
+                    "height": rect.height,
+                    "clientWidth": client_width,
+                    "clientHeight": client_height,
+                    "borderTopWidth": style_value(&snapshot, "border-top-width"),
+                    "borderLeftWidth": style_value(&snapshot, "border-left-width"),
+                    "overflowX": style_value(&snapshot, "overflow-x"),
+                    "overflowY": style_value(&snapshot, "overflow-y"),
+                }))
+            })
+            .collect::<Vec<_>>();
+        for ((index, _), measurement) in nodes.into_iter().zip(measurements) {
+            all_measurements[index] = measurement.unwrap_or(serde_json::Value::Null);
+        }
+    }
+    serde_json::to_string(&all_measurements).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// One renderer-computed CSS snapshot for `getComputedStyle()`. Returning all
@@ -8610,8 +9429,15 @@ fn op_intersection_observer_measurements(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_computed_style(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    #[string] nid_str: String,
+) -> String {
+    let Some(shared) = render_state_for_receiver(scope, state, receiver) else {
+        return String::new();
+    };
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -8648,8 +9474,14 @@ fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_metrics(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_metrics(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+) -> String {
+    let Some(shared) = render_state_for_receiver(scope, state, receiver) else {
+        return String::new();
+    };
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let viewport = gs.viewport;
@@ -8665,8 +9497,15 @@ fn op_layout_metrics(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_metrics(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    #[string] nid_str: String,
+) -> String {
+    let Some(shared) = render_state_for_receiver(scope, state, receiver) else {
+        return String::new();
+    };
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -8702,8 +9541,17 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_to(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    #[string] nid_str: String,
+    x: f64,
+    y: f64,
+) -> String {
+    let Some(shared) = render_state_for_receiver(scope, state, receiver) else {
+        return String::new();
+    };
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -8747,8 +9595,14 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_offset(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_offset(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+) -> String {
+    let Some(shared) = render_state_for_receiver(scope, state, receiver) else {
+        return String::new();
+    };
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let requested = gs.scroll_offset;
@@ -8759,8 +9613,16 @@ fn op_scroll_offset(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_to(state: &OpState, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_to(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    x: f64,
+    y: f64,
+) -> String {
+    let Some(shared) = render_state_for_receiver(scope, state, receiver) else {
+        return String::new();
+    };
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let previous = gs.scroll_offset;

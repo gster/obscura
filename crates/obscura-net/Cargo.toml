@@ -28,6 +28,8 @@ futures-util = "0.3"
 bytes = "1"
 primp = { version = "=2.0.1", default-features = false, features = ["gzip", "brotli", "deflate", "zstd", "stream"] }
 http = "1"
+# Uses only framing over the mandatory primp-upgraded stream.
+tokio-tungstenite = { workspace = true }
 psl = "2"
 
 [dev-dependencies]

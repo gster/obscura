@@ -58,6 +58,7 @@ pub struct Exchange {
 
 #[derive(Clone)]
 pub struct RequestTrace {
+    timing: Arc<Mutex<crate::timing::RequestTiming>>,
     exchanges: Arc<Mutex<Vec<Exchange>>>,
     bodies: Arc<Mutex<crate::response_body::ResponseBodyStore>>,
     request_bodies: Arc<Mutex<crate::request_body::RequestBodyStore>>,
@@ -76,6 +77,22 @@ pub struct RequestTrace {
 }
 
 impl RequestTrace {
+    pub fn timing(&self) -> crate::timing::RequestTiming {
+        self.timing.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    }
+    pub fn timing_transport_attempted(&self) {
+        self.timing.lock().unwrap_or_else(|error| error.into_inner()).transport_attempted = true;
+    }
+    pub fn timing_protocol(&self, protocol: Option<&'static str>) {
+        self.timing.lock().unwrap_or_else(|error| error.into_inner()).protocol = protocol;
+    }
+    pub fn timing_body_completed(&self, decoded_bytes: usize) {
+        let mut timing = self.timing.lock().unwrap_or_else(|error| error.into_inner());
+        timing.end = Some(crate::timing::now());
+        timing.decoded_body_size = Some(decoded_bytes);
+        timing.complete = true;
+    }
+
     fn response_is_binary(&self, response: &Response) -> bool {
         match self.observed_resource_type {
             Some(ResourceType::Image | ResourceType::Font) => true,
@@ -97,6 +114,7 @@ impl RequestTrace {
         request_bodies: Arc<Mutex<crate::request_body::RequestBodyStore>>, request_id: String,
     ) -> Self {
         Self {
+            timing: Arc::new(Mutex::new(crate::timing::RequestTiming::default())),
             exchanges: Arc::new(Mutex::new(Vec::new())), bodies, request_bodies,
             request_id, capture_response_bodies: true,
             capture_redirect_response_bodies: true,
@@ -143,6 +161,7 @@ impl RequestTrace {
     pub fn begin(&self, url: &str, method: &str, headers: Option<HeaderCapture>, body: Option<&[u8]>)
         -> Result<(), crate::request_body::RequestBodyError>
     {
+        self.timing.lock().unwrap_or_else(|error| error.into_inner()).begin(url);
         let index = self.exchanges.lock().unwrap_or_else(|e| e.into_inner()).len();
         let body_id = body.map(|_| format!("{}-request-hop-{}-standard", self.request_id, index));
         let previous_transport_id = self.exchanges.lock().unwrap_or_else(|e| e.into_inner()).last()
@@ -296,6 +315,7 @@ impl RequestTrace {
         body_complete: bool,
         terminal_error: Option<&str>,
     ) {
+        self.timing.lock().unwrap_or_else(|error| error.into_inner()).response(response, body_complete && terminal_error.is_none());
         let _terminal_serial = body_complete.then(|| {
             self.terminal_serial.lock().unwrap_or_else(|error| error.into_inner())
         });

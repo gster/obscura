@@ -1,0 +1,20 @@
+# This oracle needs graph loading to finish before its 350 ms deadline so it
+# can check that synchronous evaluation consumes only the remaining budget.
+# Concurrent test processes can exhaust that deadline before evaluation starts.
+# Reserve the runner's slots; keep the test's budgets, assertion and retries.
+[[profile.default.overrides]]
+filter = 'package(obscura-browser) & test(=page::tests::module_graph_and_evaluation_share_one_active_budget)'
+threads-required = 'num-test-threads'
+
+# Graph preparation and evaluation must fit the original 300 ms budget. The
+# queued deferred script still runs for 500 ms, so queue accounting remains
+# observable while this precise oracle reserves the runner's slots.
+[[profile.default.overrides]]
+filter = 'package(obscura-browser) & test(=page::tests::queued_module_does_not_spend_its_budget_waiting_for_deferred_script)'
+threads-required = 'num-test-threads'
+
+# A real fixture child must publish before its original 2 s provider deadline
+# for this test to check snapshot retention and the exact nonzero exit code.
+[[profile.default.overrides]]
+filter = 'package(obscura-js) & test(=speech_provider::tests::child_tests::speech_provider_stream_preserves_real_snapshot_but_nonzero_exit_is_terminal_failure)'
+threads-required = 'num-test-threads'

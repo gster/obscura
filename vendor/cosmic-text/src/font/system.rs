@@ -117,6 +117,9 @@ pub struct FontSystem {
     /// List of fallbacks
     pub(crate) dyn_fallback: Box<dyn Fallback>,
 
+    /// Canvas-only stable base set and ordered native candidates. None preserves DOM policy.
+    pub(crate) operation_fallback: Option<(Vec<fontdb::ID>, Vec<fontdb::ID>)>,
+
     /// List of fallbacks
     pub(crate) fallbacks: Fallbacks,
 }
@@ -219,6 +222,7 @@ impl FontSystem {
             shape_buffer: ShapeBuffer::default(),
             dyn_fallback: Box::new(impl_fallback),
             fallbacks,
+            operation_fallback: None,
         }
     }
 
@@ -241,6 +245,69 @@ impl FontSystem {
     pub fn db_mut(&mut self) -> &mut fontdb::Database {
         self.font_matches_cache.clear();
         &mut self.db
+    }
+
+    /// Append selected real collection faces without replacing existing IDs.
+    /// The caller owns source validation and resource admission. None accepts all faces.
+    pub fn append_font_source(&mut self, source: fontdb::Source, indices: Option<&[u32]>) -> Vec<fontdb::ID> {
+        let mut accepted = Vec::new();
+        for id in self.db.load_font_source(source) {
+            if self.db.face(id).is_some_and(|face| indices.map_or(true, |indices| indices.contains(&face.index))) {
+                accepted.push(id);
+            } else { self.db.remove_face(id); }
+        }
+        if accepted.is_empty() { return accepted; }
+        self.font_matches_cache.clear();
+        #[cfg(feature = "shape-run-cache")]
+        { self.shape_run_cache = Default::default(); }
+        for id in &accepted {
+            if self.db.face(*id).is_some_and(|face| face.monospaced && !face.post_script_name.contains("Emoji")) {
+                self.monospace_font_ids.push(*id);
+                if cfg!(feature = "monospace_fallback") {
+                    self.db.with_face_data(*id, |data, index| {
+                        if let Ok(face) = ttf_parser::Face::parse(data, index) {
+                            for script in face.tables().gpos.into_iter().chain(face.tables().gsub).flat_map(|table| table.scripts) {
+                                let ids = self.per_script_monospace_font_ids.entry(script.tag.to_bytes()).or_default();
+                                ids.push(*id); ids.sort(); ids.dedup();
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        self.monospace_font_ids.sort();
+        self.monospace_font_ids.dedup();
+        accepted
+    }
+
+    /// Remove caller-owned idle faces without recycling surviving database IDs.
+    /// The caller must first discard all external glyph/shape/raster caches.
+    pub fn remove_font_faces(&mut self, ids: &[fontdb::ID]) {
+        for id in ids { self.db.remove_face(*id); self.font_cache.remove(id); }
+        if let Some((base, ordered)) = &mut self.operation_fallback {
+            base.retain(|id| !ids.contains(id)); ordered.retain(|id| !ids.contains(id));
+        }
+        self.font_codepoint_support_info_cache.retain(|id, _| !ids.contains(id));
+        self.monospace_font_ids.retain(|id| !ids.contains(id));
+        self.per_script_monospace_font_ids.retain(|_, values| {
+            values.retain(|id| !ids.contains(id)); !values.is_empty()
+        });
+        self.font_matches_cache.clear();
+        self.monospace_fallbacks_buffer.clear();
+        self.shape_buffer = ShapeBuffer::default();
+        #[cfg(feature = "shape-run-cache")]
+        { self.shape_run_cache = Default::default(); }
+    }
+
+    /// Install an operation-owned fallback policy before constructing a Buffer.
+    /// Base IDs are immutable resources. Native IDs are in resolver order, not DB order.
+    pub fn set_operation_fallback(&mut self, base: &[fontdb::ID], ordered: &[fontdb::ID]) {
+        if self.operation_fallback.as_ref().is_some_and(|(a, b)| a == base && b == ordered) { return; }
+        self.operation_fallback = Some((base.to_vec(), ordered.to_vec()));
+        self.font_matches_cache.clear();
+        self.monospace_fallbacks_buffer.clear();
+        #[cfg(feature = "shape-run-cache")]
+        { self.shape_run_cache = Default::default(); }
     }
 
     /// Consume this [`FontSystem`] and return the locale and database.
@@ -324,6 +391,7 @@ impl FontSystem {
                     .db
                     .faces()
                     .filter(|face| attrs.matches(face))
+                    .filter(|face| self.operation_fallback.as_ref().map_or(true, |(base, _)| base.contains(&face.id)))
                     .map(|face| FontMatchKey {
                         font_weight_diff: attrs.weight.0.abs_diff(face.weight.0),
                         font_weight: face.weight.0,

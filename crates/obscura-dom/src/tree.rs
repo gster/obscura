@@ -380,6 +380,7 @@ pub(crate) struct DomTreeInner {
     frozen_base: Option<(NodeId, String, String)>,
     base_generation: u64,
     input: InputState,
+    open_popovers: HashSet<NodeId>,
     text_controls: HashMap<NodeId, TextControlState>,
     text_generation: u64,
     checked_controls: HashMap<NodeId, CheckedState>,
@@ -426,6 +427,7 @@ impl DomTree {
                 frozen_base: None,
                 base_generation: 0,
                 input: InputState::default(),
+                open_popovers: HashSet::new(),
                 text_controls: HashMap::new(),
                 text_generation: 0,
                 checked_controls: HashMap::new(),
@@ -1561,6 +1563,24 @@ impl DomTree {
 
     /// Constant-time shadow-including connectivity. The bit is propagated over
     /// ordinary children and hosted shadow roots whenever a subtree moves.
+    /// Popover visibility is a DOM fact, shared by selectors and rendering.
+    pub fn popover_open(&self, node: NodeId) -> bool {
+        self.inner.borrow().open_popovers.contains(&node)
+    }
+
+    pub fn set_popover_open(&self, node: NodeId, open: bool) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if open {
+            let valid = inner.nodes.get(node.index()).and_then(|entry| entry.as_ref())
+                .is_some_and(|node| node.connected && node.as_element()
+                    .is_some_and(|name| name.ns == ns!(html))
+                    && node.get_attribute("popover").is_some());
+            valid && inner.open_popovers.insert(node)
+        } else {
+            inner.open_popovers.remove(&node)
+        }
+    }
+
     pub fn is_connected(&self, node: NodeId) -> bool {
         self.inner
             .borrow()
@@ -1582,6 +1602,7 @@ impl DomTree {
         if is_leaf {
             if !connected {
                 inner.input.disconnect(root);
+                inner.open_popovers.remove(&root);
                 if let Some(state) = inner.text_controls.get_mut(&root) {
                     state.before_user_edit = None;
                 }
@@ -1600,6 +1621,7 @@ impl DomTree {
             }
             if !connected {
                 inner.input.disconnect(node_id);
+                inner.open_popovers.remove(&node_id);
                 if let Some(state) = inner.text_controls.get_mut(&node_id) {
                     state.before_user_edit = None;
                 }
@@ -2137,6 +2159,7 @@ impl DomTree {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
                 inner.input.disconnect(id);
+                inner.open_popovers.remove(&id);
                 inner.text_controls.remove(&id);
                 inner.checked_controls.remove(&id);
                 inner.forwarding_labels.remove(&id);

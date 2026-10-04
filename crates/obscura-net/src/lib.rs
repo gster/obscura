@@ -2,6 +2,7 @@ pub mod client;
 pub mod response_body;
 pub mod request_body;
 pub mod observation;
+pub mod timing;
 pub mod persona;
 pub mod headers;
 pub use headers::{HeaderCapture, RawHeader};
@@ -11,6 +12,7 @@ pub mod interceptor;
 pub mod blocklist;
 pub mod network_activity;
 pub mod stealth_client;
+pub mod websocket;
 
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,

@@ -1,6 +1,6 @@
 {
   "upstream_revision": "727cc46d56290995245fbe790caed52fc699452a",
-  "source": "crates/obscura-render/src/inline.rs",
+  "source": "crates/obscura-render/src/font.rs",
   "files": [
     {
       "name": "SANS_R",

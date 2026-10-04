@@ -51,6 +51,7 @@ async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session
     resp.result.unwrap_or_else(|| json!({}))
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_key_event_escapes_backslash_in_key_and_code() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -102,6 +103,7 @@ async fn dispatch_key_event_escapes_backslash_in_key_and_code() {
 }
 
 // Keep the control-character case that used to be dropped by generated JS.
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -154,6 +156,7 @@ async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
 }
 
 // #577: Playwright's fill() focuses the field and sends one Input.insertText.
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn insert_text_types_into_the_focused_field() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -199,6 +202,7 @@ async fn insert_text_types_into_the_focused_field() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn insert_text_uses_the_native_text_path_and_real_input_events() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -279,6 +283,7 @@ async fn insert_text_uses_the_native_text_path_and_real_input_events() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn insert_text_applies_maxlength_after_reentry_and_emits_actual_text() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -384,6 +389,7 @@ async fn insert_text_applies_maxlength_after_reentry_and_emits_actual_text() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn insert_text_normalizes_multiline_payloads_before_maxlength() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -444,6 +450,7 @@ async fn insert_text_normalizes_multiline_payloads_before_maxlength() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn key_text_maxlength_uses_actual_prefix_and_actual_caret() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -504,6 +511,7 @@ async fn key_text_maxlength_uses_actual_prefix_and_actual_caret() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn enter_obeys_textarea_maxlength_without_a_protocol_error() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -563,6 +571,7 @@ async fn enter_obeys_textarea_maxlength_without_a_protocol_error() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn insert_text_re_resolves_focus_after_beforeinput() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -631,6 +640,7 @@ async fn insert_text_re_resolves_focus_after_beforeinput() {
     );
 }
 
+#[cfg(feature = "render")]
 #[tokio::test(flavor = "current_thread")]
 async fn insert_text_processes_same_document_navigation_and_emits_frame_event() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -779,5 +789,91 @@ async fn keyboard_and_text_explicitly_require_the_render_input_runtime() {
             .expect("no-render keyboard/text input must fail explicitly");
         assert_eq!(error.code, -32000, "{method}: {error:?}");
         assert!(error.message.contains("UNSUPPORTED"), "{method}: {error:?}");
+    }
+}
+
+// A rejected native operation must not partially edit or dispatch events. The
+// parameter/limit controls distinguish the real validation order from a blanket
+// unsupported reply for every Input command.
+#[cfg(not(feature = "render"))]
+#[tokio::test(flavor = "current_thread")]
+async fn no_render_keyboard_and_text_rejection_preserves_document_and_validation() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new(obscura_net::EffectivePersona::builtin(
+        obscura_net::StealthProfile::WindowsChrome145,
+    ));
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url.clone(), "waitUntil": "load"}), session_id).await;
+    let setup = cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression": r#"(() => {
+            const field = document.getElementById('i');
+            const area = document.getElementById('a');
+            field.value = 'A😀B'; area.value = 'line\nkeep';
+            field.focus(); field.setSelectionRange(1, 3);
+            globalThis.__rejectedInputEvents = [];
+            for (const type of ['keydown', 'keypress', 'keyup', 'beforeinput', 'input']) {
+                document.addEventListener(type, event => __rejectedInputEvents.push([
+                    event.type, event.key, event.data, event.isTrusted
+                ]));
+            }
+            return true;
+        })()"#,
+        "returnByValue": true,
+    }), session_id).await;
+    assert_eq!(setup["result"]["value"], json!(true));
+    let snapshot = r#"JSON.stringify([
+        document.getElementById('i').value, document.getElementById('a').value,
+        document.getElementById('i').selectionStart, document.getElementById('i').selectionEnd,
+        document.activeElement === document.getElementById('i'),
+        __keys, __rejectedInputEvents, location.href
+    ])"#;
+    let initial = cdp(&mut ctx, 3, "Runtime.evaluate", json!({
+        "expression": snapshot, "returnByValue": true,
+    }), session_id).await;
+    let initial: Value = serde_json::from_str(initial["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(initial.as_array().expect("initial document snapshot must be an array").len(), 8);
+    assert_eq!(initial[0], json!("A😀B"));
+    assert_eq!(initial[1], json!("line\nkeep"));
+    assert_eq!(initial[2], json!(1), "selection must start before the UTF-16 surrogate pair");
+    assert_eq!(initial[3], json!(3), "selection must end after the UTF-16 surrogate pair");
+    assert_eq!(initial[4], json!(true), "the input must actually hold focus");
+    assert_eq!(initial[7], json!(url), "the snapshot must belong to the navigated document");
+    assert_eq!(initial[5], json!([]));
+    assert_eq!(initial[6], json!([]));
+
+    let oversized = "x".repeat(4097);
+    for (index, (method, params, code, message)) in [
+        ("Input.insertText", json!({"text": "中🚀\n'\\"}), -32000, "INPUT_UNSUPPORTED_WITHOUT_RENDER"),
+        ("Input.insertText", json!({"text": ""}), -32000, "INPUT_UNSUPPORTED_WITHOUT_RENDER"),
+        ("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "\\", "code": "Backslash", "text": "x"}), -32000, "INPUT_UNSUPPORTED_WITHOUT_RENDER"),
+        ("Input.dispatchKeyEvent", json!({"type": "rawKeyDown", "key": "Backspace", "commands": ["deleteBackward"]}), -32000, "INPUT_UNSUPPORTED_WITHOUT_RENDER"),
+        ("Input.dispatchKeyEvent", json!({"type": "char", "text": "\n"}), -32000, "INPUT_UNSUPPORTED_WITHOUT_RENDER"),
+        ("Input.dispatchKeyEvent", json!({"type": "keyUp", "key": "x", "code": "KeyX"}), -32000, "INPUT_UNSUPPORTED_WITHOUT_RENDER"),
+        ("Input.insertText", json!({"text": 3}), -32602, "Invalid insertText text: expected a string"),
+        ("Input.insertText", json!({"text": oversized.clone()}), -32000, "INPUT_VALUE_LIMIT:NOT_SENT"),
+        ("Input.dispatchKeyEvent", json!({"type": "keyDown", "text": oversized}), -32000, "INPUT_VALUE_LIMIT"),
+        ("Input.dispatchKeyEvent", json!({"type": "keyDown", "commands": ["unsupported-command"]}), -32000, "INPUT_KEY_COMMAND_UNSUPPORTED"),
+    ].into_iter().enumerate() {
+        let id = 10 + index as u64 * 2;
+        let response = dispatch(&CdpRequest {
+            id,
+            method: method.to_string(),
+            params,
+            session_id: Some(session_id.to_string()),
+        }, &mut ctx).await;
+        assert_eq!(response.id, id);
+        assert_eq!(response.session_id.as_deref(), Some(session_id));
+        assert!(response.result.is_none(), "{method}: {response:?}");
+        let error = response.error.expect("unsupported or invalid input must return an error");
+        assert_eq!(error.code, code, "{method}: {error:?}");
+        assert_eq!(error.message, message, "{method}: {error:?}");
+        let observed = cdp(&mut ctx, id + 1, "Runtime.evaluate", json!({
+            "expression": snapshot, "returnByValue": true,
+        }), session_id).await;
+        let observed: Value = serde_json::from_str(observed["result"]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(observed, initial, "{method} changed the document despite rejection");
     }
 }

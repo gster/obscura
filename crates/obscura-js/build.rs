@@ -1,7 +1,10 @@
+mod build_speech_helper;
 use std::path::PathBuf;
 
 fn main() {
+    build_speech_helper::build_native_speech_helper();
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=js/speech_bootstrap.js");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(obscura_runtime_snapshot)");
     if std::env::var("TARGET").unwrap() != std::env::var("HOST").unwrap() {
@@ -25,9 +28,14 @@ fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
             extensions: vec![],
             extension_transpiler: None,
             with_runtime_cb: Some(Box::new(move |runtime| {
+                runtime.v8_isolate().set_prepare_stack_trace_callback(
+                    deno_core::error::prepare_stack_trace_callback_with_v8_display,
+                );
                 runtime
                     .execute_script("<obscura:bootstrap>", bootstrap_js.to_string())
                     .expect("bootstrap.js should not fail during snapshot creation");
+                runtime.execute_script("<obscura:speech-bootstrap>", include_str!("js/speech_bootstrap.js").to_string())
+                    .expect("speech bootstrap should not fail during snapshot creation");
             })),
         },
         None,

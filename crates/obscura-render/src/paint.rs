@@ -88,17 +88,20 @@ pub enum ImageRequestProfile {
     CorsInclude,
 }
 
-fn image_request_profile(tree: &DomTree, id: obscura_dom::tree::NodeId) -> ImageRequestProfile {
-    match tree
-        .get_node(id)
-        .and_then(|node| node.get_attribute("crossorigin").map(str::to_owned))
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("use-credentials") => ImageRequestProfile::CorsInclude,
-        Some(_) => ImageRequestProfile::CorsSameOrigin,
-        None => ImageRequestProfile::NoCorsInclude,
+impl ImageRequestProfile {
+    // Shared with the JS image owner path. Preserve the existing parser's
+    // whitespace behavior; changing CORS keyword semantics is a separate unit.
+    pub fn from_crossorigin_attribute(value: Option<&str>) -> Self {
+        match value {
+            Some(value) if value.trim().eq_ignore_ascii_case("use-credentials") => Self::CorsInclude,
+            Some(_) => Self::CorsSameOrigin,
+            None => Self::NoCorsInclude,
+        }
     }
+}
+fn image_request_profile(tree: &DomTree, id: obscura_dom::tree::NodeId) -> ImageRequestProfile {
+    tree.with_node(id, |node| ImageRequestProfile::from_crossorigin_attribute(node.get_attribute("crossorigin")))
+        .unwrap_or(ImageRequestProfile::NoCorsInclude)
 }
 
 fn image_resource_key(url: &str, profile: ImageRequestProfile) -> String {
@@ -430,6 +433,33 @@ impl RenderResourceCache {
                 true,
                 dimensions.map(|(_, width, height)| (width / density, height / density)),
             )),
+        }
+    }
+
+    /// Select the real responsive request without decoding its resource body.
+    pub fn image_element_request(
+        &self, tree: &DomTree, id: obscura_dom::tree::NodeId,
+        viewport: (f32, f32), base_url: Option<&str>,
+    ) -> Option<(String, f32, ImageRequestProfile)> {
+        let (src, density) = resolve_img_url(tree, id, viewport)?;
+        let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
+        Some((resolved_url, density, image_request_profile(tree, id)))
+    }
+
+    /// Cache-only bytes: None is unknown/expired, Some(None) a retained failure.
+    /// The caller owns intrinsic metadata and can compare real network Arc
+    /// identity before sniffing again. A selected data body is decoded once.
+    pub fn cached_image_content_bytes(
+        &self, selected_url: &str, profile: ImageRequestProfile,
+    ) -> Option<Option<Arc<[u8]>>> {
+        if selected_url.starts_with("data:") {
+            let mut scratch = RenderResourceCache::with_loader_and_limits(|_: &str| None, 0, 0);
+            return Some(fetch_bytes(selected_url, None, &mut scratch));
+        }
+        match self.entries.get(&image_resource_key(selected_url, profile)) {
+            Some(CachedResource::Bytes(bytes)) => Some(Some(Arc::clone(bytes))),
+            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => Some(None),
+            _ => None,
         }
     }
 
@@ -1822,6 +1852,34 @@ impl PreparedRender {
         Some((
             (rect.width - style.border.left - style.border.right).max(0.0),
             (rect.height - style.border.top - style.border.bottom).max(0.0),
+        ))
+    }
+
+    /// Physical content-box dimensions from the final layout. Neither
+    /// padding-box client metrics nor transformed visual bounds are suitable
+    /// for HTMLImageElement width/height. Percentage padding has already been
+    /// resolved by sync_resolved_percentage_padding in the layout pipeline.
+    pub fn image_content_size(&self, tree: &DomTree, id: obscura_dom::tree::NodeId) -> Option<(f32, f32)> {
+        // A zero box in a display:none subtree is not a live layout object.
+        // Do not confuse it with a genuinely laid out zero-sized image.
+        let mut ancestor = tree.with_node(id, |node| node.parent).flatten();
+        for _ in 0..tree.len() {
+            let Some(parent) = ancestor else { break; };
+            if self.layout.styles.get(&parent).is_some_and(|style| style.display == crate::Display::None) {
+                return None;
+            }
+            ancestor = tree.with_node(parent, |node| node.parent).flatten();
+        }
+        let rect = self.layout.rects.get(&id)?;
+        let style = self.layout.styles.get(&id)?;
+        if style.display == crate::Display::None || style.display_contents {
+            return None;
+        }
+        Some((
+            (rect.width - style.border.left - style.border.right
+                - style.padding.left - style.padding.right).max(0.0),
+            (rect.height - style.border.top - style.border.bottom
+                - style.padding.top - style.padding.bottom).max(0.0),
         ))
     }
 
@@ -4876,7 +4934,8 @@ fn paint_laid_dom_scrolled(
                 if !painted && name.local.as_ref() == "img" {
                     match node.get_attribute("alt") {
                         Some(alt) if !alt.trim().is_empty() => {
-                            draw_text(
+                            draw_prepared_text(
+                    &mut laid.text_engine, style,
                                 &mut pixmap,
                                 &alt,
                                 rect.x,
@@ -5006,10 +5065,11 @@ fn paint_laid_dom_scrolled(
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let mw = measure_text(&marker, fsize, false, style.font_family.as_deref());
+                let mw = measure_prepared_text(&mut laid.text_engine, style, &marker, fsize, false, 0.0);
                 let mx = rect.x + style.padding.left - mw - 6.0;
                 let my = rect.y + style.border.top + style.padding.top;
-                draw_text(
+                draw_prepared_text(
+                    &mut laid.text_engine, style,
                     &mut pixmap,
                     &marker,
                     mx,
@@ -5048,7 +5108,8 @@ fn paint_laid_dom_scrolled(
             let fsize = style.font_size.unwrap_or(16.0);
             let is_bold = crate::style::used_font_weight(style) >= 600;
             for (word_rect, word) in runs {
-                draw_text(
+                draw_prepared_text(
+                    &mut laid.text_engine, style,
                     &mut pixmap,
                     word,
                     word_rect.x + ox,
@@ -5071,10 +5132,11 @@ fn paint_laid_dom_scrolled(
         if name.local.as_ref() == "select" {
             if let Some(label) = selected_option_label(tree, nid) {
                 let fsize = style.font_size.unwrap_or(13.333_333);
-                let line_height = crate::inline::used_line_height(style);
+                let line_height = if laid.text_engine.has_prepared_native_face(style) { laid.text_engine.selected_line_height(style) } else { crate::inline::used_line_height(style) };
                 let text_x = rect.x + style.border.left + style.padding.left;
                 let text_y = rect.y + (rect.height - line_height) / 2.0;
-                draw_text(
+                draw_prepared_text(
+                    &mut laid.text_engine, style,
                     &mut pixmap,
                     &label,
                     text_x,
@@ -7264,7 +7326,7 @@ fn clip_text_fill_color(style: &crate::LayoutStyle) -> Option<[u8; 4]> {
 fn paint_text_node(
     tree: &DomTree,
     nid: obscura_dom::tree::NodeId,
-    laid: &crate::DomLayout,
+    laid: &mut crate::DomLayout,
     scroll_state: &ScrollPaintState,
     pixmap: &mut Pixmap,
     raster_scale: f32,
@@ -7298,7 +7360,8 @@ fn paint_text_node(
     });
 
     for (rect, word) in runs {
-        draw_text(
+        draw_prepared_text(
+                    &mut laid.text_engine, style,
             pixmap,
             word,
             rect.x + ox,
@@ -7317,53 +7380,35 @@ fn paint_text_node(
 }
 
 fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
-    let Some(family) = family else {
-        return FONT_BYTES;
-    };
-    for token in family.split(',') {
-        let token = token
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_ascii_lowercase();
-        if token == "system-ui" || token == "ui-sans-serif" {
-            return SYSTEM_FONT_BYTES;
-        }
-        if token == "monospace"
-            || token.contains("mono")
-            || token.contains("courier")
-            || token.contains("consol")
-            || token == "menlo"
-            || token == "monaco"
-            || token == "code"
-        {
-            return MONO_FONT_BYTES;
-        }
-        if token == "serif"
-            || token == "georgia"
-            || token.contains("times")
-            || token == "cambria"
-            || token.contains("garamond")
-            || token.contains("liberation serif")
-            || token == "roman"
-        {
-            return SERIF_FONT_BYTES;
-        }
-        if token == "sans-serif"
-            || token.contains("sans")
-            || token == "arial"
-            || token == "helvetica"
-            || token == "helvetica neue"
-            || token == "-apple-system"
-            || token == "roboto"
-            || token == "segoe ui"
-            || token == "inter"
-            || token == "verdana"
-            || token == "tahoma"
-        {
-            return FONT_BYTES;
-        }
+    match crate::font::resolve_font_family(family) {
+        crate::font::MONO_FAMILY => MONO_FONT_BYTES,
+        crate::font::SERIF_FAMILY => SERIF_FONT_BYTES,
+        crate::font::SYSTEM_FAMILY => SYSTEM_FONT_BYTES,
+        _ => FONT_BYTES,
     }
-    FONT_BYTES
+}
+
+pub(crate) fn measure_prepared_text(engine: &mut crate::inline::TextEngine, style: &crate::LayoutStyle,
+    text: &str, size: f32, is_bold: bool, letter_spacing: f32) -> f32 {
+    engine.measure_prepared_native_text(text, style, size, letter_spacing).unwrap_or_else(|| {
+        measure_text(text, size, is_bold, style.font_family.as_deref())
+            + text.chars().filter(|c| !c.is_control()).count() as f32 * letter_spacing
+    })
+}
+
+// Native DOM fallback consumers share the prepared shaper and physical face
+// indices with layout. Standalone/generic helpers keep their existing path.
+fn draw_prepared_text(
+    engine: &mut crate::inline::TextEngine, style: &crate::LayoutStyle,
+    pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: [u8; 4], size: f32,
+    is_bold: bool, family: Option<&str>, letter_spacing: f32,
+    clip: Option<crate::Rect>, clip_mask: Option<&tiny_skia::Mask>, raster_scale: f32,
+) {
+    if !engine.paint_prepared_native_text(text, style, (x, y), color, size, letter_spacing,
+        clip, pixmap, clip_mask, raster_scale) {
+        draw_text(pixmap,text,x,y,color,size,is_bold,family,
+            letter_spacing,clip,clip_mask,raster_scale);
+    }
 }
 
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
@@ -7628,6 +7673,7 @@ fn collect_web_fonts(
         }
         let css = tree.text_content(nid);
         for face in font_face_blocks(&css) {
+            let Some(family) = font_face_family(face) else { continue; };
             if !font_face_covers_ascii(face) {
                 continue;
             }
@@ -7641,7 +7687,7 @@ fn collect_web_fonts(
             }
             rules.push(FontRule {
                 sources,
-                family: font_face_family(face),
+                family: Some(family),
                 weight: font_face_weight(face),
                 italic: font_face_italic(face),
             });
@@ -7856,14 +7902,13 @@ fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn font_face_family(face: &str) -> Option<String> {
-    font_face_declaration(face, "font-family")
-        .map(|family| {
-            family
-                .trim()
-                .trim_matches(|ch| matches!(ch, '"' | '\''))
-                .to_string()
-        })
-        .filter(|family| !family.is_empty())
+    use crate::style::{parse_font_family_list, CssFontFamily};
+    let mut families = parse_font_family_list(font_face_declaration(face, "font-family")?)?;
+    if families.len() != 1 { return None; }
+    match families.pop()? {
+        CssFontFamily::Named(name) => Some(name),
+        CssFontFamily::Generic(_) => None,
+    }
 }
 
 fn font_face_weight(face: &str) -> Option<(u16, u16)> {
@@ -17842,4 +17887,140 @@ mod tests {
         assert!(at_end.layout.styles[&overlay].effectively_invisible);
         assert!(!at_end.has_active_css_animations());
     }
+}
+
+#[cfg(test)]
+mod ordered_family_paint_regressions {
+    use super::*;
+
+    #[test]
+    fn legacy_paint_uses_the_same_truthful_bundled_fallback_order() {
+        for generic in ["serif", "sans-serif", "monospace", "system-ui"] {
+            for name in ["MissingMonoFamilyQ12", "MissingSansFamilyQ12", "MissingTimesFamilyQ12"] {
+                let stack = format!("\"{name}\", {generic}");
+                assert!(fallback_font_bytes(Some(&stack)) == fallback_font_bytes(Some(generic)), "wrong fallback bytes: {stack}");
+                assert_eq!(measure_text("iiiWWW", 32.0, false, Some(&stack)), measure_text("iiiWWW", 32.0, false, Some(generic)));
+            }
+        }
+        assert!(fallback_font_bytes(Some("'serif', monospace")) == MONO_FONT_BYTES, "wrong fallback bytes: 'serif', monospace");
+        assert!(fallback_font_bytes(Some("'Absent, serif', monospace")) == MONO_FONT_BYTES, "wrong fallback bytes: 'Absent, serif', monospace");
+        assert!(fallback_font_bytes(Some("'Liberation Serif', monospace")) == SERIF_FONT_BYTES, "wrong fallback bytes: 'Liberation Serif', monospace");
+    }
+}
+
+#[cfg(test)]
+mod font_face_family_declaration_regressions {
+    use super::*;
+    use crate::font::{create_font_system, resolve_loaded_font, WebFont, MONO_R};
+    use std::sync::Arc;
+
+    #[test]
+    fn css_font_face_declarations_decode_into_the_exact_real_resource() {
+        for (declaration, decoded, usage) in [
+            (r#"font-family: Fixture  Spaced; src: url(real.ttf)"#, "Fixture Spaced", r#""Fixture Spaced", serif"#),
+            (r#"font-family: "Fixture\20 Face"; src: url(real.ttf)"#, "Fixture Face", r#""Fixture Face", serif"#),
+            (r#"font-family: Fixture\20 Face; src: url(real.ttf)"#, "Fixture Face", r#""Fixture Face", serif"#),
+            (r#"font-family: "Fixture\"Face"; src: url(real.ttf)"#, "Fixture\"Face", r#""Fixture\"Face", serif"#),
+            (r#"font-family: "Fixture, Face"; src: url(real.ttf)"#, "Fixture, Face", r#""Fixture, Face", serif"#),
+            (r#"font-family: "serif"; src: url(real.ttf)"#, "serif", r#""serif", serif"#),
+            (r#"font-family: ""; src: url(real.ttf)"#, "", r#""", serif"#),
+        ] {
+            // Exercise the actual declaration parser, rather than supplying a
+            // pre-decoded family alias directly to the registry.
+            let family = font_face_family(declaration).expect(declaration);
+            assert_eq!(family, decoded);
+            let resource = WebFont { data: Arc::new(MONO_R.to_vec()), family: Some(family), weight: Some((400,400)), italic: Some(false) };
+            let (_, loaded) = create_font_system(&[resource], false);
+            let expected = loaded[&decoded.to_ascii_lowercase()].faces[0].font_id;
+            let selected = resolve_loaded_font(Some(usage), 400, false, &loaded);
+            assert!(expected.is_some(), "fixture must load real bytes");
+            assert_eq!(selected.font_id, expected, "{declaration}");
+        }
+    }
+
+    #[test]
+    fn invalid_css_font_face_family_rules_do_not_load_an_unnamed_resource() {
+        let tree = obscura_dom::parse_html(r#"<style>
+            @font-face {font-family:serif;src:url(invalid.ttf)}
+            @font-face {font-family:A,B;src:url(invalid.ttf)}
+            @font-face {src:url(invalid.ttf)}
+        </style>"#);
+        let mut resources = RenderResourceCache::with_loader(|_: &str| {
+            panic!("invalid font-family must be rejected before resource loading")
+        });
+        assert!(collect_web_fonts(&tree, Some("https://font.test/"), &mut resources, &[]).is_empty());
+    }
+
+    #[test]
+    fn font_face_family_requires_a_single_named_family() {
+        for declaration in ["font-family: serif", "font-family: monospace", "font-family: A, B",
+            "font-family: 'A', serif", "font-family: initial", "font-family: A)"] {
+            assert!(font_face_family(declaration).is_none(), "{declaration}");
+        }
+        assert_eq!(font_face_family("font-family: ''"), Some(String::new()));
+        assert_eq!(font_face_family("font-family: 'serif'"), Some("serif".into()));
+    }
+}
+
+#[cfg(test)]
+mod image_idl_content_box_tests {
+    use super::*;
+    #[test]
+    fn image_idl_content_box_excludes_resolved_percent_padding_border_and_transform() {
+        let tree = obscura_dom::parse_html(r#"<body style='margin:0'><div style='width:200px'>
+          <img id='i' style='display:block;box-sizing:border-box;width:100px;height:80px;
+            padding:5% 10%;border:2px solid;transform:scale(3)'>
+          <img id='zero' style='display:block;width:0;height:0;padding:0;border:0'>
+          <div style='display:none'><img id='hidden' width='43'></div></div>"#);
+        let mut resources = RenderResourceCache::with_loader(|_: &str| None);
+        let prepared = prepare_dom(&tree, (400.0, 300.0), None, &mut resources).unwrap();
+        let id = tree.get_element_by_id("i").unwrap();
+        assert_eq!(prepared.image_content_size(&tree, id), Some((56.0, 56.0)));
+        assert_eq!(prepared.client_size(id), Some((96.0, 76.0)));
+        assert_eq!(prepared.image_content_size(&tree, tree.get_element_by_id("zero").unwrap()), Some((0.0, 0.0)));
+        assert_eq!(prepared.image_content_size(&tree, tree.get_element_by_id("hidden").unwrap()), None);
+    }
+    #[test]
+    fn image_loaded_fixed_axes_do_not_gain_intrinsic_or_authored_ratio_height() {
+        let tree = obscura_dom::parse_html(r#"<body style='margin:0'><div style='width:200px'>
+          <img id='loaded' src='loaded.svg' style='display:block;width:80px;height:30px;padding:4px 7px;border:3px solid'>
+          <img id='missing' src='missing.svg' style='display:block;width:80px;height:30px;padding:4px 7px;border:3px solid'>
+          <img id='border' src='loaded.svg' style='display:block;box-sizing:border-box;width:100px;height:40px;padding:4px 7px;border:3px solid'>
+          <img id='authored' src='loaded.svg' style='display:block;width:80px;height:10px;aspect-ratio:4'>
+          <img id='constrained' src='loaded.svg' style='display:block;width:80px;height:30px;min-width:120px;max-height:20px'>
+          <img id='minimum' src='loaded.svg' style='display:block;width:80px;height:30px;min-height:45px;max-height:20px'>
+          <img id='zero' src='loaded.svg' style='display:block;width:80px;height:0'>
+        </div>"#);
+        let mut resources = RenderResourceCache::with_loader(|url: &str| {
+            url.ends_with("/loaded.svg").then(|| b"<svg xmlns='http://www.w3.org/2000/svg' width='24' height='12'/>".to_vec())
+        });
+        let prepared = prepare_dom(&tree, (400.0,300.0), Some("https://image-fixture.invalid/"), &mut resources).unwrap();
+        for (name,expected) in [("loaded",(80.0,30.0)),("missing",(80.0,30.0)),
+            ("border",(80.0,26.0)),("authored",(80.0,10.0)),("constrained",(120.0,20.0)),
+            ("minimum",(80.0,45.0)),("zero",(80.0,0.0))] {
+            let node=tree.get_element_by_id(name).unwrap();
+            assert_eq!(prepared.image_content_size(&tree,node),Some(expected),"{name}");
+        }
+        let loaded=tree.get_element_by_id("loaded").unwrap();
+        assert_eq!(prepared.client_size(loaded),Some((94.0,38.0)));
+        let rect=prepared.layout.rects.get(&loaded).unwrap();
+        assert_eq!((rect.width,rect.height),(100.0,44.0));
+    }
+    #[test]
+    fn image_auto_axes_keep_intrinsic_and_authored_ratio_transfer() {
+        let tree = obscura_dom::parse_html(r#"<body style='margin:0'><div style='width:200px'>
+          <img id='fixed-width' src='loaded.svg' style='display:block;width:80px;height:auto'>
+          <img id='percentage-width' src='loaded.svg' style='display:block;width:50%;height:auto'>
+          <img id='natural' src='loaded.svg' style='display:block;width:auto;height:auto'>
+          <img id='authored-auto' src='loaded.svg' style='display:block;width:80px;height:auto;aspect-ratio:4'>
+        </div>"#);
+        let mut resources = RenderResourceCache::with_loader(|_: &str|
+            Some(b"<svg xmlns='http://www.w3.org/2000/svg' width='24' height='12'/>".to_vec()));
+        let prepared = prepare_dom(&tree,(400.0,300.0),Some("https://image-fixture.invalid/"),&mut resources).unwrap();
+        for (name,expected) in [("fixed-width",(80.0,40.0)),("percentage-width",(100.0,50.0)),
+            ("natural",(24.0,12.0)),("authored-auto",(80.0,20.0))] {
+            assert_eq!(prepared.image_content_size(&tree,tree.get_element_by_id(name).unwrap()),Some(expected),"{name}");
+        }
+    }
+
 }

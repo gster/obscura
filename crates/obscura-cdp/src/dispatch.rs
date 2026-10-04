@@ -107,6 +107,8 @@ pub(crate) struct CdpNetworkIdleCandidate {
 }
 
 pub struct CdpContext {
+    pub(crate) input_admission: Option<crate::input_admission::Admission>,
+    pub(crate) admitted_keyboard: Option<crate::input_admission::KeyboardAdmission>,
     pub pages: Vec<Page>,
     pub(crate) navigating_page_id: Option<String>,
     /// The Page is temporarily moved into the navigation task, but response
@@ -356,6 +358,8 @@ impl CdpContext {
             },
         );
         CdpContext {
+            input_admission: None,
+            admitted_keyboard: None,
             pages: Vec::new(),
             navigating_page_id: None,
             navigating_response_bodies: None,
@@ -1311,14 +1315,17 @@ fn limited_initializer(domain: &str, method: &str, params: &Value) -> Result<Val
 }
 
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
-    // headless_chrome (and older Puppeteer) wrap every CDP call inside
-    // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
-    // per-connection V8 lock — the recursive dispatch will acquire it for the
-    // inner call, and tokio Mutex is not reentrant.
-    if req.method == "Target.sendMessageToTarget" {
-        return dispatch_send_message_to_target(req, ctx).await;
-    }
+    let plan = crate::canonical_request::resolve(req);
+    let response = match plan.effective {
+        Ok(effective) => dispatch_effective(&effective, ctx).await,
+        Err(error) => error,
+    };
+    let (response, events) = crate::canonical_request::wrap_response(response, plan.wrappers);
+    ctx.pending_events.extend(events);
+    response
+}
 
+async fn dispatch_effective(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // Issue #430: keep this connection's V8 work serialized on its own thread.
     //
     // Every CDP handler below may call into a per-Page `JsRuntime` (each owning
@@ -1773,72 +1780,6 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
     ctx.pending_events.extend(events);
 }
 
-async fn dispatch_send_message_to_target(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
-    let session_id = req
-        .params
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let message = match req.params.get("message").and_then(|v| v.as_str()) {
-        Some(m) => m,
-        None => {
-            return CdpResponse::error(
-                req.id,
-                -32602,
-                "sendMessageToTarget requires a message string".into(),
-                req.session_id.clone(),
-            );
-        }
-    };
-
-    let inner: CdpRequest = match serde_json::from_str(message) {
-        Ok(r) => r,
-        Err(e) => {
-            return CdpResponse::error(
-                req.id,
-                -32700,
-                format!("sendMessageToTarget message is not a valid CDP request: {e}"),
-                req.session_id.clone(),
-            );
-        }
-    };
-
-    // Override the inner session with the one supplied by the wrapper so
-    // the inner dispatch routes against the right page. Boxing the future
-    // sidesteps the async-fn recursion limit.
-    let inner_with_session = CdpRequest {
-        id: inner.id,
-        method: inner.method.clone(),
-        params: inner.params,
-        session_id: session_id.clone().or(inner.session_id),
-    };
-    let inner_response = Box::pin(dispatch(&inner_with_session, ctx)).await;
-
-    // Re-emit the inner response as the legacy event headless_chrome (and
-    // older Puppeteer) listen for instead of correlating responses by id.
-    let inner_serialized = match serde_json::to_string(&inner_response) {
-        Ok(serialized) => serialized,
-        Err(error) => {
-            return CdpResponse::error(
-                req.id,
-                -32603,
-                format!("could not serialize inner CDP response: {error}"),
-                req.session_id.clone(),
-            );
-        }
-    };
-    ctx.pending_events.push(CdpEvent {
-        method: "Target.receivedMessageFromTarget".to_string(),
-        params: json!({
-            "sessionId": session_id.clone().unwrap_or_default(),
-            "message": inner_serialized,
-            "targetId": session_id.clone().unwrap_or_default(),
-        }),
-        session_id: req.session_id.clone(),
-    });
-
-    CdpResponse::success(req.id, json!({}), req.session_id.clone())
-}
 
 #[cfg(test)]
 mod tests {

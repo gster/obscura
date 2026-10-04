@@ -770,6 +770,8 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "render")]
+        {
         let below = handle(
             "querySelector",
             &json!({ "selector": "#below" }),
@@ -789,6 +791,7 @@ mod tests {
             json!(true),
             "an offscreen target must be centered away from fixed viewport bars"
         );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

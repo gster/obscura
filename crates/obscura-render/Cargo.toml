@@ -11,7 +11,8 @@ default = []
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+text = ["dep:cosmic-text", "dep:swash"]
+paint = ["text", "dep:tiny-skia", "dep:ab_glyph", "dep:image", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
 
 [dependencies]
 taffy = { workspace = true }

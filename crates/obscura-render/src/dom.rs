@@ -23,18 +23,21 @@ use crate::{to_taffy_style, Rect};
 /// (default)" mode.
 #[cfg(feature = "paint")]
 fn text_width(
+    engine: &mut crate::inline::TextEngine,
+    style: &crate::LayoutStyle,
     text: &str,
     size: f32,
     is_bold: bool,
-    family: Option<&str>,
+    _family: Option<&str>,
     letter_spacing: f32,
 ) -> f32 {
-    crate::paint::measure_text(text, size, is_bold, family)
-        + text.chars().filter(|c| !c.is_control()).count() as f32 * letter_spacing
+    crate::paint::measure_prepared_text(engine, style, text, size, is_bold, letter_spacing)
 }
 
 #[cfg(not(feature = "paint"))]
 fn text_width(
+    _engine: &mut crate::inline::TextEngine,
+    _style: &crate::LayoutStyle,
     text: &str,
     size: f32,
     is_bold: bool,
@@ -49,6 +52,72 @@ fn text_width(
     } else {
         glyph_width
     }) + chars * letter_spacing
+}
+
+/// Preserve the legacy generic strut/control metrics; native consumers use
+/// the physical face selected and frozen for this layout pass.
+fn prepared_line_height(engine: &crate::inline::TextEngine, style: &crate::LayoutStyle) -> f32 {
+    #[cfg(feature = "paint")]
+    if engine.has_prepared_native_face(style) { return engine.selected_line_height(style); }
+    #[cfg(not(feature = "paint"))]
+    let _ = engine;
+    crate::inline::used_line_height(style)
+}
+
+/// Admit actual text/strut consumers before any cosmic shaping. This walks
+/// the rendered tree, not all CSS declarations, and never enters hidden/SVG
+/// subtrees. Sealing fixes the font graph even for missing-glyph fallback.
+fn prepare_native_text_consumers(tree: &DomTree, root: NodeId,
+    styles: &HashMap<NodeId, crate::LayoutStyle>, engine: &mut crate::inline::TextEngine) {
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        let Some(node) = tree.get_node(id) else { continue; };
+        if let obscura_dom::tree::NodeData::Text { contents } = &node.data {
+            if let Some(style) = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)) {
+                let preserves_space = matches!(style.white_space, Some(crate::WhiteSpace::Pre
+                    | crate::WhiteSpace::PreWrap | crate::WhiteSpace::PreLine | crate::WhiteSpace::BreakSpaces));
+                if !contents.trim().is_empty() || (preserves_space && !contents.is_empty()) {
+                    engine.prepare_style(style);
+                }
+            }
+            continue;
+        }
+        let Some(element) = node.as_element() else { continue; };
+        let Some(style) = styles.get(&id) else { continue; };
+        if style.display == crate::Display::None || element.local.as_ref() == "svg" { continue; }
+        let children = rendered_children(tree, id);
+        let has_inline_line = children.iter().any(|child| {
+            tree.get_node(*child).is_some_and(|node| {
+                matches!(&node.data, obscura_dom::tree::NodeData::Text { contents } if !contents.trim().is_empty())
+                    || styles.get(child).is_some_and(|child_style| child_style.display != crate::Display::None
+                        && (child_style.ignores_used_box_sizes() || child_style.is_inline_block))
+            })
+        });
+        let tag = element.local.as_ref();
+        let text_control = matches!(tag, "button" | "select" | "textarea")
+            || (tag == "input" && !matches!(node.get_attribute("type"),
+                Some(kind) if ["hidden", "checkbox", "radio", "range", "color", "image"].iter().any(|excluded| kind.eq_ignore_ascii_case(excluded))));
+        let marker = tag == "li" && matches!(style.list_style, Some(crate::ListStyle::Disc | crate::ListStyle::Circle | crate::ListStyle::Square | crate::ListStyle::Decimal));
+        let alt = tag == "img" && node.get_attribute("alt").is_some_and(|text| !text.trim().is_empty());
+        let has_generated_text = [style.before_pseudo.as_deref(), style.after_pseudo.as_deref()]
+            .into_iter().flatten().any(|pseudo| pseudo.display != crate::Display::None
+                && pseudo.before_content.as_deref().is_some_and(|text| !text.is_empty()));
+        if has_inline_line || has_generated_text || (!style.display_contents && style.ignores_used_box_sizes())
+            || tag == "br" || text_control || marker || alt {
+            engine.prepare_style(style);
+        }
+        for pseudo in [style.before_pseudo.as_deref(), style.after_pseudo.as_deref()].into_iter().flatten() {
+            if pseudo.display != crate::Display::None && pseudo.before_content.as_deref().is_some_and(|text| !text.is_empty()) {
+                engine.prepare_style(pseudo);
+            }
+        }
+        // Closed/select-list labels and text-control values are painted from
+        // the control's own style, not independent descendant CSS boxes.
+        if !matches!(tag, "input" | "textarea" | "select") {
+            pending.extend(children.into_iter().rev());
+        }
+    }
+    engine.seal_native_preparation();
 }
 
 #[derive(Default)]
@@ -499,10 +568,12 @@ pub fn retained_attribute_mutation_kind(
             | "color"
             | "height"
             | "hidden"
+            | "popover"
             | "valign"
             | "viewbox"
             | "width"
     ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
+        || (local == "dialog" && name == "open")
         || (local == "select" && name == "size")
         || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
         || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
@@ -2724,6 +2795,26 @@ fn cascade_node_style(
         if let Some(h) = node.get_attribute("hidden") {
             if !h.eq_ignore_ascii_case("until-found") {
                 style.display = crate::Display::None;
+            }
+        }
+        // HTML's dialog defaults precede author declarations. A closed dialog
+        // has no box; an author's explicit display can still override the UA.
+        if elem.ns.as_ref() == "http://www.w3.org/1999/xhtml" && elem.local.as_ref() == "dialog" {
+            crate::style::apply_inline(&mut style,
+                "position:absolute;left:0;right:0;width:fit-content;height:fit-content;                 margin:auto;border:solid;padding:1em;background-color:Canvas;color:CanvasText");
+            if node.get_attribute("open").is_none() { style.display = crate::Display::None; }
+        }
+        // HTML UA defaults. Author declarations retain their normal precedence.
+        // Closed popovers must not generate boxes, even before script runs.
+        if elem.ns.as_ref() == "http://www.w3.org/1999/xhtml" && node.get_attribute("popover").is_some() {
+            crate::style::apply_inline(&mut style,
+                "position:fixed;inset:0;width:fit-content;height:fit-content;margin:auto;                 border:solid;padding:0.25em;overflow:auto;color:CanvasText;background-color:Canvas");
+            if !tree.popover_open(id)
+                && !(elem.local.as_ref() == "dialog" && node.get_attribute("open").is_some()) {
+                style.display = crate::Display::None;
+            } else if elem.local.as_ref() == "dialog" && tree.popover_open(id)
+                && !node.get_attribute("hidden").is_some_and(|value| !value.eq_ignore_ascii_case("until-found")) {
+                style.display = crate::Display::Block;
             }
         }
         apply_presentational_hints(&node, &mut style);
@@ -5827,6 +5918,8 @@ fn layout_dom_once(
         // top-down values are known.
         propagate_border_spacing(tree, &mut styles);
 
+        prepare_native_text_consumers(tree, root_id, &styles, &mut engine);
+
         // Resolve native form-control intrinsic border-box geometry after
         // inheritance and author cascading. Text-like inputs use the HTML
         // `size` attribute (20 by default) and the control's own computed
@@ -5896,7 +5989,7 @@ fn layout_dom_once(
                     .collect::<Vec<_>>()
                     .join(" ");
                 let mut content_width = text_width(
-                    &label,
+                    &mut engine, style, &label,
                     font_size,
                     bold,
                     style.font_family.as_deref(),
@@ -5966,7 +6059,7 @@ fn layout_dom_once(
                     .iter()
                     .map(|label| {
                         text_width(
-                            label,
+                            &mut engine, style, label,
                             font_size,
                             bold,
                             style.font_family.as_deref(),
@@ -5989,7 +6082,7 @@ fn layout_dom_once(
                     .unwrap_or(1) as f32;
                 let intrinsic_width = label_width + horizontal_edges;
                 let intrinsic_height =
-                    crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
+                    prepared_line_height(&engine, style).max(1.0) * rows + vertical_edges;
                 assign_native_control_size(
                     style,
                     native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
@@ -6027,9 +6120,14 @@ fn layout_dom_once(
                     + style.padding.bottom
                     + style.border.top
                     + style.border.bottom;
-                let intrinsic_width = cols * font_size * 0.6075 + horizontal_edges;
+                #[cfg(feature = "paint")]
+                let column_width = engine.measure_prepared_native_text("0", style, font_size, 0.0)
+                    .unwrap_or(font_size * 0.6075);
+                #[cfg(not(feature = "paint"))]
+                let column_width = font_size * 0.6075;
+                let intrinsic_width = cols * column_width + horizontal_edges;
                 let intrinsic_height =
-                    crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
+                    prepared_line_height(&engine, style).max(1.0) * rows + vertical_edges;
                 assign_native_control_size(
                     style,
                     native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
@@ -6058,7 +6156,7 @@ fn layout_dom_once(
                 style.padding.left + style.padding.right + style.border.left + style.border.right;
             let vertical_edges =
                 style.padding.top + style.padding.bottom + style.border.top + style.border.bottom;
-            let default_height = crate::inline::used_line_height(style).max(1.0) + vertical_edges;
+            let default_height = prepared_line_height(&engine, style).max(1.0) + vertical_edges;
 
             let (intrinsic_width, intrinsic_height) = match input_type.as_str() {
                 "checkbox" | "radio" => (13.0, 13.0),
@@ -6072,8 +6170,13 @@ fn layout_dom_once(
                         _ => "Submit Query",
                     };
                     let label = node.get_attribute("value").unwrap_or(fallback);
+                    #[cfg(feature = "paint")]
+                    let label_width = engine.measure_prepared_native_text(label, style, font_size, 0.0)
+                        .unwrap_or(label.chars().count() as f32 * font_size * 0.55);
+                    #[cfg(not(feature = "paint"))]
+                    let label_width = label.chars().count() as f32 * font_size * 0.55;
                     (
-                        (label.chars().count() as f32 * font_size * 0.55
+                        (label_width
                             + font_size * 1.5
                             + horizontal_edges)
                             .max(20.0),
@@ -6087,8 +6190,13 @@ fn layout_dom_once(
                         .and_then(|value| value.parse::<u32>().ok())
                         .filter(|&value| value > 0)
                         .unwrap_or(20) as f32;
+                    #[cfg(feature = "paint")]
+                    let column_width = engine.measure_prepared_native_text("0", style, font_size, 0.0)
+                        .unwrap_or(font_size * 0.6);
+                    #[cfg(not(feature = "paint"))]
+                    let column_width = font_size * 0.6;
                     (
-                        size * font_size * 0.6 + font_size * 0.675 + horizontal_edges,
+                        size * column_width + font_size * 0.675 + horizontal_edges,
                         default_height,
                     )
                 }
@@ -9845,7 +9953,7 @@ fn build_text_words(
             fsize = p_style.font_size.unwrap_or(16.0);
             is_bold = crate::style::used_font_weight(p_style) >= 600;
             family = p_style.font_family.as_deref();
-            line_height = crate::inline::used_line_height(p_style);
+            line_height = prepared_line_height(engine, p_style);
             transform = p_style.text_transform.unwrap_or(crate::TextTransform::None);
             letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
         }
@@ -9873,8 +9981,10 @@ fn build_text_words(
     }
 
     display_text = transform_word_leaf_text(&display_text, transform);
+    let default_style = crate::LayoutStyle::default();
+    let parent_style = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)).unwrap_or(&default_style);
     build_word_leaves(
-        id,
+        engine, parent_style, id,
         &display_text,
         fsize,
         line_height,
@@ -9978,6 +10088,8 @@ fn transform_word_leaf_text(text: &str, transform: crate::TextTransform) -> Stri
 /// node) and `build_pseudo_content` (a `::before`/`::after` literal, which
 /// has no text node of its own — `source_id` is the host element instead).
 fn build_word_leaves(
+    engine: &mut crate::inline::TextEngine,
+    style: &crate::LayoutStyle,
     source_id: NodeId,
     text: &str,
     fsize: f32,
@@ -9991,7 +10103,7 @@ fn build_word_leaves(
     tokenize_with_spaces(text)
         .into_iter()
         .filter_map(|token| {
-            let width = text_width(&token, fsize, is_bold, family, letter_spacing);
+            let width = text_width(engine, style, &token, fsize, is_bold, family, letter_spacing);
             // A pure-whitespace token is HTML source formatting or a bare
             // inter-element space; it keeps its (small) width so adjacent
             // inline content stays visually separated, but contributes no
@@ -10038,11 +10150,12 @@ fn build_pseudo_content(
 
     let fsize = style.font_size.unwrap_or(16.0);
     let is_bold = crate::style::used_font_weight(style) >= 600;
+    let line_height = prepared_line_height(engine, style);
     build_word_leaves(
-        id,
+        engine, style, id,
         content,
         fsize,
-        crate::inline::used_line_height(style),
+        line_height,
         is_bold,
         style.font_family.as_deref(),
         style.letter_spacing.unwrap_or(0.0),
@@ -12339,7 +12452,7 @@ fn build(
     // full-width breaker after this mapped marker; keeping that control box
     // anonymous prevents its layout surrogate from leaking into CSSOM/paint.
     if _name.local.as_ref() == "br" {
-        let height = crate::inline::used_line_height(style).max(0.0);
+        let height = prepared_line_height(engine, style).max(0.0);
         taffy_style.size.width = taffy::style::Dimension::length(0.0);
         taffy_style.size.height = taffy::style::Dimension::length(height);
         taffy_style.flex_grow = 0.0;
@@ -12571,7 +12684,19 @@ fn build(
                         (style.min_height, style.max_height),
                         (crate::Dimension::Px(_), _) | (_, crate::Dimension::Px(_))
                     ));
-            if measured_axis_constraint {
+            // Blink ComputeReplacedSizeInternal returns independently resolved
+            // and clamped axes when both are definite. Taffy's measured-leaf
+            // final pass instead floors height by border-box width / ratio.
+            // Do not let that floor override two authored fixed axes. Keep the
+            // ratio for auto/percentage/expression sizes whose definiteness can
+            // depend on the containing block; the intrinsic measurement style
+            // itself remains unchanged in every case.
+            let fixed_axes = matches!((style.width, style.height),
+                (crate::Dimension::Px(width), crate::Dimension::Px(height))
+                    if width.is_finite() && height.is_finite())
+                && style.size_expressions[0].is_none()
+                && style.size_expressions[1].is_none();
+            if measured_axis_constraint || fixed_axes {
                 taffy_style.aspect_ratio = None;
             }
             let context = engine.register_replaced_intrinsic(intrinsic, style);
@@ -13272,7 +13397,7 @@ fn build_mixed_block(
                     continue;
                 }
                 let wrapper = taffy_tree
-                    .new_with_children(run_wrapper_style(style, has_text_strut), &atoms)
+                    .new_with_children(run_wrapper_style(style, has_text_strut, engine), &atoms)
                     .ok()?;
                 child_ids.push(wrapper);
             }
@@ -13281,13 +13406,13 @@ fn build_mixed_block(
     // Pseudo content that found no adjacent run to join.
     if before_pending {
         let wrapper = taffy_tree
-            .new_with_children(run_wrapper_style(style, true), &before_leaves)
+            .new_with_children(run_wrapper_style(style, true, engine), &before_leaves)
             .ok()?;
         child_ids.insert(0, wrapper);
     }
     if after_pending {
         let wrapper = taffy_tree
-            .new_with_children(run_wrapper_style(style, true), &after_leaves)
+            .new_with_children(run_wrapper_style(style, true, engine), &after_leaves)
             .ok()?;
         child_ids.push(wrapper);
     }
@@ -13532,14 +13657,14 @@ fn run_leaf_style() -> taffy::Style {
 /// context. The parent's `text-align` moves the run's line content via
 /// justify-content, exactly as the old whole-container
 /// promotion did, but scoped to the run so sibling blocks stay full width.
-fn run_wrapper_style(parent: &crate::LayoutStyle, has_text_strut: bool) -> taffy::Style {
+fn run_wrapper_style(parent: &crate::LayoutStyle, has_text_strut: bool, engine: &crate::inline::TextEngine) -> taffy::Style {
     let justify = match parent.text_align {
         Some(taffy::AlignItems::FLEX_END) => Some(taffy::JustifyContent::FLEX_END),
         Some(taffy::AlignItems::CENTER) => Some(taffy::JustifyContent::CENTER),
         _ => None,
     };
     let line_height = if has_text_strut {
-        crate::inline::used_line_height(parent).max(0.0)
+        prepared_line_height(engine, parent).max(0.0)
     } else {
         0.0
     };
@@ -20724,5 +20849,63 @@ mod tests {
         let style = &laid.styles[&tree.get_element_by_id("plain").unwrap()];
         assert_eq!(style.display, crate::Display::Inline);
         assert!(style.is_inline_block);
+    }
+}
+
+#[cfg(test)]
+mod popover_tests {
+    use super::*;
+    use obscura_dom::parse_html;
+
+
+    #[test]
+    fn dialog_ua_cascade_hides_closed_boxes_without_overriding_author_display() {
+        let tree = parse_html(r#"<!doctype html><style>
+          body { margin:0 } dialog { width:80px; height:40px; padding:0; border:0 }
+          #override { display:block }
+        </style><dialog id="closed">Closed</dialog><dialog id="open" open>Open</dialog>
+        <dialog id="override">Override</dialog><dialog id="hidden" open hidden>Hidden</dialog><div id="next">Next</div>"#);
+        let laid = layout_dom(&tree, (900.0, 1000.0));
+        for name in ["closed", "hidden"] {
+            let id = tree.get_element_by_id(name).unwrap();
+            assert_eq!(laid.styles[&id].display, crate::Display::None);
+            assert!(!laid.rects.contains_key(&id) || laid.rects[&id].width == 0.0);
+        }
+        for name in ["open", "override"] {
+            let id = tree.get_element_by_id(name).unwrap();
+            assert_eq!(laid.styles[&id].display, crate::Display::Block);
+            assert_eq!(laid.styles[&id].position, Some(crate::Position::Absolute));
+            assert_eq!(laid.rects[&id].width, 80.0);
+            assert_eq!(laid.rects[&id].height, 40.0);
+        }
+        assert_eq!(laid.rects[&tree.get_element_by_id("next").unwrap()].y, 0.0);
+    }
+    #[test]
+    fn popover_ua_cascade_hides_closed_boxes_and_preserves_author_precedence() {
+        let tree = parse_html(r#"<!doctype html><style>
+            #override { display:block; width:50px; height:20px; padding:0; border:0 }
+            :popover-open { width:80px; height:40px; padding:0; border:0 }
+            body { margin:0 }
+        </style><div id="closed" popover="manual">Menu</div>
+        <div id="override" popover="manual">Override</div>
+        <dialog id="dialog" popover="manual" open>Dialog</dialog><dialog id="hidden-dialog" popover="manual" open hidden>Hidden</dialog><div id="next">Next</div>"#);
+        let closed = tree.get_element_by_id("closed").unwrap();
+        let override_node = tree.get_element_by_id("override").unwrap();
+        let dialog = tree.get_element_by_id("dialog").unwrap();
+        let next = tree.get_element_by_id("next").unwrap();
+        let hidden_dialog = tree.get_element_by_id("hidden-dialog").unwrap();
+        let laid = layout_dom(&tree, (900.0, 1000.0));
+        assert_eq!(laid.styles[&closed].display, crate::Display::None);
+        assert!(!laid.rects.contains_key(&closed) || laid.rects[&closed].width == 0.0);
+        assert_eq!(laid.styles[&override_node].display, crate::Display::Block);
+        assert_eq!(laid.styles[&dialog].display, crate::Display::Block);
+        assert_eq!(laid.styles[&hidden_dialog].display, crate::Display::None);
+        assert_eq!(laid.rects[&next].y, 0.0);
+        assert!(tree.set_popover_open(closed, true));
+        let laid = layout_dom(&tree, (900.0, 1000.0));
+        assert_eq!(laid.styles[&closed].display, crate::Display::Block);
+        assert_eq!(laid.rects[&closed].width, 80.0);
+        assert_eq!(laid.rects[&closed].height, 40.0);
+        assert_eq!(laid.rects[&next].y, 0.0);
     }
 }

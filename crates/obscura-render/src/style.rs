@@ -1196,8 +1196,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "font-family" => {
             let v = value.trim().to_ascii_lowercase();
-            if !v.is_empty() && v != "inherit" {
+            if matches!(v.as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+                // Preserve the existing cascade representation for CSS-wide values.
                 style.font_family = Some(v);
+            } else if let Some(families) = parse_font_family_list(&v) {
+                style.font_family = Some(serialize_font_family_list(&families));
             }
         }
         "font-optical-sizing" => {
@@ -3055,7 +3058,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "background-clip" | "-webkit-background-clip" => parse_background_clip(value).is_some(),
         "font-size" => is_font_size_token(value),
         "font-weight" => specified_font_weight(value).is_some(),
-        "font-family" => !value.trim().is_empty(),
+        "font-family" => parse_font_family_list(value).is_some(),
         "font-style" => lower == "normal" || lower == "italic" || lower.starts_with("oblique"),
         "text-align" => matches!(
             lower.as_str(),
@@ -7126,6 +7129,89 @@ pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
         .any(|unit| lower.contains(unit))
 }
 
+/// Preserve the distinction between CSS generic keywords and named families.
+/// This lives in the style core so parsing also works without the text feature.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CssFontFamily {
+    Named(String),
+    Generic(String),
+}
+
+pub(crate) fn is_generic_font_family(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(),
+        "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" | "system-ui"
+        | "ui-serif" | "ui-sans-serif" | "ui-monospace" | "ui-rounded" | "emoji"
+        | "math" | "fangsong")
+}
+
+pub(crate) fn parse_font_family_list(source: &str) -> Option<Vec<CssFontFamily>> {
+    use cssparser::{Parser, ParserInput, Token};
+    let mut input = ParserInput::new(source);
+    let mut parser = Parser::new(&mut input);
+    let mut families = Vec::new();
+    loop {
+        let first = parser.next().ok()?.clone();
+        let quoted = matches!(&first, Token::QuotedString(_));
+        let (mut name, named) = match first {
+            Token::QuotedString(value) => (value.to_string(), true),
+            Token::Ident(value) => {
+                let name = value.to_string();
+                let named = !is_generic_font_family(&name);
+                (name, named)
+            }
+            _ => return None,
+        };
+        let mut words = 1;
+        let mut comma = false;
+        while !parser.is_exhausted() {
+            match parser.next().ok()?.clone() {
+                Token::Comma => { comma = true; break; }
+                Token::Ident(value) if named && !quoted => {
+                    name.push(' ');
+                    name.push_str(&value);
+                    words += 1;
+                }
+                _ => return None,
+            }
+        }
+        if !quoted && words == 1 && matches!(name.to_ascii_lowercase().as_str(),
+            "initial" | "inherit" | "unset" | "revert" | "revert-layer" | "default") {
+            return None;
+        }
+        let vendor_generic = !quoted && words == 1 && name.eq_ignore_ascii_case("-apple-system");
+        if named && !vendor_generic { families.push(CssFontFamily::Named(name)); }
+        else { families.push(CssFontFamily::Generic(name.to_ascii_lowercase())); }
+        if parser.is_exhausted() {
+            if comma { return None; }
+            return Some(families);
+        }
+        if !comma { return None; }
+    }
+}
+
+pub(crate) fn serialize_font_family_list(families: &[CssFontFamily]) -> String {
+    let mut css = String::new();
+    for family in families {
+        if !css.is_empty() { css.push_str(", "); }
+        match family {
+            CssFontFamily::Named(name) => {
+                // A simple named identifier can be serialized without quotes;
+                // generic-looking names and punctuation must retain string kind.
+                let reserved = is_generic_font_family(name) || matches!(name.to_ascii_lowercase().as_str(),
+                    "initial" | "inherit" | "unset" | "revert" | "revert-layer" | "default" | "-apple-system");
+                let mut input = cssparser::ParserInput::new(name);
+                let mut parser = cssparser::Parser::new(&mut input);
+                let plain = !reserved && parser.expect_ident().is_ok_and(|ident| ident.as_ref() == name.as_str())
+                    && parser.is_exhausted();
+                if plain { css.push_str(name); }
+                else { let _ = cssparser::serialize_string(name, &mut css); }
+            }
+            CssFontFamily::Generic(name) => css.push_str(name),
+        }
+    }
+    css
+}
+
 /// Parse the layout-relevant portion of the CSS `font` shorthand:
 /// `[style || variant || weight || stretch]? size [/ line-height]? family`.
 ///
@@ -7165,6 +7251,17 @@ fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
         return;
     }
 
+    // Tokens are borrowed subslices of value. Preserve the original family
+    // suffix rather than joining whitespace inside quoted names or escapes.
+    let mut suffix = value;
+    for token in &tokens[..family_index] {
+        let Some(offset) = suffix.find(token) else { return; };
+        suffix = &suffix[offset + token.len()..];
+    }
+    let family_source = suffix.trim().to_ascii_lowercase();
+    let Some(families) = parse_font_family_list(&family_source) else { return; };
+    let family = serialize_font_family_list(&families);
+
     // The shorthand resets every constituent before applying supplied values.
     style.font_style_italic = Some(false);
     style.font_weight = Some("400".to_string());
@@ -7184,7 +7281,7 @@ fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
     if let Some(line_height) = line_height {
         apply_value(style, "line-height", line_height);
     }
-    style.font_family = Some(tokens[family_index..].join(" ").to_ascii_lowercase());
+    style.font_family = Some(family);
 }
 
 /// Normalize a specified CSS font weight while preserving relative keywords
@@ -10983,5 +11080,69 @@ mod tests {
     fn box_shadow_none_clears() {
         let s = compute_style("div", Some("box-shadow: none"));
         assert!(s.box_shadow.is_none());
+    }
+}
+
+#[cfg(test)]
+mod font_family_token_regressions {
+    use super::*;
+
+    #[test]
+    fn family_tokens_preserve_valid_missing_names_and_generic_syntax() {
+        for css in ["\"\", serif", "cursive, monospace", "fantasy, serif", "ui-serif, monospace",
+            "ui-rounded, monospace", "emoji, serif", "math, monospace", "fangsong, serif",
+            "inherit words, serif", "words serif, monospace", "foo default, serif",
+            "-apple-system words, serif", "\"Fixture  Spaced\", serif", "serif/**/, monospace"] {
+            let tokens = parse_font_family_list(css).expect(css);
+            assert_eq!(parse_font_family_list(&serialize_font_family_list(&tokens)), Some(tokens), "{css}");
+        }
+        for css in ["serif,", "serif words, monospace", "inherit, serif", "default, serif", "words \"x\", serif"] {
+            assert!(parse_font_family_list(css).is_none(), "{css}");
+        }
+        assert_eq!(parse_font_family_list("\"serif\", serif"), Some(vec![CssFontFamily::Named("serif".into()), CssFontFamily::Generic("serif".into())]));
+        assert_eq!(parse_font_family_list(r"s\65 rif"), Some(vec![CssFontFamily::Generic("serif".into())]));
+        assert_eq!(parse_font_family_list("\"-apple-system\""), Some(vec![CssFontFamily::Named("-apple-system".into())]));
+    }
+
+    #[test]
+    fn invalid_shorthand_family_does_not_partially_reset_prior_style() {
+        let mut style = compute_style("div", Some("font:italic 700 18px/27px serif"));
+        let before = (style.font_size, style.font_weight.clone(), style.font_style_italic,
+            style.line_height, style.font_family.clone());
+        for invalid in ["32px serif,", "32px serif words", "32px inherit"] {
+            apply_font_shorthand(&mut style, invalid);
+            assert_eq!((style.font_size, style.font_weight.clone(), style.font_style_italic,
+                style.line_height, style.font_family.clone()), before, "{invalid}");
+        }
+        for valid in ["italic small-caps 500 2em / 1.5 \"Fixture  Spaced\", serif",
+            "500 24px/30px \"Fixture  Spaced\", serif"] {
+            apply_font_shorthand(&mut style, valid);
+            assert!(style.font_family.as_deref().unwrap().contains("fixture  spaced"));
+            assert_eq!(style.font_weight.as_deref(), Some("500"));
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn repeated_space_resource_family_survives_css_shorthand_and_real_shaping() {
+        use crate::font::{create_font_system, resolve_loaded_font, WebFont, MONO_R};
+        use std::{collections::HashMap, sync::Arc};
+        let resource = WebFont { data: Arc::new(MONO_R.to_vec()), family: Some("Fixture  Spaced".into()), weight: Some((400,400)), italic: Some(false) };
+        let (_, loaded) = create_font_system(&[resource.clone()], false);
+        let style = compute_style("p", Some("font:32px \"Fixture  Spaced\", serif"));
+        let selected = resolve_loaded_font(style.font_family.as_deref(), 400, false, &loaded);
+        assert_eq!(selected.font_id, loaded["fixture  spaced"].faces[0].font_id);
+        let tree = obscura_dom::parse_html("<p id='copy'>iiiWWW</p>");
+        let node = tree.get_element_by_id("copy").unwrap();
+        let mut engine = crate::inline::TextEngine::new_with_web_fonts(&[resource]);
+        let actual = engine.try_build(&tree, node, &HashMap::from([(node, style)])).unwrap();
+        let actual_width = engine.measure(actual, None).0;
+        let reference = compute_style("p", Some("font:32px monospace"));
+        let expected = engine.try_build(&tree, node, &HashMap::from([(node, reference)])).unwrap();
+        assert!(actual_width > 0.0);
+        assert_eq!(actual_width, engine.measure(expected, None).0);
+        let serif = compute_style("p", Some("font:32px serif"));
+        let fallback = engine.try_build(&tree, node, &HashMap::from([(node, serif)])).unwrap();
+        assert_ne!(actual_width, engine.measure(fallback, None).0);
     }
 }

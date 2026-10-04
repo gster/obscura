@@ -8,11 +8,11 @@ pub fn validate_font_bundle(repository: &Path, manifest_path: &Path) -> Result<(
         .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
     let fonts: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
-    let inline_path = repository.join("crates/obscura-render/src/inline.rs");
+    let inline_path = repository.join("crates/obscura-render/src/font.rs");
     let source = fs::read_to_string(&inline_path)
         .map_err(|error| format!("cannot read {}: {error}", inline_path.display()))?;
 
-    if fonts["source"] != "crates/obscura-render/src/inline.rs" {
+    if fonts["source"] != "crates/obscura-render/src/font.rs" {
         return Err("font manifest source changed".into());
     }
     let files = fonts["files"]
@@ -23,7 +23,7 @@ pub fn validate_font_bundle(repository: &Path, manifest_path: &Path) -> Result<(
     }
     let declaration_count = source
         .lines()
-        .filter(|line| line.starts_with("static ") && line.contains("include_bytes!"))
+        .filter(|line| line.starts_with("pub(crate) static ") && line.contains("include_bytes!"))
         .count();
     if declaration_count != files.len() {
         return Err("embedded font membership changed".into());
@@ -52,7 +52,7 @@ pub fn validate_font_bundle(repository: &Path, manifest_path: &Path) -> Result<(
             return Err(format!("nested font path is not allowed: {path}"));
         }
         if !source.contains(&format!(
-            "static {name}: &[u8] = include_bytes!(\"{include_path}\");"
+            "pub(crate) static {name}: &[u8] = include_bytes!(\"{include_path}\");"
         )) {
             return Err(format!("font declaration changed: {name}"));
         }
@@ -83,7 +83,7 @@ fn main() {
     );
     let repository = crate_root.join("../..");
     let manifest = repository.join("persona-fonts.json");
-    let inline = crate_root.join("src/inline.rs");
+    let inline = crate_root.join("src/font.rs");
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rerun-if-changed={}", inline.display());
     validate_font_bundle(&repository, &manifest).unwrap_or_else(|error| panic!("{error}"));

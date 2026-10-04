@@ -48,9 +48,45 @@ impl Drop for FrameRealm {
         // Retained DOM references must not keep this document's queued tasks
         // executable after its browsing context has been destroyed.
         let mut state = self.state.borrow_mut();
+        // Retire activity now, but keep this exact DOM in its original State
+        // while retained generic Document/Node bindings still route here.
+        // ObscuraState::drop moves it to the shared image/Canvas storage once
+        // the context's last strong State reference is actually released.
+        crate::ops::retire_document_referrer(&mut state);
         state.document_generation = state.document_generation.wrapping_add(1);
         drop(state);
         self.realms.borrow_mut().forget(&self.context);
+    }
+}
+
+/// Host-only bootstrap before the loaded frame receives document state.
+/// No registry admission or publication occurs here. Dropping a failed build
+/// releases only the unregistered context and its captured private handoffs.
+struct LoadedRealmBootstrap {
+    context: deno_core::v8::Global<deno_core::v8::Context>,
+    image_initializer: deno_core::v8::Global<deno_core::v8::Function>,
+    speech_initializer: deno_core::v8::Global<deno_core::v8::Function>,
+    lifecycle: deno_core::v8::Global<deno_core::v8::Function>,
+}
+
+impl LoadedRealmBootstrap {
+    fn new(parent: &mut ObscuraJsRuntime) -> Option<Self> {
+        let context = parent.create_realm_context()?;
+        let image_initializer = parent.take_realm_native_input(&context, "__obscura_image_dimensions_handoff")?;
+        let speech_initializer = parent.take_realm_native_input(&context, "__obscura_speech_handoff")?;
+        let lifecycle = parent.take_realm_native_input(&context, "__obscura_native_lifecycle_handoff")?;
+        let open_initializer = parent.take_realm_native_input(&context, "__obscura_open_bindings_handoff")?;
+        if !parent.share_ops_with_realm(&context) {
+            return None;
+        }
+        if !parent.install_native_html_open(&context, &open_initializer) { return None; }
+        parent.copy_identity_to_realm(&context);
+        // A snapshot-created realm has null deno_core per-context state slots, so
+        // a promise rejection or dynamic import() in the frame would segfault in
+        // deno_core's global callbacks (#850, #841). Alias the main realm's state.
+        parent.share_deno_context_state_with_realm(&context);
+
+        Some(Self { context, image_initializer, speech_initializer, lifecycle })
     }
 }
 
@@ -67,16 +103,8 @@ impl FrameRealm {
         url: &str,
         html: &str,
     ) -> Option<Self> {
-        let context = parent.create_realm_context()?;
-        let lifecycle = parent.take_realm_native_input(&context, "__obscura_native_lifecycle_handoff")?;
-        if !parent.share_ops_with_realm(&context) {
-            return None;
-        }
-        parent.copy_identity_to_realm(&context);
-        // A snapshot-created realm has null deno_core per-context state slots, so
-        // a promise rejection or dynamic import() in the frame would segfault in
-        // deno_core's global callbacks (#850, #841). Alias the main realm's state.
-        parent.share_deno_context_state_with_realm(&context);
+        let LoadedRealmBootstrap { context, image_initializer, speech_initializer, lifecycle } =
+            LoadedRealmBootstrap::new(parent)?;
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
@@ -95,9 +123,22 @@ impl FrameRealm {
         state.dom.as_ref().unwrap().set_document_url(url);
         state.frame_id = frame_id;
         parent.share_resources_with(&mut state);
-
+        let policy = parent.state.borrow_mut().websocket_frame_policies.remove(&frame_id);
+        state.websocket_policy_known = policy.is_some();
+        if let Some(policy) = policy { state.script_policy = policy; }
+        let parent_owner = if parent_frame_id == 0 { Some(parent.state.clone()) }
+            else { parent.realm_states().borrow().by_frame_id(parent_frame_id) };
+        state.websocket_origin = Some(url.into());
+        let site = url::Url::parse(url).ok().and_then(|url| obscura_net::cookies::schemeful_site(&url));
+        state.websocket_site = parent_owner.and_then(|owner| {
+            let owner=owner.borrow();
+            state.websocket_owner = obscura_net::websocket::session::Owner::child(&owner.websocket_owner);
+            (owner.websocket_site == site).then(||site.clone()).flatten()
+        });
         let state = Rc::new(std::cell::RefCell::new(state));
+        crate::speech_owner::issue_document_owner(&state);
         parent.bind_realm_document_state(&context, state.clone());
+        if !parent.install_image_document(&context, &image_initializer, &state) { return None; }
         let realms = parent.realm_states();
         realms.borrow_mut().register(
             context.clone(),
@@ -124,11 +165,15 @@ impl FrameRealm {
                 &format!(
                     "globalThis.__obscura_frameId = {frame_id};\
                      globalThis.__obscura_parentFrameId = {parent_frame_id};\
-                     globalThis.__obscura_init();{}",
-                    persona.preload_script(),
+                     globalThis.__obscura_init();",
                 ),
             )
             .ok()?;
+        let speech_owner = realm.state.borrow().speech_owner.clone()?;
+        parent.install_realm_speech(&realm.context, &speech_initializer, &speech_owner)
+            .map_err(|error| eprintln!("Obscura frame Speech startup failed: {error}")).ok()?;
+        realm.run(parent, &persona.preload_script()).ok()?;
+        parent.bind_realm_document_lifecycle(&realm.context, frame_id, parent_frame_id);
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
@@ -198,6 +243,17 @@ impl FrameRealm {
         } else {
             150.0
         };
+        #[cfg(feature = "render")]
+        {
+            let mut state = self.state.borrow_mut();
+            let viewport = (width as f32, height as f32);
+            if state.viewport != viewport {
+                state.viewport = viewport;
+                state.prepared_render = None;
+                state.pending_style_mutations.clear();
+                state.resolved_scroll = None;
+            }
+        }
         self.execute_script(
             parent,
             &format!(
@@ -242,6 +298,7 @@ impl FrameRealm {
         parent: &mut ObscuraJsRuntime,
         source: &str,
     ) -> Result<(), String> {
+        self.state.borrow().javascript_task_clock.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         self.run(parent, source).map(|_| ())
     }
 
@@ -251,6 +308,7 @@ impl FrameRealm {
         parent: &mut ObscuraJsRuntime,
         expression: &str,
     ) -> Result<serde_json::Value, String> {
+        self.state.borrow().javascript_task_clock.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         let json = self.run(parent, &format!("JSON.stringify({expression})"))?;
         serde_json::from_str(&json).map_err(|error| error.to_string())
     }
@@ -276,8 +334,21 @@ impl FrameRealm {
             Err(error) => return vec![error],
         };
 
+        let (policies, final_policy) = {
+            let state=self.state.borrow();let mut active=state.script_policy.clone();let mut policies=std::collections::HashMap::new();
+            if let Some(dom)=state.dom.as_ref() {for id in dom.descendants(dom.document()) {
+                let Some(node)=dom.get_node(id) else {continue;};let Some(name)=node.as_element() else {continue;};
+                if name.local.as_ref()=="meta" && node.get_attribute("http-equiv").is_some_and(|v|v.eq_ignore_ascii_case("content-security-policy"))
+                    && dom.ancestors(id).iter().any(|id|dom.get_node(*id).is_some_and(|node|node.as_element().is_some_and(|name|name.local.as_ref()=="head"))) {
+                    if let Some(content)=node.get_attribute("content") {active.append(content);}
+                }
+                if name.local.as_ref()=="script" {policies.insert(id.raw(),active.clone());}
+            }}
+            (policies,active)
+        };
         let mut problems = Vec::new();
         for (index, script) in scripts.iter().enumerate() {
+            if let Some(policy)=policies.get(&script.nid) {self.state.borrow_mut().script_policy=policy.clone();}
             if !script.is_classic() {
                 if script.type_attribute == "module" {
                     problems.push(format!("frame module script {index} skipped: not supported"));
@@ -304,6 +375,7 @@ impl FrameRealm {
                 problems.push(format!("frame script {name} failed: {error}"));
             }
         }
+        self.state.borrow_mut().script_policy=final_policy;
         problems
     }
 
@@ -329,24 +401,19 @@ impl FrameRealm {
             .unwrap_or_else(|_| src.to_string())
     }
 
-    fn list_scripts(&self, parent: &mut ObscuraJsRuntime) -> Result<Vec<DocumentScript>, String> {
-        let listed = self.evaluate(
-            parent,
-            r#"[...document.querySelectorAll('script')].map(node => ({
-                src: node.getAttribute('src') || '',
-                type: (node.getAttribute('type') || '').toLowerCase(),
-                text: node.textContent || '',
-            }))"#,
-        );
-        match listed {
-            Ok(value) => Ok(serde_json::from_value(value).unwrap_or_default()),
-            Err(error) => Err(format!("could not list frame scripts: {error}")),
-        }
+    fn list_scripts(&self, _parent: &mut ObscuraJsRuntime) -> Result<Vec<DocumentScript>, String> {
+        let state=self.state.borrow();let Some(dom)=state.dom.as_ref() else {return Ok(Vec::new());};
+        Ok(dom.query_selector_all("script").unwrap_or_default().into_iter().filter_map(|nid| {
+            let node=dom.get_node(nid)?;
+            Some(DocumentScript {nid:nid.raw(),src:node.get_attribute("src").unwrap_or("").to_string(),
+                type_attribute:node.get_attribute("type").unwrap_or("").to_ascii_lowercase(),text:dom.text_content(nid)})
+        }).collect())
     }
 }
 
 #[derive(serde::Deserialize)]
 struct DocumentScript {
+    nid: u32,
     src: String,
     #[serde(rename = "type")]
     type_attribute: String,
@@ -1394,6 +1461,37 @@ mod tests {
         let state = parent.runtime().op_state();
         assert!(crate::ops::frame_state(&state.borrow(), 1).is_none());
         assert!(crate::ops::frame_state(&state.borrow(), 999).is_none());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn retired_frame_retains_document_image_and_canvas_without_active_publication() {
+        let mut parent=page("https://parent.example/","<title>parent</title>");
+        let frame=FrameRealm::new(&mut parent,1,0,"https://parent.example/child",
+            "<title>child</title><img id='i' width='17'><canvas id='c' width='11' height='7'></canvas>").unwrap();
+        frame.execute_script(&mut parent,"globalThis.keptImage=document.getElementById('i');globalThis.keptCanvas=document.getElementById('c');globalThis.keptContext=keptCanvas.getContext('2d');void keptImage.width;").unwrap();
+        parent.evaluate("(()=>{const child=__obscura_frameObjects[1];globalThis.savedDoc=child.document;globalThis.savedImage=child.window.keptImage;globalThis.savedCanvas=child.window.keptCanvas;globalThis.savedContext=child.window.keptContext;delete __obscura_frameObjects[1];return true;})()").unwrap();
+        let original=frame.state.clone();
+        let canvas=original.borrow().dom.as_ref().unwrap().get_element_by_id("c").unwrap();
+        let before={let state=original.borrow();let surface=state.canvas_surfaces.get(&canvas).unwrap();(surface.width,surface.height)};
+        assert_eq!(before,(11,7));
+        drop(frame);
+        assert!(!original.borrow().websocket_owner.active());
+        assert!(original.borrow().dom.is_some());
+        assert_eq!(parent.evaluate(r#"(() => {
+            savedDoc.title='old document';savedImage.width=43;
+            savedImage.src='https://image.invalid/must-not-load.svg';
+            savedCanvas.width=13;
+            savedContext.fillStyle='red';savedContext.fillRect(0,0,1,1);
+            const pixel=savedContext.getImageData(0,0,1,1).data;
+            return [savedDoc.title,document.title,savedImage.width,savedCanvas.width,
+                pixel[0]===255 && pixel[1]===0 && pixel[2]===0 && pixel[3]===255];
+        })()"#).unwrap(),serde_json::json!(["old document","parent",43,13,true]));
+        let state=original.borrow();
+        let surface=state.canvas_surfaces.get(&canvas).unwrap();
+        assert_eq!((surface.width,surface.height),before,
+            "retained Canvas drawing stays in its lease and cannot republish to inactive render State");
+        assert!(state.render_image_in_flight.is_empty());
     }
 
     #[test]

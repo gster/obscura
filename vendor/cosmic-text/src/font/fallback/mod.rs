@@ -193,6 +193,8 @@ pub struct FontFallbackIter<'a> {
     common_i: usize,
     other_i: usize,
     end: bool,
+    native_i: usize,
+    base_end: bool,
 }
 
 impl<'a> FontFallbackIter<'a> {
@@ -220,10 +222,13 @@ impl<'a> FontFallbackIter<'a> {
             common_i: 0,
             other_i: 0,
             end: false,
+            native_i: 0,
+            base_end: false,
         }
     }
 
     pub fn check_missing(&mut self, word: &str) {
+        if self.native_i > 0 && !self.end { return; }
         if self.end {
             missing_warn!(
                 "Failed to find any fallback for {:?} locale '{}': '{}'",
@@ -472,9 +477,21 @@ impl<'a> FontFallbackIter<'a> {
 impl Iterator for FontFallbackIter<'_> {
     type Item = Arc<Font>;
     fn next(&mut self) -> Option<Self::Item> {
-        let mut fallbacks = mem::take(&mut self.font_system.fallbacks);
-        let item = self.next_item(&fallbacks);
-        mem::swap(&mut fallbacks, &mut self.font_system.fallbacks);
-        item
+        if !self.base_end {
+            let mut fallbacks = mem::take(&mut self.font_system.fallbacks);
+            let item = self.next_item(&fallbacks);
+            mem::swap(&mut fallbacks, &mut self.font_system.fallbacks);
+            if item.is_some() { return item; }
+            self.base_end = true;
+        }
+        // Native candidates are selected outside shaping from actual resources.
+        // Incidental residents cannot enter either the base or this ordered tail.
+        loop {
+            let id = self.font_system.operation_fallback.as_ref()
+                .and_then(|(_, ordered)| ordered.get(self.native_i)).copied()?;
+            self.native_i += 1;
+            if Some(id) == self.skip_font_id { continue; }
+            if let Some(font) = self.font_system.get_font(id) { self.end = false; return Some(font); }
+        }
     }
 }

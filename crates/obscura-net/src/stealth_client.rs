@@ -317,6 +317,34 @@ impl StealthHttpClient {
         }
     }
 
+    // Native Rust owner capability; author JavaScript cannot supply credentials.
+    pub fn validate_websocket_target(&self, url: &Url) -> Result<(), ObscuraNetError> {
+        let (_,http)=crate::websocket::mapped_url(url)?;
+        crate::client::validate_url(&http,self.allow_private_network)
+    }
+
+    pub async fn open_websocket_transport(
+        &self, url: &Url, protocols: &[String],
+        owner: Option<&dyn crate::websocket::OwnerPolicy>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<crate::websocket::Opened, ObscuraNetError> {
+        let owner=owner.ok_or_else(||ObscuraNetError::Network("WebSocket owner policy unavailable".into()))?;
+        let (socket,http)=crate::websocket::mapped_url(url)?;
+        self.validate_websocket_target(&socket)?;
+        owner.authorize(&socket,&http,&self.cookie_jar)?;
+        if self.block_trackers() && http.host_str().is_some_and(crate::blocklist::is_blocked) {
+            return Err(ObscuraNetError::Blocked(socket.to_string()));
+        }
+        let mut info=RequestInfo {url:http,method:"GET".into(),headers:self.request_headers().await,
+            raw_headers:None,body:Vec::new(),resource_type:crate::ResourceType::Other};
+        if self.intercept(&mut info,None,None).await?.is_some() {
+            return Err(ObscuraNetError::Network("Synthetic response cannot upgrade a WebSocket".into()));
+        }
+        let bound=crate::websocket::BoundPolicy {owner,headers:info.headers};
+        crate::websocket::open(&self.client, &self.cookie_jar, self.allow_private_network,
+            &info.url, protocols, Some(&bound), cancel).await
+    }
+
     pub fn transport_params(&self) -> &TransportParams {
         &self.transport
     }
@@ -824,7 +852,9 @@ impl StealthHttpClient {
                 request_callback_fired = true;
             }
 
+            if let Some(trace) = trace { trace.timing_transport_attempted(); }
             let resp = self.client.send_prepared(transport, prepared).await?;
+            if let Some(trace) = trace { trace.timing_protocol(resp.protocol()); }
 
             let status = resp.status();
             let cors_result = validate_stealth_cors_response(
@@ -853,6 +883,7 @@ impl StealthHttpClient {
                     request_referrer: request.referrer.clone() };
                 trace.response(&response, false);
                 response.body = read_stealth_body_limited(resp.take().unwrap(), &current_url, request.max_response_bytes).await?;
+                trace.timing_body_completed(response.body.len());
                 traced_response = Some(response);
             }
 
@@ -1104,7 +1135,9 @@ impl StealthHttpClient {
             }
         }
         drop(info);
+        if let Some(trace) = trace { trace.timing_transport_attempted(); }
         let resp = self.client.send_prepared(transport, prepared).await?;
+        if let Some(trace) = trace { trace.timing_protocol(resp.protocol()); }
 
         let status = resp.status();
         if store_cookies {
@@ -1124,6 +1157,7 @@ impl StealthHttpClient {
                 request_referrer: request_referrer.clone() }, false);
         }
         let resp_body = read_stealth_body_limited(resp, url, max_response_bytes).await?;
+        if let Some(trace) = trace { trace.timing_body_completed(resp_body.len()); }
         drop(in_flight);
 
         Ok(Response {

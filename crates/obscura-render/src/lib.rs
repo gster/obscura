@@ -13,6 +13,8 @@
 
 use taffy::prelude::*;
 
+pub mod canvas_color;
+
 pub mod css;
 pub use css::{CssMediaType, Stylesheet, StylesheetCache};
 
@@ -93,6 +95,17 @@ mod image_capability_tests {
     }
 }
 
+#[cfg(feature = "text")]
+mod font;
+#[cfg(feature = "text")]
+mod native_font;
+#[cfg(feature = "text")]
+mod canvas_font_geometry;
+#[cfg(feature = "text")]
+pub mod text;
+#[cfg(feature = "text")]
+pub use font::configure_font_directories;
+
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
@@ -137,8 +150,6 @@ pub use paint::{
 // `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.
 #[cfg(feature = "paint")]
 pub mod inline;
-#[cfg(feature = "paint")]
-pub use inline::configure_font_directories;
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
@@ -172,6 +183,9 @@ pub mod inline {
         pub(crate) fn new_with_web_fonts_and_emoji(_fonts: &[WebFont], _load_emoji: bool) -> Self {
             TextEngine
         }
+
+        pub(crate) fn prepare_style(&mut self, _style: &crate::LayoutStyle) {}
+        pub(crate) fn seal_native_preparation(&mut self) {}
 
         pub fn register_replaced(
             &mut self,

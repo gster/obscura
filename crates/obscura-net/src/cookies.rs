@@ -146,6 +146,9 @@ impl CookieJar {
     }
 
     pub fn set_cookie(&self, set_cookie_str: &str, url: &Url) {
+        // This jar has no partition key. Reject rather than flatten CHIPS into
+        // ambient credentials consumed by HTTP or WebSocket.
+        if has_partitioned_attribute(set_cookie_str) { return; }
         let parts: Vec<&str> = set_cookie_str.splitn(2, ';').collect();
         let name_value = parts[0].trim();
         let (name, value) = match name_value.split_once('=') {
@@ -281,6 +284,42 @@ impl CookieJar {
         }
 
         serialize_cookie_header(matching)
+    }
+
+    /// Subresource credentials have no top-level safe-navigation exemption.
+    /// None means an opaque/cross-site ancestor chain, not an unknown policy.
+    pub fn subresource_cookie_header(&self, url: &Url, site_for_cookies: Option<&str>) -> String {
+        let same_site = site_for_cookies.is_some_and(|site| schemeful_site(url).as_deref() == Some(site));
+        let host = url.host_str().unwrap_or("");
+        let cookies = self.cookies.read().unwrap();
+        let now = unix_time_secs();
+        let entries = cookies.iter().filter(|(domain, _)| domain_matches(host, domain))
+            .flat_map(|(_, values)| values.values()).filter(|entry| {
+                (!entry.host_only || entry.domain.eq_ignore_ascii_case(host))
+                    && !cookie_is_expired(entry, now) && path_matches(url.path(), &entry.path)
+                    && (!entry.secure || subresource_secure_transport(url))
+                    && (entry.same_site != "None" || entry.secure)
+                    && (same_site || (entry.same_site == "None" && entry.secure))
+            }).collect();
+        serialize_cookie_header(entries)
+    }
+
+    pub fn set_subresource_cookie(&self, value: &str, url: &Url, site_for_cookies: Option<&str>) {
+        let mut same_site = "Lax".to_string();
+        let mut secure = false;
+        for attribute in value.split(';').skip(1) {
+            let (name, value) = attribute.trim().split_once('=').unwrap_or((attribute.trim(), ""));
+            if name.eq_ignore_ascii_case("samesite") { same_site = normalize_same_site(value.trim()); }
+            if name.eq_ignore_ascii_case("secure") { secure = true; }
+            // Partition keys are not represented by this jar. Refuse rather
+            // than silently store a partitioned response in an unpartitioned jar.
+            if name.eq_ignore_ascii_case("partitioned") { return; }
+        }
+        let same_context = site_for_cookies.is_some_and(|site| schemeful_site(url).as_deref() == Some(site));
+        if secure && !subresource_secure_transport(url) { return; }
+        if same_site == "None" && !secure { return; }
+        if !same_context && same_site != "None" { return; }
+        self.set_cookie(value, url);
     }
 
     pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
@@ -518,6 +557,7 @@ impl CookieJar {
     }
 
     pub fn set_cookie_from_js(&self, cookie_str: &str, url: &Url) {
+        if has_partitioned_attribute(cookie_str) { return; }
         let parts: Vec<&str> = cookie_str.splitn(2, ';').collect();
         let name_value = parts[0].trim();
         let (name, value) = match name_value.split_once('=') {
@@ -2237,4 +2277,30 @@ mod tests {
             jar.get_js_visible_cookies(&checkout)
         );
     }
+}
+
+/// Schemeful site with the embedded PSL, including its private section.
+pub fn schemeful_site(url: &Url) -> Option<String> {
+    if !matches!(url.scheme(), "http" | "https") { return None; }
+    let site = match url.host()? {
+        url::Host::Domain(host) => psl::domain_str(host).unwrap_or(host).to_ascii_lowercase(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => format!("[{ip}]"),
+    };
+    Some(format!("{}://{}", url.scheme(), site))
+}
+
+fn subresource_secure_transport(url: &Url) -> bool {
+    if url.scheme()=="https" {return true;}
+    if url.scheme()!="http" {return false;}
+    match url.host() {
+        Some(url::Host::Ipv4(ip))=>ip.is_loopback(),
+        Some(url::Host::Ipv6(ip))=>ip.is_loopback(),
+        Some(url::Host::Domain(host))=>host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost"),
+        None=>false,
+    }
+}
+
+fn has_partitioned_attribute(value: &str) -> bool {
+    value.split(';').skip(1).any(|part|part.trim().split('=').next().is_some_and(|name|name.trim().eq_ignore_ascii_case("partitioned")))
 }

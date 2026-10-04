@@ -7,7 +7,10 @@ const Deno = globalThis.Deno;
 const _clockDateNow = Date.now.bind(Date);
 let _clockTimeOrigin = _clockDateNow();
 let _clockLastReading = 0;
+let _nativeTimingReady = false;
+let _nativeTimingNow = null;
 function _relativeTimeNow() {
+  if (_nativeTimingReady) return _nativeTimingNow(_performanceOwner);
   const elapsed = _clockDateNow() - _clockTimeOrigin;
   if (elapsed > _clockLastReading) _clockLastReading = elapsed;
   return _clockLastReading;
@@ -30,7 +33,9 @@ function _relativeTimeNow() {
     '__obscura_ua_full_version', '__obscura_ua_architecture', '__obscura_ua_brands',
     '__obscura_do_not_track', '__obscura_language', '__obscura_languages',
     '__obscura_webgl_vendor', '__obscura_webgl_renderer',
-    '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_markTrusted', '__obscura_core_handoff', '__obscura_plugin_registry_handoff', '__obscura_open_bindings_handoff',
+    '__obscura_navigator_registry_handoff', '__obscura_performance_registry_handoff', '__obscura_response_registry_handoff',
+    '__obscura_checked_receivers_handoff', '__obscura_bind_checked_receivers_handoff',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
@@ -98,13 +103,114 @@ function _relativeTimeNow() {
   }
 })();
 
+// Only trusted document/iframe factories mint these receiver slots. They are
+// shared before frame initialization, so borrowed getters follow the receiver.
+let _domReceiverSlots = new WeakMap();
+let _popoverSlots = new WeakMap();
+const _domReceiverGet = Function.call.bind(WeakMap.prototype.get);
+const _domReceiverSet = Function.call.bind(WeakMap.prototype.set);
+const _domReceiverTypeError = TypeError;
+const _domReceiverOwner = function () {};
+function _domReceiverState(value, kind) {
+  const state = _domReceiverGet(_domReceiverSlots, value);
+  if (!state || state.kind !== kind) throw new _domReceiverTypeError('Illegal invocation');
+  return state;
+}
+function _registerDocumentReceiver(doc, referrer, url) {
+  const state = {kind: 'document', referrer, url, active: () => true};
+  _domReceiverSet(_domReceiverSlots, doc, state);
+  return state;
+}
+function _registerLiveDocumentReceiver(doc) {
+  const handle = Deno.core.ops.op_document_create_referrer_handle(_domReceiverOwner);
+  _registerDocumentReceiver(doc,
+    () => Deno.core.ops.op_document_referrer_value(handle),
+    () => _domParse('document_url') || 'about:blank');
+  const state = _domReceiverState(doc, 'document');
+  state.active = () => Deno.core.ops.op_document_referrer_is_current(handle);
+  state.retire = () => {
+    Deno.core.ops.op_document_referrer_retire(handle);
+    // Nested real realms have their own context sets. Retire them before the
+    // host's later FrameRealm sweep while retained DOM references stay alive.
+    for (const frame of [..._iframeContextElements]) {
+      if (_iframeContextElements.has(frame)) _discardIframeContext(frame);
+    }
+  };
+  state.bindFrame = (frameId, childDocument) => {
+    const frame = globalThis.__obscura_frameElements[frameId];
+    const receiver = _domReceiverGet(_domReceiverSlots, frame);
+    if (receiver?.kind === 'iframe') receiver.loadedDocument = childDocument;
+  };
+}
+function _iframeReceiverDocument(frame) {
+  const state = _domReceiverState(frame, 'iframe');
+  const rootId = +_dom('node_root', state.nid);
+  const root = _cache.get(rootId);
+  if (root instanceof ShadowRoot) return root.host.ownerDocument;
+  return _iframeDocuments.get(rootId) || state.ownerDocument;
+}
+function _registerIframeReceiver(frame, nid, ownerDocument = globalThis.document) {
+  _domReceiverSet(_domReceiverSlots, frame, {kind: 'iframe', nid, ownerDocument,
+    source: () => {
+      const raw = _domParse('get_attribute', nid, 'src') || '';
+      return raw ? (_urlResolveOp(raw, _documentBase() || 'about:blank') ?? raw) : '';
+    },
+    document: () => _readIframeContentDocument(frame),
+    window: () => _readIframeContentWindow(frame)});
+}
+
 // Handoff for child frame realms. deno_core binds ops into the main context
 // only, so a realm restored from the snapshot arrives with its own empty
 // `Deno.core.ops`. The host reads this to take the main realm's bound op table
 // and to find each new realm's own table to fill, then deletes the global in
 // the same step, so page script never sees it (see runtime.rs
 // `take_ops_handoff` / `share_ops_with_realm`).
-globalThis.__obscura_core_handoff = Deno.core;
+let _unrefNativeOpPromise = Deno.core.unrefOpPromise;
+globalThis.__obscura_core_handoff = {
+  // Read at handoff time: deno_core binds the restored context's ops after
+  // snapshot creation. The callback stays in the same private binding registry.
+  get ops() { return Deno.core.ops; },
+  initializePromiseUnref(shared) { if(shared)_unrefNativeOpPromise=shared;return _unrefNativeOpPromise; },
+  initializeCanvasRegistry(shared) { return _initializeCanvasRegistry(shared); },
+  initializeDOMReceiverRegistry(shared) {
+    if (shared) { _domReceiverSlots = shared; _popoverSlots = shared.popoverSlots; }
+    else {
+      _domReceiverSlots.popoverSlots = _popoverSlots;
+      _domReceiverSlots.bindFrameDocument = (owner, frameId, childDocument) => {
+      _domReceiverState(owner, 'document').bindFrame?.(frameId, childDocument);
+      };
+    }
+    if (shared) { _websocketSlots = shared.websocketSlots; _websocketBlobBytes = shared.websocketBlobs; _websocketCloseEvents = shared.websocketCloseEvents; }
+    else { _domReceiverSlots.websocketSlots = _websocketSlots; _domReceiverSlots.websocketBlobs = _websocketBlobBytes; _domReceiverSlots.websocketCloseEvents = _websocketCloseEvents; }
+    return _domReceiverSlots;
+  },
+  initializeFontFaceRegistry(shared) {
+    if (shared) _fontFaceSlots = shared;
+    return _fontFaceSlots;
+  },
+  initializeScreenRegistry(shared) {
+    if (shared) {
+      _screenSet(shared, _screenObject, _screenState(_screenObject));
+      _screenSlots = shared;
+      _screenLookup = _screenBind(_screenGet, shared);
+    }
+    return _screenSlots;
+  },
+  registerNativeBindings(ctor) {
+    _markNative(ctor);
+    for (const key of Object.getOwnPropertyNames(ctor)) {
+      const descriptor = Object.getOwnPropertyDescriptor(ctor, key);
+      if (typeof descriptor.get === 'function') _markNativeGetter(descriptor.get, key);
+      if (typeof descriptor.set === 'function') _markNativeSetter(descriptor.set, key);
+    }
+    for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, key);
+      if (typeof descriptor.value === 'function') _markNative(descriptor.value);
+      if (typeof descriptor.get === 'function') _markNativeGetter(descriptor.get, key);
+      if (typeof descriptor.set === 'function') _markNativeSetter(descriptor.set, key);
+    }
+  },
+};
 
 globalThis.__obscura_errors = [];
 
@@ -153,6 +259,7 @@ globalThis.dispatchEvent = function(event) {
 let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
 const _iframeContextElements = new Set();
+const _iframeDocuments = new Map();
 const _iframeContextPaths = new WeakMap();
 const _iframeAncestorCounts = new Map();
 const _pendingIframeLoads = new Set();
@@ -212,7 +319,7 @@ const _dom = (cmd, a1, a2) => {
         || cmd === 'set_inner_html' || cmd === 'set_inner_html_context'
         || cmd === 'set_fragment_html_executable')) {
       for (const frame of _iframeContextElements) {
-        if (movedFrames?.includes(frame) || _dom('is_connected', frame._nid) !== 'true') {
+        if (movedFrames?.includes(frame) || _dom('is_connected', _domReceiverState(frame, 'iframe').nid) !== 'true') {
           _discardIframeContext(frame);
         }
       }
@@ -221,6 +328,7 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
+let _canvasNativeLookup = null;
 const _nativeFns = new Set();
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
@@ -231,6 +339,8 @@ const _origToString = Function.prototype.toString;
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
+    const canvasBinding = _canvasNativeLookup && _canvasNativeLookup(this);
+    if (canvasBinding) return canvasBinding;
     if (_nativeStr.has(this)) { return _nativeStr.get(this); }
     if (_nativeFns.has(this)) {
       return `function ${this.name || ''}() { [native code] }`;
@@ -443,8 +553,8 @@ async function __fetchDynClassicScript(task) {
     }
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, task.mode, task.credentials,
-      JSON.stringify({ destination: "script", scriptPriority: task.scriptPriority })
+      task.url, "GET", "{}", new Uint8Array(0), task.mode, task.credentials,
+      [JSON.stringify({ destination: "script", scriptPriority: task.scriptPriority }), _performanceOwner, task.pageOrigin]
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -458,6 +568,10 @@ async function __fetchDynClassicScript(task) {
     // Classic scripts use the response URL as their import() base, including
     // redirects. The originally requested URL still identifies the fetch.
     task.executionUrl = parsed.url || task.url;
+    if (!Deno.core.ops.op_csp_script_allowed(task.executionUrl, task.nonce, '',
+        task.executionUrl !== task.url, _realmFrameId)) {
+      throw new Error('Content Security Policy blocked script');
+    }
   }
   return body;
 }
@@ -665,7 +779,7 @@ function _cssImportApplies(media) {
 
 async function _fetchLinkedCssText(url, pageOrigin) {
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", new Uint8Array(0), "no-cors", "same-origin", [JSON.stringify({ destination: "style" }), _performanceOwner, pageOrigin]
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -846,6 +960,22 @@ function _loadFormState(nid) {
   _formStateLoaded.add(nid);
 }
 
+// Activation reads native checkedness through the receiver's original realm.
+// Page-defined accessors only observe explicit script assignments.
+let _checkedReceivers = new WeakMap();
+const _checkedReceiverGet = Function.call.bind(WeakMap.prototype.get);
+const _checkedReceiverSet = Function.call.bind(WeakMap.prototype.set);
+const _checkedRead = nid => _domParse('checked_state', nid);
+const _checkedWrite = (nid, value) => _dom('checked_set', nid, _domString(!!value));
+const _indeterminateWrite = (nid, value) => _dom('indeterminate_set', nid, _domString(!!value));
+function _registerCheckedReceiver(receiver, nid) {
+  _checkedReceiverSet(_checkedReceivers, receiver, {
+    nid, read: _checkedRead, checked: _checkedWrite, indeterminate: _indeterminateWrite,
+  });
+}
+globalThis.__obscura_checked_receivers_handoff = _checkedReceivers;
+globalThis.__obscura_bind_checked_receivers_handoff = registry => { _checkedReceivers = registry; };
+
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
 // JS \s is wider (U+000B, U+00A0, U+2028, etc.), so it must not be used here.
@@ -1011,8 +1141,8 @@ const _scheduleAfter = (delay, fn) => {
   // reads per-context state that only a deno_core-created context carries, and
   // a realm restored from the snapshot has none, so queueing from a frame
   // dereferences uninitialized memory. A host sleep does the same job, and
-  // because its continuation is an ordinary microtask, V8 reports the frame as
-  // the microtask context and the ops the callback makes still resolve against
+  // its Promise reaction then queues a browser task in the original context.
+  // Each timer receives its own microtask checkpoint, while its ops still find
   // the frame's own document. Frame timer ids are negative so clearTimeout can
   // tell the two queues apart. Keep cancellation state by native id and remove
   // it on either fire or clear, so repeated clearTimeout calls do not grow a
@@ -1021,11 +1151,16 @@ const _scheduleAfter = (delay, fn) => {
     const frameTimerId = -(++_frameTimerSeq);
     const state = { cancelled: false };
     _frameTimerStates.set(frameTimerId, state);
+    const generation = _browserPostedTaskGeneration();
     Deno.core.ops.op_sleep(d).then(() => {
-      _frameTimerStates.delete(frameTimerId);
       if (state.cancelled) return;
-      Deno.core.ops.op_begin_render_task?.();
-      fn();
+      _browserPostedTaskEnqueue(() => {
+        _frameTimerStates.delete(frameTimerId);
+        if (!state.cancelled) fn();
+      }, 1, generation, () => {
+        state.cancelled = true;
+        _frameTimerStates.delete(frameTimerId);
+      });
     });
     return frameTimerId;
   }
@@ -1035,7 +1170,8 @@ const _scheduleAfter = (delay, fn) => {
     // HTML timer/observer/rAF delivery starts a new task. Freeze animation
     // time lazily on that task's first style/layout read so a callback that
     // waited in the host queue samples its actual delivery instant.
-    Deno.core.ops.op_begin_render_task?.();
+    _idbDeactivateTransactions();
+      Deno.core.ops.op_begin_render_task?.();
     return fn();
   });
 };
@@ -1266,7 +1402,7 @@ let _browserPostedTaskWakePending = false;
 const _invalidPostedTaskGeneration = -1;
 
 function _browserPostedTaskGeneration() {
-  return Deno.core.ops.op_posted_task_generation(_realmFrameId);
+  return Deno.core.ops.op_posted_task_generation(_browserPostedTaskRunOne);
 }
 
 function _browserPostedTaskDiscardQueue(queue) {
@@ -1282,7 +1418,7 @@ function _browserPostedTaskScheduleWake() {
   if (_browserPostedTaskWakePending) return;
   if (!Deno.core.ops.op_async_runtime_available()) return;
   const generation = Deno.core.ops.op_posted_task(
-    _realmFrameId, _browserPostedTaskRunOne);
+    _browserPostedTaskRunOne);
   _browserPostedTaskWakePending = generation !== _invalidPostedTaskGeneration;
   if (!_browserPostedTaskWakePending) {
     for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
@@ -1296,6 +1432,7 @@ function _browserPostedTaskEnqueue(
 }
 
 function _browserPostedTaskRunOne(currentGeneration = _invalidPostedTaskGeneration) {
+  _idbDeactivateTransactions();
   // Document replacement and frame teardown are cancellation boundaries.
   // Borrow contention is cancelled too: a browser task must not unwind through
   // V8 or enter a realm whose native owner is unavailable.
@@ -1955,6 +2092,13 @@ function _shallowCloneNode(node) {
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
+let _speechEventTargetRecords = null;
+const _eventRegistryGet = Function.prototype.call.bind(WeakMap.prototype.get);
+function _eventTargetRegistry(target) {
+  const speech = _speechEventTargetRecords && _eventRegistryGet(_speechEventTargetRecords, target);
+  return speech ? speech.eventListeners : _eventTargetListeners;
+}
+
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -1966,10 +2110,10 @@ function _eventTargetAdd(target, type, callback, options) {
   const capture = _eventCapture(options);
   const signal = options && typeof options === "object" ? options.signal : null;
   if (signal && signal.aborted) return;
-  let byType = _eventTargetListeners.get(target);
+  let byType = _eventTargetRegistry(target).get(target);
   if (!byType) {
     byType = new Map();
-    _eventTargetListeners.set(target, byType);
+    _eventTargetRegistry(target).set(target, byType);
   }
   let listeners = byType.get(type);
   if (!listeners) {
@@ -1992,7 +2136,7 @@ function _eventTargetAdd(target, type, callback, options) {
   }
 }
 function _eventTargetRemove(target, type, callback, options) {
-  const byType = _eventTargetListeners.get(target);
+  const byType = _eventTargetRegistry(target).get(target);
   if (!byType) return;
   type = String(type);
   const listeners = byType.get(type);
@@ -2008,9 +2152,9 @@ function _eventTargetRemove(target, type, callback, options) {
     break;
   }
   if (listeners.length === 0) byType.delete(type);
-  if (byType.size === 0) _eventTargetListeners.delete(target);
+  if (byType.size === 0) _eventTargetRegistry(target).delete(target);
 }
-function _eventTargetDispatch(target, event) {
+function _eventTargetDispatch(target,event,reportException,phase=2) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
@@ -2019,10 +2163,11 @@ function _eventTargetDispatch(target, event) {
   }
   if (!event.target) event.target = target;
   event.currentTarget = target;
-  event.eventPhase = 2;
-  const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
+  event.eventPhase = phase;
+  const listeners = (_eventTargetRegistry(target).get(target)?.get(String(event.type)) || []).slice();
   for (const entry of listeners) {
-    const current = _eventTargetListeners.get(target)?.get(String(event.type));
+    if((phase===1&&!entry.capture)||(phase===3&&entry.capture))continue;
+    const current = _eventTargetRegistry(target).get(target)?.get(String(event.type));
     if (!current || !current.includes(entry)) continue;
     if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
     const callback = entry.callback;
@@ -2030,6 +2175,7 @@ function _eventTargetDispatch(target, event) {
       if (typeof callback === "function") callback.call(target, event);
       else callback.handleEvent.call(callback, event);
     } catch (error) {
+      if(reportException)reportException(error);
       console.error(error);
     }
     if (event._immediatePropagationStopped) break;
@@ -2047,6 +2193,10 @@ function _eventTargetDispatch(target, event) {
 const _customElementConstructionStack = [];
 
 function __prepareInsertedScript(script) {
+  // Initial blank iframe documents currently have DOM trees but no V8 realm.
+  // Keep their scripts unsupported rather than executing them in the parent.
+  // Loaded frames use their own global document and continue through here.
+  if (script.ownerDocument !== globalThis.document) return;
   if (!Deno.core.ops.op_script_try_start(script._nid, _realmFrameId)) return;
   let scriptBlockType = 'text/javascript';
   const rawType = script.getAttribute('type');
@@ -2068,6 +2218,32 @@ function __prepareInsertedScript(script) {
 
   const isModule = scriptBlockType === 'module';
   const isImportMap = scriptBlockType === 'importmap';
+  const _JS_MIME_TYPES = new Set([
+    'text/javascript', 'application/javascript', 'text/ecmascript',
+    'application/ecmascript', 'text/x-javascript', 'application/x-javascript',
+    'text/x-ecmascript', 'application/x-ecmascript', 'text/jscript', 'text/livescript',
+    'text/javascript1.0', 'text/javascript1.1', 'text/javascript1.2',
+    'text/javascript1.3', 'text/javascript1.4', 'text/javascript1.5',
+  ]);
+  if (!isModule && !isImportMap && !_JS_MIME_TYPES.has(scriptBlockType)) {
+    return;
+  }
+  // Evaluate policy before any fetch or code execution, including data/blob URLs.
+  const cspSrc = script.getAttribute('src');
+  const cspNonce = script.getAttribute('nonce') || '';
+  const cspInline = cspSrc === null ? (script.textContent || '') : '';
+  let cspUrl = '';
+  if (cspSrc !== null) {
+    try { cspUrl = new URL(cspSrc, script.baseURI || location.href).href; }
+    catch (_) { cspUrl = cspSrc; }
+  }
+  if (!Deno.core.ops.op_csp_script_allowed(cspUrl, cspNonce,
+      cspInline, false, _realmFrameId)) {
+    queueMicrotask(() => {
+      try { script.dispatchEvent(new Event('error')); } catch (_) {}
+    });
+    return;
+  }
   if (isImportMap) {
     const src = script.getAttribute('src');
     let error = '';
@@ -2091,18 +2267,8 @@ function __prepareInsertedScript(script) {
     }
     return;
   }
-  const _JS_MIME_TYPES = new Set([
-    'text/javascript', 'application/javascript', 'text/ecmascript',
-    'application/ecmascript', 'text/x-javascript', 'application/x-javascript',
-    'text/x-ecmascript', 'application/x-ecmascript', 'text/jscript', 'text/livescript',
-    'text/javascript1.0', 'text/javascript1.1', 'text/javascript1.2',
-    'text/javascript1.3', 'text/javascript1.4', 'text/javascript1.5',
-  ]);
-  if (!isModule && !_JS_MIME_TYPES.has(scriptBlockType)) {
-    return;
-  }
   const src = script.getAttribute('src');
-  const code = src ? "" : script.textContent;
+  const code = src ? "" : cspInline;
   if (!src && !code) return;
   const prevNid = globalThis.__currentScriptNid;
   if (src) {
@@ -2131,6 +2297,7 @@ function __prepareInsertedScript(script) {
       ?? (typeof script.crossOrigin === 'string' ? script.crossOrigin : null);
     const task = {
       url: fullUrl,
+      nonce: cspNonce,
       isModule,
       nid: script._nid,
       prevNid,
@@ -2194,12 +2361,20 @@ function __prepareInsertedScript(script) {
   }
 }
 
+const _websocketMetaOwner = function websocketMetaOwner() {};
+function _websocketPrepareMeta(meta) {
+  const doc=meta.ownerDocument;
+  const receiver=_domReceiverGet(_domReceiverSlots,doc);
+  if(receiver?.websocketOwner) Deno.core.ops.op_websocket_blank_meta(receiver.websocketOwner,meta._nid);
+  else if(doc===globalThis.document) Deno.core.ops.op_websocket_meta(_websocketMetaOwner,meta._nid);
+}
 function __prepareInsertedSubtree(root) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
   // every script in that subtree in tree order.
-  if (!root || !root.isConnected) return;
+  if (!root || !root.isConnected || root.ownerDocument?._active === false) return;
   _startConnectedIframeLoads();
+  if (root.localName === 'meta') _websocketPrepareMeta(root);
   if (root.nodeType === 1 && root.tagName === 'IFRAME') {
     const src = root.getAttribute('src');
     if (src && src !== 'about:blank') root._loadIframeSrc(src);
@@ -2210,9 +2385,10 @@ function __prepareInsertedSubtree(root) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe,meta") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
+    if (script?.localName === 'meta') { scripts.push(script); continue; }
     if (script?.localName === 'iframe') {
       const src = script.getAttribute('src');
       if (src && src !== 'about:blank') script._loadIframeSrc(src);
@@ -2223,7 +2399,10 @@ function __prepareInsertedSubtree(root) {
       seen.add(script._nid);
     }
   }
-  for (const script of scripts) __prepareInsertedScript(script);
+  for (const script of scripts) {
+    if (script.localName === 'meta') { _websocketPrepareMeta(script); }
+    else __prepareInsertedScript(script);
+  }
 }
 
 function _seedDetachedTreeState(node) {
@@ -2284,10 +2463,15 @@ class Node extends EventTarget {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { super(); this._nid = nid; }
+  constructor(nid) { super();this._nid=nid;_domReceiverSet(_domReceiverSlots,this,{kind:'node'}); }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
-  get ownerDocument() { return globalThis.document; }
+  get ownerDocument() {
+    if (!_iframeDocuments.size) return this._ownerDocument || globalThis.document;
+    const root = _wrap(+_dom("node_root", this._nid));
+    if (root instanceof ShadowRoot) return root.host.ownerDocument;
+    return _iframeDocuments.get(root?._nid) || root?._ownerDocument || globalThis.document;
+  }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
     try { return _documentBase(); } catch (e) { return ""; }
@@ -2297,7 +2481,10 @@ class Node extends EventTarget {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) {
       const child = _wrap(c);
-      if (child) _detachStyleSheetsInSubtree(child);
+      if (child) {
+        if (_iframeDocuments.size) child._ownerDocument = child.ownerDocument;
+        _detachStyleSheetsInSubtree(child);
+      }
       _dom("remove_child", c);
     }
     let added = [];
@@ -2403,6 +2590,7 @@ class Node extends EventTarget {
       _linkedStylesheetNodes.delete(c);
     }
     const parentConnected = this.isConnected;
+    const owner = this.nodeType === 9 ? this : this.ownerDocument;
     const removed = _dom("remove_child", c._nid) === "true";
     if (!removed) {
       throw new DOMException(
@@ -2411,6 +2599,7 @@ class Node extends EventTarget {
       );
     }
     _seedUnchangedConnection(this, parentConnected);
+    c._ownerDocument = owner;
     _seedDetachedTreeState(c);
     _detachStyleSheetsInSubtree(c);
     _reconcileWindowNamedProperties(removedWindowNames);
@@ -2436,6 +2625,7 @@ class Node extends EventTarget {
     else if (newChild.parentNode) _detachStyleSheetsInSubtree(newChild);
     const parentConnected = this.isConnected;
     const removedWindowNames = _windowNamedNamesInTree(oldChild);
+    const owner = this.nodeType === 9 ? this : this.ownerDocument;
     const inserted = _dom("insert_before", newChild._nid, oldChild._nid) === "true";
     if (!inserted) {
       throw new DOMException(
@@ -2447,6 +2637,7 @@ class Node extends EventTarget {
     if (!removed) throw new DOMException("The node could not be replaced.", "NotFoundError");
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(newChild, this, parentConnected);
+    oldChild._ownerDocument = owner;
     _seedDetachedTreeState(oldChild);
     _detachStyleSheetsInSubtree(oldChild);
     _registerWindowNamedTree(newChild);
@@ -3160,6 +3351,8 @@ class NamedNodeMap {
     });
   }
   _names() {
+    const image = _domReceiverGet(_domReceiverSlots, this._element);
+    if (image?.kind === "image") return JSON.parse(Deno.core.ops.op_image_attribute(image.handle, "attribute_names", "", ""));
     return _domParse("attribute_names", this._element._nid) || [];
   }
   _attr(name) {
@@ -3579,8 +3772,12 @@ class Element extends Node {
     for (const style of this.querySelectorAll("style")) _detachStyleSheet(style);
     let oldChildren = [];
     let newChildren = [];
-    if (globalThis.__mutationObservers?.length) {
+    if (globalThis.__mutationObservers?.length || _iframeDocuments.size) {
       oldChildren = _domParse("child_nodes", this._nid) || [];
+    }
+    if (_iframeDocuments.size) {
+      const owner = this.ownerDocument;
+      for (const nid of oldChildren) _wrap(nid)._ownerDocument = owner;
     }
     _dom("set_inner_html", this._nid, String(v ?? ""));
     // HTML fragment parsing can introduce IDs without calling the JS
@@ -3685,7 +3882,21 @@ class Element extends Node {
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
   getAttribute(n) {
+    const image = _domReceiverGet(_domReceiverSlots, this);
+    if (image?.kind === "image") return JSON.parse(Deno.core.ops.op_image_attribute(image.handle, "get_attribute", String(n).toLowerCase(), ""));
     n = _htmlAttrName(this, n);
+    if (n === 'popover' || n === 'open') {
+      const slot = _domReceiverGet(_popoverSlots, this);
+      if (slot) {
+        const facts = slot.facts();
+        if (n === 'popover') return facts.attribute ?? null;
+        if (facts.localName === 'dialog' || facts.localName === 'details') return facts.openAttribute ?? null;
+      }
+    }
+    if (n === 'width' || n === 'height') {
+      const canvas = _canvasHtmlLookup(this);
+      if (canvas) return canvas.rawAttribute(n);
+    }
     // Script-created elements start with a provably empty attribute set. Keep
     // that small null-namespace map coherent through the ordinary mutation
     // APIs so React's write-then-read reflection does not cross the bridge.
@@ -3697,13 +3908,25 @@ class Element extends Node {
     return _domParse("get_attribute", this._nid, n);
   }
   setAttribute(n, v) {
+    const image = _domReceiverGet(_domReceiverSlots, this);
+    if (image?.kind === "image") { image.mutate(this, "set_attribute", String(n).toLowerCase(), String(v)); return; }
     n = _htmlAttrName(this, n);
-    const popoverPrev = (n === "popover") ? this.popover : undefined;
+    if (n === 'popover' || n === 'open') {
+      const slot = _domReceiverGet(_popoverSlots, this);
+      if (slot) {
+        if (n === 'popover') { slot.attribute(String(v)); return; }
+        const tag = slot.facts().localName;
+        if (tag === 'dialog' || tag === 'details') { slot.openAttribute(String(v)); return; }
+      }
+    }
+    const popoverPrev = (n === "popover") ? _domReceiverGet(_popoverSlots, this)?.facts().type : undefined;
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
     const value = String(v);
+    if (_canvasAttributeMutation(this, n, value, false)) return;
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if(this.localName==='meta' && (n==='content'||n==='http-equiv')) _websocketPrepareMeta(this);
     if (n === "src" && this.localName === "iframe") {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
@@ -3740,10 +3963,16 @@ class Element extends Node {
     }
   }
   setAttributeNS(ns, n, v) {
+    const image = _domReceiverGet(_domReceiverSlots, this);
+    if (image?.kind === "image") {
+      ns = ns == null ? "" : String(ns); n = String(n); v = String(v);
+      _ns_validateQualifiedName(ns, n); image.mutateNS(this, "set_attribute", ns, n, v); return;
+    }
     ns = ns == null || ns === '' ? '' : String(ns);
     n = String(n);
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
+    if (ns === "" && _canvasAttributeMutation(this, n, value, false)) return;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
@@ -3752,11 +3981,22 @@ class Element extends Node {
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
   }
   removeAttribute(n) {
+    const image = _domReceiverGet(_domReceiverSlots, this);
+    if (image?.kind === "image") { image.mutate(this, "remove_attribute", String(n).toLowerCase(), ""); return; }
     n = _htmlAttrName(this, n);
-    const popoverPrev = (n === "popover") ? this.popover : undefined;
+    if (n === 'popover' || n === 'open') {
+      const slot = _domReceiverGet(_popoverSlots, this);
+      if (slot) {
+        if (n === 'popover') { slot.attribute(null); return; }
+        const tag = slot.facts().localName;
+        if (tag === 'dialog' || tag === 'details') { slot.openAttribute(null); return; }
+      }
+    }
+    const popoverPrev = (n === "popover") ? _domReceiverGet(_popoverSlots, this)?.facts().type : undefined;
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
+    if (_canvasAttributeMutation(this, n, null, true)) return;
     _dom("remove_attribute", this._nid, n);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
@@ -3784,20 +4024,36 @@ class Element extends Node {
     }
   }
   removeAttributeNS(ns, n) {
+    const image = _domReceiverGet(_domReceiverSlots, this);
+    if (image?.kind === "image") { image.mutateNS(this, "remove_attribute", ns == null ? "" : String(ns), String(n), ""); return; }
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    if (ns === "" && _canvasAttributeMutation(this, n, null, true)) return;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
-  getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
+  getAttributeNames() {
+    const image = _domReceiverGet(_domReceiverSlots, this);
+    if (image?.kind === "image") return JSON.parse(Deno.core.ops.op_image_attribute(image.handle, "attribute_names", "", ""));
+    return _domParse("attribute_names", this._nid) || [];
+  }
   get attributes() {
     if (!this._attributes) this._attributes = new NamedNodeMap(this);
     return this._attributes;
   }
-  getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
+  getAttributeNS(ns, n) {
+    const image = _domReceiverGet(_domReceiverSlots, this);
+    if (image?.kind === "image") return JSON.parse(Deno.core.ops.op_image_attribute(image.handle, "get_attribute_ns", (ns == null ? "" : String(ns)) + "\0" + String(n), ""));
+    ns = String(ns == null ? "" : ns); n = String(n);
+    if (ns === '' && (n === 'width' || n === 'height')) {
+      const canvas = _canvasHtmlLookup(this);
+      if (canvas) return canvas.rawAttribute(n);
+    }
+    return _domParse("get_attribute_ns", this._nid, ns + "\0" + n);
+  }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
@@ -3806,17 +4062,8 @@ class Element extends Node {
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
-    // :popover-open is a JS-observable popover state, not understood by the
-    // native selector engine. Handle it here (and strip it from compound
-    // selectors so the rest can still be matched natively).
-    if (typeof s === "string" && s.indexOf(":popover-open") !== -1) {
-      if (this._popoverState !== "showing") return false;
-      const rest = s.replace(/:popover-open/g, "").trim();
-      if (rest === "") return true;
-      return this.matches(rest);
-    }
     // :modal is a JS-observable dialog state (a dialog opened via showModal()),
-    // not understood by the native selector engine; handle it like :popover-open.
+    // not understood by the native selector engine; handle it here.
     if (typeof s === "string" && s.indexOf(":modal") !== -1) {
       if (this._dialogModal !== true) return false;
       const rest = s.replace(/:modal/g, "").trim();
@@ -3978,10 +4225,13 @@ class Element extends Node {
     if (_isActuallyDisabled(this) && _tag !== 'LABEL') {
       return;
     }
+    const _checkedReceiver = _checkable ? _checkedReceiverGet(_checkedReceivers, this) : null;
+    if (_checkable && !_checkedReceiver) throw new TypeError('Illegal invocation');
     let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
     if (_checkable) {
-      _oldChecked = !!this.checked;
-      _oldIndeterminate = !!this.indeterminate;
+      const state = _checkedReceiver.read(_checkedReceiver.nid);
+      _oldChecked = state?.checked ?? false;
+      _oldIndeterminate = state?.indeterminate ?? false;
       if (_type === 'radio') {
         const _name = this.getAttribute('name') || '';
         if (_name) {
@@ -3991,29 +4241,39 @@ class Element extends Node {
             const r = _all[i];
             if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
             if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
-            _radioStates.push([r, !!r.checked]);
-            if (r !== this) r.checked = false;
+            const receiver = _checkedReceiverGet(_checkedReceivers, r);
+            if (!receiver) throw new TypeError('Illegal invocation');
+            _radioStates.push([receiver, receiver.read(receiver.nid)?.checked ?? false]);
+            if (r !== this) receiver.checked(receiver.nid, false);
           }
         }
-        this.checked = true;
+        _checkedReceiver.checked(_checkedReceiver.nid, true);
       } else {
         // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
         // checkedness *and* drops indeterminateness. Clearing it here, not on
         // `change`, is what lets the cancelled-activation path put the old
         // flag back instead of leaving it stuck off.
-        this.checked = !_oldChecked;
-        this.indeterminate = false;
+        _checkedReceiver.checked(_checkedReceiver.nid, !_oldChecked);
+        _checkedReceiver.indeterminate(_checkedReceiver.nid, false);
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
     if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
-      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
+      if (_radioStates) {
+        for (let i = 0; i < _radioStates.length; i++) {
+          const entry = _radioStates[i], receiver = entry[0];
+          receiver.checked(receiver.nid, entry[1]);
+        }
+      }
+      else if (_checkable) {
+        _checkedReceiver.checked(_checkedReceiver.nid, _oldChecked);
+        _checkedReceiver.indeterminate(_checkedReceiver.nid, _oldIndeterminate);
+      }
       return;
     }
-    if (_checkable && this.checked !== _oldChecked) {
+    if (_checkable && (_checkedReceiver.read(_checkedReceiver.nid)?.checked ?? false) !== _oldChecked) {
       for (const _type of ['input', 'change']) {
         const _e = new Event(_type, {bubbles: true});
         if (_trusted) globalThis.__obscura_markTrusted(_e);
@@ -4068,101 +4328,62 @@ class Element extends Node {
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
 
   // --- Popover API (HTML "popover") ---------------------------------------
-  // Read the popover content attribute case-insensitively. The HTML parser
-  // lowercases attribute names, but runtime setAttribute("PoPoVeR", ...)
-  // preserves case, and the IDL reflection matches the name ASCII-case-
-  // insensitively. Returns the raw stored string, or null if absent.
-  _popoverAttrValue() {
-    const v = this.getAttribute("popover");
-    if (v !== null) return v;
-    const names = _domParse("attribute_names", this._nid) || [];
-    for (let i = 0; i < names.length; i++) {
-      if (names[i].toLowerCase() === "popover") return this.getAttribute(names[i]);
-    }
-    return null;
-  }
-  // The reflected (effective) popover type: null (No Popover), "auto",
-  // "hint", or "manual". Empty string maps to "auto"; any non-keyword value
-  // (invalid) maps to "manual".
-  get popover() {
-    const raw = this._popoverAttrValue();
-    if (raw === null) return null;
-    const v = String(raw).toLowerCase();
-    if (v === "auto" || v === "hint" || v === "manual") return v;
-    if (v === "") return "auto";
-    return "manual";
-  }
-  set popover(value) {
-    if (value === null || value === undefined) { this._popoverRemoveAttr(); return; }
-    this.setAttribute("popover", String(value));
-  }
-  _popoverRemoveAttr() {
-    if (this.getAttribute("popover") !== null) { this.removeAttribute("popover"); return; }
-    const names = _domParse("attribute_names", this._nid) || [];
-    for (let i = 0; i < names.length; i++) {
-      if (names[i].toLowerCase() === "popover") { this.removeAttribute(names[i]); return; }
-    }
-  }
   // "check popover validity". expectedToBeShowing is true for hide, false for
   // show. Throws NotSupportedError when there is no valid popover type, and
   // InvalidStateError when the element is not connected; returns false (no
   // throw) when the current state does not match expectedToBeShowing.
-  _checkPopoverValidity(expectedToBeShowing) {
-    if (this.popover === null) throw new DOMException("Not supported on elements that don't have a valid value for the popover attribute", "NotSupportedError");
-    const showing = this._popoverState === "showing";
-    if ((expectedToBeShowing && !showing) || (!expectedToBeShowing && showing)) return false;
-    if (!this.isConnected) throw new DOMException("Invalid on popover elements which aren't connected", "InvalidStateError");
-    return true;
-  }
+  _checkPopoverValidity(expectedToBeShowing) { return _popoverCheck(this, expectedToBeShowing); }
   showPopover() {
-    if (!this._checkPopoverValidity(/*expectedToBeShowing*/false)) return;
-    const beforeEvent = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
-    if (!this.dispatchEvent(beforeEvent)) return;
+    if (!_popoverCheck(this, false)) return;
+    const slot = _popoverSlot(this);
+    if (!slot.emit("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" })) return;
     // The beforetoggle handler may have changed our type or shown us; re-check.
-    if (!this._checkPopoverValidity(/*expectedToBeShowing*/false)) return;
-    this._popoverState = "showing";
+    if (!_popoverCheck(this, false)) return;
+    _popoverSlot(this).set(true);
     const target = this;
-    setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
+    setTimeout(() => { try { _popoverSlot(target).emit("toggle", { oldState: "closed", newState: "open" }); } catch (e) {} }, 0);
   }
   hidePopover() {
-    if (!this._checkPopoverValidity(/*expectedToBeShowing*/true)) return;
-    this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-    this._popoverState = "hidden";
+    if (!_popoverCheck(this, true)) return;
+    _popoverSlot(this).emit("beforetoggle", { oldState: "open", newState: "closed" });
+    _popoverSlot(this).set(false);
     const target = this;
-    setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
+    setTimeout(() => { try { _popoverSlot(target).emit("toggle", { oldState: "open", newState: "closed" }); } catch (e) {} }, 0);
   }
   togglePopover(force) {
     let options = force;
     if (options && typeof options === "object") force = options.force;
-    const showing = this._popoverState === "showing";
+    const showing = _popoverFacts(this).open;
     if (showing && (force === undefined || force === null || force === false)) {
       this.hidePopover();
     } else if (force === undefined || force === null || force === true) {
       this.showPopover();
     }
-    return this._popoverState === "showing";
+    return _popoverFacts(this).open;
   }
   // Called from setAttribute/removeAttribute/IDL setter when the popover
   // attribute may have changed. If the effective type changed while showing,
   // hide the popover (firing the hide events) per the HTML spec.
   _popoverTypeMaybeChanged(prevType) {
-    const newType = this.popover;
-    if (this._popoverState === "showing" && prevType !== newType) {
+    // Foreign elements and host reads before page initialization have no
+    // popover capability; their ordinary attribute writes remain ordinary.
+    const slot = _domReceiverGet(_popoverSlots, this);
+    if (!slot) return;
+    const state = slot.facts();
+    if (state.open && prevType !== state.type) {
       // Hide directly. Do not call hidePopover(): it re-validates against the
       // popover attribute, which may now be removed (No Popover), and would
       // throw NotSupportedError. This mirrors the spec hide with throw=false.
-      this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-      this._popoverState = "hidden";
+      _popoverSlot(this).emit("beforetoggle", { oldState: "open", newState: "closed" });
+      _popoverSlot(this).set(false);
       const target = this;
-      setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
+      setTimeout(() => { try { _popoverSlot(target).emit("toggle", { oldState: "open", newState: "closed" }); } catch (e) {} }, 0);
     }
   }
-  // HTMLDialogElement members (live on Element.prototype like popover/input;
-  // meaningful only when localName === 'dialog'). Modal top-layer/focus/render
+  // Remaining dialog methods still need their interface and brand audit.
+  // Modal top-layer/focus/render
   // is layout (out of scope); the open state, returnValue, and beforetoggle/
   // toggle/close/cancel events are JS-observable and implemented here.
-  get open() { return this.hasAttribute('open'); }
-  set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
   set returnValue(v) { this._returnValue = String(v); }
   get oncancel() { return this._oncancel || null; }
@@ -4546,14 +4767,14 @@ class Element extends Node {
   }
   _resetIframeFrame() {
     _discardIframeContext(this, false);
-    if (!this.isConnected) return;
+    if (!_iframeCanHaveContext(this)) return;
     this._iframeDoc = new _IframeDocument(
       '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
     this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
     _trackIframeContext(this);
   }
   _loadIframeSrc(url) {
-    if (!this.isConnected) { _queueIframeLoad(this); return; }
+    if (!_iframeCanHaveContext(this)) { _queueIframeLoad(this); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -4565,18 +4786,21 @@ class Element extends Node {
     this._iframeLoadingUrl = fullUrl;
     const generation = this._iframeGeneration;
     const el = this;
-    fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
-      if (el._iframeGeneration !== generation || el._iframeLoadingUrl !== fullUrl || !el.isConnected) return;
+    const fetchInit = {mode: 'no-cors'};
+    _markFrameFetchInit(fetchInit);
+    fetch(fullUrl, fetchInit).then(async resp => {
+      if (el._iframeGeneration !== generation || el._iframeLoadingUrl !== fullUrl || !_iframeCanHaveContext(el)) return;
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
-        if (el._iframeGeneration !== generation || !el.isConnected) return;
+        if (el._iframeGeneration !== generation || el._iframeLoadingUrl !== fullUrl || !_iframeCanHaveContext(el)) return;
         // Hand the document to the host, which gives this frame a realm of its
         // own and runs the scripts that came with it (issue #600). The shim
         // document below stays: it is what the parent reads through
         // contentDocument.
+        _retireIframeShimDocument(el);
         const box = el.getBoundingClientRect();
         el._frameId = Deno.core.ops.op_frame_document_ready(
-          fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+          fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, _getResponsePolicyId(resp));
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
@@ -4589,6 +4813,7 @@ class Element extends Node {
           globalThis.__obscura_frameElements[el._frameId] = el;
         }
       } else {
+        _retireIframeShimDocument(el);
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
@@ -4598,46 +4823,16 @@ class Element extends Node {
       // directly bypasses listeners registered via addEventListener.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
-      if (el._iframeGeneration !== generation || el._iframeLoadingUrl !== fullUrl || !el.isConnected) return;
+      if (el._iframeGeneration !== generation || el._iframeLoadingUrl !== fullUrl || !_iframeCanHaveContext(el)) return;
+      _retireIframeShimDocument(el);
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
       el.dispatchEvent(new Event('load'));
     });
   }
-  get contentDocument() {
-    if (this.localName !== 'iframe') return undefined;
-    if (!this.isConnected) return null;
-    const real = _frameObjectsFor(this);
-    if (real?.document) return real.document;
-    if (this._iframeDoc) {
-      const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
-      const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
-      if (pageOrigin === iframeOrigin || this.src === '' || this.src === 'about:blank' || !this.src.includes('://')) {
-        return this._iframeDoc;
-      }
-      return null; // Cross-origin: blocked
-    }
-    if (!this._iframeDoc) {
-      this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-      this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
-      _trackIframeContext(this);
-    }
-    return this._iframeDoc;
-  }
-  get contentWindow() {
-    if (this.localName !== 'iframe') return undefined;
-    if (!this.isConnected) return null;
-    if (_frameObjectsFor(this)) {
-      const win = _frameWindowFor(this._frameId);
-      if (win) return win;
-    }
-    if (!this._iframeWin) {
-      if (this.parentNode === null) return null;
-      this.contentDocument;
-    }
-    return this._iframeWin;
-  }
+  get contentDocument() { return _domReceiverState(this, 'iframe').document(); }
+  get contentWindow() { return _domReceiverState(this, 'iframe').window(); }
   get action() {
     // A missing action falls back to the document URL, a present one resolves against the base.
     const action = this.getAttribute("action") || _domParse("document_url") || "";
@@ -4835,7 +5030,7 @@ class Element extends Node {
   _renderClientMetrics() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = Deno.core.ops.op_layout_geometry(this, String(this._nid | 0));
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4860,7 +5055,7 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = Deno.core.ops.op_layout_geometry(this, String(this._nid | 0));
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4920,7 +5115,7 @@ class Element extends Node {
   _renderScrollMetrics() {
     if (typeof Deno.core.ops.op_layout_metrics !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_layout_metrics();
+      const raw = Deno.core.ops.op_layout_metrics(this);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -4929,7 +5124,7 @@ class Element extends Node {
   _renderElementScrollMetrics() {
     if (typeof Deno.core.ops.op_element_scroll_metrics !== 'function') return undefined;
     try {
-      const raw = Deno.core.ops.op_element_scroll_metrics(String(this._nid | 0));
+      const raw = Deno.core.ops.op_element_scroll_metrics(this, String(this._nid | 0));
       if (!raw) return null;
       const metrics = JSON.parse(raw);
       return metrics && metrics.hasBox !== false ? metrics : null;
@@ -4940,7 +5135,7 @@ class Element extends Node {
   _renderScrollOffset() {
     if (typeof Deno.core.ops.op_scroll_offset !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_scroll_offset();
+      const raw = Deno.core.ops.op_scroll_offset(this);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -4949,7 +5144,7 @@ class Element extends Node {
   _setRenderScroll(x, y) {
     if (typeof Deno.core.ops.op_scroll_to !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_scroll_to(+x || 0, +y || 0);
+      const raw = Deno.core.ops.op_scroll_to(this, +x || 0, +y || 0);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -4958,7 +5153,7 @@ class Element extends Node {
   _setRenderElementScroll(x, y) {
     if (typeof Deno.core.ops.op_element_scroll_to !== 'function') return null;
     try {
-      const raw = Deno.core.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      const raw = Deno.core.ops.op_element_scroll_to(this, String(this._nid | 0), +x || 0, +y || 0);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5243,7 +5438,129 @@ class Element extends Node {
 // `window.HTMLElement === window.Element` true and gave every HTML element
 // interface the wrong ancestor. SVGElement stays a direct child of Element,
 // as in the browser.
-class HTMLElement extends Element {}
+const _popoverHandlerFunction = Function;
+const _popoverAttributeString = String;
+const _popoverWeakSet = WeakSet;
+const _popoverPendingAdd = Function.call.bind(WeakSet.prototype.add);
+const _popoverPendingHas = Function.call.bind(WeakSet.prototype.has);
+let _popoverPendingElements = new _popoverWeakSet();
+function _popoverSlot(receiver) {
+  const slot = _domReceiverGet(_popoverSlots, receiver);
+  if (!slot) throw new _domReceiverTypeError('Illegal invocation');
+  return slot;
+}
+function _popoverFacts(receiver) { return _popoverSlot(receiver).facts(); }
+function _popoverCheck(receiver, expected) {
+  const state = _popoverFacts(receiver);
+  if (state.type === null) throw new DOMException("Not supported on elements that don't have a valid value for the popover attribute", "NotSupportedError");
+  if (state.open !== expected) return false;
+  if (!state.connected || !state.active) throw new DOMException("Invalid on popover elements which aren't connected to an active document", "InvalidStateError");
+  return true;
+}
+function _registerPopoverElement(element, nid, namespace) {
+  if (namespace !== 'http://www.w3.org/1999/xhtml') return;
+  if (!_imageDimensionOwner || !Deno.core.ops.op_popover_document_current(_imageDimensionOwner)) {
+    // Host DOM replacement can precede page initialization. These factory
+    // wrappers have no capability; invalidate their cache entries at handoff
+    // instead of granting retained references a different document's owner.
+    _popoverPendingAdd(_popoverPendingElements, element);
+    return;
+  }
+  const handle = Deno.core.ops.op_popover_bind_handle(_imageDimensionOwner, nid >>> 0);
+  const openInterface = Deno.core.ops.op_popover_open_interface(handle);
+  const handlers = new Map(), inline = new Map();
+  const facts = () => _domJSONParse(Deno.core.ops.op_popover_state(handle));
+  _domReceiverSet(_popoverSlots, element, {
+    openInterface,
+    openValue: expected => Deno.core.ops.op_popover_open_value(handle, expected),
+    handlers,
+    openAttribute: value => {
+      const previous = facts();
+      const changed = previous.localName === 'details'
+        ? Deno.core.ops.op_details_attribute(handle, value)
+        : Deno.core.ops.op_dialog_attribute(handle, value);
+      if (changed) {
+        _domMutationEpoch++;
+        if (previous.active && globalThis.__mutationObservers?.length)
+          globalThis.__notifyMutation('attributes', nid, [], [], 'open');
+      }
+    },
+    attribute: value => {
+      const previous = facts();
+      const changed = Deno.core.ops.op_popover_attribute(handle, value);
+      if (changed) {
+        _domMutationEpoch++;
+        if (previous.active && globalThis.__mutationObservers?.length)
+          globalThis.__notifyMutation('attributes', nid, [], [], 'popover');
+      }
+      if (previous.open && previous.type !== facts().type) {
+        const slot = _popoverSlot(element);
+        slot.emit('beforetoggle', { oldState:'open', newState:'closed' });
+        slot.set(false);
+        setTimeout(() => { try { slot.emit('toggle', { oldState:'open', newState:'closed' }); } catch (_) {} }, 0);
+      }
+    },
+    facts: () => _domJSONParse(Deno.core.ops.op_popover_state(handle)),
+    set: open => {
+      const changed = Deno.core.ops.op_popover_set(handle, open);
+      if (changed) _domMutationEpoch++;
+      return changed;
+    },
+    emit: (type, init) => {
+      const event = new _popoverToggleEvent(type, init);
+      event.target = element; event.currentTarget = element; event.eventPhase = 2;
+      let handler = handlers.get(type);
+      if (!handler) {
+        const source = facts()['on' + type];
+        let cached = inline.get(type);
+        if (!cached || cached.source !== source) {
+          cached = { source, callback:null };
+          if (source) try { cached.callback = new _popoverHandlerFunction('event', source); } catch (_) {}
+          inline.set(type, cached);
+        }
+        handler = cached.callback;
+      }
+      if (typeof handler === 'function') {
+        try { if (handler.call(element, event) === false) event.preventDefault(); }
+        catch (error) { console.error(error); }
+      }
+      // Element listeners use this realm's native identity. An author expando
+      // or accessor on _nid must not reroute cancellation to another element.
+      for (const listener of (_eventRegistry[nid] || {})[type] || []) {
+        try { listener.call(element, event); } catch (error) { console.error(error); }
+        if (event._immediatePropagationStopped) break;
+      }
+      event.currentTarget = null; event.eventPhase = 0;
+      return !event.defaultPrevented;
+    },
+  });
+}
+class HTMLElement extends Element {
+  get popover() { return _popoverFacts(this).type; }
+  set popover(value) {
+    const slot = _popoverSlot(this);
+    if (typeof value === 'symbol') throw new _domReceiverTypeError('Cannot convert a Symbol value to a string');
+    slot.attribute(value === null || value === undefined ? null : _popoverAttributeString(value));
+  }
+}
+// These are HTML interface members. Their implementations still use native
+// original-document capabilities; SVG must not inherit HTML popover authority.
+Object.defineProperty(HTMLElement.prototype, 'popover', {
+  ...Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'popover'), enumerable:true,
+});
+for (const name of ['showPopover', 'hidePopover', 'togglePopover']) {
+  Object.defineProperty(HTMLElement.prototype, name, {
+    ...Object.getOwnPropertyDescriptor(Element.prototype, name), enumerable:true,
+  });
+  delete Element.prototype[name];
+}
+for (const type of ['beforetoggle', 'toggle']) {
+  Object.defineProperty(HTMLElement.prototype, 'on' + type, {
+    configurable:true, enumerable:true,
+    get() { return _popoverSlot(this).handlers.get(type) || null; },
+    set(callback) { _popoverSlot(this).handlers.set(type, typeof callback === 'function' ? callback : null); },
+  });
+}
 globalThis.HTMLElement = HTMLElement;
 // WHATWG "convert nodes into a node": a Node argument passes through, anything
 // else is stringified into a Text node, so e.g. append(null) inserts the text
@@ -5337,6 +5654,7 @@ function _convertNodes(nodes) {
 
   // Global content attributes reflected on every element (HTML "global attributes").
   reflectStr("title", "title");
+  reflectStr("nonce", "nonce");
   reflectStr("lang", "lang");
   reflectStr("accessKey", "accesskey");
   reflectStr("slot", "slot");
@@ -5482,7 +5800,44 @@ function _throwDocumentDomainSecurityError() {
   throw new DOMException("Failed to set the 'domain' property on 'Document'", "SecurityError");
 }
 
+function _readIframeContentDocument(frame) {
+  if (!_iframeCanHaveContext(frame)) return null;
+  const real = _frameObjectsFor(frame);
+  if (real?.document) return real.document;
+  if (frame._iframeDoc) {
+    const src = _domReceiverState(frame, 'iframe').source();
+    const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
+    const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(src);
+    if (pageOrigin === iframeOrigin || src === '' || src === 'about:blank' || !src.includes('://')) {
+      return frame._iframeDoc;
+    }
+    return null; // Cross-origin: blocked
+  }
+  if (!frame._iframeDoc) {
+    frame._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', frame);
+    frame._iframeWin = new _IframeWindow(frame._iframeDoc, 'about:blank');
+    _trackIframeContext(frame);
+  }
+  return frame._iframeDoc;
+}
+function _readIframeContentWindow(frame) {
+  if (!_iframeCanHaveContext(frame)) return null;
+  if (_frameObjectsFor(frame)) {
+    const win = _frameWindowFor(frame._frameId);
+    if (win) return win;
+  }
+  if (!frame._iframeWin) {
+    if (_wrap(+_dom('parent_node', _domReceiverState(frame, 'iframe').nid)) === null) return null;
+    _readIframeContentDocument(frame);
+  }
+  return frame._iframeWin;
+}
+
 class Document extends Node {
+  constructor(nid) {
+    super(nid);
+    _registerDocumentReceiver(this, () => '', () => 'about:blank');
+  }
   get timeline() {
     if (!this._timeline) {
       this._timeline = new DocumentTimeline();
@@ -5554,7 +5909,7 @@ class Document extends Node {
     // grant cross-document access.
     this._effectiveDomain = candidate;
   }
-  get referrer() { return _domParse("document_referrer") ?? ""; }
+  get referrer() { return _domReceiverState(this, 'document').referrer(); }
   get location() { return globalThis.location; }
   set location(url) { _locationNavigate(url); }
   get defaultView() { return globalThis; }
@@ -5633,7 +5988,10 @@ class Document extends Node {
       "http://www.w3.org/1999/xhtml",
       localName,
     );
-    const el = new C(nid);
+    const el = new C(nid, C === HTMLImageElement ? _imageConstructionToken : undefined);
+    _registerPopoverElement(el, nid, 'http://www.w3.org/1999/xhtml');
+    if (localName === 'iframe') _registerIframeReceiver(el, nid, this);
+    _registerCheckedReceiver(el, nid);
     // This node was just created from values already known to JS. Seed its
     // immutable metadata instead of rediscovering it through native calls in
     // hydration's tag/local-name checks.
@@ -5655,7 +6013,8 @@ class Document extends Node {
     const namespace = ns == null ? null : String(ns);
     const qualified = String(t);
     _ns_validateQualifiedName(namespace == null ? "" : namespace, qualified);
-    if (namespace === "http://www.w3.org/1999/xhtml") {
+    if (namespace === "http://www.w3.org/1999/xhtml"
+        && (qualified === 'canvas' || qualified.split(':').pop().toLowerCase() !== 'canvas')) {
       const el = this.createElement(qualified);
       if (el) el._ns = namespace;
       return el;
@@ -5666,10 +6025,12 @@ class Document extends Node {
     );
     const effectiveNamespace = namespace == null ? "" : namespace;
     const C = _elementClassForKnownName(effectiveNamespace, qualified);
-    const el = new C(nid);
+    const el = new C(nid, C === HTMLImageElement ? _imageConstructionToken : undefined);
+    _registerPopoverElement(el, nid, effectiveNamespace);
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
+    if (effectiveNamespace === 'http://www.w3.org/1999/xhtml' && localName === 'iframe') _registerIframeReceiver(el, nid, this);
     el._tagName = qualified;
     el._lname = localName;
     el._ns = effectiveNamespace;
@@ -6305,13 +6666,81 @@ function _imageEncodingError() {
   return new DOMException("The source image cannot be decoded.", "EncodingError");
 }
 
+// Only the host captures this initializer before author execution. The
+// document capability is never reconstructed from a public owner/nid/frame id.
+let _imageDimensionOwner = null;
+const _imageConstructionToken = {};
+const _imageCacheForEach = Function.call.bind(Map.prototype.forEach);
+const _imageCacheDelete = Function.call.bind(Map.prototype.delete);
+globalThis.__obscura_image_dimensions_handoff = function(owner) {
+  if (_imageDimensionOwner && Deno.core.ops.op_image_same_document(_imageDimensionOwner, owner)) return;
+  // A reused runtime may contain old wrappers under colliding numeric ids.
+  // Existing references retain their original native handles; new lookups
+  // must create wrappers under the newly host-issued document capability.
+  _imageCacheForEach(_cache, (value, key) => {
+    if (_domReceiverGet(_domReceiverSlots, value)?.kind === 'image'
+        || _domReceiverGet(_popoverSlots, value)
+        || _popoverPendingHas(_popoverPendingElements, value)
+        || Deno.core.ops.op_image_cache_node(owner, key)) _imageCacheDelete(_cache, key);
+  });
+  _popoverPendingElements = new _popoverWeakSet();
+  _imageDimensionOwner = owner;
+};
+function _imageDimensionRecord(image) {
+  const record = _domReceiverState(image, 'image');
+  if (!record.handle) throw new _domReceiverTypeError('Image document unavailable');
+  return record;
+}
+function _imageAttributeWrite(image, command, name, value) {
+  const record = _imageDimensionRecord(image);
+  const popoverPrev = name === 'popover' ? image.popover : undefined;
+  const active = Deno.core.ops.op_image_active(record.handle);
+  const oldName = active && (name === 'id' || name === 'name')
+    ? JSON.parse(Deno.core.ops.op_image_attribute(record.handle, 'get_attribute', name, '')) : null;
+  Deno.core.ops.op_image_attribute(record.handle, command, name, value);
+  const removing = command === 'remove_attribute';
+  if (name === 'style') image._style._replaceFromAttribute(removing ? '' : value);
+  if (popoverPrev !== undefined) image._popoverTypeMaybeChanged(popoverPrev);
+  if (active && (name === 'id' || name === 'name')) {
+    if (!removing && image.getRootNode() === globalThis.document) {
+      _ensureWindowNamedProperty(value); _registerDocumentNamedElement(image);
+    }
+    if (oldName && oldName !== value) _reconcileWindowNamedProperty(oldName);
+  }
+  if (active && globalThis.__mutationObservers?.length)
+    globalThis.__notifyMutation('attributes', record.nid, [], [], name);
+  if (name === 'src' || name === 'srcset' || name === 'sizes' || name === 'crossorigin') {
+    image._imageSourceChanged();
+  } else if (active && (name === 'onload' || name === 'onerror') && !image._imageComplete) {
+    image._queueImageRequest();
+  }
+}
+function _imageAttributeWriteNS(image, command, namespace, name, value) {
+  const record = _imageDimensionRecord(image);
+  Deno.core.ops.op_image_attribute(record.handle, command + '_ns', namespace + '\0' + name, value);
+  const local = name.includes(':') ? name.slice(name.indexOf(':') + 1) : name;
+  if (namespace === '' && local === 'style') image._style._replaceFromAttribute(command === 'set_attribute' ? value : '');
+  if (namespace === '' && ['src','srcset','sizes','crossorigin'].includes(local)) image._imageSourceChanged();
+  if (Deno.core.ops.op_image_active(record.handle) && globalThis.__mutationObservers?.length)
+    globalThis.__notifyMutation('attributes', record.nid, [], [], local);
+}
+function _setImageDimension(image, height, value) {
+  const record = _imageDimensionRecord(image);
+  const converted = (+value) >>> 0;
+  record.mutate(image, 'set_attribute', height ? 'height' : 'width', String(converted));
+}
+
 // HTMLImageElement is backed by the same retained resource cache used by
 // layout/paint. The render-only native op owns responsive candidate selection,
 // fetching, and metadata sniffing; bootstrap owns only the observable request
 // state and event timing.
 class HTMLImageElement extends HTMLElement {
-  constructor(nid) {
+  constructor(nid, token) {
+    if (token !== _imageConstructionToken) throw new _domReceiverTypeError("Illegal constructor");
     super(nid);
+    _domReceiverSet(_domReceiverSlots, this, {kind: 'image', nid,
+      handle: _imageDimensionOwner ? Deno.core.ops.op_image_bind_handle(_imageDimensionOwner, nid >>> 0) : null,
+      mutate: _imageAttributeWrite, mutateNS: _imageAttributeWriteNS});
     this._imageRequest = 0;
     this._imageQueued = false;
     this._imageInitialized = false;
@@ -6380,15 +6809,15 @@ class HTMLImageElement extends HTMLElement {
   }
 
   get width() {
-    const value = Number.parseInt(this.getAttribute("width") || "", 10);
-    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalWidth;
+    const record = _imageDimensionRecord(this);
+    return Deno.core.ops.op_image_idl_dimension(record.handle, false);
   }
-  set width(value) { this.setAttribute("width", Math.max(0, Number(value) || 0)); }
+  set width(value) { _setImageDimension(this, false, value); }
   get height() {
-    const value = Number.parseInt(this.getAttribute("height") || "", 10);
-    return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalHeight;
+    const record = _imageDimensionRecord(this);
+    return Deno.core.ops.op_image_idl_dimension(record.handle, true);
   }
-  set height(value) { this.setAttribute("height", Math.max(0, Number(value) || 0)); }
+  set height(value) { _setImageDimension(this, true, value); }
 
   get srcset() { return this.getAttribute("srcset") || ""; }
   set srcset(value) { this.setAttribute("srcset", value); }
@@ -6410,27 +6839,8 @@ class HTMLImageElement extends HTMLElement {
     else this.setAttribute("crossorigin", String(value));
   }
 
-  setAttribute(name, value) {
-    const normalized = String(name).toLowerCase();
-    super.setAttribute(name, value);
-    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
-        || normalized === "crossorigin") {
-      this._imageSourceChanged();
-    }
-    else if ((normalized === "onload" || normalized === "onerror")
-        && !this._imageComplete) this._queueImageRequest();
-  }
-
-  removeAttribute(name) {
-    const normalized = String(name).toLowerCase();
-    super.removeAttribute(name);
-    if (normalized === "src" || normalized === "srcset" || normalized === "sizes"
-        || normalized === "crossorigin") {
-      this._imageSourceChanged();
-    }
-  }
-
   decode() {
+    if (!Deno.core.ops.op_image_active(_imageDimensionRecord(this).handle)) return Promise.reject(_imageEncodingError());
     this._refreshImageFromCache();
     if (this._imageComplete) {
       return this._imageDecoded
@@ -6444,6 +6854,7 @@ class HTMLImageElement extends HTMLElement {
   }
 
   _imageSourceChanged() {
+    if (!Deno.core.ops.op_image_active(_imageDimensionRecord(this).handle)) return;
     // The lightweight build has no retained render-resource cache. It still
     // preserves the historical non-blocking Image lifecycle so preloaders do
     // not hang while rendering is disabled.
@@ -6466,6 +6877,7 @@ class HTMLImageElement extends HTMLElement {
   }
 
   _queueImageRequest() {
+    if (!Deno.core.ops.op_image_active(_imageDimensionRecord(this).handle)) return;
     if (this._imageQueued || this._imageComplete) return;
     this._imageQueued = true;
     const request = this._imageRequest;
@@ -6479,8 +6891,10 @@ class HTMLImageElement extends HTMLElement {
   }
 
   _runImageRequest(request) {
+    const handle = _imageDimensionRecord(this).handle;
+    if (!Deno.core.ops.op_image_active(handle)) return;
     const finish = (metadata) => {
-      if (request !== this._imageRequest) return;
+      if (request !== this._imageRequest || !Deno.core.ops.op_image_active(handle)) return;
       this._imageQueued = false;
       if (metadata && metadata.state === "stale") {
         this._refreshImageFromCache(true);
@@ -6492,7 +6906,7 @@ class HTMLImageElement extends HTMLElement {
     try {
       const op = Deno.core.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        Promise.resolve(op(handle)).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -6514,9 +6928,8 @@ class HTMLImageElement extends HTMLElement {
 
   _refreshImageFromCache(deferCompletion) {
     try {
-      const op = Deno.core.ops.op_image_metadata;
-      if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      if (typeof Deno.core.ops.op_image_metadata !== "function") return;
+      const metadata = JSON.parse(Deno.core.ops.op_image_handle_metadata(_imageDimensionRecord(this).handle));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
@@ -6747,6 +7160,10 @@ globalThis.VTTCue = VTTCue;
 
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
+  if (tag && (tag === 'CANVAS' || tag.endsWith(':CANVAS'))
+      && _domParse('namespace_uri', nid) === 'http://www.w3.org/1999/xhtml') {
+    return _domParse('local_name', nid) === 'canvas' ? _htmlElementClasses.CANVAS : HTMLElement;
+  }
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
   // namespace for possible SVG wrappers.
@@ -6765,8 +7182,8 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLSlotElement;
   }
-  if (tag === "IMG") return HTMLImageElement;
-  if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+  if (tag === "IMG" && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") return HTMLImageElement;
+  if (tag === "CANVAS") return Element;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
@@ -6785,13 +7202,14 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
+    if (localName.toLowerCase() === 'canvas') return localName === 'canvas' ? _htmlElementClasses.CANVAS : HTMLElement;
     const tag = localName.toUpperCase();
     if (_htmlElementClasses[tag]) return _htmlElementClasses[tag];
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
-    if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+    if (tag === "CANVAS") return Element;
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
@@ -6805,10 +7223,19 @@ function _wrap(nid) {
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
   let n;
-  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  if (t === 1) {
+    const C = _elementClassFor(nid); n = new C(nid, C === HTMLImageElement ? _imageConstructionToken : undefined);
+    _registerCheckedReceiver(n, nid);
+    _registerPopoverElement(n, nid, _domParse('namespace_uri', nid));
+    if (C === _htmlElementClasses.IFRAME && _domParse('local_name', nid) === 'iframe') _registerIframeReceiver(n, nid);
+  }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
-  else if (t === 9) n = new HTMLDocument(nid);
+  else if (t === 9) {
+    n = new HTMLDocument(nid);
+    // A cloned/detached Document root has no active document loader.
+    if (nid === +_dom('document_node_id')) _registerLiveDocumentReceiver(n);
+  }
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -6817,7 +7244,10 @@ function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
-  const n = new C(nid);
+  const n = new C(nid, C === HTMLImageElement ? _imageConstructionToken : undefined);
+  _registerPopoverElement(n, nid, _domParse('namespace_uri', nid));
+  if (C === _htmlElementClasses.IFRAME && _domParse('local_name', nid) === 'iframe') _registerIframeReceiver(n, nid);
+  _registerCheckedReceiver(n, nid);
   _cache.set(nid, n);
   return n;
 }
@@ -7110,75 +7540,95 @@ function Navigator() { throw new TypeError("Illegal constructor"); }
 _markNative(Navigator);
 Object.defineProperty(globalThis, "Navigator", {value: Navigator, writable: true, configurable: true});
 
-// PluginArray must exist before navigator is built so the plugins getter can use it.
-function PluginArray(items) {
-  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
-  this.length = items.length;
-}
-PluginArray.prototype = Object.create(Array.prototype);
-PluginArray.prototype.constructor = PluginArray;
-PluginArray.prototype.item = function(i) { return this[i] || null; };
-PluginArray.prototype.namedItem = function(name) {
-  for (var _pi = 0; _pi < this.length; _pi++) {
-    if (this[_pi].name === name) return this[_pi];
+// Keep browser-interface state off the enumerable object surface. In
+// particular MimeType.enabledPlugin must not create a JSON serialization cycle.
+let _pluginRegistry = new WeakMap();
+const _pluginObjects = [];
+const _pluginStateMap = kind => ({
+  get(object) {
+    const slot = _pluginRegistry.get(object);
+    return slot && slot.kind === kind ? slot.state : undefined;
+  },
+  set(object, state) {
+    _pluginRegistry.set(object, {kind, state});
+    _pluginObjects.push(object);
+  },
+});
+const _pluginArrayData = _pluginStateMap('PluginArray');
+const _pluginData = _pluginStateMap('Plugin');
+const _mimeTypeData = _pluginStateMap('MimeType');
+const _mimeTypeArrayData = _pluginStateMap('MimeTypeArray');
+// The native host consumes this before page script. A loaded child realm
+// contributes its objects to the same private registry, preserving WebIDL
+// brands for borrowed getters and methods across same-origin frames.
+globalThis.__obscura_plugin_registry_handoff = shared => {
+  if (shared) {
+    for (const object of _pluginObjects) shared.set(object, _pluginRegistry.get(object));
+    _pluginRegistry = shared;
   }
-  return null;
+  return _pluginRegistry;
 };
-PluginArray.prototype.refresh = function() {};
-PluginArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+const _pluginInterfaceState = (map, receiver) => {
+  const state = map.get(receiver);
+  if (!state) throw new TypeError("Illegal invocation");
+  return state;
+};
+const _pluginInterfaceGetter = (prototype, map, key) => {
+  Object.defineProperty(prototype, key, {
+    get: _markNativeGetter({ getValue() { return _pluginInterfaceState(map, this)[key]; } }.getValue, key),
+    enumerable: true, configurable: true,
+  });
+};
+const _pluginIndexedProperties = (object, items, names) => {
+  items.forEach((item, index) => Object.defineProperty(object, index, {
+    value: item, enumerable: true, configurable: true,
+  }));
+  for (const [name, item] of names) Object.defineProperty(object, name, {
+    value: item, enumerable: false, configurable: true,
+  });
+};
+const _pluginCollectionMethods = (prototype, map) => {
+  Object.defineProperties(prototype, {
+    item: { value: _markNative({ item(index) {
+      const state = _pluginInterfaceState(map, this);
+      if (!arguments.length) throw new TypeError("1 argument required");
+      return state.items[Number(index) >>> 0] || null;
+    } }.item), writable: true, enumerable: true, configurable: true },
+    namedItem: { value: _markNative({ namedItem(name) {
+      const state = _pluginInterfaceState(map, this);
+      if (!arguments.length) throw new TypeError("1 argument required");
+      return state.names.get(String(name)) || null;
+    } }.namedItem), writable: true, enumerable: true, configurable: true },
+    [Symbol.iterator]: { value: _markNative({ values() {
+      return _pluginInterfaceState(map, this).items[Symbol.iterator]();
+    } }.values), writable: true, configurable: true },
+  });
+  _pluginInterfaceGetter(prototype, map, 'length');
+};
+
+function PluginArray() { throw new TypeError("Illegal constructor"); }
+_pluginCollectionMethods(PluginArray.prototype, _pluginArrayData);
+PluginArray.prototype.refresh = _markNative({ refresh() {
+  _pluginInterfaceState(_pluginArrayData, this);
+} }.refresh);
 Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {value: 'PluginArray', configurable: true});
 _markNative(PluginArray);
-_markNative(PluginArray.prototype.item);
-_markNative(PluginArray.prototype.namedItem);
-_markNative(PluginArray.prototype.refresh);
 
-// Plugin / MimeType / MimeTypeArray global interfaces. Chrome exposes these as
-// global constructors; their absence threw "ReferenceError: Plugin is not
-// defined" in site bundles that reference them (issue #305). Plain function
-// declarations (no globalThis assignment) so they survive the V8 snapshot, the
-// same pattern PluginArray uses.
-function Plugin(name, filename, description, mimeTypes) {
-  this.name = name;
-  this.filename = filename;
-  this.description = description;
-  var mt = mimeTypes || [];
-  for (var _i = 0; _i < mt.length; _i++) this[_i] = mt[_i];
-  this.length = mt.length;
-}
-Plugin.prototype.item = function(i) { return this[i] || null; };
-Plugin.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
-};
-Plugin.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+function Plugin() { throw new TypeError("Illegal constructor"); }
+_pluginCollectionMethods(Plugin.prototype, _pluginData);
+for (const key of ['name', 'filename', 'description']) _pluginInterfaceGetter(Plugin.prototype, _pluginData, key);
 Object.defineProperty(Plugin.prototype, Symbol.toStringTag, {value: 'Plugin', configurable: true});
 _markNative(Plugin);
-_markNative(Plugin.prototype.item);
-_markNative(Plugin.prototype.namedItem);
 
-function MimeType(type, description, suffixes, plugin) {
-  this.type = type;
-  this.description = description;
-  this.suffixes = suffixes;
-  this.enabledPlugin = plugin || null;
-}
+function MimeType() { throw new TypeError("Illegal constructor"); }
+for (const key of ['type', 'description', 'suffixes', 'enabledPlugin']) _pluginInterfaceGetter(MimeType.prototype, _mimeTypeData, key);
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
 
-function MimeTypeArray(items) {
-  for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
-  this.length = items.length;
-}
-MimeTypeArray.prototype.item = function(i) { return this[i] || null; };
-MimeTypeArray.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
-};
-MimeTypeArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+function MimeTypeArray() { throw new TypeError("Illegal constructor"); }
+_pluginCollectionMethods(MimeTypeArray.prototype, _mimeTypeArrayData);
 Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'MimeTypeArray', configurable: true});
 _markNative(MimeTypeArray);
-_markNative(MimeTypeArray.prototype.item);
-_markNative(MimeTypeArray.prototype.namedItem);
 
 globalThis.Navigator = Navigator;
 globalThis.PluginArray = PluginArray;
@@ -7541,6 +7991,55 @@ var _navigatorSeed = {
   webkitPersistentStorage: { queryUsageAndQuota(success) { if (success) success(0, globalThis.__obscura_storage_quota ?? 10738064711); }, requestQuota(bytes, success) { if (success) success(bytes); } },
 };
 
+// Navigator brands are independent of prototypes, which page script can forge
+// or replace. The host shares this registry with actual child realms.
+let _navigatorRegistry = new WeakMap();
+const _navigatorRegistryGet = Function.call.bind(WeakMap.prototype.get);
+const _navigatorRegistrySet = Function.call.bind(WeakMap.prototype.set);
+const _navigatorApply = Reflect.apply;
+const _navigatorTypeError = TypeError;
+const _navigatorMembers = Object.create(null);
+let _navigatorObject;
+globalThis.__obscura_navigator_registry_handoff = shared => {
+  if (shared) {
+    _navigatorRegistrySet(shared, _navigatorObject, _navigatorMembers);
+    _navigatorRegistry = shared;
+  }
+  return _navigatorRegistry;
+};
+function _navigatorMember(receiver, key) {
+  const members = _navigatorRegistryGet(_navigatorRegistry, receiver);
+  if (!members) throw new _navigatorTypeError('Illegal invocation');
+  return members[key];
+}
+function _brandNavigatorMember(key, descriptor) {
+  _navigatorMembers[key] = descriptor;
+  const branded = { ...descriptor };
+  if (descriptor.get) {
+    branded.get = _markNativeGetter({ getValue() {
+      return _navigatorApply(_navigatorMember(this, key).get, this, []);
+    } }.getValue, key);
+  }
+  if (descriptor.set) {
+    branded.set = _markNativeSetter({ setValue(value) {
+      return _navigatorApply(_navigatorMember(this, key).set, this, [value]);
+    } }.setValue, key);
+  }
+  if (typeof descriptor.value === 'function') {
+    const operation = { [key](...args) {
+      // WebIDL operations returning a Promise reject receiver errors.
+      if (key === 'getBattery' || key === 'share') {
+        try { return _navigatorApply(_navigatorMember(this, key).value, this, args); }
+        catch (error) { return Promise.reject(error); }
+      }
+      return _navigatorApply(_navigatorMember(this, key).value, this, args);
+    } }[key];
+    Object.defineProperty(operation, 'length', { value: descriptor.value.length, configurable: true });
+    branded.value = _markNative(operation);
+  }
+  Object.defineProperty(Navigator.prototype, key, branded);
+}
+
 // Navigator members belong on Navigator.prototype. A real navigator has no own
 // properties at all, and a production detector checks exactly that
 // (rebrowser bot-detector: `navigatorWebdriver`, "Object.getOwnPropertyNames
@@ -7634,18 +8133,29 @@ var _navigatorSeed = {
     "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
     "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
   ];
-  var _pluginItems = _pluginNames.map(function(name) {
-    var plugin = new Plugin(name, "internal-pdf-viewer", "Portable Document Format", []);
-    var mimeTypes = [
-      new MimeType("application/pdf", "Portable Document Format", "pdf", plugin),
-      new MimeType("text/pdf", "Portable Document Format", "pdf", plugin),
-    ];
-    for (var i = 0; i < mimeTypes.length; i++) plugin[i] = mimeTypes[i];
-    plugin.length = mimeTypes.length;
-    return plugin;
+  const _pluginItems = _pluginNames.map(() => Object.create(Plugin.prototype));
+  const _makeMimeType = (type) => {
+    const mime = Object.create(MimeType.prototype);
+    _mimeTypeData.set(mime, {type, description: "Portable Document Format", suffixes: "pdf", enabledPlugin: _pluginItems[0]});
+    return mime;
+  };
+  const _mimeItems = ["application/pdf", "text/pdf"].map(_makeMimeType);
+  const _mimeNames = new Map(_mimeItems.map(mime => [mime.type, mime]));
+  _pluginItems.forEach((plugin, index) => {
+    // Chrome's per-plugin indexed objects are distinct from the navigator's
+    // named MIME objects; all enabledPlugin getters return the generic viewer.
+    const items = ["application/pdf", "text/pdf"].map(_makeMimeType);
+    _pluginData.set(plugin, {name: _pluginNames[index], filename: "internal-pdf-viewer",
+      description: "Portable Document Format", items, names: _mimeNames, length: items.length});
+    _pluginIndexedProperties(plugin, items, _mimeNames);
   });
-  var _plugins = new PluginArray(_pluginItems);
-  var _mimeTypes = new MimeTypeArray([_pluginItems[0][0], _pluginItems[0][1]]);
+  const _plugins = Object.create(PluginArray.prototype);
+  const _pluginNamesMap = new Map(_pluginItems.map(plugin => [plugin.name, plugin]));
+  _pluginArrayData.set(_plugins, {items: _pluginItems, names: _pluginNamesMap, length: _pluginItems.length});
+  _pluginIndexedProperties(_plugins, _pluginItems, _pluginNamesMap);
+  const _mimeTypes = Object.create(MimeTypeArray.prototype);
+  _mimeTypeArrayData.set(_mimeTypes, {items: _mimeItems, names: _mimeNames, length: _mimeItems.length});
+  _pluginIndexedProperties(_mimeTypes, _mimeItems, _mimeNames);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
@@ -7666,6 +8176,13 @@ var _navigatorSeed = {
   // A bare instance of Navigator: the members above are all on the prototype,
   // so Object.getOwnPropertyNames(navigator) is empty as in Chromium.
   globalThis.navigator = Object.create(Navigator.prototype);
+  _navigatorObject = globalThis.navigator;
+  _navigatorRegistrySet(_navigatorRegistry, _navigatorObject, _navigatorMembers);
+  for (const key of Object.getOwnPropertyNames(_navProto)) {
+    if (key !== 'constructor') {
+      _brandNavigatorMember(key, Object.getOwnPropertyDescriptor(_navProto, key));
+    }
+  }
   globalThis.clientInformation = globalThis.navigator;
 })();
 
@@ -7673,7 +8190,7 @@ var _navigatorSeed = {
 // Navigator.prototype for the same reason as the members above: an assignment
 // on the instance re-creates exactly the own-property list the detector reads.
 function _defNavigatorMember(key, value) {
-  Object.defineProperty(Navigator.prototype, key, {
+  _brandNavigatorMember(key, {
     get: _markNativeGetter(function() { return value; }, key),
     enumerable: true, configurable: true,
   });
@@ -7751,66 +8268,122 @@ _markNative(ScreenOrientation.prototype.lock);
 _markNative(ScreenOrientation.prototype.unlock);
 globalThis.ScreenOrientation = ScreenOrientation;
 
-// Screen state lives in a side table, not in own properties of the instance: a
-// real Screen has no own properties, and `Object.getOwnPropertyNames(screen)`
-// listing _w/_h/_availW/_availH is a one-line difference from Chromium. The
-// public members are prototype accessors for the same reason.
-const _screenSlots = new WeakMap();
-class Screen {
-  constructor(w, h, availW, availH) {
-    _screenSlots.set(this, {
-      w: w, h: h,
+// Screen objects are privately branded across real realms. The host shares
+// this registry through the existing core handoff before any page script runs.
+let _screenSlots = new WeakMap();
+const _screenGet = WeakMap.prototype.get;
+const _screenBind = Function.call.bind(Function.prototype.bind);
+let _screenLookup = _screenBind(_screenGet, _screenSlots);
+const _screenSet = Function.call.bind(WeakMap.prototype.set);
+const _screenApply = Reflect.apply;
+const _screenTypeError = TypeError;
+const _screenToken = {};
+let _screenEventConstructor;
+let _screenSecure = false;
+let _screenInitialized = false;
+const _screenState = receiver => {
+  if (receiver === _screenObject) return _screenOwnSlots;
+  const slots = _screenLookup(receiver);
+  if (!slots) throw new _screenTypeError('Illegal invocation');
+  return slots;
+};
+class Screen extends EventTarget {
+  constructor() {
+    super();
+    const [key, w, h, availW, availH] = arguments;
+    if (key !== _screenToken) throw new _screenTypeError('Illegal constructor');
+    const owner = this;
+    const slots = {
+      w, h,
       availW: availW === undefined ? w : availW,
       availH: availH === undefined ? h - 40 : availH,
-      colorDepth: 24,
-      orientation: new ScreenOrientation(),
-    });
+      colorDepth: 24, orientation: new ScreenOrientation(),
+      onchange: null, changePending: false,
+      // Register in the receiver's owning realm, including when its setter is
+      // borrowed from another same-origin frame. A stable listener preserves
+      // event-handler ordering when onchange is replaced with another function.
+      updateHandler(callback) {
+        const next = typeof callback === 'function' ? callback : null;
+        if (!slots.onchange && next) _eventTargetAdd(owner, 'change', changeHandler, false);
+        else if (slots.onchange && !next) _eventTargetRemove(owner, 'change', changeHandler, false);
+        slots.onchange = next;
+      },
+    };
+    const changeHandler = event => {
+      if (slots.onchange && _screenApply(slots.onchange, owner, [event]) === false) event.preventDefault();
+    };
+    _screenSet(_screenSlots, this, slots);
   }
-  get width() { return _screenSlots.get(this).w; }
-  get height() { return _screenSlots.get(this).h; }
-  get availWidth() { return _screenSlots.get(this).availW; }
-  get availHeight() { return _screenSlots.get(this).availH; }
-  get colorDepth() { return _screenSlots.get(this).colorDepth; }
-  get pixelDepth() { return _screenSlots.get(this).colorDepth; }
-  get availTop() { return 0; }
-  get availLeft() { return 0; }
-  get isExtended() { return false; }
-  get orientation() { return _screenSlots.get(this).orientation; }
+  get width() { return _screenState(this).w; }
+  get height() { return _screenState(this).h; }
+  get availWidth() { return _screenState(this).availW; }
+  get availHeight() { return _screenState(this).availH; }
+  get colorDepth() { return _screenState(this).colorDepth; }
+  get pixelDepth() { return _screenState(this).colorDepth; }
+  get availTop() { _screenState(this); return 0; }
+  get availLeft() { _screenState(this); return 0; }
+  get isExtended() { _screenState(this); return false; }
+  get orientation() { return _screenState(this).orientation; }
+  get onchange() { return _screenState(this).onchange; }
+  set onchange(callback) {
+    const slots = _screenState(this);
+    if (!arguments.length) throw new _screenTypeError('One argument required');
+    slots.updateHandler(callback);
+  }
 }
-Object.defineProperty(Screen.prototype, 'onchange', {
-  value: null, writable: true, configurable: true, enumerable: true,
-});
-['width','height','availWidth','availHeight','colorDepth','pixelDepth','availTop','availLeft','isExtended','orientation'].forEach(function(k) {
-  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
-  if (d && d.get) {
-    _markNativeGetter(d.get, k);
-    Object.defineProperty(Screen.prototype, k, { ...d, enumerable: true });
-  }
-});
+for (const key of ['width','height','availWidth','availHeight','colorDepth','pixelDepth','availTop','availLeft','isExtended','orientation','onchange']) {
+  const descriptor = Object.getOwnPropertyDescriptor(Screen.prototype, key);
+  _markNativeGetter(descriptor.get, key);
+  if (descriptor.set) _markNativeSetter(descriptor.set, key);
+  Object.defineProperty(Screen.prototype, key, { ...descriptor, enumerable: true });
+}
 _markNative(Screen);
 globalThis.Screen = Screen;
-globalThis.screen = new Screen(1920, 1080);
-function _applyScreenSize(w, h, emulated) {
-  const slots = globalThis.screen instanceof Screen ? _screenSlots.get(globalThis.screen) : null;
-  if (slots) {
-    slots.w = w;
-    slots.h = h;
-    slots.availW = w;
-    slots.availH = emulated ? h : h - 40;
-  } else {
-    globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
+const _screenObject = new Screen(_screenToken, 1920, 1080);
+const _screenOwnSlots = _screenLookup(_screenObject);
+globalThis.screen = _screenObject;
+const _screenSecureDescriptors = {
+  isExtended: Object.getOwnPropertyDescriptor(Screen.prototype, 'isExtended'),
+  onchange: Object.getOwnPropertyDescriptor(Screen.prototype, 'onchange'),
+};
+// A restored initial about:blank is not secure. Per-document initialization
+// exposes these members only after URL and framing relationships are known.
+delete Screen.prototype.isExtended;
+delete Screen.prototype.onchange;
+const _configureScreenExposure = () => {
+  _screenSecure = _isSecureContext();
+  _screenEventConstructor = globalThis.Event;
+  for (const key of ['isExtended', 'onchange']) {
+    if (_screenSecure) Object.defineProperty(Screen.prototype, key, _screenSecureDescriptors[key]);
+    else delete Screen.prototype[key];
   }
+  _screenInitialized = true;
+};
+const _queueScreenChange = () => {
+  const slots = _screenState(_screenObject);
+  if (!_screenInitialized || slots.changePending) return;
+  slots.changePending = true;
+  _browserPostedTaskEnqueue(() => {
+    slots.changePending = false;
+    const event = new _screenEventConstructor('change');
+    _markTrustedEvent(event);
+    _eventTargetDispatch(_screenObject, event);
+  }, 2, _browserPostedTaskGeneration(), () => { slots.changePending = false; });
+};
+function _applyScreenSize(w, h, emulated, notify = false) {
+  const slots = _screenState(_screenObject);
+  const availH = emulated ? h : h - 40;
+  const changed = slots.w !== w || slots.h !== h || slots.availW !== w || slots.availH !== availH;
+  slots.w = w; slots.h = h; slots.availW = w; slots.availH = availH;
+  if (notify && changed) _queueScreenChange();
 }
 function _setScreenColorDepth(depth) {
-  const slots = globalThis.screen instanceof Screen ? _screenSlots.get(globalThis.screen) : null;
-  if (slots) slots.colorDepth = depth;
+  _screenState(_screenObject).colorDepth = depth;
 }
-// Persona application sets the available screen area after the page realm is
-// built. It goes through a hook rather than assigning `screen._availW`, which
-// would create own properties on the instance and bypass the accessors.
+// Persona initialization sets available area before document script runs. It
+// must not synthesize a display-change event merely by applying initial values.
 globalThis.__obscura_set_screen_avail = function(w, h) {
-  const slots = globalThis.screen instanceof Screen ? _screenSlots.get(globalThis.screen) : null;
-  if (!slots) return;
+  const slots = _screenState(_screenObject);
   if (Number.isFinite(w) && w > 0) slots.availW = w;
   if (Number.isFinite(h) && h > 0) slots.availH = h;
 };
@@ -7819,13 +8392,13 @@ globalThis.__obscura_set_screen_override = function(w, h, emulated) {
   if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
     globalThis.__obscura_screen_w = w;
     globalThis.__obscura_screen_h = h;
-    _applyScreenSize(w, h, !!emulated);
+    _applyScreenSize(w, h, !!emulated, true);
     return;
   }
   delete globalThis.__obscura_screen_w;
   delete globalThis.__obscura_screen_h;
   const fallback = _fp('screen');
-  _applyScreenSize(fallback[0], fallback[1], !!emulated);
+  _applyScreenSize(fallback[0], fallback[1], !!emulated, true);
 };
 
 class VisualViewport extends EventTarget {
@@ -7938,20 +8511,22 @@ function _arrayBufferFromBytes(bytes) {
 
 function _installWasmStreamingFallback() {
   if (typeof WebAssembly === 'undefined') return;
-  if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
-  const nativeInstantiateStreaming = WebAssembly.instantiateStreaming;
-  const fallback = async function instantiateStreaming(source, imports) {
+  // deno_core's streaming callback is not installed by this browser. Never
+  // delegate to it, even for invalid input: it panics across V8's FFI boundary.
+  const compile=WebAssembly.compile, instantiate=WebAssembly.instantiate;
+  const body = async source => {
     const response = await source;
-    if (response && typeof response.arrayBuffer === 'function') {
-      return WebAssembly.instantiate(await response.arrayBuffer(), imports);
-    }
-    if (typeof nativeInstantiateStreaming === 'function') {
-      return nativeInstantiateStreaming.call(WebAssembly, response, imports);
-    }
-    return WebAssembly.instantiate(response, imports);
+    const slots=_responseState(response);
+    if (slots.headerMap['content-type'] !== 'application/wasm') throw new TypeError('Incorrect response MIME type');
+    if (slots.status<200 || slots.status>=300) throw new TypeError('WebAssembly response was not successful');
+    return _arrayBufferFromBytes(_consumeResponse(response).bytes);
   };
-  fallback.__obscuraFallback = true;
-  WebAssembly.instantiateStreaming = fallback;
+  WebAssembly.compileStreaming = async function compileStreaming(source) {
+    return compile(await body(source));
+  };
+  WebAssembly.instantiateStreaming = async function instantiateStreaming(source, imports) {
+    return instantiate(await body(source), imports);
+  };
 }
 _installWasmStreamingFallback();
 
@@ -8057,8 +8632,14 @@ const _consumeWorkerFetchInit = _workerFetchInits.delete.bind(_workerFetchInits)
 const _xhrFetchInits = new WeakSet();
 const _markXhrFetchInit = _xhrFetchInits.add.bind(_xhrFetchInits);
 const _consumeXhrFetchInit = _xhrFetchInits.delete.bind(_xhrFetchInits);
+const _responsePolicyIds = new WeakMap();
+const _getResponsePolicyId = _responsePolicyIds.get.bind(_responsePolicyIds);
+const _setResponsePolicyId = _responsePolicyIds.set.bind(_responsePolicyIds);
+const _frameFetchInits = new WeakSet();
+const _markFrameFetchInit = _frameFetchInits.add.bind(_frameFetchInits);
+const _consumeFrameFetchInit = _frameFetchInits.delete.bind(_frameFetchInits);
 globalThis.fetch = async (input, init = {}) => {
-  const destination = _consumeWorkerFetchInit(init) ? "worker" : undefined;
+  const destination = _consumeWorkerFetchInit(init) ? "worker" : (_consumeFrameFetchInit(init) ? "iframe" : undefined);
   const resourceType = _consumeXhrFetchInit(init) ? "XHR" : undefined;
   init = init || {};
   const request = input instanceof Request ? input : null;
@@ -8126,12 +8707,13 @@ globalThis.fetch = async (input, init = {}) => {
   if (alreadyAborted) abort();
   let raw;
   try {
-    raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, JSON.stringify({destination, requestId, resourceType, bodyPresent}));
+    raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, fetchMode, fetchCredentials, [JSON.stringify({destination, requestId, resourceType, bodyPresent}), _performanceOwner, pageOrigin]);
   } catch (error) {
     if (signal && signal.aborted) throw signal.reason;
     throw error;
   } finally {
     Deno.core.ops.op_fetch_cleanup(requestId);
+    _notifyPerformanceObservers();
     if (signal) signal.removeEventListener('abort', abort);
   }
   const parsed = JSON.parse(raw);
@@ -8156,6 +8738,7 @@ globalThis.fetch = async (input, init = {}) => {
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
   if (parsed.requestId) {
+    if(destination === "worker" || destination === "iframe") _setResponsePolicyId(response, parsed.requestId);
     Object.defineProperty(response, "__obscuraRequestId", {
       value: parsed.requestId,
       configurable: true,
@@ -8164,28 +8747,31 @@ globalThis.fetch = async (input, init = {}) => {
   return response;
 };
 
+const _headersRecords=new WeakMap();
+const _headerRecordGet=Function.call.bind(WeakMap.prototype.get);
+const _headerRecordSet=Function.call.bind(WeakMap.prototype.set);
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
     constructor(init={}) {
-      this._h=Object.create(null);
-      if(init instanceof Headers) { init.forEach((v,k)=>{this._h[k]=v;}); }
+      _headerRecordSet(_headersRecords,this,Object.create(null));
+      if(init instanceof Headers) { init.forEach((v,k)=>{_headerRecordGet(_headersRecords,this)[k]=v;}); }
       else if(init != null && typeof init[Symbol.iterator] === 'function') {
         for(const pair of init) {
           if(pair == null || typeof pair === 'string' || typeof pair[Symbol.iterator] !== 'function') throw new TypeError('Invalid header pair');
           const values = Array.from(pair);
           if(values.length !== 2) throw new TypeError('Header pair must have two values');
           const name = String(values[0]).toLowerCase(), value = String(values[1]);
-          this._h[name] = this._h[name] === undefined ? value : this._h[name] + ', ' + value;
+          _headerRecordGet(_headersRecords,this)[name] = _headerRecordGet(_headersRecords,this)[name] === undefined ? value : _headerRecordGet(_headersRecords,this)[name] + ', ' + value;
         }
-      } else if(init && typeof init==="object") { for(const[k,v]of Object.entries(init)) this._h[k.toLowerCase()]=String(v); }
+      } else if(init && typeof init==="object") { for(const[k,v]of Object.entries(init)) _headerRecordGet(_headersRecords,this)[k.toLowerCase()]=String(v); }
     }
-    get(n) { return this._h[n.toLowerCase()]??null; } set(n,v) { this._h[n.toLowerCase()]=String(v); }
-    has(n) { return n.toLowerCase() in this._h; } delete(n) { delete this._h[n.toLowerCase()]; }
-    append(n,v) { this._h[n.toLowerCase()]=String(v); }
-    forEach(cb) { for(const[k,v] of Object.entries(this._h)) cb(v,k,this); }
-    entries() { return Object.entries(this._h)[Symbol.iterator](); }
-    keys() { return Object.keys(this._h)[Symbol.iterator](); }
-    values() { return Object.values(this._h)[Symbol.iterator](); }
+    get(n) { return _headerRecordGet(_headersRecords,this)[n.toLowerCase()]??null; } set(n,v) { _headerRecordGet(_headersRecords,this)[n.toLowerCase()]=String(v); }
+    has(n) { return n.toLowerCase() in _headerRecordGet(_headersRecords,this); } delete(n) { delete _headerRecordGet(_headersRecords,this)[n.toLowerCase()]; }
+    append(n,v) { _headerRecordGet(_headersRecords,this)[n.toLowerCase()]=String(v); }
+    forEach(cb) { for(const[k,v] of Object.entries(_headerRecordGet(_headersRecords,this))) cb(v,k,this); }
+    entries() { return Object.entries(_headerRecordGet(_headersRecords,this))[Symbol.iterator](); }
+    keys() { return Object.keys(_headerRecordGet(_headersRecords,this))[Symbol.iterator](); }
+    values() { return Object.values(_headerRecordGet(_headersRecords,this))[Symbol.iterator](); }
     [Symbol.iterator]() { return this.entries(); }
   };
 }
@@ -8649,6 +9235,26 @@ function _decodeBodyWithCharset(bytes, headers) {
   catch (e) { return new TextDecoder().decode(bytes); }
 }
 
+let _responseInstances = new WeakMap();
+const _responseGet = Function.call.bind(WeakMap.prototype.get);
+const _responseSet = Function.call.bind(WeakMap.prototype.set);
+const _responseState = response => {
+  const slots=_responseGet(_responseInstances,response);
+  if (!slots) throw new TypeError('Expected a Response or Promise<Response>');
+  return slots;
+};
+const _responseDisturbed = slots => slots.used || !!slots.streamState?.disturbed;
+const _consumeResponse = response => {
+  const slots=_responseState(response);
+  if (_responseDisturbed(slots) || slots.streamState?.locked) throw new TypeError('Body is already consumed or locked');
+  if (!slots.nullBody) slots.used=true;
+  return slots;
+};
+let _readableStreamState;
+globalThis.__obscura_response_registry_handoff = shared => {
+  if (shared) _responseInstances=shared;
+  return _responseInstances;
+};
 let _createInternalResponse;
 if (typeof Response === 'undefined') {
   const internalResponseInit = {};
@@ -8662,67 +9268,58 @@ if (typeof Response === 'undefined') {
       const headers = init.headers;
       const status = init.status;
       const statusText = init.statusText;
-      this.status = status === undefined ? 200 : (internal ? status : (+status & 0xffff));
-      this.statusText = statusText === undefined ? '' : `${statusText}`;
+      const responseStatus=status === undefined ? 200 : (internal ? status : (+status & 0xffff));
+      const responseStatusText=statusText === undefined ? '' : `${statusText}`;
       if (!internal) {
-        if (this.status < 200 || this.status > 599) throw new RangeError('Invalid response status');
-        if (/[^\t\x20-\x7e\x80-\xff]/.test(this.statusText)) throw new TypeError('Invalid response statusText');
-        if (body != null && (this.status === 204 || this.status === 205 || this.status === 304)) {
+        if (responseStatus < 200 || responseStatus > 599) throw new RangeError('Invalid response status');
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(responseStatusText)) throw new TypeError('Invalid response statusText');
+        if (body != null && (responseStatus === 204 || responseStatus === 205 || responseStatus === 304)) {
           throw new TypeError('Response status cannot have a body');
         }
-      } else if (this.status === 204 || this.status === 205 || this.status === 304) {
+      } else if (responseStatus === 204 || responseStatus === 205 || responseStatus === 304) {
         body = null;
       }
-      this._bodyBytes = _bodyToUint8Array(body);
-      this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(headers);
-      this.type = internal ? (init.type || 'default') : 'default';
-      this.url = internal ? (init.url || '') : '';
-      this.redirected = internal && !!init.redirected;
-      // #818: body/bodyUsed. A null-body response (null or no body passed)
-      // has body === null; every other body is a one-chunk stream, created
-      // lazily so merely touching .body does not copy the bytes.
-      this._bodyNull = body === null || body === undefined;
-      this._bodyStream = null;
-      this._bodyUsed = false;
+      const responseHeaders=new Headers(headers);
+      _responseSet(_responseInstances,this,{
+        bytes:_bodyToUint8Array(body).slice(), status:responseStatus, statusText:responseStatusText,
+        headers:responseHeaders, headerMap:_headerRecordGet(_headersRecords,responseHeaders),
+        type:internal ? (init.type || 'default') : 'default', url:internal ? (init.url || '') : '',
+        redirected:internal && !!init.redirected, nullBody:body==null, stream:null, streamState:null, used:false,
+      });
+      // Public accessors can be shadowed by author code. Body consumers retain
+      // the response's own state and never dispatch through author properties.
     }
-    _consumeBody() {
-      if (this._bodyUsed) throw new TypeError("Body is already consumed");
-      this._bodyUsed = true;
-    }
+    get status() { return _responseState(this).status; }
+    get statusText() { return _responseState(this).statusText; }
+    get ok() { const status=_responseState(this).status;return status>=200&&status<300; }
+    get headers() { return _responseState(this).headers; }
+    get type() { return _responseState(this).type; }
+    get url() { return _responseState(this).url; }
+    get redirected() { return _responseState(this).redirected; }
     get body() {
-      if (this._bodyNull) return null;
-      if (this._bodyUsed) throw new TypeError("Body is already consumed");
-      if (!this._bodyStream) {
-        this._bodyStream = new ReadableStream({
-          start: (controller) => {
-            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
-            controller.close();
-          },
-        });
-        // bodyUsed flips the moment the stream is locked for reading
-        // (spec: the body becomes "disturbed"), which no state probe can
-        // observe on a native ReadableStream, so hook getReader instead.
-        const response = this;
-        const stream = this._bodyStream;
-        const getReader = stream.getReader.bind(stream);
-        stream.getReader = function () {
-          response._bodyUsed = true;
-          return getReader();
-        };
-        stream.releaseLock = function () {
-          response._bodyUsed = true;
-          stream.locked = false;
-        };
+      const slots=_responseState(this);
+      if (slots.nullBody) return null;
+      if (!slots.stream) {
+        slots.stream=new ReadableStream({start(controller) {
+          if (slots.bytes.length) controller.enqueue(slots.bytes);
+          controller.close();
+        }});
+        slots.streamState=_readableStreamState(slots.stream);
+        if (slots.used) slots.streamState.disturbed=true;
       }
-      return this._bodyStream;
+      return slots.stream;
     }
-    get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
-    clone() { return _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
+    get bodyUsed() { return _responseDisturbed(_responseState(this)); }
+    async text() { const s=_consumeResponse(this);return _decodeBodyWithCharset(s.bytes,s.headers); }
+    async json() { const s=_consumeResponse(this);return JSON.parse(_decodeBodyWithCharset(s.bytes,s.headers)); }
+    async arrayBuffer() { return _arrayBufferFromBytes(_consumeResponse(this).bytes); }
+    async blob() { return new Blob([_consumeResponse(this).bytes]); }
+    clone() {
+      const s=_responseState(this);
+      if (_responseDisturbed(s)||s.streamState?.locked) throw new TypeError('Body is already consumed or locked');
+      return _createInternalResponse(s.nullBody ? null : s.bytes,
+        {status:s.status,statusText:s.statusText,headers:s.headers,type:s.type,url:s.url,redirected:s.redirected});
+    }
     static error() { return _createInternalResponse(null, { status: 0, type: 'error' }); }
     static redirect(url, status = 302) {
       url = `${url}`;
@@ -8748,12 +9345,14 @@ if (!Element.prototype.replaceWith) {
   // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
   // a Text node via String(n), matching the spec and append()/prepend(); the
   // old `typeof n === 'string'` check corrupted insert_before for other types.
-  Element.prototype.replaceWith = function(...nodes) {
-    const parent = this.parentNode;
-    if (!parent) return;
-    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
-    parent.removeChild(this);
-  };
+  Element.prototype.replaceWith = {
+    replaceWith(...nodes) {
+      const parent = this.parentNode;
+      if (!parent) return;
+      for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
+      parent.removeChild(this);
+    },
+  }.replaceWith;
   _markNative(Element.prototype.replaceWith);
 }
 if (!Element.prototype.before) {
@@ -8890,7 +9489,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof Deno.core.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = Deno.core.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = Deno.core.ops.op_layout_geometry(target, String(target._nid | 0));
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -8992,7 +9591,7 @@ function _roMeasurements(targets) {
   if (typeof bulk === "function"
       && targets.every(target => target?._nid != null)) {
     try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)));
+      const raw = bulk(targets, JSON.stringify(targets.map(target => target._nid | 0)));
       const geometries = raw ? JSON.parse(raw) : null;
       if (Array.isArray(geometries) && geometries.length === targets.length) {
         for (let index = 0; index < targets.length; index++) {
@@ -9234,6 +9833,9 @@ function _splitMediaAnd(input) {
 }
 
 function _mediaViewportDimension(name) {
+  if (name === 'device-width' || name === 'device-height') {
+    return Number(globalThis.screen[name === 'device-width' ? 'width' : 'height']);
+  }
   const value = name === 'width' ? Number(globalThis.innerWidth) : Number(globalThis.innerHeight);
   if (Number.isFinite(value)) return value;
   return name === 'width' ? 1440 : 900;
@@ -9255,7 +9857,7 @@ function _compareMediaValues(left, operator, right) {
 }
 
 function _evaluateMediaDimension(feature) {
-  let match = feature.match(/^(min|max)-(width|height)\s*:\s*(.+)$/);
+  let match = feature.match(/^(min|max)-(width|height|device-width|device-height)\s*:\s*(.+)$/);
   if (match) {
     const expected = _parseMediaPx(match[3]);
     if (expected === null) return false;
@@ -9263,27 +9865,27 @@ function _evaluateMediaDimension(feature) {
     return match[1] === 'min' ? actual >= expected : actual <= expected;
   }
 
-  match = feature.match(/^(width|height)\s*:\s*(.+)$/);
+  match = feature.match(/^(width|height|device-width|device-height)\s*:\s*(.+)$/);
   if (match) {
     const expected = _parseMediaPx(match[2]);
     return expected !== null && _mediaViewportDimension(match[1]) === expected;
   }
 
-  match = feature.match(/^(width|height)\s*(<=|>=|=|<|>)\s*(.+)$/);
+  match = feature.match(/^(width|height|device-width|device-height)\s*(<=|>=|=|<|>)\s*(.+)$/);
   if (match) {
     const expected = _parseMediaPx(match[3]);
     return expected !== null
       && _compareMediaValues(_mediaViewportDimension(match[1]), match[2], expected);
   }
 
-  match = feature.match(/^(.+?)\s*(<=|>=|=|<|>)\s*(width|height)$/);
+  match = feature.match(/^(.+?)\s*(<=|>=|=|<|>)\s*(width|height|device-width|device-height)$/);
   if (match) {
     const expected = _parseMediaPx(match[1]);
     return expected !== null
       && _compareMediaValues(expected, match[2], _mediaViewportDimension(match[3]));
   }
 
-  match = feature.match(/^(.+?)\s*(<=|>=|<|>)\s*(width|height)\s*(<=|>=|<|>)\s*(.+)$/);
+  match = feature.match(/^(.+?)\s*(<=|>=|<|>)\s*(width|height|device-width|device-height)\s*(<=|>=|<|>)\s*(.+)$/);
   if (match) {
     const lower = _parseMediaPx(match[1]);
     const upper = _parseMediaPx(match[5]);
@@ -9293,9 +9895,52 @@ function _evaluateMediaDimension(feature) {
       && _compareMediaValues(actual, match[4], upper);
   }
 
-  if (feature === 'width' || feature === 'height')
+  if (/^(width|height|device-width|device-height)$/.test(feature))
     return _mediaViewportDimension(feature) !== 0;
   return null;
+}
+
+function _parseMediaResolution(value) {
+  value = String(value).trim();
+  if (value === 'infinite') return Infinity;
+  const match = value.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(dpi|dpcm|dppx|x)$/);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  return match[2] === 'dpi' ? amount / 96
+    : match[2] === 'dpcm' ? amount * 2.54 / 96 : amount;
+}
+
+function _evaluateMediaResolution(feature) {
+  if (!feature.includes('resolution')) return null;
+  const actual = Number(globalThis.devicePixelRatio);
+  if (!Number.isFinite(actual) || actual <= 0) return false;
+  if (feature === 'resolution') return true;
+  let match = feature.match(/^(?:(min|max)-)?resolution\s*:\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaResolution(match[2]);
+    return expected !== null && _compareMediaValues(actual,
+      match[1] === 'min' ? '>=' : match[1] === 'max' ? '<=' : '=', expected);
+  }
+  match = feature.match(/^resolution\s*(<=|>=|=|<|>)\s*(.+)$/);
+  if (match) {
+    const expected = _parseMediaResolution(match[2]);
+    return expected !== null && _compareMediaValues(actual, match[1], expected);
+  }
+  match = feature.match(/^(.+?)\s*(<=|>=|=|<|>)\s*resolution$/);
+  if (match) {
+    const expected = _parseMediaResolution(match[1]);
+    return expected !== null && _compareMediaValues(expected, match[2], actual);
+  }
+  match = feature.match(/^(.+?)\s*(<=|>=|<|>)\s*resolution\s*(<=|>=|<|>)\s*(.+)$/);
+  if (match && match[2][0] === match[3][0]) {
+    const first = _parseMediaResolution(match[1]);
+    const last = _parseMediaResolution(match[4]);
+    return first !== null && last !== null
+      && _compareMediaValues(first, match[2], actual)
+      && _compareMediaValues(actual, match[3], last);
+  }
+  return false;
 }
 
 function _evaluateMediaFeature(raw) {
@@ -9305,6 +9950,8 @@ function _evaluateMediaFeature(raw) {
 
   const dimension = _evaluateMediaDimension(feature);
   if (dimension !== null) return dimension;
+  const resolution = _evaluateMediaResolution(feature);
+  if (resolution !== null) return resolution;
 
   let match = feature.match(/^orientation\s*:\s*(portrait|landscape)$/);
   if (match) {
@@ -9315,17 +9962,32 @@ function _evaluateMediaFeature(raw) {
 
   match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
   if (match) return match[1] === 'light';
-  match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
+  match = feature.match(/^prefers-reduced-(motion|transparency)\s*:\s*(reduce|no-preference)$/);
+  if (match) return match[2] === 'no-preference';
+  match = feature.match(/^prefers-contrast\s*:\s*(no-preference|more|less|custom)$/);
   if (match) return match[1] === 'no-preference';
+  match = feature.match(/^forced-colors\s*:\s*(none|active)$/);
+  if (match) return match[1] === 'none';
+
+  // The paint pipeline produces sRGB SDR pixels. Do not advertise P3 or HDR
+  // merely because the host display supports them.
+  match = feature.match(/^color-gamut\s*:\s*(srgb|p3|rec2020)$/);
+  if (match) return match[1] === 'srgb';
+  match = feature.match(/^dynamic-range\s*:\s*(standard|high)$/);
+  if (match) return match[1] === 'standard';
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
   match = feature.match(/^(hover|any-hover)\s*:\s*(none|hover)$/);
   if (match) return match[2] === 'hover';
 
-  if (feature === 'color') return true;
-  match = feature.match(/^color\s*:\s*(\d+)$/);
-  if (match) return Number(match[1]) === 8;
+  match = feature.match(/^(?:(min|max)-)?(color|color-index|monochrome|grid)(?:\s*:\s*(\d+))?$/);
+  if (match) {
+    const actual = match[2] === 'color' ? Math.floor(Number(globalThis.screen.colorDepth) / 3) : 0;
+    if (match[3] === undefined) return !match[1] && actual !== 0;
+    if (match[2] === 'grid' && (match[1] || Number(match[3]) > 1)) return false;
+    return _compareMediaValues(actual, match[1] === 'min' ? '>=' : match[1] === 'max' ? '<=' : '=', Number(match[3]));
+  }
   return false;
 }
 
@@ -9403,12 +10065,15 @@ globalThis.getComputedStyle = (el) => {
   const refreshRendered = () => {
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
       && _animationsForTarget(el).some(animation => animation.playState === 'running');
-    if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation) return;
+    // A foreign document has its own mutation epoch; the caller's epoch
+    // cannot validate its cached style. Native retained layout is still reused.
+    const sameDocument = el?.ownerDocument === globalThis.document;
+    if (sameDocument && snapshot.epoch === _domMutationEpoch && !hasRunningAnimation) return;
     snapshot.epoch = _domMutationEpoch;
     snapshot.rendered = null;
     if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
+        const raw = Deno.core.ops.op_computed_style(el, String(el._nid | 0));
         snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
@@ -10109,6 +10774,12 @@ globalThis.MutationObserver = class MutationObserver {
     });
   }
 };
+// WebIDL operations are enumerable. Native-class wrappers used by frameworks
+// discover these methods by enumerating an instance's inherited properties.
+for (const name of ['observe', 'disconnect', 'takeRecords']) {
+  const descriptor = Object.getOwnPropertyDescriptor(MutationObserver.prototype, name);
+  Object.defineProperty(MutationObserver.prototype, name, { ...descriptor, enumerable: true });
+}
 globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue) {
   if (!globalThis.__mutationObservers.length) return;
   // Use `_wrap` (the canonical node-id → wrapper resolver) instead of a
@@ -10511,7 +11182,7 @@ function _ioMeasurements(elements) {
   const nativeElements = elements.filter(element => element?._nid != null);
   if (typeof bulk !== "function" || !nativeElements.length) return measurements;
   try {
-    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)));
+    const raw = bulk(nativeElements, JSON.stringify(nativeElements.map(element => element._nid | 0)));
     const geometries = raw ? JSON.parse(raw) : null;
     if (Array.isArray(geometries) && geometries.length === nativeElements.length) {
       for (let index = 0; index < nativeElements.length; index++) {
@@ -10820,7 +11491,9 @@ LocationError = DOMException;
 // obscura's CDP input pipeline marks its synthetic events via the
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
-globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+const _markTrustedEvent = _trustedEvents.add.bind(_trustedEvents);
+const _isTrustedEvent = _trustedEvents.has.bind(_trustedEvents);
+globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _markTrustedEvent(ev); } catch (_e) {} return ev; };
 
 // Write value/checked through the element's *prototype* accessor, skipping any
 // per-instance property a framework layered on top. React (and Preact/Vue)
@@ -11019,7 +11692,7 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=_relativeTimeNow();this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return _trustedEvents.has(this); }
+  get isTrusted() { return _isTrustedEvent(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   composedPath() {
@@ -11242,6 +11915,7 @@ globalThis.ToggleEvent = class ToggleEvent extends Event {
   }
 };
 _markNative(globalThis.ToggleEvent);
+const _popoverToggleEvent = globalThis.ToggleEvent;
 
 globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
   constructor(type, init) {
@@ -11398,6 +12072,25 @@ function _blobPartToBytes(p, native) {
   return new TextEncoder().encode(s);
 }
 function _bytesToBinaryString(bytes) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return s; }
+let _websocketBlobBytes = new WeakMap();
+let _websocketSlots = new WeakMap();
+let _websocketCloseEvents = new WeakMap();
+// The host replaces these maps with shared registries for real frame realms.
+// Capture methods without binding the initial maps or exposing private slots.
+const _websocketMapGet = Function.call.bind(WeakMap.prototype.get);
+const _websocketMapSet = Function.call.bind(WeakMap.prototype.set);
+const _websocketMapHas = Function.call.bind(WeakMap.prototype.has);
+const _websocketBufferIntrinsics = {
+  isView: ArrayBuffer.isView,
+  arrayBufferLength: Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get,
+  typedLength: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteLength').get,
+  typedOffset: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteOffset').get,
+  typedBuffer: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer').get,
+  dataLength: Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get,
+  dataOffset: Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get,
+  dataBuffer: Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get,
+  bytes: Uint8Array,
+};
 if (typeof Blob === "undefined") globalThis.Blob = class Blob {
   constructor(parts, opts) {
     opts = opts || {};
@@ -11412,6 +12105,7 @@ if (typeof Blob === "undefined") globalThis.Blob = class Blob {
     const data = new Uint8Array(total); let off = 0;
     for (const c of chunks) { data.set(c, off); off += c.length; }
     this._bytes = data;
+    _websocketMapSet(_websocketBlobBytes, this, data.slice());
     this.size = total;
     const t = opts.type != null ? String(opts.type) : "";
     this.type = /^[\x20-\x7e]*$/.test(t) ? t.toLowerCase() : "";
@@ -11424,6 +12118,7 @@ if (typeof Blob === "undefined") globalThis.Blob = class Blob {
     if (e < s) e = s;
     const out = new Blob([], contentType != null ? { type: contentType } : {});
     out._bytes = this._bytes.slice(s, e);
+    _websocketMapSet(_websocketBlobBytes, out, out._bytes.slice());
     out.size = out._bytes.length;
     return out;
   }
@@ -11722,7 +12417,7 @@ globalThis.DOMParser = class DOMParser {
       get documentURI() { return "about:blank"; },
       get domain() { return _incumbentDocumentDomain(); },
       set domain(value) { String(value); _throwDocumentDomainSecurityError(); },
-      get referrer() { return ""; },
+      get referrer() { return _domReceiverState(this, 'document').referrer(); },
       get baseURI() { return "about:blank"; },
       get compatMode() { return "CSS1Compat"; },
       get characterSet() { return "UTF-8"; },
@@ -11787,6 +12482,7 @@ globalThis.DOMParser = class DOMParser {
       contains(n) { return root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
+    _registerDocumentReceiver(docNode, () => '', () => 'about:blank');
     return docNode;
   }
 };
@@ -11815,6 +12511,294 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
+let _performanceRecords = new WeakMap();
+const _performanceRecordGet = Function.call.bind(WeakMap.prototype.get);
+const _performanceRecordSet = Function.call.bind(WeakMap.prototype.set);
+const _performanceIsArray = Array.isArray;
+const _performanceTypeError = TypeError;
+globalThis.__obscura_performance_registry_handoff = shared => {
+  if (shared) _performanceRecords = shared;
+  return _performanceRecords;
+};
+const _performanceEntryKey = {};
+const _performanceOwner = {};
+const _performanceEntryCache = new Map();
+let _performanceSnapshotOrigin;
+function _acceptPerformanceEpoch(origin) {
+  if (_performanceSnapshotOrigin===origin) return;
+  if (_performanceSnapshotOrigin!==undefined) {
+    for (const observer of _activePerformanceObservers) {
+      const state=_observerState.get(observer);state.records=[];state.types.clear();state.generation++;
+    }
+    _activePerformanceObservers.clear();_performanceTaskQueued=false;_performanceDropped=0;
+  }
+  _performanceEntryCache.clear();_userTimingDetails.clear();_performanceSnapshotOrigin=origin;
+}
+const _performanceSnapshot = (navigationOnly=false) => {
+  if (!_nativeTimingReady) return {entries:[],dropped:0};
+  const snapshot=JSON.parse(navigationOnly ? Deno.core.ops.op_timing_navigation(_performanceOwner)
+    : Deno.core.ops.op_timing_entries(_performanceOwner));
+  _acceptPerformanceEpoch(snapshot.origin);
+  const navigation=_performanceEntryCache.get('navigation');
+  if(navigation) {
+    const record=snapshot.entries.find(entry=>entry.entryType==='navigation');
+    if(record) Object.assign(_performanceRecordGet(_performanceRecords,navigation),record);
+  }
+  return snapshot;
+};
+class PerformanceEntry {
+  constructor(key, record) {
+    if (key !== _performanceEntryKey) throw new TypeError('Illegal constructor');
+    _performanceRecordSet(_performanceRecords, this, record);
+  }
+  toJSON() {
+    const record = _performanceRecordGet(_performanceRecords, this);
+    if (!record || _performanceIsArray(record)) throw new _performanceTypeError('Illegal invocation');
+    if (record.refresh) record.refresh();
+    const result = {...record}; delete result.sequence; return result;
+  }
+}
+const _storageCore=Deno.core;
+const _storageSerialize=(...args)=>_storageCore.ops.op_history_serialize(...args);
+const _storageDeserialize=Deno.core.deserialize;
+const _storageOptions=Object.freeze({forStorage:true});
+const _storageError=DOMException, _storageBytes=Uint8Array;
+const _serializeStorage=value=>_storageSerialize(value,message=>{throw new _storageError(message,'DataCloneError');},value=>
+  !!_domReceiverGet(_domReceiverSlots,value)||!!_responseGet(_responseInstances,value)||!!_performanceRecordGet(_performanceRecords,value));
+const _cloneStorage=value=>_storageDeserialize(new _storageBytes(_serializeStorage(value)),_storageOptions);
+const _userTimingDetails = new Map();
+const _userTimingRecord = (name, type, start, duration, detail) => ({
+  name, entryType:type, startTime:start, duration, detail,
+});
+const _userTimingStart = value => {
+  const time=Number(value);
+  if (!Number.isFinite(time) || time<0) throw new TypeError('Invalid startTime');
+  return time;
+};
+const _userTimingName = name => {
+  name=String(name);
+  if (['navigationStart','unloadEventStart','unloadEventEnd','redirectStart','redirectEnd',
+    'fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart',
+    'requestStart','responseStart','responseEnd','domLoading','domInteractive','domContentLoadedEventStart',
+    'domContentLoadedEventEnd','domComplete','loadEventStart','loadEventEnd'].includes(name))
+    throw new DOMException('Reserved timing name','SyntaxError');
+  return name;
+};
+class PerformanceMark extends PerformanceEntry {
+  constructor(name, options={}) {
+    if (name===_performanceEntryKey) { super(name,options); return; }
+    if (!arguments.length) throw new TypeError('A mark name is required');
+    name=_userTimingName(name);
+    const start=options?.startTime===undefined ? _relativeTimeNow() : _userTimingStart(options.startTime);
+    const detail=options?.detail===undefined ? null : _cloneStorage(options.detail);
+    super(_performanceEntryKey,_userTimingRecord(name,'mark',start,0,detail));
+  }
+  get detail() { return _entryValue(this,'detail',PerformanceMark); }
+  toJSON() { return _userTimingJSON(this,PerformanceMark); }
+}
+class PerformanceMeasure extends PerformanceEntry {
+  get detail() { return _entryValue(this,'detail',PerformanceMeasure); }
+  toJSON() { return _userTimingJSON(this,PerformanceMeasure); }
+}
+const _userTimingJSON = (entry,Class) => ({
+  name:_entryValue(entry,'name',Class),entryType:_entryValue(entry,'entryType',Class),
+  startTime:_entryValue(entry,'startTime',Class),duration:_entryValue(entry,'duration',Class),
+  detail:_entryValue(entry,'detail',Class),
+});
+Object.defineProperty(PerformanceMark.prototype,Symbol.toStringTag,{value:'PerformanceMark',configurable:true});
+Object.defineProperty(PerformanceMeasure.prototype,Symbol.toStringTag,{value:'PerformanceMeasure',configurable:true});
+class PerformanceResourceTiming extends PerformanceEntry {
+  toJSON() { return _entryJSON(this, PerformanceResourceTiming); }
+}
+class PerformanceNavigationTiming extends PerformanceResourceTiming {
+  toJSON() { return _entryJSON(this, PerformanceNavigationTiming); }
+}
+const _entryValue = (entry, key, Class) => {
+  const record = _performanceRecordGet(_performanceRecords, entry);
+  if (!record || _performanceIsArray(record)
+      || (Class === PerformanceResourceTiming && !['resource','navigation'].includes(record.entryType))
+      || (Class === PerformanceNavigationTiming && record.entryType !== 'navigation')
+      || (Class === PerformanceMark && record.entryType !== 'mark')
+      || (Class === PerformanceMeasure && record.entryType !== 'measure')) throw new _performanceTypeError('Illegal invocation');
+  if (record.refresh) record.refresh();
+  return record[key];
+};
+const _entryJSON = (entry, Class) => {
+  _entryValue(entry, 'entryType', Class);
+  const result = {..._performanceRecordGet(_performanceRecords, entry)};
+  delete result.sequence; return result;
+};
+for (const [Class, names] of [
+  [PerformanceEntry, ['name','entryType','startTime','duration']],
+  [PerformanceResourceTiming, ['initiatorType','fetchStart','responseEnd','nextHopProtocol','decodedBodySize',
+    'redirectStart','redirectEnd','domainLookupStart','domainLookupEnd','connectStart','connectEnd',
+    'secureConnectionStart','requestStart','responseStart','transferSize','encodedBodySize']],
+  [PerformanceNavigationTiming, ['domInteractive','domContentLoadedEventStart','domContentLoadedEventEnd',
+    'domComplete','loadEventStart','loadEventEnd']]
+]) {
+  for (const name of names) {
+    const getter = { getValue() { return _entryValue(this, name, Class); } }.getValue;
+    _markNativeGetter(getter, name);
+    Object.defineProperty(Class.prototype, name, {get:getter, enumerable:true, configurable:true});
+  }
+  Object.defineProperty(Class.prototype, Symbol.toStringTag, {value:Class.name, configurable:true});
+  Object.defineProperty(Class, 'length', {value:0, configurable:true});
+  Object.defineProperty(Class.prototype, 'toJSON', {...Object.getOwnPropertyDescriptor(Class.prototype,'toJSON'), enumerable:true});
+  _markNative(Class.prototype.toJSON); _markNative(Class);
+}
+const _makePerformanceEntry = (record, retained=true) => {
+  const navigation=record.entryType==='navigation';
+  const key=navigation ? 'navigation' : record.sequence;
+  let entry=_performanceEntryCache.get(key);
+  if (entry) return entry;
+  const Class=navigation ? PerformanceNavigationTiming : record.entryType==='mark' ? PerformanceMark
+    : record.entryType==='measure' ? PerformanceMeasure : PerformanceResourceTiming;
+  if (record.entryType==='mark'||record.entryType==='measure') record.detail=_userTimingDetails.get(record.sequence) ?? null;
+  entry=new Class(_performanceEntryKey,record);
+  if(navigation) {
+    const origin=_performanceSnapshotOrigin;
+    Object.defineProperty(record,'refresh',{value(){
+      // A retained entry stays tied to its creation document. Navigation-only
+      // reads are O(1), independent of the resource buffer's size.
+      if (_performanceSnapshotOrigin===origin) _performanceSnapshot(true);
+    }});
+  }
+  // Observer-only records do not grow or evict the public entry identity cache.
+  if (retained) _performanceEntryCache.set(key,entry);return entry;
+};
+Object.assign(globalThis,{PerformanceEntry,PerformanceResourceTiming,PerformanceNavigationTiming,PerformanceMark,PerformanceMeasure});
+const _observerState = new WeakMap();
+const _activePerformanceObservers = new Set();
+const _performanceScheduleTask = globalThis.setTimeout.bind(globalThis);
+let _performanceTaskQueued = false;
+let _performanceDropped = 0;
+const _performanceListEntries = receiver => {
+  const entries = _performanceRecordGet(_performanceRecords, receiver);
+  if (!_performanceIsArray(entries)) throw new _performanceTypeError('Illegal invocation');
+  return entries;
+};
+class PerformanceObserverEntryList {
+  constructor(key, entries) {
+    if (key !== _performanceEntryKey) throw new TypeError('Illegal constructor');
+    _performanceRecordSet(_performanceRecords, this, entries);
+  }
+  getEntries() { return _performanceListEntries(this).slice().sort((a,b)=>a.startTime-b.startTime); }
+  getEntriesByType(type) { return this.getEntries().filter(entry=>entry.entryType===String(type)); }
+  getEntriesByName(name,type) { return this.getEntries().filter(entry=>entry.name===String(name)&&(type===undefined||entry.entryType===String(type))); }
+}
+class NativePerformanceObserver {
+  constructor(callback) {
+    if (typeof callback !== 'function') throw new TypeError('callback is not callable');
+    _observerState.set(this,{callback,types:new Set(),generation:0,records:[],mode:null});
+  }
+  observe(options={}) {
+    const state=_observerState.get(this); if (!state) throw new _performanceTypeError('Illegal invocation');
+    const single=options.type!==undefined, multiple=options.entryTypes!==undefined;
+    if (single===multiple) throw new TypeError('Specify type or entryTypes');
+    if (multiple && (options.buffered!==undefined || options.durationThreshold!==undefined)) throw new TypeError('Invalid observer options');
+    const mode=single?'single':'multiple';
+    if (state.mode && state.mode!==mode) throw new DOMException('Observer mode cannot change','InvalidModificationError');
+    if (multiple && !Array.isArray(options.entryTypes)) throw new TypeError('entryTypes must be a sequence');
+    const types=(single?[String(options.type)]:options.entryTypes.map(String)).filter(type=>['resource','navigation','mark','measure'].includes(type));
+    if (!types.length) return;
+    if (!_activePerformanceObservers.has(this) && _activePerformanceObservers.size>=128) throw new RangeError('Performance observer budget exceeded');
+    _collectPerformanceObserverRecords();
+    state.mode=mode;
+    if (multiple) state.types=new Set(types); else for(const type of types) state.types.add(type);
+    const entries=_performanceSnapshot().entries;
+    if (single&&options.buffered) state.records.push(...entries.filter(e=>e.entryType===types[0]&&e.sequence>0).slice(0,1024-state.records.length).map(record=>_makePerformanceEntry(record)));
+    _activePerformanceObservers.add(this); _syncPerformanceObserverTypes(); _notifyPerformanceObservers();
+  }
+  disconnect() { const state=_observerState.get(this); if (!state) throw new _performanceTypeError('Illegal invocation'); _collectPerformanceObserverRecords(); _activePerformanceObservers.delete(this); state.generation++; state.records=[]; state.types.clear(); _syncPerformanceObserverTypes(); }
+  takeRecords() { const state=_observerState.get(this); if (!state) throw new _performanceTypeError('Illegal invocation'); _collectPerformanceObserverRecords(); const records=state.records; state.records=[]; return records; }
+}
+Object.defineProperty(NativePerformanceObserver,'name',{value:'PerformanceObserver',configurable:true});
+Object.defineProperty(NativePerformanceObserver,'supportedEntryTypes',{get:_markNativeGetter({getValue(){return Object.freeze(['mark','measure','navigation','resource']);}}.getValue,'supportedEntryTypes'),enumerable:true,configurable:true});
+Object.defineProperty(PerformanceObserverEntryList,'length',{value:0,configurable:true});
+Object.defineProperty(NativePerformanceObserver.prototype,Symbol.toStringTag,{value:'PerformanceObserver',configurable:true});
+Object.defineProperty(PerformanceObserverEntryList.prototype,Symbol.toStringTag,{value:'PerformanceObserverEntryList',configurable:true});
+for (const Class of [NativePerformanceObserver,PerformanceObserverEntryList]) {
+  _markNative(Class);
+  for(const name of Object.getOwnPropertyNames(Class.prototype)) if(name!=='constructor'&&typeof Class.prototype[name]==='function') {
+    Object.defineProperty(Class.prototype,name,{...Object.getOwnPropertyDescriptor(Class.prototype,name),enumerable:true});
+    _markNative(Class.prototype[name]);
+  }
+}
+globalThis.PerformanceObserver=NativePerformanceObserver;
+globalThis.PerformanceObserverEntryList=PerformanceObserverEntryList;
+function _syncPerformanceObserverTypes() {
+  if (!_nativeTimingReady) return;
+  let types=0;
+  for (const observer of _activePerformanceObservers) for (const type of _observerState.get(observer).types) types |= ({resource:1,navigation:2,mark:4,measure:8})[type];
+  Deno.core.ops.op_timing_observe(_performanceOwner,types);
+}
+function _collectPerformanceObserverRecords() {
+  if (!_nativeTimingReady || !_activePerformanceObservers.size) return;
+  const batch=JSON.parse(Deno.core.ops.op_timing_take_observer_records(_performanceOwner));
+  _acceptPerformanceEpoch(batch.origin);
+  for (const [record,retained] of batch.entries) {
+    let entry;
+    for (const observer of _activePerformanceObservers) {
+      const state=_observerState.get(observer);
+      if (state.types.has(record.entryType) && state.records.length<1024) {
+        entry ||= _makePerformanceEntry(record,retained); state.records.push(entry);
+      }
+    }
+  }
+}
+function _notifyPerformanceObservers() {
+  if (!_nativeTimingReady) return;
+  // Production records are independent of public resource retention. Collect
+  // before returning to script so takeRecords/clear have normal queue semantics.
+  _collectPerformanceObserverRecords();
+  if (_performanceTaskQueued) return;
+  const bufferListeners = _eventTargetListeners.get(performance)?.get('resourcetimingbufferfull');
+  if (!_activePerformanceObservers.size && !bufferListeners?.length && !performance.onresourcetimingbufferfull) return;
+  const taskGeneration=Deno.core.ops.op_timing_owner_generation(_performanceOwner);
+  if (taskGeneration<0) return;
+  _performanceTaskQueued=true;
+  const taskOrigin=_performanceSnapshotOrigin;
+  _performanceScheduleTask(()=>{
+    if (taskOrigin!==_performanceSnapshotOrigin) return;
+    _performanceTaskQueued=false;
+    if (Deno.core.ops.op_timing_owner_generation(_performanceOwner)!==taskGeneration) return;
+    _collectPerformanceObserverRecords();
+    const snapshot=_performanceSnapshot();
+    // User callbacks may disconnect/reobserve or register other observers.
+    // Freeze task eligibility, never iterate a live Set across a callback.
+    const notifyList=Array.from(_activePerformanceObservers,observer=>[observer,_observerState.get(observer).generation]);
+    for(const [observer,generation] of notifyList) {
+      const state=_observerState.get(observer);
+      if (!_activePerformanceObservers.has(observer) || state.generation!==generation) continue;
+      if(state.records.length) {
+        const records=state.records; state.records=[];
+        try { state.callback(new PerformanceObserverEntryList(_performanceEntryKey,records),observer); } catch(error) { /* event callbacks do not unwind native request completion */ }
+      }
+    }
+    if(snapshot.dropped>_performanceDropped) {
+      _performanceDropped=snapshot.dropped;
+      performance.dispatchEvent(new Event('resourcetimingbufferfull'));
+      if(typeof performance.onresourcetimingbufferfull==='function') performance.onresourcetimingbufferfull.call(performance,new Event('resourcetimingbufferfull'));
+    }
+  },0);
+}
+
+const _retainUserTiming = (name,type,start,duration,detail) => {
+  _performanceSnapshot();
+  const record=JSON.parse(Deno.core.ops.op_timing_user(_performanceOwner,name,type==='measure',start,duration));
+  if (!record) throw new RangeError('User timing budget exceeded');
+  _userTimingDetails.set(record.sequence,detail);
+  const entry=_makePerformanceEntry(record);
+  _notifyPerformanceObservers();
+  return entry;
+};
+const _clearUserTiming = (measure,name) => {
+  _collectPerformanceObserverRecords();
+  Deno.core.ops.op_timing_clear_user(_performanceOwner,measure,name);
+  for(const [key,entry] of _performanceEntryCache) if(entry.entryType===(measure?'measure':'mark')&&(name===undefined||entry.name===name)) {
+    _performanceEntryCache.delete(key);_userTimingDetails.delete(key);
+  }
+};
 class Performance extends EventTarget {
   constructor() {
     super();
@@ -11829,18 +12813,65 @@ class Performance extends EventTarget {
     this._onresourcetimingbufferfull = null;
   }
   now() { return _relativeTimeNow(); }
-  mark() {}
-  measure() {}
-  clearMarks() {}
-  clearMeasures() {}
-  clearResourceTimings() {}
-  getEntries() { return []; }
-  getEntriesByName() { return []; }
-  getEntriesByType() { return []; }
-  setResourceTimingBufferSize() {}
-  get timeOrigin() { return this._timeOrigin || 0; }
+  mark(name, options) {
+    if (!arguments.length) throw new TypeError('A mark name is required');
+    const mark=new PerformanceMark(name,options);
+    return _retainUserTiming(mark.name,'mark',mark.startTime,0,mark.detail);
+  }
+  measure(name, startOrOptions, endMark) {
+    if (!arguments.length) throw new TypeError('A measure name is required');
+    name=String(name);
+    const resolve=value=> {
+      if (typeof value==='number') return _userTimingStart(value);
+      const name=String(value);
+      const marks=_performanceSnapshot().entries.filter(entry=>entry.entryType==='mark'&&entry.name===name);
+      if (!marks.length) throw new DOMException('The mark does not exist','SyntaxError');
+      const latest=marks.reduce((a,b)=>a.sequence>b.sequence?a:b);
+      return latest.startTime;
+    };
+    let start=0,end=_relativeTimeNow(),detail=null;
+    if (startOrOptions!==null && typeof startOrOptions==='object') {
+      const options=startOrOptions;
+      if (endMark!==undefined) throw new TypeError('Options cannot be combined with endMark');
+      const hasStart=options.start!==undefined,hasEnd=options.end!==undefined,hasDuration=options.duration!==undefined;
+      if (hasDuration && (hasStart===hasEnd)) throw new TypeError('Duration requires exactly one boundary');
+      if (hasStart) start=resolve(options.start);
+      if (hasEnd) end=resolve(options.end);
+      if (hasDuration) {
+        const duration=Number(options.duration);
+        if (!Number.isFinite(duration)||duration<0) throw new TypeError('Invalid duration');
+        if(hasStart) end=start+duration; else start=end-duration;
+      }
+      if (options.detail!==undefined) detail=_cloneStorage(options.detail);
+    } else {
+      if(startOrOptions!==undefined) start=resolve(startOrOptions);
+      if(endMark!==undefined) end=resolve(endMark);
+    }
+    return _retainUserTiming(name,'measure',start,end-start,detail);
+  }
+  clearMarks(name) { _clearUserTiming(false,arguments.length ? String(name) : undefined); }
+  clearMeasures(name) { _clearUserTiming(true,arguments.length ? String(name) : undefined); }
+  clearResourceTimings() {
+    _collectPerformanceObserverRecords();
+    Deno.core.ops.op_timing_clear(_performanceOwner);
+    for(const [key,entry] of _performanceEntryCache) if(entry.entryType==='resource') _performanceEntryCache.delete(key);
+  }
+  getEntries() { return _performanceSnapshot().entries.map(record=>_makePerformanceEntry(record)); }
+  getEntriesByName(name,type) { return this.getEntries().filter(entry=>entry.name===String(name)&&(type===undefined||entry.entryType===String(type))); }
+  getEntriesByType(type) { return this.getEntries().filter(entry=>entry.entryType===String(type)); }
+  setResourceTimingBufferSize(size) {
+    const number=Number(size);
+    if (!Number.isFinite(number)||number<0||number>1024) throw new RangeError('Resource timing buffer budget exceeded');
+    if (!Deno.core.ops.op_timing_limit(_performanceOwner,Math.trunc(number))) throw new RangeError('Resource timing buffer budget exceeded');
+  }
+  get timeOrigin() { return _nativeTimingReady ? Deno.core.ops.op_timing_origin(_performanceOwner) : _clockTimeOrigin; }
   set timeOrigin(v) { this._timeOrigin = v; }
-  get timing() { return this._timing; }
+  get timing() {
+    const entry=this.getEntriesByType('navigation')[0];
+    const epoch=value=>value ? this.timeOrigin+value : 0;
+    return {navigationStart:this.timeOrigin,domContentLoadedEventEnd:entry?epoch(entry.domContentLoadedEventEnd):0,
+      loadEventEnd:entry?epoch(entry.loadEventEnd):0};
+  }
   set timing(v) { this._timing = v; }
   get navigation() { return this._navigation; }
   set navigation(v) { this._navigation = v; }
@@ -12967,6 +13998,34 @@ for (const [tag, name] of Object.entries({
   _htmlElementClasses[tag] = type;
   globalThis[name] = type;
 }
+const _htmlOpenBindingRecords = [];
+for (const [type, tag, openInterface] of [[HTMLDialogElement, 'dialog', 2], [HTMLDetailsElement, 'details', 1]]) {
+  Object.defineProperty(type.prototype, 'open', {
+    configurable:true, enumerable:true,
+    get() {
+      const slot = _popoverSlot(this);
+      if (slot.openInterface !== openInterface) throw new _domReceiverTypeError('Illegal invocation');
+      const value = slot.openValue(openInterface);
+      if (value !== 0 && value !== 1) throw new _domReceiverTypeError('Illegal invocation');
+      return value === 1;
+    },
+    set(value) {
+      const slot = _popoverSlot(this);
+      if (slot.facts().localName !== tag) throw new _domReceiverTypeError('Illegal invocation');
+      slot.openAttribute(value ? '' : null);
+    },
+  });
+  const descriptor = Object.getOwnPropertyDescriptor(type.prototype, 'open');
+  const accepts = receiver => {
+    const slot = _domReceiverGet(_popoverSlots, receiver);
+    return !!slot && slot.openInterface === openInterface;
+  };
+  _htmlOpenBindingRecords.push([type.prototype, descriptor.get, descriptor.set, accepts]);
+}
+// The host captures and deletes this before any author code. Each real realm
+// supplies its own semantics and prototype; Document handoff never reinstalls.
+globalThis.__obscura_open_bindings_handoff = () => _htmlOpenBindingRecords;
+
 globalThis.HTMLOptionElement = class HTMLOptionElement extends HTMLElement {
   get label() {
     const label = this.getAttribute('label');
@@ -14295,7 +15354,6 @@ _markNative(globalThis.Selection);
   Element.prototype.addEventListener, Element.prototype.removeEventListener,
   Element.prototype.dispatchEvent, Element.prototype.click,
   Element.prototype.focus, Element.prototype.blur,
-  Element.prototype.showPopover, Element.prototype.hidePopover, Element.prototype.togglePopover,
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.insertAdjacentText,
   Element.prototype.insertAdjacentElement, Element.prototype.scrollIntoView,
@@ -14328,12 +15386,21 @@ _markNative(globalThis.Selection);
 // Use startup references for the constructor's create/append/query operations.
 const _iframeCreateElement = Document.prototype.createElement;
 const _iframeQuerySelector = Element.prototype.querySelector;
-class _IframeDocument {
+class _IframeDocument extends Node {
   constructor(html, url, iframeEl) {
+    const nativeRoot = +_dom('create_iframe_document');
+    super(nativeRoot);
+    const owner = _domReceiverState(_iframeReceiverDocument(iframeEl), 'document');
+    const referrer = owner.url();
+    const receiver = _registerDocumentReceiver(this,
+      () => receiver.active() ? referrer : '', () => url);
+    receiver.websocketOwner = Deno.core.ops.op_websocket_blank_owner(_domReceiverOwner, owner.websocketOwner || null, nativeRoot, url);
+    receiver.retire = () => Deno.core.ops.op_websocket_blank_retire(receiver.websocketOwner);
+    _cache.set(this._nid, this);
+    _iframeDocuments.set(this._nid, this);
     this._url = url;
     this._iframeEl = iframeEl;
-    this.nodeType = 9;
-    this.nodeName = '#document';
+    this._active = true;
     this.readyState = 'complete';
     this.characterSet = 'UTF-8';
     this.contentType = 'text/html';
@@ -14343,8 +15410,14 @@ class _IframeDocument {
     this._root = _iframeCreateElement.call(document, 'html');
     this._head = _iframeCreateElement.call(document, 'head');
     this._body = _iframeCreateElement.call(document, 'body');
-    _nodeAppendChild.call(this._root, this._head);
-    _nodeAppendChild.call(this._root, this._body);
+    // A frame document is its own tree, never a subtree of the main document.
+    // Native connectivity then also applies to nested initial blank frames.
+    // Construction is not an insertion into a live page: do not run the
+    // global pending-load pump before this frame's document is published.
+    for (const [parent, child] of [[this, this._root], [this._root, this._head], [this._root, this._body]]) {
+      _dom('append_child', parent._nid, child._nid);
+      _seedInsertedTreeState(child, parent, true);
+    }
     var bodyContent = html
       .replace(/^<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
@@ -14362,6 +15435,7 @@ class _IframeDocument {
     }
   }
 
+  get referrer() { return _domReceiverState(this, 'document').referrer(); }
   get documentElement() { return this._root; }
   get head() { return this._head; }
   get body() { return this._body; }
@@ -14390,11 +15464,11 @@ class _IframeDocument {
   getElementsByClassName(cls) {
     return _getElementsByClassName(this._root, cls);
   }
-  createElement(tag) { return document.createElement(tag); }
-  createElementNS(ns, tag) { return document.createElementNS(ns, tag); }
-  createTextNode(text) { return document.createTextNode(text); }
-  createComment(text) { return document.createComment(text); }
-  createDocumentFragment() { return document.createDocumentFragment(); }
+  createElement(tag) { return _iframeOwnedNode(this, document.createElement(tag)); }
+  createElementNS(ns, tag) { return _iframeOwnedNode(this, document.createElementNS(ns, tag)); }
+  createTextNode(text) { return _iframeOwnedNode(this, document.createTextNode(text)); }
+  createComment(text) { return _iframeOwnedNode(this, document.createComment(text)); }
+  createDocumentFragment() { return _iframeOwnedNode(this, document.createDocumentFragment()); }
   createEvent(type) { return document.createEvent(type); }
   createRange() { return new Range(); }
   hasFocus() { return false; }
@@ -14440,6 +15514,18 @@ class _IframeDocument {
   close() {}
 }
 
+const _iframeOwnedNode = (doc, node) => {
+  node._ownerDocument = doc;
+  const receiver = _domReceiverGet(_domReceiverSlots, node);
+  if (receiver?.kind === 'iframe') receiver.ownerDocument = doc;
+  return node;
+};
+const _iframeCanHaveContext = frame => {
+  const state = _domReceiverState(frame, 'iframe');
+  return _dom('is_connected', state.nid) === 'true'
+    && _domReceiverState(_iframeReceiverDocument(frame), 'document').active();
+};
+
 // Keep iframe teardown synchronous with DOM removal, including removal of an
 // ancestor or a shadow host. Saved references keep their old document; a later
 // insertion creates a different context and cannot accept an old fetch result.
@@ -14454,7 +15540,7 @@ function _startConnectedIframeLoads() {
   for (const ref of _pendingIframeLoads) {
     const frame = ref.deref();
     if (!frame) { _pendingIframeLoads.delete(ref); continue; }
-    if (!frame.isConnected) continue;
+    if (!_iframeCanHaveContext(frame)) continue;
     _pendingIframeLoads.delete(ref);
     _pendingIframeLoadRefs.delete(frame);
     const src = frame.getAttribute('src');
@@ -14467,9 +15553,12 @@ function _trackIframeContext(frame) {
   const path = [];
   let node = frame;
   while (node) {
-    path.push(node._nid);
-    _iframeAncestorCounts.set(node._nid, (_iframeAncestorCounts.get(node._nid) || 0) + 1);
-    node = node.parentNode || (node instanceof ShadowRoot ? node.host : null);
+    const receiver = _domReceiverGet(_domReceiverSlots, node);
+    const nid = receiver?.kind === 'iframe' ? receiver.nid : node._nid;
+    path.push(nid);
+    _iframeAncestorCounts.set(nid, (_iframeAncestorCounts.get(nid) || 0) + 1);
+    node = _wrap(+_dom('parent_node', nid)) || (node instanceof ShadowRoot ? node.host
+      : node instanceof _IframeDocument ? node._iframeEl : null);
   }
   _iframeContextPaths.set(frame, path);
   _iframeContextElements.add(frame);
@@ -14483,7 +15572,29 @@ function _iframeContextsWithin(nid) {
   return result;
 }
 
+// Replacing a provisional document retires only that document and its
+// descendants. Keep the containing frame's response generation and queued id.
+function _retireIframeShimDocument(frame) {
+  const doc = frame._iframeDoc;
+  if (!doc) return;
+  doc._active = false;
+  const receiver = _domReceiverGet(_domReceiverSlots, doc);
+  if (receiver?.kind === 'document') { receiver.active = () => false; receiver.retire?.(); }
+  for (const child of _iframeContextsWithin(doc._nid)) {
+    if (child !== frame && _iframeContextElements.has(child)) _discardIframeContext(child);
+  }
+}
+
 function _discardIframeContext(frame, removed = true) {
+  const frameReceiver = _domReceiverState(frame, 'iframe');
+  const loaded = frameReceiver.loadedDocument;
+  frameReceiver.loadedDocument = null;
+  if (loaded) _domReceiverState(loaded, 'document').retire?.();
+  // Child document roots remain separate connected DOM trees, but their
+  // browsing contexts must close when the containing frame is discarded.
+  for (const child of _iframeContextsWithin(_domReceiverState(frame, 'iframe').nid)) {
+    if (child !== frame && _iframeContextElements.has(child)) _discardIframeContext(child, removed);
+  }
   for (const nid of _iframeContextPaths.get(frame) || []) {
     const count = _iframeAncestorCounts.get(nid) - 1;
     if (count) _iframeAncestorCounts.set(nid, count);
@@ -14492,6 +15603,7 @@ function _discardIframeContext(frame, removed = true) {
   _iframeContextPaths.delete(frame);
   _iframeContextElements.delete(frame);
   const oldId = frame._frameId;
+  _retireIframeShimDocument(frame);
   if (frame._iframeWin) {
     if (removed) frame._iframeWin.closed = true;
     frame._iframeWin._frameId = 0;
@@ -14508,7 +15620,7 @@ function _discardIframeContext(frame, removed = true) {
   frame._iframeLoadingUrl = null;
   frame._iframeDoc = null;
   frame._iframeWin = null;
-  if (frame.getAttribute('src')) _queueIframeLoad(frame);
+  if (removed && frame.getAttribute('src')) _queueIframeLoad(frame);
 }
 
 const _iframeRealmGlobalCache = new WeakMap();
@@ -14538,6 +15650,14 @@ function _iframeRealmFunction(target, name, source) {
         writable: true,
         configurable: true,
       });
+      // The initial blank facade keeps these attributes on the interface's
+      // own prototype, while the private slots still identify actual receivers.
+      const members = name === 'Document' ? ['referrer']
+        : name === 'HTMLIFrameElement' ? ['contentDocument', 'contentWindow'] : [];
+      for (const member of members) {
+        const descriptor = Object.getOwnPropertyDescriptor(source.prototype, member);
+        if (descriptor) Object.defineProperty(prototype, member, descriptor);
+      }
       wrapped.prototype = prototype;
     }
   } else {
@@ -14642,7 +15762,7 @@ globalThis.__obscura_liveFrameIds = function () {
   const live = [];
   for (const id in globalThis.__obscura_frameElements) {
     const element = globalThis.__obscura_frameElements[id];
-    if (element && element.isConnected) live.push(id >>> 0);
+    if (element && _iframeCanHaveContext(element)) live.push(id >>> 0);
   }
   return live;
 };
@@ -14826,6 +15946,7 @@ function _installFramingRelationships() {
 class _IframeWindow {
   constructor(doc, url) {
     this.document = doc;
+    this.WebSocket = _makeWebSocketConstructor(_domReceiverState(doc, 'document').websocketOwner);
     this._url = url;
     this.top = globalThis;
     this.parent = globalThis;
@@ -14955,25 +16076,234 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+// The registry is shared only by the host, before a realm can create DOM wrappers.
+let _canvasRegistry = {html: new WeakMap(), contexts: new WeakMap(), offscreen: new WeakMap(), native: new WeakMap()};
+const _canvasBind = Function.call.bind(Function.prototype.bind);
+const _canvasGet = WeakMap.prototype.get;
+const _canvasSet = Function.call.bind(WeakMap.prototype.set);
+const _canvasApply = Reflect.apply;
+const _canvasDefine = Object.defineProperty;
+const _canvasCreate = Object.create;
+const _canvasDescriptor = Object.getOwnPropertyDescriptor;
+const _canvasTypeError = TypeError;
+const _canvasDOMException = DOMException;
+const _canvasBlob = Blob;
+const _canvasPromise = Promise;
+const _canvasAtob = atob;
+const _canvasToken = {};
+const _canvasFinite = Number.isFinite;
+const _canvasTrunc = Math.trunc;
+const _canvasParseInt = Number.parseInt;
+const _canvasOwner = function canvasOwner() {};
+let _canvasHtmlLookup = _canvasBind(_canvasGet, _canvasRegistry.html);
+let _canvasContextLookup = _canvasBind(_canvasGet, _canvasRegistry.contexts);
+let _canvasOffscreenLookup = _canvasBind(_canvasGet, _canvasRegistry.offscreen);
+_canvasNativeLookup = _canvasBind(_canvasGet, _canvasRegistry.native);
+const _canvasBindings = [];
+function _canvasMarkNative(fn) {
+  if (!_canvasNativeLookup(fn)) {
+    _canvasSet(_canvasRegistry.native, fn, `function ${fn.name || ''}() { [native code] }`);
+    _canvasBindings.push(fn);
+  }
+  return _markNative(fn);
+}
+function _canvasRememberDescriptor(descriptor) {
+  for (const fn of [descriptor.get, descriptor.set, descriptor.value]) {
+    if (typeof fn === 'function') _canvasMarkNative(fn);
+  }
+}
+function _initializeCanvasRegistry(shared) {
+  if (shared) {
+    for (const fn of _canvasBindings) _canvasSet(shared.native, fn, _canvasNativeLookup(fn));
+    _canvasRegistry = shared;
+    _canvasNativeLookup = _canvasBind(_canvasGet, shared.native);
+    _canvasHtmlLookup = _canvasBind(_canvasGet, shared.html);
+    _canvasContextLookup = _canvasBind(_canvasGet, shared.contexts);
+    _canvasOffscreenLookup = _canvasBind(_canvasGet, shared.offscreen);
+  }
+  return _canvasRegistry;
+}
+function _canvasState(receiver) {
+  const record = _canvasHtmlLookup(receiver);
+  if (!record) throw new _canvasTypeError('Illegal invocation');
+  return record;
+}
+function _canvasContextState(receiver, offscreen = false) {
+  const engine = _canvasContextLookup(receiver);
+  if (!engine || !!engine._record.offscreen !== offscreen) throw new _canvasTypeError('Illegal invocation');
+  return engine;
+}
+function _canvasUnsignedLong(value) {
+  const n = +value;
+  if (!_canvasFinite(n) || n === 0) return 0;
+  const int = _canvasTrunc(n);
+  return ((int % 4294967296) + 4294967296) % 4294967296;
+}
+function _canvasDimensionValue(raw, fallback) {
+  if (raw === null || !/^[\t\n\f\r ]*\+?\d/.test(raw)) return fallback;
+  const value = _canvasParseInt(raw, 10);
+  return _canvasFinite(value) && value >= 0 && value <= 2147483647 ? value : fallback;
+}
+function _canvasAttributeMutation(receiver, name, value, remove) {
+  if (name !== 'width' && name !== 'height') return false;
+  const record = _canvasHtmlLookup(receiver);
+  if (!record) return false;
+  record.attribute(name, value, remove);
+  return true;
+}
+let _canvasPendingBlobs = 0;
+let _canvasPendingBlobBytes = 0;
+function _canvasRecord(canvas, nid) {
+  const handle = Deno.core.ops.op_canvas_create_handle(_canvasOwner, nid);
+  const creationGeneration = _browserPostedTaskGeneration();
+  const dimensions = {};
+  for (const name of ['width', 'height']) {
+    const raw = JSON.parse(Deno.core.ops.op_canvas_attribute(handle, 'get_attribute', name, ''));
+    dimensions[name] = _canvasDimensionValue(raw, name === 'width' ? 300 : 150);
+  }
+  const record = {
+    canvas, nid, handle, generation: creationGeneration, owner: _canvasOwner, kind: null, context: null, engine: null,
+    refreshingDimensions: false,
+    dimension(name) {
+      const raw = record.rawAttribute(name);
+      const value = _canvasDimensionValue(raw, name === 'width' ? 300 : 150);
+      if (value !== dimensions[name]) {
+        dimensions[name] = value;
+        if (record.engine && !record.refreshingDimensions) {
+          record.refreshingDimensions = true;
+          try { record.engine._resizeFromCanvas(); }
+          finally { record.refreshingDimensions = false; }
+        }
+      }
+      return value;
+    },
+    rawAttribute(name) { return JSON.parse(Deno.core.ops.op_canvas_attribute(handle, 'get_attribute', name, '')); },
+    attribute(name, value, remove) {
+      const raw = remove ? null : `${value}`;
+      Deno.core.ops.op_canvas_attribute(handle, remove ? 'remove_attribute' : 'set_attribute', name, raw === null ? '' : raw);
+      dimensions[name] = _canvasDimensionValue(raw, name === 'width' ? 300 : 150);
+      // Leave generic attribute reads coherent without treating the public cache as authority.
+      canvas._nullNamespaceAttrs = null;
+      if (record.engine) record.engine._resizeFromCanvas();
+      if (_browserPostedTaskGeneration() === creationGeneration) {
+        _domMutationEpoch++;
+        _scheduleResizeRenderCheckpoint();
+        _scheduleIntersectionRenderCheckpoint();
+        if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', nid, [], [], name);
+      }
+    },
+    getContext(type, attributes) { return _canvasCreateContext(record, type, attributes); },
+    dataURL() { return _canvasDataURL(record); },
+    toBlob(callback) { return _canvasQueueBlob(record, callback); },
+  };
+  return record;
+}
+function _canvasDataURL(record) {
+  if (record.engine && record.engine._buf) {
+    const engine = record.engine;
+    return engine._w && engine._h ? _encodePNG(engine._w, engine._h, engine._buf) : 'data:,';
+  }
+  if (record.engine && record.engine._pixels) {
+    const w = record.dimension('width'), h = record.dimension('height');
+    if (!w || !h) return 'data:,';
+    const source = record.engine._pixels;
+    if (source.length !== w * h * 4) throw new _canvasDOMException('Canvas bitmap is unavailable', 'InvalidStateError');
+    const pixels = new Uint8Array(source.length);
+    const stride = w * 4;
+    for (let y = 0; y < h; y++) pixels.set(source.subarray((h - y - 1) * stride, (h - y) * stride), y * stride);
+    return _encodePNG(w, h, pixels);
+  }
+  const w = record.dimension('width'), h = record.dimension('height');
+  if (!w || !h || w > _MAX_CANVAS_DIMENSION || h > _MAX_CANVAS_DIMENSION || w * h > _MAX_CANVAS_PIXELS) return 'data:,';
+  return _encodePNG(w, h, new Uint8ClampedArray(w * h * 4));
+}
+function _canvasQueueBlob(record, callback) {
+  const generation = _browserPostedTaskGeneration();
+  if (generation === _invalidPostedTaskGeneration || generation !== record.generation) return;
+  if (_canvasPendingBlobs >= 16) throw new _canvasDOMException('Canvas serialization queue is full', 'QuotaExceededError');
+  const url = record.dataURL();
+  let blob = null;
+  let size = 0;
+  if (url !== 'data:,') {
+    const binary = _canvasAtob(url.slice(url.indexOf(',') + 1));
+    size = binary.length;
+    if (size > 32 * 1024 * 1024 - _canvasPendingBlobBytes) throw new _canvasDOMException('Canvas serialization budget exceeded', 'QuotaExceededError');
+    const bytes = new Uint8Array(size);
+    for (let i = 0; i < size; i++) bytes[i] = binary.charCodeAt(i);
+    blob = new _canvasBlob([bytes], {type: 'image/png'});
+  }
+  _canvasPendingBlobs++;
+  _canvasPendingBlobBytes += size;
+  let pending = true;
+  const release = () => {
+    if (!pending) return;
+    pending = false;
+    _canvasPendingBlobs--;
+    _canvasPendingBlobBytes -= size;
+  };
+  _browserPostedTaskEnqueue(() => {
+    release();
+    _canvasApply(callback, undefined, [blob]);
+  }, 2, generation, release);
+}
+class CanvasRenderingContext2D {
+  constructor() { throw new _canvasTypeError('Illegal constructor'); }
+}
+_canvasDefine(CanvasRenderingContext2D.prototype, Symbol.toStringTag, {value: 'CanvasRenderingContext2D', configurable: true});
+_canvasDefine(globalThis, 'CanvasRenderingContext2D', {value: CanvasRenderingContext2D, configurable: true, writable: true});
+_canvasMarkNative(CanvasRenderingContext2D);
+class OffscreenCanvasRenderingContext2D {
+  constructor() { throw new _canvasTypeError('Illegal constructor'); }
+}
+_canvasDefine(OffscreenCanvasRenderingContext2D.prototype, Symbol.toStringTag, {value: 'OffscreenCanvasRenderingContext2D', configurable: true});
+_canvasDefine(globalThis, 'OffscreenCanvasRenderingContext2D', {value: OffscreenCanvasRenderingContext2D, configurable: true, writable: true});
+_canvasMarkNative(OffscreenCanvasRenderingContext2D);
+
+const _textMetricsValues = new WeakMap();
+class TextMetrics {
+  constructor() { throw new TypeError('Illegal constructor'); }
+}
+for (const name of ['width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight',
+                    'actualBoundingBoxAscent', 'actualBoundingBoxDescent',
+                    'fontBoundingBoxAscent', 'fontBoundingBoxDescent']) {
+  const get = _markNativeGetter({ getValue() {
+    const values = _textMetricsValues.get(this);
+    if (!values) throw new TypeError('Illegal invocation');
+    return values[name];
+  } }.getValue, name);
+  Object.defineProperty(TextMetrics.prototype, name, {
+    enumerable: true, configurable: true, get,
+  });
+}
+Object.defineProperty(TextMetrics.prototype, Symbol.toStringTag, {value: 'TextMetrics', configurable: true});
+globalThis.TextMetrics = TextMetrics;
+function _canvasTextMetrics(values) {
+  const metrics = Object.create(TextMetrics.prototype);
+  _textMetricsValues.set(metrics, values);
+  return metrics;
+}
+// Parsed sRGB colors do not depend on drawing state. Keep repeated chart
+// palettes local to each context, with a fixed bound on retained strings.
+const _canvasColorCaches = new WeakMap();
 class _Canvas2D {
-  constructor(canvas) {
-    this.canvas = canvas;
+  constructor(record) {
+    this._record = record;
+    this.canvas = record.canvas;
     this._damageQueued = false;
     this._resizeFromCanvas();
   }
   _canvasDimension(name, fallback) {
-    const raw = this.canvas.getAttribute(name);
-    if (raw === null || raw === '') return fallback;
-    const parsed = Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+    return this._record.dimension(name);
   }
   _resetDrawingState() {
+    this._fillInput = this._strokeInput = undefined;
     this.fillStyle = '#000000';
     this.strokeStyle = '#000000';
     this.lineWidth = 1;
     this.font = '10px sans-serif';
     this.textAlign = 'start';
     this.textBaseline = 'alphabetic';
+    this.direction = 'inherit';
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
     this._stateStack = [];
@@ -14997,52 +16327,81 @@ class _Canvas2D {
         this._buf.byteOffset,
         this._buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+      if (!register(this._record.handle, this._w, this._h, bytes)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
   }
   _markPaintDamage() {
+    if (this._record.offscreen) return;
     if (this._damageQueued) return;
     this._damageQueued = true;
     queueMicrotask(() => {
       this._damageQueued = false;
       const damage = Deno.core.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas._nid);
+      if (typeof damage === 'function') damage(this._record.owner, this._record.handle);
     });
   }
-  _parseColor(css) {
-    if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
-    if (css.startsWith('#')) {
-      const hex = css.slice(1);
-      if (hex.length === 3) return [parseInt(hex[0]+hex[0],16),parseInt(hex[1]+hex[1],16),parseInt(hex[2]+hex[2],16),255];
-      if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
-      if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
+  _setPaintStyle(slot, value) {
+    if (typeof value !== 'string') return;
+    if (this[slot + 'Input'] === value) return;
+    let cache = _canvasColorCaches.get(this);
+    let color = cache && cache.get(value);
+    if (!color) {
+      const parsed = Deno.core.ops.op_canvas_parse_color(value);
+      if (!parsed) return;
+      color = JSON.parse(parsed);
+      if (!cache) {
+        cache = new Map();
+        _canvasColorCaches.set(this, cache);
+      }
+      if (cache.size === 16) cache.delete(cache.keys().next().value);
+      cache.set(value, color);
     }
-    const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
-    const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
-    return named[css] || [0,0,0,255];
+    this[slot + 'Input'] = value;
+    this[slot + 'Style'] = color.css;
+    this[slot + 'Color'] = color.rgba;
+  }
+  get fillStyle() { return this._fillStyle; }
+  set fillStyle(value) { this._setPaintStyle('_fill', value); }
+  get strokeStyle() { return this._strokeStyle; }
+  set strokeStyle(value) { this._setPaintStyle('_stroke', value); }
+  get globalAlpha() { return this._globalAlpha; }
+  set globalAlpha(value) {
+    value = Number(value);
+    if (Number.isFinite(value) && value >= 0 && value <= 1) this._globalAlpha = value;
   }
   _setPixel(x, y, r, g, b, a) {
     x = Math.round(x); y = Math.round(y);
     if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
+    const sourceAlpha = (a / 255) * this.globalAlpha;
+    if (sourceAlpha === 0) return;
     const idx = (y * this._w + x) * 4;
-    const alpha = (a / 255) * this.globalAlpha;
-    if (this.globalCompositeOperation === 'multiply') {
-      this._buf[idx+0] = Math.round((r/255) * (this._buf[idx+0]/255) * 255);
-      this._buf[idx+1] = Math.round((g/255) * (this._buf[idx+1]/255) * 255);
-      this._buf[idx+2] = Math.round((b/255) * (this._buf[idx+2]/255) * 255);
-      this._buf[idx+3] = Math.min(255, this._buf[idx+3] + Math.round(a * alpha));
-    } else {
-      this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-      this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-      this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-      this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+    const multiply = this.globalCompositeOperation === 'multiply';
+    if (sourceAlpha === 1 && !multiply) {
+      this._buf[idx] = r; this._buf[idx+1] = g; this._buf[idx+2] = b; this._buf[idx+3] = 255;
+      return;
     }
+    if (sourceAlpha === 1 && this._buf[idx+3] === 255 && multiply) {
+      this._buf[idx] = Math.round(r * this._buf[idx] / 255);
+      this._buf[idx+1] = Math.round(g * this._buf[idx+1] / 255);
+      this._buf[idx+2] = Math.round(b * this._buf[idx+2] / 255);
+      return;
+    }
+    // The backing store and ImageData both contain straight RGBA. Composite
+    // in premultiplied space, then divide once by the resulting alpha.
+    const backdropAlpha = this._buf[idx+3] / 255;
+    const outputAlpha = sourceAlpha + backdropAlpha * (1 - sourceAlpha);
+    const sourceWeight = sourceAlpha * (multiply ? 1 - backdropAlpha : 1) / outputAlpha;
+    const backdropWeight = backdropAlpha * (1 - sourceAlpha) / outputAlpha;
+    const blendWeight = multiply ? sourceAlpha * backdropAlpha / (255 * outputAlpha) : 0;
+    this._buf[idx] = Math.round(r * sourceWeight + this._buf[idx] * backdropWeight + r * this._buf[idx] * blendWeight);
+    this._buf[idx+1] = Math.round(g * sourceWeight + this._buf[idx+1] * backdropWeight + g * this._buf[idx+1] * blendWeight);
+    this._buf[idx+2] = Math.round(b * sourceWeight + this._buf[idx+2] * backdropWeight + b * this._buf[idx+2] * blendWeight);
+    this._buf[idx+3] = Math.round(outputAlpha * 255);
   }
   fillRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    const [r,g,b,a] = this._fillColor;
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
       for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
@@ -15062,7 +16421,7 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   strokeRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.strokeStyle);
+    const [r,g,b,a] = this._strokeColor;
     const lw = this.lineWidth;
     for (let px = Math.round(x); px < Math.round(x+w); px++) {
       for (let l = 0; l < lw; l++) { this._setPixel(px, Math.round(y)+l, r,g,b,a); this._setPixel(px, Math.round(y+h)-1-l, r,g,b,a); }
@@ -15072,37 +16431,46 @@ class _Canvas2D {
     }
     this._markPaintDamage();
   }
-  fillText(text, x, y) {
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
-    const fontSize = parseInt(this.font) || 10;
-    const scale = Math.max(1, Math.round(fontSize / 10));
-    const str = String(text);
-    let cx = Math.round(x);
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      for (let row = 0; row < 7; row++) {
-        for (let col = 0; col < 5; col++) {
-          const on = ((_fpRand(code * 100 + row * 10 + col) > 0.45) &&
-                      (row > 0 && row < 6 && col > 0 && col < 4)) ||
-                     (_fpRand(code * 200 + row * 7 + col) > 0.7);
-          if (on) {
-            for (let sy = 0; sy < scale; sy++) {
-              for (let sx = 0; sx < scale; sx++) {
-                this._setPixel(cx + col*scale + sx, Math.round(y) - 7*scale + row*scale + sy, r, g, b, a);
-              }
-            }
-          }
-        }
-      }
-      cx += 6 * scale;
+  get font() { return this._font; }
+  set font(value) {
+    const parsed = Deno.core.ops.op_canvas_parse_font(String(value));
+    if (parsed) this._font = parsed;
+  }
+  _textRequest(text) {
+    return { font: this.font, text: String(text), align: this.textAlign,
+      baseline: this.textBaseline, rtl: this.direction === 'rtl' };
+  }
+  get lineWidth() { return this._lineWidth; }
+  set lineWidth(value) {
+    value = Number(value);
+    if (Number.isFinite(value) && value > 0) this._lineWidth = value;
+  }
+  _drawText(text, x, y, maxWidth, stroke) {
+    x = Number(x); y = Number(y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    if (maxWidth !== undefined) {
+      maxWidth = Number(maxWidth);
+      if (!Number.isFinite(maxWidth) || maxWidth <= 0) return;
     }
+    if (this.globalCompositeOperation !== 'source-over') {
+      throw new DOMException('Canvas text supports source-over compositing', 'NotSupportedError');
+    }
+    // CSS color channels are clamped to their representable range before
+    // crossing the typed native boundary. Measurement never reads paint state.
+    const color = (stroke ? this._strokeColor : this._fillColor).slice();
+    const alpha = (color[3] / 255) * this.globalAlpha;
+    color[3] = 255;
+    const request = { ...this._textRequest(text), x, y, color, alpha,
+      strokeWidth: stroke ? this.lineWidth : null, maxWidth: maxWidth ?? null };
+    const bytes = new Uint8Array(this._buf.buffer, this._buf.byteOffset, this._buf.byteLength);
+    Deno.core.ops.op_canvas_draw_text(this._record.handle, this._w, this._h, bytes, JSON.stringify(request));
     this._markPaintDamage();
   }
-  strokeText(text, x, y) { this.fillText(text, x, y); }
-  measureText(t) {
-    const fontSize = parseInt(this.font) || 10;
-    const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+  fillText(text, x, y, maxWidth) { this._drawText(text, x, y, maxWidth, false); }
+  strokeText(text, x, y, maxWidth) { this._drawText(text, x, y, maxWidth, true); }
+  measureText(text) {
+    return _canvasTextMetrics(JSON.parse(Deno.core.ops.op_canvas_measure_text(this._record.handle,
+      JSON.stringify(this._textRequest(text)))));
   }
   getImageData(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
@@ -15142,8 +16510,9 @@ class _Canvas2D {
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
-    if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
+    const source = _canvasHtmlLookup(img);
+    if (source && source.engine && source.engine._buf) {
+      const src = source.engine;
       dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
       for (let py = 0; py < dh; py++) {
         for (let px = 0; px < dw; px++) {
@@ -15168,7 +16537,7 @@ class _Canvas2D {
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
   fill() {
     if (!this._path) return;
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    const [r,g,b,a] = this._fillColor;
     for (const seg of this._path) {
       if (seg.t === 'A') {
         const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
@@ -15185,7 +16554,7 @@ class _Canvas2D {
   }
   stroke() {}
   clip() {}
-  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
+  save() { this._stateStack.push({_fillStyle: this._fillStyle, _fillColor: this._fillColor, _fillInput: this._fillInput, _strokeStyle: this._strokeStyle, _strokeColor: this._strokeColor, _strokeInput: this._strokeInput, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth, textAlign: this.textAlign, textBaseline: this.textBaseline, direction: this.direction, globalCompositeOperation: this.globalCompositeOperation}); }
   restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
   translate() {} rotate() {} scale() {}
   setTransform() {} resetTransform() {} transform() {}
@@ -15205,35 +16574,103 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
+// Public wrappers carry no pixel state. Forward once at the WebIDL boundary;
+// the existing engine's drawing loops and palette cache remain direct.
+const _canvasMethodLengths = {
+  fillRect: 4, clearRect: 4, strokeRect: 4, fillText: 3, strokeText: 3,
+  measureText: 1, getImageData: 4, putImageData: 3, createImageData: 1,
+  drawImage: 3, beginPath: 0, closePath: 0, moveTo: 2, lineTo: 2,
+  bezierCurveTo: 6, quadraticCurveTo: 4, arc: 5, arcTo: 5, rect: 4,
+  fill: 0, stroke: 0, clip: 0, save: 0, restore: 0, translate: 2,
+  rotate: 1, scale: 2, setTransform: 0, resetTransform: 0, transform: 6,
+  createLinearGradient: 4, createRadialGradient: 6, createPattern: 2,
+  isPointInPath: 2, isPointInStroke: 2, setLineDash: 1, getLineDash: 0,
+  ellipse: 7, roundRect: 4, createConicGradient: 3, getContextAttributes: 0,
+};
+for (const [target, offscreen] of [[CanvasRenderingContext2D.prototype, false], [OffscreenCanvasRenderingContext2D.prototype, true]]) {
+const _canvasDirectMethods = {
+  fillRect(x, y, w, h) { return _canvasContextState(this, offscreen).fillRect(x, y, w, h); },
+  clearRect(x, y, w, h) { return _canvasContextState(this, offscreen).clearRect(x, y, w, h); },
+  strokeRect(x, y, w, h) { return _canvasContextState(this, offscreen).strokeRect(x, y, w, h); },
+  measureText(text) { return _canvasContextState(this, offscreen).measureText(text); },
+  getImageData(x, y, w, h) { return _canvasContextState(this, offscreen).getImageData(x, y, w, h); },
+  putImageData(image, x, y) { return _canvasContextState(this, offscreen).putImageData(image, x, y); },
+};
+for (const name of Object.keys(_canvasMethodLengths)) {
+  const impl = _Canvas2D.prototype[name];
+  if (typeof impl !== 'function') continue;
+  const method = _canvasDirectMethods[name] || { [name](...args) {
+    return _canvasApply(impl, _canvasContextState(this, offscreen), args);
+  } }[name];
+  _canvasDefine(method, 'length', {value: _canvasMethodLengths[name], configurable: true});
+  _canvasDefine(target, name, {value: _canvasMarkNative(method), writable: true, enumerable: true, configurable: true});
+}
+for (const name of ['canvas','fillStyle','strokeStyle','globalAlpha','font','lineWidth',
+  'textAlign','textBaseline','direction','globalCompositeOperation']) {
+  const descriptor = {enumerable: true, configurable: true,
+    get: _markNativeGetter({ getValue() { return _canvasContextState(this, offscreen)[name]; } }.getValue, name)};
+  if (name !== 'canvas') descriptor.set = _markNativeSetter({ setValue(value) {
+    const engine = _canvasContextState(this, offscreen);
+    if (!arguments.length) throw new _canvasTypeError('One argument required');
+    engine[name] = value;
+  } }.setValue, name);
+  _canvasRememberDescriptor(descriptor);
+  _canvasDefine(target, name, descriptor);
+}
+}
 class HTMLCanvasElement extends HTMLElement {
-  get width() {
-    const raw = this.getAttribute('width');
-    const parsed = raw === null ? 300 : Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300;
+  constructor() {
+    if (arguments[0] !== _canvasToken) throw new _canvasTypeError('Illegal constructor');
+    super(arguments[1]);
+    _canvasSet(_canvasRegistry.html, this, _canvasRecord(this, arguments[1]));
   }
-  set width(value) { this.setAttribute('width', Math.max(0, Number(value) || 0)); }
-  get height() {
-    const raw = this.getAttribute('height');
-    const parsed = raw === null ? 150 : Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 150;
+  get width() { return _canvasState(this).dimension('width'); }
+  set width(value) {
+    const record = _canvasState(this);
+    if (!arguments.length) throw new _canvasTypeError('One argument required');
+    const converted = _canvasUnsignedLong(value);
+    record.attribute('width', converted > 2147483647 ? 300 : converted, false);
   }
-  set height(value) { this.setAttribute('height', Math.max(0, Number(value) || 0)); }
-  setAttribute(name, value) {
-    super.setAttribute(name, value);
-    const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      this._ctx._resizeFromCanvas();
-    }
+  get height() { return _canvasState(this).dimension('height'); }
+  set height(value) {
+    const record = _canvasState(this);
+    if (!arguments.length) throw new _canvasTypeError('One argument required');
+    const converted = _canvasUnsignedLong(value);
+    record.attribute('height', converted > 2147483647 ? 150 : converted, false);
   }
-  removeAttribute(name) {
-    super.removeAttribute(name);
-    const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      this._ctx._resizeFromCanvas();
-    }
+  getContext(type) {
+    const record = _canvasState(this);
+    if (!arguments.length) throw new _canvasTypeError('One argument required');
+    return record.getContext(`${type}`, arguments[1]);
+  }
+  toDataURL() {
+    const record = _canvasState(this);
+    if (arguments[0] !== undefined) `${arguments[0]}`;
+    return record.dataURL();
+  }
+  toBlob(callback) {
+    const record = _canvasState(this);
+    if (!arguments.length || typeof callback !== 'function') throw new _canvasTypeError('A callback function is required');
+    if (arguments[1] !== undefined) `${arguments[1]}`;
+    record.toBlob(callback);
   }
 }
-globalThis.HTMLCanvasElement = HTMLCanvasElement;
+_canvasDefine(HTMLCanvasElement.prototype, Symbol.toStringTag, {value: 'HTMLCanvasElement', configurable: true});
+for (const name of ['width','height','getContext','toDataURL','toBlob']) {
+  const descriptor = _canvasDescriptor(HTMLCanvasElement.prototype, name);
+  descriptor.enumerable = true;
+  if (descriptor.get) _markNativeGetter(descriptor.get, name);
+  if (descriptor.set) _markNativeSetter(descriptor.set, name);
+  if (descriptor.value) _markNative(descriptor.value);
+  _canvasRememberDescriptor(descriptor);
+  _canvasDefine(HTMLCanvasElement.prototype, name, descriptor);
+}
+_canvasMarkNative(HTMLCanvasElement);
+_canvasDefine(globalThis, 'HTMLCanvasElement', {value: HTMLCanvasElement, configurable: true, writable: true});
+// createElement, createElementNS, _wrap and _wrapEl all select this private factory.
+_htmlElementClasses.CANVAS = function canvasElementFactory(nid) {
+  return new HTMLCanvasElement(_canvasToken, nid);
+};
 
 const _WEBGL_EXTENSIONS = [
   'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_clip_control',
@@ -15288,9 +16725,12 @@ class _SoftwareWebGLContext {
   get drawingBufferWidth() { return this.canvas.width; }
   get drawingBufferHeight() { return this.canvas.height; }
   _resizeFromCanvas() {
-    const size = Math.max(0, this.canvas.width * this.canvas.height * 4);
+    const width = this.canvas.width, height = this.canvas.height;
+    const valid = width <= _MAX_CANVAS_DIMENSION && height <= _MAX_CANVAS_DIMENSION
+      && width * height <= _MAX_CANVAS_PIXELS;
+    const size = valid ? Math.max(0, width * height * 4) : 0;
     if (!this._pixels || this._pixels.length !== size) this._pixels = new Uint8Array(size);
-    this._viewport = [0, 0, this.canvas.width, this.canvas.height];
+    this._viewport = [0, 0, valid ? width : 0, valid ? height : 0];
   }
   getContextAttributes() { return Object.assign({}, this._attributes); }
   isContextLost() { return false; }
@@ -15546,45 +16986,34 @@ Object.assign(globalThis.WebGL2RenderingContext.prototype, { MAX_DRAW_BUFFERS: 0
   }
 })();
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
-  type = String(type).toLowerCase();
+function _canvasCreateContext(record, type, attributes) {
   if (type === '2d') {
-    if (this._contextType && this._contextType !== '2d') return null;
-    if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
-      catch (_error) { return null; }
+    if (record.kind && record.kind !== '2d') return null;
+    if (!record.context) {
+      let engine;
+      try { engine = new _Canvas2D(record); } catch (_) { return null; }
+      const wrapper = _canvasCreate(record.offscreen ? OffscreenCanvasRenderingContext2D.prototype : CanvasRenderingContext2D.prototype);
+      _canvasSet(_canvasRegistry.contexts, wrapper, engine);
+      record.engine = engine;
+      record.context = wrapper;
     }
-    this._contextType = '2d';
-    return this._ctx;
+    record.kind = '2d';
+    return record.context;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
     const family = type === 'webgl2' ? 'webgl2' : 'webgl';
-    if (this._contextType && this._contextType !== family) return null;
-    if (!this._ctx) this._ctx = family === 'webgl2'
-      ? new WebGL2RenderingContext(this, arguments[1], true)
-      : new WebGLRenderingContext(this, arguments[1], false);
-    this._contextType = family;
-    return this._ctx;
+    if (record.kind && record.kind !== family) return null;
+    const w = record.dimension('width'), h = record.dimension('height');
+    if (w > _MAX_CANVAS_DIMENSION || h > _MAX_CANVAS_DIMENSION || w * h > _MAX_CANVAS_PIXELS) return null;
+    if (!record.context) record.context = family === 'webgl2'
+      ? new WebGL2RenderingContext(record.canvas, attributes, true)
+      : new WebGLRenderingContext(record.canvas, attributes, false);
+    record.kind = family;
+    record.engine = record.context;
+    return record.context;
   }
   return null;
-};
-HTMLCanvasElement.prototype.toDataURL = function(type) {
-  const ctx = this._ctx || this.getContext('2d');
-  if (ctx && ctx._buf) {
-    if (ctx._w === 0 || ctx._h === 0) return 'data:,';
-    return _encodePNG(ctx._w, ctx._h, ctx._buf);
-  }
-  return 'data:,';
-};
-HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
-  const url = this.toDataURL(type, q);
-  const comma = url.indexOf(',');
-  if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
-  const binary = atob(url.slice(comma + 1));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  cb(new Blob([bytes], {type: String(type || 'image/png')}));
-};
+}
 [
   SVGGraphicsElement.prototype.getBBox,
   SVGGraphicsElement.prototype.getCTM,
@@ -15668,155 +17097,365 @@ if (typeof Document !== 'undefined' && typeof Document.parseHTMLUnsafe !== 'func
   _markNative(Document.parseHTMLUnsafe);
 }
 
-globalThis.AudioBuffer = class AudioBuffer {
-  constructor(opts) {
-    var o = (typeof opts === 'object' && opts !== null) ? opts : {};
-    this.numberOfChannels = o.numberOfChannels || 1;
-    this.length = o.length || 0;
-    this.sampleRate = o.sampleRate || 44100;
-    this.duration = this.length / (this.sampleRate || 44100);
-    this._chs = [];
-    for (var c = 0; c < this.numberOfChannels; c++) this._chs.push(new Float32Array(this.length));
+// Web Audio keeps graph and Float32 storage private; DSP is a bounded native job.
+(() => {
+  const buffers = new WeakMap(), contexts = new WeakMap(), nodes = new WeakMap(), params = new WeakMap();
+  const token = {};
+  const typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Float32Array.prototype), Symbol.toStringTag).get;
+  function brand(map, receiver) { const state = map.get(receiver); if (!state) throw new TypeError('Illegal invocation'); return state; }
+  function error(name, message) { return new DOMException(message, name); }
+  function finite(value) { value = Number(value); if (!Number.isFinite(value)) throw new TypeError('Expected a finite number'); return value; }
+  function float(value) { value = Math.fround(finite(value)); if (!Number.isFinite(value)) throw new TypeError('Value exceeds float range'); return value; }
+  function time(value = 0) { value = finite(value); if (value < 0) throw new RangeError('Time must be non-negative'); return value; }
+  function uint(value) { return Number(value) >>> 0; }
+  function typed(value, type) { if (typedArrayTag.call(value) !== type) throw new TypeError('Expected ' + type); }
+  function format(channels, length, rate) {
+    channels = uint(channels); length = uint(length); rate = float(rate);
+    if (channels < 1 || channels > 32 || length === 0 || rate < 8000 || rate > 96000) throw error('NotSupportedError', 'Invalid audio buffer format');
+    if (channels * length > 8388608) throw error('NotSupportedError', 'Audio buffer allocation budget exceeded');
+    return { channels, length, rate };
   }
-  getChannelData(c) { return this._chs[c] || this._chs[0] || new Float32Array(0); }
-  copyFromChannel(dst, ch, start) { var s=this._chs[ch]||this._chs[0]; start=start||0; for(var i=0;i<dst.length;i++) dst[i]=(s&&s[start+i])||0; }
-  copyToChannel(src, ch, start) { var d=this._chs[ch]||this._chs[0]; start=start||0; if(d) for(var i=0;i<src.length;i++) d[start+i]=src[i]; }
-};
-
-class BaseAudioContext extends EventTarget {
-  constructor() {
-    super();
-    this.sampleRate = 48000;
-    this.state = 'suspended';
-    this.currentTime = 0;
-    this.destination = {
-      maxChannelCount: 2, numberOfInputs: 1, numberOfOutputs: 0,
-      channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers'
-    };
-    this.listener = {};
-    this.onstatechange = null;
+  function unpack(encoded) {
+    const bytes = atob(encoded), data = new Float32Array(bytes.length / 4), view = new DataView(data.buffer);
+    for (let i = 0; i < bytes.length; i++) view.setUint8(i, bytes.charCodeAt(i));
+    return data;
   }
-}
-Object.defineProperty(BaseAudioContext.prototype, Symbol.toStringTag, { value: 'BaseAudioContext', configurable: true });
-_markNative(BaseAudioContext);
-globalThis.BaseAudioContext = BaseAudioContext;
-
-class AudioScheduledSourceNode extends EventTarget {
-  constructor() {
-    super();
-    this.onended = null;
-  }
-}
-Object.defineProperty(AudioScheduledSourceNode.prototype, Symbol.toStringTag, { value: 'AudioScheduledSourceNode', configurable: true });
-_markNative(AudioScheduledSourceNode);
-globalThis.AudioScheduledSourceNode = AudioScheduledSourceNode;
-
-class AudioWorkletNode extends EventTarget {
-  constructor() {
-    super();
-    this.parameters = new Map();
-    this.port = new MessageChannel().port1;
-    this.onprocessorerror = null;
-  }
-}
-Object.defineProperty(AudioWorkletNode.prototype, Symbol.toStringTag, { value: 'AudioWorkletNode', configurable: true });
-_markNative(AudioWorkletNode);
-globalThis.AudioWorkletNode = AudioWorkletNode;
-
-class ScriptProcessorNode extends EventTarget {
-  constructor() {
-    super();
-    this.bufferSize = 4096;
-    this.onaudioprocess = null;
-  }
-}
-Object.defineProperty(ScriptProcessorNode.prototype, Symbol.toStringTag, { value: 'ScriptProcessorNode', configurable: true });
-_markNative(ScriptProcessorNode);
-globalThis.ScriptProcessorNode = ScriptProcessorNode;
-
-globalThis.AudioContext = class AudioContext extends BaseAudioContext {
-  constructor() {
-    super();
-    this.sampleRate=48000; this.state='suspended'; this.currentTime=0;
-    this.baseLatency=0.005333333333333333; this.outputLatency=0;
-    this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,
-      channelCount:2,channelCountMode:'explicit',channelInterpretation:'speakers'};
-    this._listeners={};
-  }
-  addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
-  removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
-  _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
-  createOscillator() { return {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}}; }
-  createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
-  createAnalyser() {
-    return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
-      getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);},
-      getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}
-    };
-  }
-  createGain() { return {context:this,gain:this._ap(1),connect(){},disconnect(){}}; }
-  createBiquadFilter() { return {context:this,type:'lowpass',frequency:this._ap(350, 0, 22050),Q:this._ap(1, 0.0001, 1000),gain:this._ap(0, -40, 40),connect(){},disconnect(){}}; }
-  createBufferSource() { return {context:this,buffer:null,connect(){},start(){},stop(){},disconnect(){},loop:false}; }
-  createBuffer(ch,len,rate) { return new globalThis.AudioBuffer({numberOfChannels:ch||1,length:len||0,sampleRate:rate||44100}); }
-  createScriptProcessor() { return {connect(){},disconnect(){},onaudioprocess:null}; }
-  decodeAudioData(buf) { return Promise.resolve(this.createBuffer(2,44100,44100)); }
-  resume() { this.state='running'; return Promise.resolve(); }
-  suspend() { this.state='suspended'; return Promise.resolve(); }
-  close() { this.state='closed'; return Promise.resolve(); }
-};
-globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext {
-  constructor(ch,len,rate) {
-    super();
-    if (typeof ch === 'object' && ch !== null) {
-      this.length = ch.length || 44100;
-      this.sampleRate = ch.sampleRate || 44100;
-    } else {
-      this.length = len || 44100;
-      this.sampleRate = rate || 44100;
+  class AudioBuffer {
+    constructor(options) {
+      if (!options || options.length === undefined || options.sampleRate === undefined) throw new TypeError('AudioBuffer requires length and sampleRate');
+      const s = format(options.numberOfChannels === undefined ? 1 : options.numberOfChannels, options.length, options.sampleRate);
+      s.data = Array.from({ length: s.channels }, () => new Float32Array(s.length)); buffers.set(this, s);
     }
-    this.oncomplete = null;
-  }
-  startRendering() {
-    var self = this;
-    var buf = this.createBuffer(1, self.length, 44100);
-    var data = buf.getChannelData(0);
-    // Simulate compressed triangle wave at 10kHz.
-    // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
-    var target = 124.04347527516074;
-    var freq = 10000, sr = 44100;
-    for (var i = 0; i < self.length; i++) {
-      var phase = ((i * freq / sr) % 1 + 1) % 1;
-      data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+    get numberOfChannels() { return brand(buffers, this).channels; }
+    get length() { return brand(buffers, this).length; }
+    get sampleRate() { return brand(buffers, this).rate; }
+    get duration() { const s = brand(buffers, this); return s.length / s.rate; }
+    getChannelData(channel) { const s = brand(buffers, this); channel = uint(channel); if (channel >= s.channels) throw error('IndexSizeError', 'Invalid channel'); return s.data[channel]; }
+    copyFromChannel(destination, channel, offset = 0) {
+      const s = brand(buffers, this); typed(destination, 'Float32Array'); channel = uint(channel); offset = uint(offset);
+      if (!destination.length) return;
+      if (channel >= s.channels) throw error('IndexSizeError', 'Invalid channel');
+      if (offset < s.length) destination.set(s.data[channel].subarray(offset, offset + destination.length));
     }
-    var s = 0;
-    for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
-    var scale = s > 0 ? target / s : 0;
-    for (var i = 0; i < self.length; i++) data[i] *= scale;
-    // Fire oncomplete + 'complete' listeners on next microtask so callers
-    // can register handlers synchronously after startRendering().
-    var p = Promise.resolve().then(function() {
-      var evt = {renderedBuffer: buf, target: self, type: 'complete'};
-      if (typeof self.oncomplete === 'function') {
-        try { self.oncomplete(evt); } catch(e) {}
-      }
-      var listeners = (self._listeners && self._listeners['complete']) || [];
-      for (var i = 0; i < listeners.length; i++) {
-        try { listeners[i](evt); } catch(e) {}
-      }
-      return buf;
-    });
-    return p;
+    copyToChannel(source, channel, offset = 0) {
+      const s = brand(buffers, this); typed(source, 'Float32Array'); channel = uint(channel); offset = uint(offset);
+      if (!source.length) return;
+      if (channel >= s.channels) throw error('IndexSizeError', 'Invalid channel');
+      if (offset < s.length) s.data[channel].set(source.subarray(0, s.length - offset), offset);
+    }
   }
-};
-globalThis.webkitAudioContext = globalThis.AudioContext;
+  class AudioParam {
+    constructor(key, initial, min, max, rate) {
+      if (key !== token) throw new TypeError('Illegal constructor');
+      params.set(this, { value: Math.fround(initial), defaultValue: Math.fround(initial), minValue: Math.fround(min), maxValue: Math.fround(max), events: [], automationRate: rate });
+    }
+    get value() { const s = brand(params, this); return Math.max(s.minValue, Math.min(s.maxValue, parameterValue(s, s.context ? contexts.get(s.context).currentTime : 0))); }
+    set value(value) { const s = brand(params, this); editable(s.context); s.value = Math.max(s.minValue, Math.min(s.maxValue, s.biquad ? biquadFloat(value) : float(value))); }
+    get defaultValue() { return brand(params, this).defaultValue; }
+    get minValue() { return brand(params, this).minValue; }
+    get maxValue() { return brand(params, this).maxValue; }
+    get automationRate() { return brand(params, this).automationRate; }
+    set automationRate(value) {
+      const s = brand(params, this); value = String(value);
+      if (s.biquad) { editable(s.context); if (value !== 'a-rate' && value !== 'k-rate') throw new TypeError('Invalid automation rate'); s.automationRate = value; }
+      else if (value !== s.automationRate) throw error('NotSupportedError', 'Changing automation rate is not supported');
+    }
+    setValueAtTime(value, when) { schedule(this, 'set', value, when); return this; }
+    linearRampToValueAtTime(value, when) { schedule(this, 'linear', value, when); return this; }
+    exponentialRampToValueAtTime(value, when) { value = params.get(this)?.biquad ? biquadFloat(value) : float(value); if (value === 0) throw new RangeError('Exponential ramp target must be nonzero'); schedule(this, 'exponential', value, when); return this; }
+    setTargetAtTime(value, when, constant) { constant = time(constant); schedule(this, constant === 0 ? 'set' : 'target', value, when, constant); return this; }
+    cancelScheduledValues(when) { const s = brand(params, this); editable(s.context); when = time(when); s.events = s.events.filter(e => e.time < when); return this; }
+    cancelAndHoldAtTime() { brand(params, this); throw error('NotSupportedError', 'cancelAndHoldAtTime is not implemented'); }
+    setValueCurveAtTime() { brand(params, this); throw error('NotSupportedError', 'Value curves are not implemented'); }
+  }
+  function editable(context) {
+    if (context && contexts.get(context).state === 'running') throw error('NotSupportedError', 'Editing a graph while offline rendering is in progress is not implemented');
+  }
+  function parameterValue(s, when) {
+    let previous = s.value, previousTime = 0, target;
+    for (const event of s.events) {
+      if (when < event.time) {
+        if (event.kind === 'linear' || event.kind === 'exponential') {
+          const fraction = Math.max(0, Math.min(1, (when - previousTime) / (event.time - previousTime)));
+          return Math.fround(event.kind === 'linear' ? previous + fraction * (event.value - previous) : previous !== 0 && Math.sign(previous) === Math.sign(event.value) ? previous * Math.pow(event.value / previous, fraction) : previous);
+        }
+        break;
+      }
+      if (target) previous = target.value + (previous - target.value) * Math.exp(-(event.time - previousTime) / target.constant);
+      if (event.kind === 'target') target = event; else { previous = event.value; target = null; }
+      previousTime = event.time;
+    }
+    return Math.fround(target ? target.value + (previous - target.value) * Math.exp(-(when - previousTime) / target.constant) : previous);
+  }
+  function schedule(parameter, kind, value, when, constant = 0) {
+    const s = brand(params, parameter); editable(s.context); value = s.biquad ? biquadFloat(value) : float(value); when = time(when);
+    if (s.biquad) {
+      const timeline = s.events.filter(e => e.time !== when || e.kind !== kind).concat({ kind, value, time: when, constant }).sort((a,b) => a.time-b.time);
+      if (timeline.length > 128) throw error('NotSupportedError', 'Audio automation budget exceeded');
+      if (timeline.some((e,i) => i && timeline[i-1].kind === 'target' && (e.kind === 'linear' || e.kind === 'exponential'))) throw error('NotSupportedError', 'Target-to-ramp biquad automation is not implemented');
+      s.events = timeline; return;
+    }
+    const same = s.events.findIndex(e => e.time === when && e.kind === kind);
+    if (same >= 0) s.events.splice(same, 1);
+    if (s.events.length >= 128) throw error('NotSupportedError', 'Audio automation budget exceeded');
+    s.events.push({ kind, value, time: when, constant }); s.events.sort((a, b) => a.time - b.time);
+  }
+  function param(node, name, value, min = -3.4028234663852886e38, max = 3.4028234663852886e38, rate = 'a-rate') {
+    const p = new AudioParam(token, value, min, max, rate); params.get(p).context = nodes.get(node).context; nodes.get(node).params[name] = p;
+  }
+  class AudioNode extends EventTarget {
+    constructor(context, kind, key) {
+      super(); if (key !== token) throw new TypeError('Illegal constructor');
+      const c = brand(contexts, context); editable(context); if (c.nodes.length >= 64) throw error('NotSupportedError', 'Audio graph node budget exceeded');
+      nodes.set(this, { context, kind, id: c.nodes.length, inputs: new Set(), params: {}, channelCount: 2, channelCountMode: 'max', channelInterpretation: 'speakers' });
+      c.nodes.push(this);
+    }
+    get context() { return brand(nodes, this).context; }
+    get numberOfInputs() { return brand(nodes, this).kind === 'oscillator' ? 0 : 1; }
+    get numberOfOutputs() { return brand(nodes, this).kind === 'destination' ? 0 : 1; }
+    get channelCount() { return brand(nodes, this).channelCount; }
+    set channelCount(value) { const s = brand(nodes, this); editable(s.context); value = uint(value); if (value < 1 || value > 2) throw error('NotSupportedError', 'Only mono and stereo node mixing is supported'); s.channelCount = value; }
+    get channelCountMode() { return brand(nodes, this).channelCountMode; }
+    set channelCountMode(value) { const s = brand(nodes, this); if (String(value) !== s.channelCountMode) throw error('NotSupportedError', 'This channel mixing mode is not implemented'); }
+    get channelInterpretation() { return brand(nodes, this).channelInterpretation; }
+    set channelInterpretation(value) { const s = brand(nodes, this); if (String(value) !== 'speakers') throw error('NotSupportedError', 'Discrete mixing is not implemented'); }
+    connect(destination, output = 0, input = 0) {
+      const s = brand(nodes, this); editable(s.context); if (params.has(destination)) throw error('NotSupportedError', 'Audio-rate parameter connections are not implemented');
+      const d = brand(nodes, destination);
+      if (s.context !== d.context) throw error('InvalidAccessError', 'Nodes belong to different contexts');
+      if (uint(output) !== 0 || uint(input) !== 0 || !this.numberOfOutputs || !destination.numberOfInputs) throw error('IndexSizeError', 'Invalid node port');
+      d.inputs.add(s.id); return destination;
+    }
+    disconnect(destination, output = 0, input = 0) {
+      const s = brand(nodes, this), c = contexts.get(s.context); editable(s.context);
+      if (destination === undefined || typeof destination === 'number') {
+        if (destination !== undefined && uint(destination) !== 0) throw error('IndexSizeError', 'Invalid node port');
+        for (const node of c.nodes) nodes.get(node).inputs.delete(s.id); return;
+      }
+      const d = brand(nodes, destination);
+      if (uint(output) !== 0 || uint(input) !== 0) throw error('IndexSizeError', 'Invalid node port');
+      if (s.context !== d.context || !d.inputs.delete(s.id)) throw error('InvalidAccessError', 'Nodes are not connected');
+    }
+  }
+  class AudioDestinationNode extends AudioNode {
+    constructor(context, key) { if (key !== token) throw new TypeError('Illegal constructor'); super(context, 'destination', token); const s = nodes.get(this); s.channelCount = contexts.get(context).channels; s.channelCountMode = 'explicit'; }
+    get maxChannelCount() { return brand(nodes, this).channelCount; }
+  }
+  class AudioScheduledSourceNode extends AudioNode {
+    constructor(context, kind, key) { super(context, kind, key); this.onended = null; }
+    start(when = 0) { const s = brand(nodes, this); editable(s.context); when = time(when); if (s.start !== undefined) throw error('InvalidStateError', 'Source has already started'); s.start = when; }
+    stop(when = 0) { const s = brand(nodes, this); editable(s.context); when = time(when); if (s.start === undefined) throw error('InvalidStateError', 'Source has not started'); s.stop = when; }
+  }
+  class OscillatorNode extends AudioScheduledSourceNode {
+    constructor(context, options = {}) {
+      super(context, 'oscillator', token); nodes.get(this).shape = 'sine';
+      param(this, 'frequency', 440, -context.sampleRate / 2, context.sampleRate / 2); param(this, 'detune', 0, -153600, 153600);
+      if (options.type !== undefined) this.type = options.type;
+      if (options.frequency !== undefined) this.frequency.value = options.frequency;
+      if (options.detune !== undefined) this.detune.value = options.detune;
+    }
+    get type() { return brand(nodes, this).shape; }
+    set type(value) { const s = brand(nodes, this); editable(s.context); value = String(value); if (!['sine','square','sawtooth','triangle'].includes(value)) throw error('NotSupportedError', 'Unsupported oscillator type'); s.shape = value; }
+    get frequency() { return brand(nodes, this).params.frequency; }
+    get detune() { return brand(nodes, this).params.detune; }
+    setPeriodicWave() { brand(nodes, this); throw error('NotSupportedError', 'Custom periodic waves are not implemented'); }
+  }
+  class GainNode extends AudioNode {
+    constructor(context, options = {}) { super(context, 'gain', token); param(this, 'gain', 1); if (options.gain !== undefined) this.gain.value = options.gain; }
+    get gain() { return brand(nodes, this).params.gain; }
+  }
+  class DynamicsCompressorNode extends AudioNode {
+    constructor(context, options = {}) {
+      super(context, 'compressor', token); nodes.get(this).reduction = 0; nodes.get(this).channelCountMode = 'clamped-max';
+      for (const [key, value, min, max] of [['threshold',-24,-100,0],['knee',30,0,40],['ratio',12,1,20],['attack',0.003,0,1],['release',0.25,0,1]]) {
+        param(this, key, Math.fround(value), min, max, 'k-rate'); if (options[key] !== undefined) this[key].value = options[key];
+      }
+    }
+    get threshold() { return brand(nodes, this).params.threshold; }
+    get knee() { return brand(nodes, this).params.knee; }
+    get ratio() { return brand(nodes, this).params.ratio; }
+    get attack() { return brand(nodes, this).params.attack; }
+    get release() { return brand(nodes, this).params.release; }
+    get reduction() { return brand(nodes, this).reduction; }
+  }
+  const biquadTypes = ['lowpass','highpass','bandpass','lowshelf','highshelf','peaking','notch','allpass'];
+  const biquadMaxGain = Math.fround(40 * Math.fround(Math.log10(Math.fround(3.4028234663852886e38))));
+  function biquadFloat(value) { return float(+value); } // WebIDL float rejects BigInt, including object conversion.
+  function biquadState(receiver) { const s = brand(nodes, receiver); if (s.kind !== 'biquad') throw new TypeError('Illegal invocation'); return s; }
+  const audioArrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+  const audioTypedArray = Object.getPrototypeOf(Float32Array.prototype);
+  const audioViewGetters = Object.fromEntries(['buffer','byteOffset','byteLength','length'].map(key => [key, Object.getOwnPropertyDescriptor(audioTypedArray, key).get]));
+  function biquadView(value) {
+    typed(value, 'Float32Array');
+    const buffer = audioViewGetters.buffer.call(value);
+    audioArrayBufferLength.call(buffer); // WebIDL NotShared: reject SharedArrayBuffer.
+    const bytes = new Uint8Array(buffer, audioViewGetters.byteOffset.call(value), audioViewGetters.byteLength.call(value)); // Also rejects detached buffers.
+    return { bytes, length: audioViewGetters.length.call(value) };
+  }
+  class BiquadFilterNode extends AudioNode {
+    constructor(context, options = {}) {
+      const c = brand(contexts, context);
+      if (options == null) options = {};
+      if (typeof options !== 'object' && typeof options !== 'function') throw new TypeError('BiquadFilterOptions must be a dictionary');
+      // Convert before allocating a graph node, so a failed constructor cannot
+      // consume the finite graph budget. Only existing supported mixing modes.
+      const settings = {};
+      for (const key of ['channelCount','channelCountMode','channelInterpretation','Q','detune','frequency','gain','type']) {
+        const value = options[key];
+        if (value !== undefined) settings[key] = key === 'channelCount' ? uint(+value) : ['Q','detune','frequency','gain'].includes(key) ? biquadFloat(value) : String(value);
+      }
+      if (settings.type !== undefined && !biquadTypes.includes(settings.type)) throw new TypeError('Invalid BiquadFilterType');
+      if (settings.channelCount !== undefined && (settings.channelCount < 1 || settings.channelCount > 2)) throw error('NotSupportedError', 'Only mono and stereo node mixing is supported');
+      if (settings.channelCountMode !== undefined && settings.channelCountMode !== 'max') throw error('NotSupportedError', 'This channel mixing mode is not implemented');
+      if (settings.channelInterpretation !== undefined && settings.channelInterpretation !== 'speakers') throw error('NotSupportedError', 'Discrete mixing is not implemented');
+      super(context, 'biquad', token); nodes.get(this).shape = settings.type === undefined ? 'lowpass' : settings.type;
+      if (settings.channelCount !== undefined) nodes.get(this).channelCount = settings.channelCount;
+      param(this, 'frequency', 350, 0, c.rate / 2); param(this, 'detune', 0, -153600, 153600);
+      param(this, 'Q', 1); param(this, 'gain', 0, -3.4028234663852886e38, biquadMaxGain);
+      for (const key of ['frequency','detune','Q','gain']) {
+        params.get(nodes.get(this).params[key]).biquad = true;
+        if (settings[key] !== undefined) { const p = params.get(nodes.get(this).params[key]); p.value = Math.max(p.minValue, Math.min(p.maxValue, settings[key])); }
+      }
+    }
+    get type() { return biquadState(this).shape; }
+    set type(value) { const s = biquadState(this); editable(s.context); value = String(value); if (!biquadTypes.includes(value)) throw new TypeError('Invalid BiquadFilterType'); s.shape = value; }
+    get frequency() { return biquadState(this).params.frequency; }
+    get detune() { return biquadState(this).params.detune; }
+    get Q() { return biquadState(this).params.Q; }
+    get gain() { return biquadState(this).params.gain; }
+    getFrequencyResponse(frequencyHz, magResponse, phaseResponse) {
+      const s = biquadState(this), f = biquadView(frequencyHz), m = biquadView(magResponse), p = biquadView(phaseResponse);
+      if (f.length !== m.length || f.length !== p.length) throw error('InvalidAccessError', 'Frequency response arrays must have equal lengths');
+      if (f.length > 32768) throw error('NotSupportedError', 'Biquad response budget exceeded');
+      if (!f.length) return;
+      const config = { shape: s.shape, rate: contexts.get(s.context).rate, values: ['frequency','detune','Q','gain'].map(key => { const p = params.get(s.params[key]); return Math.max(p.minValue, Math.min(p.maxValue, parameterValue(p, contexts.get(s.context).currentTime))); }) };
+      let result;
+      try { result = JSON.parse(Deno.core.ops.op_audio_biquad_response(JSON.stringify(config), f.bytes)); }
+      catch (failure) { const match = /^([A-Za-z]+Error): (.*)$/.exec(String(failure.message || failure)); if (match) throw error(match[1], match[2]); throw failure; }
+      const magnitudes = unpack(result[0]), phases = unpack(result[1]);
+      // Frequencies were consumed before any writes. Preserve Blink's per-index
+      // magnitude/phase write order even when the output views overlap.
+      for (let i = 0; i < f.length; i++) { magResponse[i] = magnitudes[i]; phaseResponse[i] = phases[i]; }
+    }
+  }
+  // WebIDL prototype members are enumerable, methods non-constructible, and
+  // each receiver is checked against the private native-node state above.
+  for (const key of ['type','frequency','detune','Q','gain','getFrequencyResponse']) {
+    const d = Object.getOwnPropertyDescriptor(BiquadFilterNode.prototype, key); d.enumerable = true;
+    if (d.get) _markNativeGetter(d.get, key); if (d.set) _markNativeSetter(d.set, key);
+    Object.defineProperty(BiquadFilterNode.prototype, key, d);
+  }
+  function spectrum(node) {
+    const s = brand(nodes, node), c = contexts.get(s.context);
+    if (s.analysisTime !== c.currentTime) {
+      const history = s.history || new Float32Array(32768);
+      const samples = history.subarray(history.length - s.fftSize);
+      const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+      const values = JSON.parse(Deno.core.ops.op_audio_analyse(bytes));
+      for (let i = 0; i < values.length; i++) s.magnitudes[i] = s.smoothingTimeConstant * s.magnitudes[i] + (1 - s.smoothingTimeConstant) * values[i];
+      s.analysisTime = c.currentTime;
+    }
+    return s;
+  }
+  class AnalyserNode extends AudioNode {
+    constructor(context, options = {}) {
+      super(context, 'analyser', token); Object.assign(nodes.get(this), { fftSize: 2048, minDecibels: -100, maxDecibels: -30, smoothingTimeConstant: 0.8, magnitudes: new Float32Array(1024), analysisTime: -1 });
+      for (const key of ['fftSize','minDecibels','maxDecibels','smoothingTimeConstant']) if (options[key] !== undefined) this[key] = options[key];
+    }
+    get fftSize() { return brand(nodes, this).fftSize; }
+    set fftSize(value) { const s = brand(nodes, this); value = uint(value); if (value < 32 || value > 32768 || (value & (value - 1))) throw error('IndexSizeError', 'FFT size must be a power of two from 32 to 32768'); if (value !== s.fftSize) { s.fftSize = value; s.magnitudes = new Float32Array(value / 2); s.analysisTime = -1; } }
+    get frequencyBinCount() { return brand(nodes, this).fftSize / 2; }
+    get minDecibels() { return brand(nodes, this).minDecibels; }
+    set minDecibels(value) { const s = brand(nodes, this); value = finite(value); if (value >= s.maxDecibels) throw error('IndexSizeError', 'Invalid decibel range'); s.minDecibels = value; }
+    get maxDecibels() { return brand(nodes, this).maxDecibels; }
+    set maxDecibels(value) { const s = brand(nodes, this); value = finite(value); if (value <= s.minDecibels) throw error('IndexSizeError', 'Invalid decibel range'); s.maxDecibels = value; }
+    get smoothingTimeConstant() { return brand(nodes, this).smoothingTimeConstant; }
+    set smoothingTimeConstant(value) { const s = brand(nodes, this); value = finite(value); if (value < 0 || value > 1) throw error('IndexSizeError', 'Invalid smoothing constant'); s.smoothingTimeConstant = value; }
+    getFloatFrequencyData(array) { typed(array, 'Float32Array'); const s = spectrum(this); for (let i = 0; i < Math.min(array.length, s.magnitudes.length); i++) array[i] = 20 * Math.log10(s.magnitudes[i]); }
+    getByteFrequencyData(array) { typed(array, 'Uint8Array'); const s = spectrum(this); for (let i = 0; i < Math.min(array.length, s.magnitudes.length); i++) array[i] = Math.max(0, Math.min(255, 255 * (20 * Math.log10(s.magnitudes[i]) - s.minDecibels) / (s.maxDecibels - s.minDecibels))); }
+    getFloatTimeDomainData(array) { typed(array, 'Float32Array'); const s = brand(nodes, this), history = s.history; for (let i = 0; i < Math.min(array.length, s.fftSize); i++) array[i] = history ? history[history.length - s.fftSize + i] : 0; }
+    getByteTimeDomainData(array) { typed(array, 'Uint8Array'); const s = brand(nodes, this), history = s.history; for (let i = 0; i < Math.min(array.length, s.fftSize); i++) array[i] = Math.max(0, Math.min(255, 128 * (1 + (history ? history[history.length - s.fftSize + i] : 0)))); }
+  }
+  class BaseAudioContext extends EventTarget {
+    constructor(key, rate, channels, length, offline) {
+      super(); if (key !== token) throw new TypeError('Illegal constructor');
+      contexts.set(this, { rate, channels, length, offline, nodes: [], state: 'suspended', currentTime: 0, started: false });
+      contexts.get(this).destination = new AudioDestinationNode(this, token); this.onstatechange = null;
+    }
+    get sampleRate() { return brand(contexts, this).rate; }
+    get currentTime() { return brand(contexts, this).currentTime; }
+    get state() { return brand(contexts, this).state; }
+    get destination() { return brand(contexts, this).destination; }
+    createBuffer(channels, length, rate) { brand(contexts, this); return new AudioBuffer({ numberOfChannels: channels, length, sampleRate: rate }); }
+    createOscillator() { brand(contexts, this); return new OscillatorNode(this); }
+    createGain() { brand(contexts, this); return new GainNode(this); }
+    createDynamicsCompressor() { brand(contexts, this); return new DynamicsCompressorNode(this); }
+    createAnalyser() { brand(contexts, this); return new AnalyserNode(this); }
+    createBiquadFilter() { brand(contexts, this); return new BiquadFilterNode(this); }
+    createBufferSource() { throw error('NotSupportedError', 'Audio buffer sources are not implemented'); }
+    createScriptProcessor() { throw error('NotSupportedError', 'ScriptProcessorNode is not implemented'); }
+    createPeriodicWave() { throw error('NotSupportedError', 'Custom periodic waves are not implemented'); }
+    decodeAudioData() { return Promise.reject(error('NotSupportedError', 'Audio decoding is not implemented')); }
+  }
+  Object.defineProperty(BaseAudioContext.prototype, 'createBiquadFilter', { ...Object.getOwnPropertyDescriptor(BaseAudioContext.prototype, 'createBiquadFilter'), enumerable: true });
+  function statechange(context, state) { contexts.get(context).state = state; context.dispatchEvent(new Event('statechange')); }
+  class AudioContext extends BaseAudioContext {
+    constructor(options = {}) { const rate = options.sampleRate === undefined ? 48000 : float(options.sampleRate); if (rate < 8000 || rate > 96000) throw error('NotSupportedError', 'Invalid sample rate'); super(token, rate, 2, 0, false); }
+    get baseLatency() { brand(contexts, this); return 128 / this.sampleRate; }
+    get outputLatency() { brand(contexts, this); return 0; }
+    resume() { brand(contexts, this); return Promise.reject(error('NotSupportedError', 'Real-time audio output is not implemented')); }
+    suspend() { const s = brand(contexts, this); if (s.state === 'closed') return Promise.reject(error('InvalidStateError', 'Context is closed')); statechange(this, 'suspended'); return Promise.resolve(); }
+    close() { const s = brand(contexts, this); if (s.state === 'closed') return Promise.reject(error('InvalidStateError', 'Context is closed')); statechange(this, 'closed'); return Promise.resolve(); }
+  }
+  class OfflineAudioContext extends BaseAudioContext {
+    constructor(channels, length, rate) {
+      const o = channels !== null && typeof channels === 'object' ? channels : { numberOfChannels: channels, length, sampleRate: rate };
+      const s = format(o.numberOfChannels === undefined ? 1 : o.numberOfChannels, o.length, o.sampleRate);
+      if (s.channels > 2) throw error('NotSupportedError', 'Offline rendering currently supports mono and stereo');
+      super(token, s.rate, s.channels, s.length, true); this.oncomplete = null;
+    }
+    get length() { return brand(contexts, this).length; }
+    startRendering() {
+      const s = brand(contexts, this);
+      if (s.started) return Promise.reject(error('InvalidStateError', 'Offline rendering has already started'));
+      s.started = true;
+      const graph = { rate: s.rate, channels: s.channels, length: s.length, nodes: s.nodes.map(node => {
+        const n = nodes.get(node), result = { kind: n.kind, inputs: Array.from(n.inputs), params: {}, shape: n.shape, start: n.start, stop: n.stop };
+        for (const [key, parameter] of Object.entries(n.params)) { const p = params.get(parameter); result.params[key] = { value: p.value, events: p.events }; if (p.biquad) result.params[key].rate = p.automationRate; }
+        return result;
+      }) };
+      statechange(this, 'running');
+      return Deno.core.ops.op_audio_render(JSON.stringify(graph)).then(result => {
+        const data = JSON.parse(result), buffer = new AudioBuffer({ numberOfChannels: s.channels, length: s.length, sampleRate: s.rate });
+        for (let i = 0; i < s.channels; i++) buffers.get(buffer).data[i].set(unpack(data.channels[i]));
+        for (let i = 0; i < data.nodes.length; i++) { const n = nodes.get(s.nodes[i]); n.reduction = data.nodes[i].reduction; if (data.nodes[i].history) n.history = unpack(data.nodes[i].history); }
+        s.currentTime = data.frames / s.rate; statechange(this, 'closed');
+        for (const node of s.nodes) { const n = nodes.get(node); if (n.start !== undefined && n.stop !== undefined && n.stop <= s.currentTime) node.dispatchEvent(new Event('ended')); }
+        const event = new Event('complete'); Object.defineProperty(event, 'renderedBuffer', { value: buffer, enumerable: true }); this.dispatchEvent(event);
+        return buffer;
+      }, failure => {
+        statechange(this, 'closed'); const message = String(failure.message || failure), match = /^([A-Za-z]+Error): (.*)$/.exec(message);
+        throw error(match ? match[1] : 'OperationError', match ? match[2] : message);
+      });
+    }
+    suspend() { brand(contexts, this); return Promise.reject(error('NotSupportedError', 'Offline suspension is not implemented')); }
+    resume() { brand(contexts, this); return Promise.reject(error('NotSupportedError', 'Offline suspension is not implemented')); }
+  }
+  class AudioWorkletNode extends AudioNode { constructor() { throw error('NotSupportedError', 'AudioWorkletNode is not implemented'); } }
+  class ScriptProcessorNode extends AudioNode { constructor() { throw new TypeError('Illegal constructor'); } }
+  for (const ctor of [AudioBuffer, AudioParam, AudioNode, AudioDestinationNode, AudioScheduledSourceNode, OscillatorNode, GainNode, DynamicsCompressorNode, BiquadFilterNode, AnalyserNode, BaseAudioContext, AudioContext, OfflineAudioContext, AudioWorkletNode, ScriptProcessorNode]) {
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: ctor.name, configurable: true });
+    _markNative(ctor);
+    for (const key of Object.getOwnPropertyNames(ctor.prototype)) {
+      const d = Object.getOwnPropertyDescriptor(ctor.prototype, key);
+      if (typeof d.value === 'function') _markNative(d.value); if (d.get) _markNative(d.get); if (d.set) _markNative(d.set);
+    }
+    globalThis[ctor.name] = ctor;
+  }
+  globalThis.webkitAudioContext = AudioContext;
+  globalThis.webkitOfflineAudioContext = OfflineAudioContext;
+})();
 
-globalThis.speechSynthesis = {
-  speaking: false, pending: false, paused: false,
-  getVoices() { return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; },
-  speak() {}, cancel() {}, pause() {}, resume() {},
-  addEventListener() {}, removeEventListener() {},
-  onvoiceschanged: null,
-};
 globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { constructor(t){this.text=t;this.lang='en-US';this.rate=1;this.pitch=1;this.volume=1;} };
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
@@ -15836,51 +17475,102 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
-// Spec-shape-correct in-memory IndexedDB shim.
-//
-// Requests are real EventTargets, so they must SETTLE BY DISPATCHING EVENTS.
-// Calling only the `onsuccess` property is not enough: a caller that uses
-// `addEventListener("success", ...)` - which is what modern libraries and the
-// Airship web SDK do - would never be notified and its awaiting promise would
-// hang forever. `open()` must likewise fire `upgradeneeded` before `success`,
-// otherwise a caller never gets the chance to create the object stores it is
-// about to transact with.
-//
-// Object stores live in a per-page registry keyed by database name, so data
-// written in one connection is visible to the next, and `count()` reflects
-// what was actually stored.
-const _IDB_DATABASES = new Map(); // name -> { version, stores: Map<name, IDBObjectStore> }
-
-function _idbDispatch(req, type, handlerProp, event) {
-  req.readyState = 'done';
-  let ev = event;
-  if (!ev) {
-    try { ev = new Event(type); } catch (e) { ev = { type: type, target: req }; }
+// Committed database bytes belong to the native BrowserContext and origin.
+// Each transaction has an independent decoded view and an exclusive lease;
+// aborts and failed commits never replace the last committed snapshot.
+const _idbOp=(...args)=>_storageCore.ops.op_indexed_db(...args);
+const _idbTask=globalThis.setTimeout.bind(globalThis);
+const _idbConnections=new Set();
+const _idbActiveTransactions=new Set();
+function _idbDeactivateTransactions() {_storageCore.ops.op_indexed_db_begin_task(_performanceOwner);for(const tx of _idbActiveTransactions)tx._active=false;_idbActiveTransactions.clear();}
+const _idbError=name=>new DOMException(name,name);
+const _idbTaskEpoch=()=>_storageCore.ops.op_indexed_db_task_epoch(_performanceOwner);
+const _idbNative=(action,name='',lease='',version=0,bytes=new Uint8Array())=>{
+  const result=JSON.parse(_idbOp(_performanceOwner,action,name,lease,version,bytes));
+  if(result.error) throw _idbError(result.error);
+  return result;
+};
+const _idbDecode=snapshot=>{
+  const registry={version:snapshot.version,stores:new Map()};
+  if(!snapshot.data) return registry;
+  const saved=_storageDeserialize(_base64ToUint8Array(snapshot.data),_storageOptions);
+  for(const [name,record] of saved.stores) {
+    const store=new IDBObjectStore(name);
+    Object.assign(store,{keyPath:record.keyPath,autoIncrement:record.autoIncrement,_autoKey:record.autoKey,_data:record.data});
+    for(const [name,meta] of record.indexes) {
+      const index=new IDBIndex();Object.assign(index,meta,{name,objectStore:store});store._indexes.set(name,index);
+    }
+    registry.stores.set(name,store);
   }
-  try { req.dispatchEvent(ev); } catch (e) {}
-  try {
-    const handler = req[handlerProp];
-    if (typeof handler === 'function') handler.call(req, ev);
-  } catch (e) {}
+  return registry;
+};
+const _idbEncode=registry=>new _storageBytes(_serializeStorage({stores:new Map(
+  Array.from(registry.stores,([name,store])=>[name,{keyPath:store.keyPath,autoIncrement:store.autoIncrement,
+    autoKey:store._autoKey,data:store._data,indexes:new Map(Array.from(store._indexes,([name,index])=>
+      [name,{keyPath:index.keyPath,multiEntry:index.multiEntry,unique:index.unique}]))}]))}));
+const _idbNames=names=>{
+  const keys=Array.from(names).sort();const list={length:keys.length,contains:name=>keys.includes(String(name)),
+    item:index=>keys[index]??null,[Symbol.iterator]:()=>keys[Symbol.iterator]()};
+  keys.forEach((key,index)=>list[index]=key);return list;
+};
+function _idbAcquire(name,callback,failure,open=0) {
+  let ticket='',cancelled=false;
+  const attempt=()=>{
+    if(cancelled)return;
+    try {
+      const result=_idbNative('begin',name,ticket,open);
+      if(result.busy) {ticket=result.ticket;_idbTask(attempt,5);}
+      else _idbTask(()=>{
+        if(cancelled){_idbNative('abort',name,result.lease);return;}
+        try{callback(result);}catch(error){try{_idbNative('abort',name,result.lease);}catch(_){}failure(error);}
+      },0);
+    }catch(error){_idbTask(()=>failure(error),0);}
+  };
+  attempt();return ()=>{cancelled=true;if(ticket)try{_idbNative('cancel',name,ticket);}catch(_){}};
+}
+let _idbWatchPending=false,_idbOwner;
+function _idbWatchConnections() {
+  if(_idbWatchPending||!_idbConnections.size)return;
+  _idbOwner||=_storageCore.ops.op_indexed_db_owner(_performanceOwner);
+  _idbWatchPending=true;const pending=_storageCore.ops.op_indexed_db_watch(_idbOwner);
+  _unrefNativeOpPromise(pending);
+  pending.then(batch=>{
+    _idbWatchPending=false;if(batch===null)return;
+    _idbTask(()=>{
+      for(const notice of JSON.parse(batch)) {
+        const db=Array.from(_idbConnections).find(db=>db._connection===notice.id);
+        if(db) {
+          if(!db._closed)_idbDispatch(db,'versionchange','onversionchange',new IDBVersionChangeEvent('versionchange',notice));
+          _idbNative('ack',db.name,notice.id,Number(notice.ticket));
+        }
+      }
+      _idbWatchConnections();
+    },0);
+  },()=>{_idbWatchPending=false;});
 }
 
-function _idbRequest(produceResult, tx) {
-  const req = new IDBRequest();
-  Promise.resolve().then(() => {
-    let value;
-    try {
-      value = produceResult();
-    } catch (e) {
-      req.error = e;
-      if (tx && typeof tx._finish === 'function') tx._finish();
-      _idbDispatch(req, 'error', 'onerror');
-      return;
+function _idbDispatch(req,type,handlerProp,event) {
+  if(req instanceof IDBRequest)req.readyState='done';
+  const ev=event||new Event(type);ev.target=req;let failed=false;
+  const ancestors=req instanceof IDBRequest&&req.transaction?[req.transaction,req.transaction.db]:[];
+  const invoke=(target,phase,handler)=>{
+    try {_eventTargetDispatch(target,ev,()=>{failed=true;},phase);}catch(error){failed=true;}
+    if(handler&&!ev._immediatePropagationStopped) {
+      try {ev.currentTarget=target;ev.eventPhase=phase;const callback=target[handler];if(typeof callback==='function')callback.call(target,ev);}
+      catch(error){failed=true;}finally{ev.currentTarget=null;ev.eventPhase=0;}
     }
-    req.result = value;
-    if (tx && typeof tx._finish === 'function') tx._finish();
-    _idbDispatch(req, 'success', 'onsuccess');
-  });
-  return req;
+  };
+  for(const ancestor of ancestors.slice().reverse()) {invoke(ancestor,1);if(ev._propagationStopped)break;}
+  if(!ev._propagationStopped)invoke(req,2,handlerProp);
+  if(ev.bubbles&&!ev._propagationStopped)for(const ancestor of ancestors) {invoke(ancestor,3,handlerProp);if(ev._propagationStopped)break;}
+  if(failed&&req.transaction)req.transaction._abort(_idbError('AbortError'));
+  return !failed;
+}
+
+function _idbRequest(produceResult,tx,source,request) {
+  const req=request||new IDBRequest();req.transaction=tx||null;req.source=source||null;
+  if(!tx) throw _idbError('InvalidStateError');
+  tx._assertActive();tx._begin();tx._queue.push([req,produceResult]);tx._schedule();return req;
 }
 
 class IDBRequest extends EventTarget {
@@ -15919,63 +17609,92 @@ _markNative(IDBOpenDBRequest);
 globalThis.IDBOpenDBRequest = IDBOpenDBRequest;
 
 class IDBTransaction extends EventTarget {
-  constructor(storeNames) {
-    super();
-    this.db = null;
-    this.mode = 'readonly';
-    this.error = null;
-    this._pending = 0;
-    this._completed = false;
-    this._storeNames = Array.isArray(storeNames) ? storeNames.map(String) : (storeNames ? [String(storeNames)] : []);
-    this._stores = new Map();
-    this.objectStoreNames = {
-      contains: (n) => this._stores.has(String(n)),
-      get length() { return this._stores.size; },
-      item: (i) => { const k = Array.from(this._stores.keys()); return i >= 0 && i < k.length ? k[i] : null; },
-    };
-    this._onabort = null;
-    this._oncomplete = null;
-    this._onerror = null;
-    // A transaction completes only once every request started inside it has
-    // settled, so `complete` can never overtake the reads it should follow.
-    Promise.resolve().then(() => this._maybeComplete());
-  }
-  _begin() { this._pending += 1; }
-  _finish() {
-    this._pending -= 1;
-    Promise.resolve().then(() => this._maybeComplete());
-  }
-  _maybeComplete() {
-    if (this._completed || this._pending > 0) return;
-    this._completed = true;
-    _idbDispatch(this, 'complete', 'oncomplete');
-  }
-  get onabort() { return this._onabort; }
-  set onabort(fn) { this._onabort = typeof fn === 'function' ? fn : null; }
-  get oncomplete() { return this._oncomplete; }
-  set oncomplete(fn) { this._oncomplete = typeof fn === 'function' ? fn : null; }
-  get onerror() { return this._onerror; }
-  set onerror(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
-  abort() {}
-  commit() {}
-  objectStore(name) {
-    const key = String(name);
-    let store = this._stores.get(key);
-    if (!store && this.db && this.db._registry) {
-      // During a versionchange upgrade the transaction must also see object
-      // stores that the upgrade itself just created, so resolve through the
-      // database registry rather than the list captured at construction.
-      const registered = this.db._registry.stores.get(key);
-      if (registered) {
-        store = registered;
-        this._stores.set(key, store);
+  constructor(storeNames,db,mode='readonly',snapshot=null) {
+    super();this.db=db;this.mode=mode;this.error=null;db._transactions.add(this);this._active=true;this._taskEpoch=_idbTaskEpoch();_idbActiveTransactions.add(this);
+    this._pending=0;this._completed=false;this._aborted=false;this._committing=false;
+    this._storeNames=Array.isArray(storeNames)?storeNames.map(String):[String(storeNames)];
+    this._stores=new Map();this._queue=[];this._lease=null;this._scheduled=false;
+    this._onabort=null;this._oncomplete=null;this._onerror=null;
+    const admitted=snapshot=>{
+      if(this._aborted) {try {_idbNative('abort',db.name,snapshot.lease);} catch(_){}return;}
+      this._lease=snapshot.lease;this._registry=_idbDecode(snapshot);
+      if(mode==='versionchange') this._registry.version=db.version;
+      // Store wrappers requested before lease admission retain their identity.
+      for(const [name,store] of this._stores) {
+        const fresh=this._registry.stores.get(name);
+        if(fresh) {store._data=fresh._data;store._autoKey=fresh._autoKey;this._registry.stores.set(name,store);}
       }
+      if(mode==='versionchange') db._registry=this._registry;
+      this._schedule();
+    };
+    if(snapshot) {this._lease=snapshot.lease;this._registry=_idbDecode(snapshot);this._registry.version=db.version;db._registry=this._registry;}
+    else this._cancelAcquire=_idbAcquire(db.name,admitted,error=>this._abort(error));
+    this._schedule();
+  }
+  get objectStoreNames() {return _idbNames(this.mode==='versionchange'?this._registry.stores.keys():this._storeNames);}
+  _assertActive() {if(!this._active||this._taskEpoch!==_idbTaskEpoch()||this._completed||this._aborted||this._committing) throw _idbError('TransactionInactiveError');}
+  _begin() {this._pending++;}
+  _finish() {this._pending--;this._schedule();}
+  _schedule() {
+    if(this._scheduled||!this._lease||this._completed||this._aborted) return;
+    this._scheduled=true;_idbTask(()=>{this._scheduled=false;this._pump();},0);
+  }
+  _pump() {
+    if(this._aborted||this._completed) return;
+    const next=this._queue.shift();
+    if(next) {
+      const [req,produce]=next;this._active=true;this._taskEpoch=_idbTaskEpoch();_idbActiveTransactions.add(this);
+      try {const result=produce();req.result=req._cursor?result:_cloneStorage(result);_idbDispatch(req,'success','onsuccess');}
+      catch(error) {
+        req.error=error;const event=new Event('error',{cancelable:true,bubbles:true});
+        _idbDispatch(req,'error','onerror',event);
+        if(!event.defaultPrevented) {this._abort(error);return;}
+      }
+      if(this._aborted)return;this._finish();return;
     }
-    // Returning a detached placeholder here would silently throw away writes
-    // and index registrations; an unknown store is an error.
-    if (!store) throw new Error("NotFoundError");
-    store.transaction = this;
-    return store;
+    if(this._pending) return;
+    try {
+      if(this.mode==='readonly') _idbNative('abort',this.db.name,this._lease);
+      else {
+        const result=_idbNative(this.mode==='versionchange'?'upgrade':'commit',this.db.name,this._lease,this._registry.version,_idbEncode(this._registry));
+        if(this.mode==='versionchange')this.db._connection=result.connection;
+      }
+      this._lease=null;this._completed=true;this.db._transactions.delete(this);this.db._releaseConnection();
+      this.db._registry=this._registry;
+      _idbDispatch(this,'complete','oncomplete');if(this._afterComplete)this._afterComplete();
+    } catch(error) {this._abort(error);}
+  }
+  _abort(error) {
+    if(this._aborted||this._completed) return;
+    this._aborted=true;this.error=error;this._cancelAcquire?.();
+    if(this._lease) {try {_idbNative('abort',this.db.name,this._lease);} catch(_){}this._lease=null;}
+    const queued=this._queue.splice(0);
+    _idbTask(()=>{
+      for(const [req] of queued) {req.error=_idbError('AbortError');_idbDispatch(req,'error','onerror',new Event('error',{cancelable:true,bubbles:true}));}
+      this.db._transactions.delete(this);this.db._releaseConnection();
+      _idbDispatch(this,'abort','onabort');if(this._afterAbort)this._afterAbort(error);
+    },0);
+  }
+  abort() {if(this._completed||this._aborted)throw _idbError('InvalidStateError');this._abort(null);}
+  commit() {this._assertActive();this._committing=true;this._schedule();}
+  get onabort() {return this._onabort;}
+  set onabort(fn) {this._onabort=typeof fn==='function'?fn:null;}
+  get oncomplete() {return this._oncomplete;}
+  set oncomplete(fn) {this._oncomplete=typeof fn==='function'?fn:null;}
+  get onerror() {return this._onerror;}
+  set onerror(fn) {this._onerror=typeof fn==='function'?fn:null;}
+  objectStore(name) {
+    if(this._completed||this._aborted) throw _idbError('InvalidStateError');
+    name=String(name);if(this.mode!=='versionchange'&&!this._storeNames.includes(name))throw _idbError('NotFoundError');
+    if(this._stores.has(name))return this._stores.get(name);
+    const registered=(this._registry||this.db._registry).stores.get(name);
+    if(!registered)throw _idbError('NotFoundError');
+    const store=new IDBObjectStore(name);Object.assign(store,{keyPath:registered.keyPath,autoIncrement:registered.autoIncrement,
+      _autoKey:registered._autoKey,_data:registered._data,transaction:this});
+    for(const [key,index] of registered._indexes) {
+      const copy=new IDBIndex();Object.assign(copy,{name:key,keyPath:index.keyPath,multiEntry:index.multiEntry,unique:index.unique,objectStore:store});store._indexes.set(key,copy);
+    }
+    this._stores.set(name,store);if(this._registry)this._registry.stores.set(name,store);return store;
   }
 }
 Object.defineProperty(IDBTransaction.prototype, Symbol.toStringTag, { value: 'IDBTransaction', configurable: true });
@@ -15990,7 +17709,7 @@ class IDBDatabase extends EventTarget {
     super();
     this.name = name;
     this.version = version;
-    this._registry = null;
+    this._registry = null;this._transactions=new Set();this._closed=false;this._connection=null;
     this._onabort = null;
     this._onclose = null;
     this._onerror = null;
@@ -16004,52 +17723,31 @@ class IDBDatabase extends EventTarget {
   set onerror(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
   get onversionchange() { return this._onversionchange; }
   set onversionchange(fn) { this._onversionchange = typeof fn === 'function' ? fn : null; }
-  // A live, array-like view of the registry. Callers reach these stores through
-  // `Array.from(...)`, `.length`, `.item()` and `.contains()`, so the numeric
-  // indices have to exist as well - a bare `length` getter silently yields `[]`.
-  get objectStoreNames() {
-    const keys = this._registry ? Array.from(this._registry.stores.keys()) : [];
-    const list = {
-      length: keys.length,
-      contains: (n) => keys.indexOf(String(n)) !== -1,
-      item: (i) => (i >= 0 && i < keys.length ? keys[i] : null),
-    };
-    keys.forEach((k, i) => { list[i] = k; });
-    return list;
-  }
-  close() {}
-  _storeFor(name) {
-    if (!this._registry) return new IDBObjectStore(String(name));
-    let store = this._registry.stores.get(String(name));
-    if (!store) {
-      store = new IDBObjectStore(String(name));
-      this._registry.stores.set(String(name), store);
+  get objectStoreNames() {return _idbNames(this._registry?this._registry.stores.keys():[]);}
+  close() {this._closed=true;this._releaseConnection();}
+  _releaseConnection() {
+    if(this._closed&&!this._transactions.size&&this._connection) {
+      try {_idbNative('disconnect',this.name,this._connection);}catch(_){}
+      _idbConnections.delete(this);this._connection=null;
     }
-    return store;
   }
-  createObjectStore(name, options = {}) {
-    // Valid only while `upgradeneeded` is running, where the new store must be
-    // registered on the database so later transactions can reach it.
-    if (!this._registry) throw new Error("InvalidStateError");
-    const key = String(name);
-    if (this._registry.stores.has(key)) throw new Error("ConstraintError");
-    const store = new IDBObjectStore(key);
-    if (options && options.keyPath !== undefined) store.keyPath = options.keyPath;
-    if (options && options.autoIncrement !== undefined) store.autoIncrement = !!options.autoIncrement;
-    this._registry.stores.set(key, store);
-    return store;
+  createObjectStore(name,options={}) {
+    const tx=this._upgrade;if(!tx||tx._completed||tx._aborted)throw _idbError('InvalidStateError');tx._assertActive();
+    name=String(name);if(this._registry.stores.has(name))throw _idbError('ConstraintError');
+    const store=new IDBObjectStore(name);store.keyPath=options.keyPath??null;store.autoIncrement=!!options.autoIncrement;store.transaction=tx;
+    this._registry.stores.set(name,store);tx._stores.set(name,store);return store;
   }
-  deleteObjectStore(name) { if (this._registry) this._registry.stores.delete(String(name)); }
-  transaction(storeNames, mode) {
-    const tx = new IDBTransaction(storeNames);
-    tx.db = this;
-    tx.mode = mode || 'readonly';
-    for (const n of tx._storeNames) {
-      const store = this._storeFor(n);
-      store.transaction = tx;
-      tx._stores.set(n, store);
-    }
-    return tx;
+  deleteObjectStore(name) {
+    const tx=this._upgrade;if(!tx)throw _idbError('InvalidStateError');tx._assertActive();
+    if(!this._registry.stores.delete(String(name)))throw _idbError('NotFoundError');tx._stores.delete(String(name));
+  }
+  transaction(storeNames,mode='readonly') {
+    if(this._closed||this._upgrade)throw _idbError('InvalidStateError');
+    if(!['readonly','readwrite'].includes(mode))throw new TypeError('Invalid transaction mode');
+    const names=Array.isArray(storeNames)?storeNames.map(String):[String(storeNames)];
+    if(!names.length)throw _idbError('InvalidAccessError');
+    for(const name of names)if(!this._registry.stores.has(name))throw _idbError('NotFoundError');
+    return new IDBTransaction(names,this,mode);
   }
 }
 Object.defineProperty(IDBDatabase.prototype, Symbol.toStringTag, { value: 'IDBDatabase', configurable: true });
@@ -16061,79 +17759,54 @@ _markNative(IDBDatabase.prototype.transaction);
 globalThis.IDBDatabase = IDBDatabase;
 
 class IDBFactory {
-  open(name, version) {
-    const req = new IDBOpenDBRequest();
-    const key = String(name);
-    Promise.resolve().then(() => {
-      try {
-        let requested = version;
-        if (requested !== undefined) {
-          requested = Number(requested);
-          if (!Number.isInteger(requested) || requested < 1) {
-            req.error = new Error("TypeError: version must be a positive integer");
-            return _idbDispatch(req, 'error', 'onerror');
-          }
+  open(name,version) {
+    name=String(name);
+    if(version!==undefined) {version=Number(version);if(!Number.isSafeInteger(version)||version<1)throw new TypeError('Invalid database version');}
+    const req=new IDBOpenDBRequest();
+    const fail=error=>{req.error=error;_idbDispatch(req,'error','onerror');};
+    _idbAcquire(name,snapshot=>{
+      const current=snapshot.version,target=version===undefined?(current||1):version;
+      if(target<current) {_idbNative('abort',name,snapshot.lease);fail(_idbError('VersionError'));return;}
+      const db=new IDBDatabase(name,target);db._registry=_idbDecode(snapshot);req.result=db;
+      const succeed=()=>{
+        req.transaction=null;db._upgrade=null;
+        if(db._closed){fail(_idbError('AbortError'));return;}
+        db._connection||=_idbNative('open',name,snapshot.lease,db.version).connection;
+        _idbConnections.add(db);_idbWatchConnections();_idbDispatch(req,'success','onsuccess');
+      };
+      if(target===current) {succeed();return;}
+      let blocked=false;
+      const upgrade=()=>{
+        const prepared=_idbNative('prepare',name,snapshot.lease,target);
+        if(prepared.blocked) {
+          if(!blocked&&!prepared.awaiting) {_idbDispatch(req,'blocked','onblocked',new IDBVersionChangeEvent('blocked',{oldVersion:current,newVersion:target}));blocked=true;}
+          _idbTask(upgrade,5);return;
         }
-        const existing = _IDB_DATABASES.get(key);
-        const current = existing ? existing.version : 0;
-        if (requested !== undefined && requested < current) {
-          req.error = new Error("VersionError: requested version is lower than the existing version");
-          return _idbDispatch(req, 'error', 'onerror');
-        }
-        const target = requested !== undefined ? requested : (current || 1);
-        const registry = existing || { version: current, stores: new Map() };
-        const db = new IDBDatabase(key, target);
-        db._registry = registry;
-        if (current === 0 || target > current) {
-          // `upgradeneeded` runs with the database already usable so the handler
-          // can create object stores; the new version is committed after it.
-          //
-          // The handler receives the upgrade transaction as `request.transaction`
-          // - that is how callers reach the stores and register indexes. Leaving
-          // it null makes every migration fail, and the schema (including every
-          // index) is then silently never created.
-          const upgrade = new IDBTransaction(Array.from(registry.stores.keys()));
-          upgrade.db = db;
-          upgrade.mode = 'versionchange';
-          for (const storeName of upgrade._storeNames) {
-            const store = db._storeFor(storeName);
-            store.transaction = upgrade;
-            upgrade._stores.set(storeName, store);
-          }
-          req.transaction = upgrade;
-          // Hold the transaction open across the handler so `complete` cannot
-          // fire before the migration has run.
-          upgrade._begin();
-          req.result = db;
-          _idbDispatch(req, 'upgradeneeded', 'onupgradeneeded',
-            new IDBVersionChangeEvent('upgradeneeded', { oldVersion: current, newVersion: target }));
-          upgrade._finish();
-          registry.version = target;
-          db.version = target;
-          req.transaction = null;
-        }
-        _IDB_DATABASES.set(key, registry);
-        req.result = db;
-        _idbDispatch(req, 'success', 'onsuccess');
-      } catch (e) {
-        req.error = e;
-        _idbDispatch(req, 'error', 'onerror');
-      }
-    });
-    return req;
+        snapshot={...snapshot,...prepared};db._registry=_idbDecode(snapshot);
+        const tx=new IDBTransaction(Array.from(db._registry.stores.keys()),db,'versionchange',snapshot);
+        db._upgrade=tx;req.transaction=tx;
+        tx._afterComplete=succeed;
+        tx._afterAbort=error=>{db.close();db._upgrade=null;req.transaction=null;fail(error||_idbError('AbortError'));};
+        _idbDispatch(req,'upgradeneeded','onupgradeneeded',new IDBVersionChangeEvent('upgradeneeded',{oldVersion:current,newVersion:target}));
+      };
+      upgrade();
+    },fail,1);return req;
   }
   deleteDatabase(name) {
-    const req = new IDBOpenDBRequest();
-    const key = String(name);
-    Promise.resolve().then(() => {
-      _IDB_DATABASES.delete(key);
-      req.result = undefined;
-      _idbDispatch(req, 'success', 'onsuccess');
-    });
-    return req;
+    name=String(name);const req=new IDBOpenDBRequest();
+    const fail=error=>{req.error=error;_idbDispatch(req,'error','onerror');};
+    _idbAcquire(name,snapshot=>{
+      let blocked=false;const finish=()=>{
+        const prepared=_idbNative('prepare',name,snapshot.lease,0);
+        if(prepared.blocked) {
+          if(!blocked&&!prepared.awaiting) {_idbDispatch(req,'blocked','onblocked');blocked=true;}_idbTask(finish,5);return;
+        }
+        try {_idbNative('delete',name,snapshot.lease);req.result=undefined;_idbDispatch(req,'success','onsuccess');}catch(error){fail(error);}
+      };finish();
+    },fail,1);return req;
   }
-  databases() { return Promise.resolve(Array.from(_IDB_DATABASES.entries()).map(([name, r]) => ({ name: name, version: r.version }))); }
-  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
+  databases() {try {return Promise.resolve(_idbNative('catalog').databases);}catch(error){return Promise.reject(error);}}
+  cmp(a,b) {return _idbCompareKeys(_idbCursorKey(a),_idbCursorKey(b));}
 }
 Object.defineProperty(IDBFactory.prototype, Symbol.toStringTag, { value: 'IDBFactory', configurable: true });
 _markNative(IDBFactory);
@@ -16213,14 +17886,17 @@ function _idbExtractKey(value, keyPath) {
 
 function _idbRangeFor(query) {
   if (query === undefined || query === null) return null;
-  if (query instanceof IDBKeyRange) return query;
-  if (typeof query === 'object' && typeof query.includes === 'function') return query;
+  const state=_domReceiverGet(_domReceiverSlots,query);
+  if(state&&state.kind==='idb-keyrange')return query;
   return IDBKeyRange.only(query);
 }
 
 function _idbInRange(key, range) {
   if (!range) return true;
-  try { return range.includes(key); } catch (e) { return true; }
+  const state=_idbKeyRangeState(range);
+  const lower=state.lower===undefined?1:_idbCompareKeys(key,state.lower);
+  const upper=state.upper===undefined?-1:_idbCompareKeys(key,state.upper);
+  return (lower>0||(lower===0&&!state.lowerOpen))&&(upper<0||(upper===0&&!state.upperOpen));
 }
 
 /// Order rows for a cursor. `direction` is one of next/nextunique/prev/prevunique;
@@ -16231,7 +17907,7 @@ function _idbOrderRows(rows, direction) {
   rows.sort((x, y) => {
     const c = _idbCompareKeys(x.key, y.key);
     if (c) return dir * c;
-    return dir * _idbCompareKeys(x.primaryKey, y.primaryKey);
+    return (direction==='prevunique'?1:dir) * _idbCompareKeys(x.primaryKey, y.primaryKey);
   });
   if (direction === 'nextunique' || direction === 'prevunique') {
     const out = [];
@@ -16253,30 +17929,79 @@ function _idbOrderRows(rows, direction) {
 /// every `continue()` settles the same request again. Callers that drive
 /// iteration by awaiting the request (rather than by listening once) would
 /// otherwise stop after the first record.
-function _idbCursorRequest(rows, direction, withValue, source, tx) {
-  const req = new IDBRequest();
-  let index = 0;
-  if (tx && typeof tx._begin === 'function') tx._begin();
-  const step = () => {
-    if (index >= rows.length) {
-      req.result = null;
-      if (tx && typeof tx._finish === 'function') tx._finish();
-      _idbDispatch(req, 'success', 'onsuccess');
-      return;
+const _idbKeyDate=Date;
+const _idbKeyDateValue=Function.prototype.call.bind(Date.prototype.getTime);
+const _idbKeyArray=Array.isArray;
+const _idbKeyBufferLength=Function.prototype.call.bind(Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get);
+const _idbKeyView=ArrayBuffer.isView;
+function _idbCursorKey(value) {
+  const ancestors=new Set();
+  const convert=value=>{
+    if(typeof value==='number') {if(!Number.isNaN(value))return value;}
+    else if(typeof value==='string')return value;
+    else if(value&&typeof value==='object') {
+      if(_idbKeyArray(value)) {
+        if(ancestors.has(value))throw _idbError('DataError');
+        ancestors.add(value);const key=[];
+        // Only array elements participate in a key. Unrelated properties and
+        // their values are not part of IndexedDB's key conversion algorithm.
+        for(let i=0;i<value.length;i++) {if(!(i in value))throw _idbError('DataError');key.push(convert(value[i]));}
+        ancestors.delete(value);return key;
+      }
+      let time;try {time=_idbKeyDateValue(value);}catch(_) {}
+      if(time!==undefined) {if(!Number.isNaN(time))return new _idbKeyDate(time);}
+      else {
+        let buffer=false;try {_idbKeyBufferLength(value);buffer=true;}catch(_) {}
+        if(buffer||_idbKeyView(value)) {
+          try {return _cloneStorage(value);}catch(_) {throw _idbError('DataError');}
+        }
+      }
     }
-    const row = rows[index];
-    const cursor = withValue ? new IDBCursorWithValue() : new IDBCursor();
-    cursor.source = source;
-    cursor.direction = direction;
-    cursor.key = row.key;
-    cursor.primaryKey = row.primaryKey;
-    if (withValue) cursor.value = row.value;
-    cursor._advance = (n) => { index += (n > 0 ? n : 1); Promise.resolve().then(step); };
-    req.result = cursor;
-    _idbDispatch(req, 'success', 'onsuccess');
+    throw _idbError('DataError');
   };
-  Promise.resolve().then(step);
-  return req;
+  return convert(value);
+}
+const _idbCursorConstruction={};
+function _idbCursorState(cursor,active=false) {
+  const state=_domReceiverGet(_domReceiverSlots,cursor);
+  if(!state||state.kind!=='idb-cursor')throw new TypeError('Illegal invocation');
+  if(active) {
+    state.tx._assertActive();
+    if(!state.gotValue)throw _idbError('InvalidStateError');
+  }
+  return state;
+}
+function _idbCursorRequest(produceRows,direction,withValue,source,tx) {
+  direction=String(direction);
+  if(!['next','nextunique','prev','prevunique'].includes(direction))throw new TypeError('Invalid cursor direction');
+  const req=new IDBRequest(),cursor=withValue?new IDBCursorWithValue(_idbCursorConstruction):new IDBCursor(_idbCursorConstruction);
+  const state={kind:'idb-cursor',source,direction,request:req,tx,gotValue:false,key:undefined,primaryKey:undefined,value:undefined,
+    position:null,target:null,count:1,withValue,isIndex:source instanceof IDBIndex};
+  const sign=direction.startsWith('prev')?-1:1;
+  const compare=(key,primary,row)=>{
+    const order=_idbCompareKeys(row.key,key);
+    return sign*(order||_idbCompareKeys(row.primaryKey,primary));
+  };
+  const step=()=>{
+    // Re-read the transaction's live records after earlier queued mutations.
+    let rows=produceRows();
+    if(state.position)rows=rows.filter(row=>direction.endsWith('unique')?
+      sign*_idbCompareKeys(row.key,state.position.key)>0:compare(state.position.key,state.position.primaryKey,row)>0);
+    if(state.target)rows=rows.filter(row=>state.target.primaryKey===undefined?
+      sign*_idbCompareKeys(row.key,state.target.key)>=0:compare(state.target.key,state.target.primaryKey,row)>=0);
+    const row=rows[state.count-1];state.target=null;state.count=1;
+    if(!row) {state.gotValue=false;state.value=undefined;return null;}
+    state.position={key:_cloneStorage(row.key),primaryKey:_cloneStorage(row.primaryKey)};
+    state.key=_cloneStorage(row.key);state.primaryKey=_cloneStorage(row.primaryKey);
+    if(withValue)state.value=_cloneStorage(row.value);
+    state.gotValue=true;return cursor;
+  };
+  state.advance=(count,target)=>{
+    state.gotValue=false;state.count=count;state.target=target;req.readyState='pending';
+    _idbRequest(step,tx,source,req);
+  };
+  _domReceiverSet(_domReceiverSlots,cursor,state);
+  req._cursor=true;return _idbRequest(step,tx,source,req);
 }
 
 class IDBObjectStore {
@@ -16301,40 +18026,53 @@ class IDBObjectStore {
     keys.forEach((k, i) => { list[i] = k; });
     return list;
   }
-  _keyFor(value, key) {
-    if (key !== undefined) return key;
-    if (this.keyPath) {
-      let current = value;
-      for (const part of String(this.keyPath).split('.')) {
-        if (current == null) return undefined;
-        current = current[part];
-      }
-      return current;
+  _keyFor(value,key) {
+    let result=key;
+    if(this.keyPath!==null) {
+      if(key!==undefined)throw _idbError('DataError');result=_idbExtractKey(value,this.keyPath);
     }
-    if (this.autoIncrement) { this._autoKey += 1; return this._autoKey; }
-    return undefined;
+    if(result===undefined&&this.autoIncrement) {
+      result=++this._autoKey;
+      if(this.keyPath!==null) {
+        if(typeof value!=='object'||value===null||Array.isArray(this.keyPath))throw _idbError('DataError');
+        const parts=String(this.keyPath).split('.');let target=value;
+        for(const part of parts.slice(0,-1)) {
+          if(target[part]===undefined)target[part]={};
+          if(typeof target[part]!=='object'||target[part]===null)throw _idbError('DataError');target=target[part];
+        }
+        target[parts[parts.length-1]]=result;
+      }
+    }
+    if(typeof result==='number'&&Number.isFinite(result)&&result>=this._autoKey)this._autoKey=Math.floor(result);
+    return result;
   }
-  _op(produce) {
-    if (this.transaction && typeof this.transaction._begin === 'function') this.transaction._begin();
-    return _idbRequest(produce, this.transaction);
+  _checkIndexes(value,key) {
+    for(const index of this._indexes.values()) {
+      if(!index.unique)continue;const extracted=_idbExtractKey(value,index.keyPath);if(extracted===undefined)continue;
+      const keys=index.multiEntry&&Array.isArray(extracted)?extracted:[extracted];
+      for(const row of index._rows(null))if(_idbCompareKeys(row.primaryKey,key)!==0&&keys.some(candidate=>_idbCompareKeys(candidate,row.key)===0))throw _idbError('ConstraintError');
+    }
   }
-  add(value, key) {
-    return this._op(() => {
-      const k = this._keyFor(value, key);
-      if (k === undefined) throw new Error("DataError");
-      if (this._data.has(k)) throw new Error("ConstraintError");
-      this._data.set(k, value);
-      return k;
-    });
+  _assert(write=false) {
+    if(!this.transaction)throw _idbError('InvalidStateError');this.transaction._assertActive();
+    if(write&&this.transaction.mode==='readonly')throw _idbError('ReadOnlyError');
   }
-  put(value, key) {
-    return this._op(() => {
-      const k = this._keyFor(value, key);
-      if (k === undefined) throw new Error("DataError");
-      this._data.set(k, value);
-      return k;
-    });
+  _op(produce,write=false) {this._assert(write);return _idbRequest(produce,this.transaction,this);}
+  _write(value,key,add) {
+    this._assert(true);value=_cloneStorage(value);if(key!==undefined)key=_cloneStorage(key);
+    return this._op(()=>{
+      const generator=this._autoKey;try {
+      const k=this._keyFor(value,key);if(k===undefined)throw _idbError('DataError');
+      const existing=Array.from(this._data.keys()).find(stored=>_idbCompareKeys(stored,k)===0);
+      if(existing!==undefined&&add)throw _idbError('ConstraintError');
+      this._checkIndexes(value,k);
+      if(existing!==undefined)this._data.delete(existing);
+      this._data.set(k,value);return k;
+      }catch(error){this._autoKey=generator;throw error;}
+    },true);
   }
+  add(value,key) {return this._write(value,key,true);}
+  put(value,key) {return this._write(value,key,false);}
   // Records in primary-key order, which is the order IndexedDB reports them in.
   _rows(range) {
     const rows = [];
@@ -16363,22 +18101,23 @@ class IDBObjectStore {
       const targets = _idbRangeFor(query) ? this._rows(_idbRangeFor(query)).map((r) => r.primaryKey) : [query];
       for (const k of targets) this._data.delete(k);
       return undefined;
-    });
+    },true);
   }
-  clear() { return this._op(() => { this._data.clear(); return undefined; }); }
+  clear() { return this._op(() => { this._data.clear(); return undefined; },true); }
   count(query) { return this._op(() => this._rows(_idbRangeFor(query)).length); }
   openCursor(query, direction) {
-    const dir = direction || 'next';
-    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, true, this, this.transaction);
+    const dir = direction===undefined?'next':String(direction);query=_idbRangeFor(query);
+    return _idbCursorRequest(()=>_idbOrderRows(this._rows(query), dir), dir, true, this, this.transaction);
   }
   openKeyCursor(query, direction) {
-    const dir = direction || 'next';
-    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, false, this, this.transaction);
+    const dir = direction===undefined?'next':String(direction);query=_idbRangeFor(query);
+    return _idbCursorRequest(()=>_idbOrderRows(this._rows(query), dir), dir, false, this, this.transaction);
   }
   // Indexes must be registered on the store. Returning a throwaway object here
   // makes every later `store.index(name)` query empty, and libraries that read
   // their queue or cache through an index silently see nothing at all.
   createIndex(name, keyPath, options = {}) {
+    this._assert();if(this.transaction.mode!=='versionchange')throw _idbError('InvalidStateError');
     const key = String(name);
     if (this._indexes.has(key)) throw new Error("ConstraintError");
     const index = new IDBIndex();
@@ -16387,15 +18126,18 @@ class IDBObjectStore {
     index.keyPath = keyPath;
     index.multiEntry = !!options.multiEntry;
     index.unique = !!options.unique;
-    this._indexes.set(key, index);
-    return index;
+    if(index.unique) {
+      const rows=index._rows(null).sort((a,b)=>_idbCompareKeys(a.key,b.key));
+      for(let i=1;i<rows.length;i++)if(_idbCompareKeys(rows[i-1].key,rows[i].key)===0&&_idbCompareKeys(rows[i-1].primaryKey,rows[i].primaryKey)!==0)throw _idbError('ConstraintError');
+    }
+    this._indexes.set(key,index);return index;
   }
   index(name) {
     const index = this._indexes.get(String(name));
     if (!index) throw new Error("NotFoundError");
     return index;
   }
-  deleteIndex(name) { this._indexes.delete(String(name)); }
+  deleteIndex(name) {this._assert();if(this.transaction.mode!=='versionchange')throw _idbError('InvalidStateError');if(!this._indexes.delete(String(name)))throw _idbError('NotFoundError');}
 }
 Object.defineProperty(IDBObjectStore.prototype, Symbol.toStringTag, { value: 'IDBObjectStore', configurable: true });
 _markNative(IDBObjectStore);
@@ -16427,11 +18169,7 @@ class IDBIndex {
     }
     return rows;
   }
-  _op(produce) {
-    const tx = this.objectStore ? this.objectStore.transaction : null;
-    if (tx && typeof tx._begin === 'function') tx._begin();
-    return _idbRequest(produce, tx);
-  }
+  _op(produce) {this.objectStore._assert();return _idbRequest(produce,this.objectStore.transaction,this);}
   get(query) {
     return this._op(() => {
       const rows = _idbOrderRows(this._rows(_idbRangeFor(query)), 'next');
@@ -16458,14 +18196,14 @@ class IDBIndex {
   }
   count(query) { return this._op(() => this._rows(_idbRangeFor(query)).length); }
   openCursor(query, direction) {
-    const dir = direction || 'next';
+    const dir = direction===undefined?'next':String(direction);query=_idbRangeFor(query);
     const tx = this.objectStore ? this.objectStore.transaction : null;
-    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, true, this, tx);
+    return _idbCursorRequest(()=>_idbOrderRows(this._rows(query), dir), dir, true, this, tx);
   }
   openKeyCursor(query, direction) {
-    const dir = direction || 'next';
+    const dir = direction===undefined?'next':String(direction);query=_idbRangeFor(query);
     const tx = this.objectStore ? this.objectStore.transaction : null;
-    return _idbCursorRequest(_idbOrderRows(this._rows(_idbRangeFor(query)), dir), dir, false, this, tx);
+    return _idbCursorRequest(()=>_idbOrderRows(this._rows(query), dir), dir, false, this, tx);
   }
 }
 Object.defineProperty(IDBIndex.prototype, Symbol.toStringTag, { value: 'IDBIndex', configurable: true });
@@ -16473,38 +18211,46 @@ _markNative(IDBIndex);
 globalThis.IDBIndex = IDBIndex;
 
 class IDBCursor {
-  constructor() {
-    this.source = null;
-    this.direction = 'next';
-    this.key = undefined;
-    this.primaryKey = undefined;
-    this._advance = null;
-  }
-  _store() {
-    const source = this.source;
-    if (!source) return null;
-    return source.objectStore ? source.objectStore : source;
-  }
+  constructor(token) {if(token!==_idbCursorConstruction)throw new TypeError('Illegal constructor');}
+  get source() {return _idbCursorState(this).source;}
+  get direction() {return _idbCursorState(this).direction;}
+  get key() {return _idbCursorState(this).key;}
+  get primaryKey() {return _idbCursorState(this).primaryKey;}
+  get request() {return _idbCursorState(this).request;}
   advance(count) {
-    if (typeof this._advance === 'function') this._advance(count | 0);
+    if(typeof count==='bigint')throw new TypeError('Invalid cursor count');
+    count=Number(count);
+    if(!Number.isFinite(count)||Math.trunc(count)<1||Math.trunc(count)>4294967295)throw new TypeError('Invalid cursor count');
+    const state=_idbCursorState(this,true);state.advance(Math.trunc(count),null);
   }
   continue(key) {
-    if (typeof this._advance === 'function') this._advance(1);
+    const state=_idbCursorState(this,true);let target=null;
+    if(key!==undefined) {
+      key=_idbCursorKey(key);const sign=state.direction.startsWith('prev')?-1:1;
+      if(sign*_idbCompareKeys(key,state.position.key)<=0)throw _idbError('DataError');target={key};
+    }
+    state.advance(1,target);
   }
-  continuePrimaryKey(key, primaryKey) {
-    if (typeof this._advance === 'function') this._advance(1);
+  continuePrimaryKey(key,primaryKey) {
+    const state=_idbCursorState(this,true);
+    if(!state.isIndex||state.direction.endsWith('unique'))throw _idbError('InvalidAccessError');
+    key=_idbCursorKey(key);primaryKey=_idbCursorKey(primaryKey);
+    const sign=state.direction.startsWith('prev')?-1:1;
+    if(sign*(_idbCompareKeys(key,state.position.key)||_idbCompareKeys(primaryKey,state.position.primaryKey))<=0)throw _idbError('DataError');
+    state.advance(1,{key,primaryKey});
   }
   delete() {
-    const store = this._store();
-    if (!store) return _idbRequest(() => undefined);
-    return store.delete(this.primaryKey);
+    const state=_idbCursorState(this),store=state.source.objectStore||state.source;store._assert(true);
+    if(!state.gotValue||!state.withValue)throw _idbError('InvalidStateError');
+    const req=store.delete(state.position.primaryKey);req.source=this;return req;
   }
-  // `update` writes against the cursor's primary key, so it must pass the key
-  // explicitly - the record's own key path may not match the store's.
   update(value) {
-    const store = this._store();
-    if (!store) return _idbRequest(() => undefined);
-    return store.put(value, this.primaryKey);
+    const state=_idbCursorState(this),store=state.source.objectStore||state.source;
+    store._assert(true);
+    if(!state.gotValue||!state.withValue)throw _idbError('InvalidStateError');
+    value=_cloneStorage(value);
+    if(store.keyPath!==null&&_idbCompareKeys(_idbExtractKey(value,store.keyPath),state.position.primaryKey)!==0)throw _idbError('DataError');
+    const req=store.put(value,store.keyPath===null?state.position.primaryKey:undefined);req.source=this;return req;
   }
 }
 Object.defineProperty(IDBCursor.prototype, Symbol.toStringTag, { value: 'IDBCursor', configurable: true });
@@ -16512,9 +18258,11 @@ _markNative(IDBCursor);
 globalThis.IDBCursor = IDBCursor;
 
 class IDBCursorWithValue extends IDBCursor {
-  constructor() {
-    super();
-    this.value = undefined;
+  constructor(token) {super(token);}
+  get value() {
+    const state=_idbCursorState(this);
+    if(!state.withValue)throw new TypeError('Illegal invocation');
+    return state.value;
   }
 }
 Object.defineProperty(IDBCursorWithValue.prototype, Symbol.toStringTag, { value: 'IDBCursorWithValue', configurable: true });
@@ -16536,29 +18284,41 @@ globalThis.indexedDB = new IDBFactory();
 // A real constructor, not a bag of object literals: `instanceof` has to work,
 // and `includes` must compare with IndexedDB key ordering - plain `>`/`<` would
 // compare array keys by their string form and silently match the wrong records.
+const _idbKeyRangeConstruction={};
+function _idbKeyRangeState(range) {
+  const state=_domReceiverGet(_domReceiverSlots,range);
+  if(!state||state.kind!=='idb-keyrange')throw new TypeError('Illegal invocation');return state;
+}
 class IDBKeyRange {
-  constructor(lower, upper, lowerOpen, upperOpen) {
-    this.lower = lower;
-    this.upper = upper;
-    this.lowerOpen = !!lowerOpen;
-    this.upperOpen = !!upperOpen;
+  constructor(token,lower,upper,lowerOpen,upperOpen) {
+    if(token!==_idbKeyRangeConstruction)throw new TypeError('Illegal constructor');
+    _domReceiverSet(_domReceiverSlots,this,{kind:'idb-keyrange',lower,upper,lowerOpen:!!lowerOpen,upperOpen:!!upperOpen,
+      lowerValue:lower===undefined?undefined:_cloneStorage(lower),upperValue:upper===undefined?undefined:_cloneStorage(upper)});
   }
+  get lower() {return _idbKeyRangeState(this).lowerValue;}
+  get upper() {return _idbKeyRangeState(this).upperValue;}
+  get lowerOpen() {return _idbKeyRangeState(this).lowerOpen;}
+  get upperOpen() {return _idbKeyRangeState(this).upperOpen;}
   includes(key) {
-    if (this.lower !== undefined && this.lower !== null) {
-      const c = _idbCompareKeys(key, this.lower);
-      if (c < 0 || (c === 0 && this.lowerOpen)) return false;
+    const state=_idbKeyRangeState(this);key=_idbCursorKey(key);
+    if(state.lower!==undefined) {
+      const order=_idbCompareKeys(key,state.lower);if(order<0||(order===0&&state.lowerOpen))return false;
     }
-    if (this.upper !== undefined && this.upper !== null) {
-      const c = _idbCompareKeys(key, this.upper);
-      if (c > 0 || (c === 0 && this.upperOpen)) return false;
+    if(state.upper!==undefined) {
+      const order=_idbCompareKeys(key,state.upper);if(order>0||(order===0&&state.upperOpen))return false;
     }
     return true;
   }
-  static only(value) { return new IDBKeyRange(value, value, false, false); }
-  static lowerBound(lower, open) { return new IDBKeyRange(lower, null, open, true); }
-  static upperBound(upper, open) { return new IDBKeyRange(null, upper, true, open); }
-  static bound(lower, upper, lowerOpen, upperOpen) { return new IDBKeyRange(lower, upper, lowerOpen, upperOpen); }
+  static only(value) {value=_idbCursorKey(value);return new IDBKeyRange(_idbKeyRangeConstruction,value,value,false,false);}
+  static lowerBound(lower,open=false) {return new IDBKeyRange(_idbKeyRangeConstruction,_idbCursorKey(lower),undefined,open,true);}
+  static upperBound(upper,open=false) {return new IDBKeyRange(_idbKeyRangeConstruction,undefined,_idbCursorKey(upper),true,open);}
+  static bound(lower,upper,lowerOpen=false,upperOpen=false) {
+    lower=_idbCursorKey(lower);upper=_idbCursorKey(upper);const order=_idbCompareKeys(lower,upper);
+    if(order>0||(order===0&&(lowerOpen||upperOpen)))throw _idbError('DataError');
+    return new IDBKeyRange(_idbKeyRangeConstruction,lower,upper,lowerOpen,upperOpen);
+  }
 }
+
 Object.defineProperty(IDBKeyRange.prototype, Symbol.toStringTag, { value: 'IDBKeyRange', configurable: true });
 _markNative(IDBKeyRange);
 globalThis.IDBKeyRange = IDBKeyRange;
@@ -16599,14 +18359,61 @@ globalThis.SpeechRecognition = globalThis.webkitSpeechRecognition = class Speech
 };
 _markNative(globalThis.SpeechRecognition);
 
-_defNavigatorMember('mediaCapabilities', {
-  decodingInfo(cfg) {
-    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
-  },
-  encodingInfo(cfg) {
-    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg });
-  },
-});
+(() => {
+  const validateConfiguration = (cfg, decoding) => {
+    const types = decoding ? ['file', 'media-source', 'webrtc'] : ['record', 'webrtc'];
+    if (!cfg || !types.includes(String(cfg.type)) ||
+        (cfg.audio === undefined && cfg.video === undefined)) {
+      throw new TypeError('Invalid media capability configuration');
+    }
+    for (const kind of ['audio', 'video']) {
+      const track = cfg[kind];
+      if (track === undefined) continue;
+      const mime = track && String(track.contentType).trim().match(
+        /^([!#$%&'*+.^_`|~\w-]+)\/([!#$%&'*+.^_`|~\w-]+)\s*(?:;(.*))?$/);
+      if (!mime || ![kind, 'application'].includes(mime[1].toLowerCase())) {
+        throw new TypeError('Invalid media content type');
+      }
+      // Container queries describe one track and require one codec. Unknown
+      // MIME types remain valid queries, but are unsupported below.
+      if (/^(mp4|webm|ogg)$/i.test(mime[2]) &&
+          !/^\s*codecs\s*=\s*(?:"[^",;\s]+"|[^",;\s]+)\s*$/i.test(mime[3] || '')) {
+        throw new TypeError('A single codec is required');
+      }
+      if (kind === 'video' && (
+          ['width', 'height', 'bitrate', 'framerate'].some(key => track[key] === undefined) ||
+          !Number.isFinite(Number(track.framerate)) || Number(track.framerate) <= 0)) {
+        throw new TypeError('Invalid video configuration');
+      }
+    }
+    if (decoding && cfg.keySystemConfiguration !== undefined) {
+      const keys = cfg.keySystemConfiguration;
+      if (!keys || keys.keySystem === undefined || cfg.type === 'webrtc' ||
+          (keys.audio !== undefined && cfg.audio === undefined) ||
+          (keys.video !== undefined && cfg.video === undefined)) {
+        throw new TypeError('Invalid media key system configuration');
+      }
+      if (!globalThis.isSecureContext) throw new DOMException('A secure context is required', 'SecurityError');
+    }
+    const configuration = { ...cfg };
+    for (const kind of ['audio', 'video']) {
+      if (cfg[kind] !== undefined) configuration[kind] = { ...cfg[kind] };
+    }
+    return configuration;
+  };
+  // No audio/video decoder or encoder is connected to these APIs. Keep this
+  // consistent with HTMLMediaElement playback instead of promising success.
+  _defNavigatorMember('mediaCapabilities', {
+    async decodingInfo(cfg) {
+      const configuration = validateConfiguration(cfg, true);
+      return { supported: false, smooth: false, powerEfficient: false, keySystemAccess: null, configuration };
+    },
+    async encodingInfo(cfg) {
+      const configuration = validateConfiguration(cfg, false);
+      return { supported: false, smooth: false, powerEfficient: false, configuration };
+    },
+  });
+})();
 _defNavigatorMember('locks', {
   request(name, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
@@ -17017,7 +18824,7 @@ function _autoRunWorker(worker) {
   const state = _workerInstanceState.get(worker);
   if (state.terminated || state.workerId !== null || state.code === undefined) return;
   try {
-    const workerId = Deno.core.ops.op_worker_create(state.url || '');
+    const workerId = Deno.core.ops.op_worker_create(state.url || '', state.responseId);
     if (!workerId) throw new Error('Worker resource limit exceeded');
     state.workerId = workerId;
     _workerById.set(workerId, worker);
@@ -17081,6 +18888,7 @@ function Worker(url) {
           _markWorkerFetchInit(init);
           const resp = await globalThis.fetch(resolvedUrl, init);
           state.code = await resp.text();
+          state.responseId = _getResponsePolicyId(resp);
           if (!state.terminated) _autoRunWorker(worker);
         } catch(e) { _workerError(worker, e); }
       })();
@@ -17308,6 +19116,10 @@ globalThis.postMessage = function(data, targetOrigin, _transfer) {
 _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
+const _readableStreamRecords=new WeakMap();
+const _streamRecordGet=Function.call.bind(WeakMap.prototype.get);
+const _streamRecordSet=Function.call.bind(WeakMap.prototype.set);
+_readableStreamState=stream=>_streamRecordGet(_readableStreamRecords,stream);
 if (typeof ReadableStream === 'undefined') {
   globalThis.ReadableStream = class ReadableStream {
     constructor(source = {}, strategy = {}) {
@@ -17316,7 +19128,7 @@ if (typeof ReadableStream === 'undefined') {
       this._reads = [];
       this._state = "readable";
       this._error = null;
-      this.locked = false;
+      _streamRecordSet(_readableStreamRecords,this,{locked:false,disturbed:false});
       const stream = this;
       this._controller = {
         enqueue(chunk) {
@@ -17349,18 +19161,22 @@ if (typeof ReadableStream === 'undefined') {
         this._controller.error(error);
       }
     }
+    get locked() { return _readableStreamState(this).locked; }
     getReader() {
-      if (this.locked) throw new TypeError("ReadableStream is locked");
-      this.locked = true;
+      const record=_readableStreamState(this);
+      if (record.locked) throw new TypeError("ReadableStream is locked");
+      record.locked = true;
       const stream = this;
       return {
         read() {
+          if (!record.locked) return Promise.reject(new TypeError("Reader has been released"));
+          record.disturbed=true;
           if (stream._queue.length > 0) return Promise.resolve({ value: stream._queue.shift(), done: false });
           if (stream._state === "closed") return Promise.resolve({ value: undefined, done: true });
           if (stream._state === "errored") return Promise.reject(stream._error);
           return new Promise((resolve, reject) => stream._reads.push({resolve, reject}));
         },
-        releaseLock() { stream.locked = false; },
+        releaseLock() { record.locked=false; },
         cancel(reason) { return stream.cancel(reason); },
         get closed() {
           if (stream._state === "closed") return Promise.resolve();
@@ -17377,6 +19193,7 @@ if (typeof ReadableStream === 'undefined') {
       };
     }
     cancel(reason) {
+      _readableStreamState(this).disturbed=true;
       this._queue.length = 0;
       this._controller.close();
       try { return Promise.resolve(this._source.cancel?.(reason)); }
@@ -17947,13 +19764,7 @@ if (typeof FileReader === 'undefined') {
   Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
 }
 
-// Real network sockets aren't implemented; we don't have a runtime WS / SSE
-// client in V8. But pages that wait for an `open` event (Vite HMR clients
-// embedded on docs sites, live-dashboards, anything calling
-// `await new Promise(r => ws.addEventListener('open', r))`) silently hang
-// forever otherwise. Fire `open` after a microtask so the consumer at least
-// proceeds; subsequent messages never arrive, which is no worse than the
-// current "no signal whatsoever" behaviour.
+// EventSource currently provides lifecycle events without an SSE transport.
 // Minimal EventTarget shared by socket-like classes. Real `EventTarget` is
 // currently aliased to `Node`, which would drag DOM-tree assumptions into a
 // `WebSocket`. Defining a private shim avoids that.
@@ -18002,44 +19813,165 @@ if (typeof EventSource === 'undefined') {
   };
 }
 
-if (typeof WebSocket === 'undefined') {
-  globalThis.WebSocket = class WebSocket {
-    constructor(url, protocols) {
-      // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
-      if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
-        throw new DOMException(
-          "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
-          'SyntaxError'
-        );
+if (typeof CloseEvent === 'undefined') {
+  const record=event=>{const value=_websocketMapGet(_websocketCloseEvents,event);if(!value)throw new TypeError('Illegal invocation');return value;};
+  class CloseEvent extends Event {
+    constructor(type,init={}) {
+      super(type,init);
+      if(typeof init.reason==='symbol')throw new TypeError('Cannot convert a Symbol to a string');
+      _websocketMapSet(_websocketCloseEvents,this,{code:Number(init.code||0)&65535,reason:init.reason===undefined?'':String(init.reason),wasClean:!!init.wasClean});
+    }
+    get code(){return record(this).code;}
+    get reason(){return record(this).reason;}
+    get wasClean(){return record(this).wasClean;}
+  }
+  for(const name of ['code','reason','wasClean']) {
+    const descriptor=Object.getOwnPropertyDescriptor(CloseEvent.prototype,name);descriptor.enumerable=true;Object.defineProperty(CloseEvent.prototype,name,descriptor);
+  }
+  Object.defineProperty(CloseEvent.prototype,Symbol.toStringTag,{value:'CloseEvent',configurable:true});
+  globalThis.CloseEvent=CloseEvent;
+}
+
+function _makeWebSocketConstructor(blankOwner = null) {
+  const stateFor = target => { const state = _websocketMapGet(_websocketSlots,target); if (!state) throw new TypeError('Illegal invocation'); return state; };
+  const owner = function websocketOwner() {};
+  const ops = Deno.core.ops;
+  const encoder = new TextEncoder();
+  const domString = value => { if(typeof value==='symbol')throw new TypeError('Cannot convert a Symbol to a string');return String(value); };
+  const NativeURL = URL, NativeBlob = Blob, NativeCloseEvent = CloseEvent;
+  const post = callback => new Promise(resolve => {
+    _browserPostedTaskEnqueue(() => { try { callback(); } finally { resolve(); } }, 0, _browserPostedTaskGeneration(), resolve);
+  });
+  function emit(socket, type, data) {
+    const state = stateFor(socket);
+    if (!ops.op_websocket_active(state.handle)) return;
+    let event;
+    if (type === 'message') {
+      const bytes = ops.op_websocket_payload(state.handle);
+      const value = data.text ? new TextDecoder().decode(bytes) : bytes;
+      event = new MessageEvent('message', { data: typeof value === 'string' ? value :
+        (state.binaryType === 'arraybuffer' ? value.buffer : new NativeBlob([value])), origin: new NativeURL(state.url).origin });
+    } else {
+      event = type === 'close' ? new NativeCloseEvent(type,{code:data.code,reason:data.reason,wasClean:data.clean}) : new Event(type);
+    }
+    _markTrustedEvent(event);
+    _eventTargetDispatch(socket,event);
+  }
+  async function run(socket) {
+    const state = stateFor(socket);
+    try {
+      state.url = await ops.op_websocket_connect(state.handle);
+      while (true) {
+        const raw = await ops.op_websocket_next(state.handle);
+        if (raw === null) { state.readyState=3; break; }
+        const data = JSON.parse(raw);
+        await post(() => {
+          if (!ops.op_websocket_active(state.handle)) return;
+          if (data.type === 'open') {
+            if (state.readyState !== 0) return;
+            state.protocol = data.protocol; state.readyState = 1;
+          }
+          if (data.type === 'error' || data.type === 'close') state.readyState = 3;
+          emit(socket,data.type,data);
+        });
+        ops.op_websocket_ack(state.handle);
+        if(data.type==='close')break;
       }
-      this.url = url;
-      this.readyState = 0; // CONNECTING
-      this.bufferedAmount = 0;
-      this.binaryType = 'blob';
-      this.extensions = '';
-      this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
-      this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
-      _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
+    } catch (_) {
+      await post(() => {
+        if (!ops.op_websocket_active(state.handle)) return;
+        state.readyState = 3; emit(socket,'error',{});
+        emit(socket,'close',{code:1006,reason:'',clean:false});
       });
     }
-    send(data) { /* drop; no real socket */ }
-    close(code, reason) {
-      if (this.readyState >= 2) return;
-      this.readyState = 3; // CLOSED
-      const ev = new Event('close');
-      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+  }
+  class WebSocket extends EventTarget {
+    constructor(url, protocols = []) {
+      super();
+      if (arguments.length === 0) throw new TypeError('WebSocket requires a URL');
+      const urlString=domString(url);
+      let parsed;
+      try {
+        parsed = new NativeURL(urlString, blankOwner ? ops.op_websocket_blank_base(blankOwner) : globalThis.location?.href);
+        if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+        if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+        if (!['ws:','wss:'].includes(parsed.protocol) || parsed.hash || parsed.href.includes('#')) throw 0;
+      } catch (error) { if(typeof url==='symbol')throw error;throw new DOMException('Invalid WebSocket URL','SyntaxError'); }
+      protocols = protocols != null && typeof protocols !== 'string' && typeof protocols[Symbol.iterator] !== 'undefined'
+        ? Array.from(protocols, domString) : [domString(protocols)];
+      const seen = new Set();
+      for (const protocol of protocols) {
+        if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(protocol) || seen.has(protocol)) throw new DOMException('Invalid WebSocket protocols','SyntaxError');
+        seen.add(protocol);
+      }
+      const handle = ops.op_websocket_create(owner,parsed.href,JSON.stringify(protocols),blankOwner);
+      _websocketMapSet(_websocketSlots,this,{handle,url:parsed.href,readyState:0,protocol:'',binaryType:'blob',discarded:0,handlers:Object.create(null)});
+      run(this);
     }
-    static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
-  };
+    get url() { return stateFor(this).url; }
+    get readyState() { const state=stateFor(this);return ops.op_websocket_active(state.handle)?state.readyState:3; }
+    get protocol() { return stateFor(this).protocol; }
+    get extensions() { stateFor(this); return ''; }
+    get binaryType() { return stateFor(this).binaryType; }
+    set binaryType(value) { const state=stateFor(this); value=domString(value); if (value==='blob'||value==='arraybuffer') state.binaryType=value; }
+    get bufferedAmount() { const state=stateFor(this); return state.discarded + ops.op_websocket_buffered(state.handle); }
+    send(data) {
+      const state=stateFor(this);
+      if (arguments.length===0) throw new TypeError('WebSocket.send requires data');
+      let bytes, text=false;
+      const limit=1<<20;
+      const oversized=()=>{ops.op_websocket_close(state.handle,0,'');state.readyState=2;throw new DOMException('WebSocket message exceeds limit','QuotaExceededError');};
+      if (_websocketMapHas(_websocketBlobBytes,data)) { const value=_websocketMapGet(_websocketBlobBytes,data);if(value.length>limit)oversized();bytes=value.slice(); }
+      else {
+        const intrinsic=_websocketBufferIntrinsics;
+        let buffer,offset=0,length;
+        if(intrinsic.isView(data)) {
+          try { length=intrinsic.typedLength.call(data);offset=intrinsic.typedOffset.call(data);buffer=intrinsic.typedBuffer.call(data); }
+          catch(_) { length=intrinsic.dataLength.call(data);offset=intrinsic.dataOffset.call(data);buffer=intrinsic.dataBuffer.call(data); }
+        } else {
+          try { length=intrinsic.arrayBufferLength.call(data);buffer=data; } catch(_) {}
+        }
+        if(length!==undefined) { if(length>limit)oversized();bytes=new intrinsic.bytes(buffer,offset,length).slice(); }
+        else { text=true;const value=domString(data);if(value.length>limit)oversized();bytes=encoder.encode(value);if(bytes.length>limit)oversized(); }
+      }
+      if (state.readyState===0) throw new DOMException('WebSocket is connecting','InvalidStateError');
+      if (state.readyState>=2) { state.discarded+=bytes.byteLength; return; }
+      ops.op_websocket_send(state.handle,bytes,text);
+    }
+    close(code, reason = '') {
+      const state=stateFor(this);
+      if (code !== undefined) { code=Number(code); if(!Number.isFinite(code)||code<0||code>65535)throw new DOMException('Invalid close code','InvalidAccessError');code=Math.trunc(code); if(code!==1000&&(code<3000||code>4999)) throw new DOMException('Invalid close code','InvalidAccessError'); }
+      reason=domString(reason);
+      if(encoder.encode(reason).byteLength>123) throw new DOMException('Close reason too long','SyntaxError');
+      if(state.readyState>=2)return;
+      state.readyState=2;
+      ops.op_websocket_close(state.handle,code===undefined?0:code,reason);
+    }
+  }
+  for(const [name,value] of [['CONNECTING',0],['OPEN',1],['CLOSING',2],['CLOSED',3]]) {
+    Object.defineProperty(WebSocket,name,{value,enumerable:true});
+    Object.defineProperty(WebSocket.prototype,name,{value,enumerable:true});
+  }
+  for(const type of ['open','message','error','close']) {
+    Object.defineProperty(WebSocket.prototype,'on'+type,{enumerable:true,configurable:true,
+      get(){return stateFor(this).handlers[type]?.value||null;},
+      set(value){
+        const state=stateFor(this);let entry=state.handlers[type];
+        if((typeof value!=='function' && typeof value!=='object') || value===null)value=null;
+        if(!entry && value){entry=state.handlers[type]={value:null};entry.listener=event=>{
+          const cb=entry.value;if(typeof cb==='function')cb.call(this,event);
+        };_eventTargetAdd(this,type,entry.listener);}
+        if(entry){entry.value=value;if(!value){_eventTargetRemove(this,type,entry.listener);delete state.handlers[type];}}
+      }
+    });
+  }
+  Object.defineProperty(WebSocket.prototype,Symbol.toStringTag,{value:'WebSocket',configurable:true});
+  for(const name of ['url','readyState','protocol','extensions','binaryType','bufferedAmount','send','close']) {
+    const descriptor=Object.getOwnPropertyDescriptor(WebSocket.prototype,name);descriptor.enumerable=true;Object.defineProperty(WebSocket.prototype,name,descriptor);
+  }
+  return WebSocket;
 }
+if (typeof WebSocket === 'undefined') globalThis.WebSocket=_makeWebSocketConstructor();
 
 if (typeof BroadcastChannel === 'undefined') {
   // BroadcastChannel is used by authentication/session coordinators and by
@@ -18181,28 +20113,83 @@ if (typeof ImageData === 'undefined') {
   };
 }
 
-if (typeof CanvasRenderingContext2D === 'undefined') {
-  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
+function _canvasEnforceSize(value) {
+  const number = +value;
+  if (!_canvasFinite(number)) throw new _canvasTypeError('Canvas size must be finite');
+  const result = _canvasTrunc(number);
+  if (result < 0 || result >= 18446744073709551616) throw new _canvasTypeError('Canvas size is out of range');
+  return result === 0 ? 0 : result;
 }
-
-if (typeof OffscreenCanvas === 'undefined') {
-  globalThis.OffscreenCanvas = class OffscreenCanvas {
-    constructor(w, h) { this.width = w; this.height = h; }
-    getContext(type, options) {
-      type = String(type);
-      if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-        if (this.width > _MAX_CANVAS_DIMENSION || this.height > _MAX_CANVAS_DIMENSION
-            || this.width * this.height > _MAX_CANVAS_PIXELS) return null;
-        // WebGL owns a software surface and does not require a Document.
-        return HTMLCanvasElement.prototype.getContext.call(this, type, options);
-      }
-      if (this._contextType) return null;
-      return globalThis.document?.createElement('canvas')?.getContext(type, options) || null;
-    }
-    convertToBlob() { return Promise.resolve(new Blob([''])); }
-    transferToImageBitmap() { return {}; }
-  };
+function _offscreenState(receiver) {
+  const record = _canvasOffscreenLookup(receiver);
+  if (!record) throw new _canvasTypeError('Illegal invocation');
+  return record;
 }
+class OffscreenCanvas {
+  constructor(width, height) {
+    if (arguments.length < 2) throw new _canvasTypeError('Two arguments required');
+    const dimensions = {width: _canvasEnforceSize(width), height: _canvasEnforceSize(height)};
+    const canvas = this;
+    const record = {canvas, offscreen: true, owner: _canvasOwner,
+      handle: Deno.core.ops.op_canvas_create_offscreen_handle(_canvasOwner),
+      generation: _browserPostedTaskGeneration(), kind: null, context: null, engine: null,
+      dimension(name) { return dimensions[name]; },
+      resize(name, value) { dimensions[name] = value; if (record.engine) record.engine._resizeFromCanvas(); },
+      getContext(type, attributes) { return _canvasCreateContext(record, type, attributes); },
+      dataURL() { return _canvasDataURL(record); },
+    };
+    _canvasSet(_canvasRegistry.offscreen, this, record);
+  }
+  get width() { return _offscreenState(this).dimension('width'); }
+  set width(value) {
+    const record = _offscreenState(this);
+    if (!arguments.length) throw new _canvasTypeError('One argument required');
+    record.resize('width', _canvasEnforceSize(value));
+  }
+  get height() { return _offscreenState(this).dimension('height'); }
+  set height(value) {
+    const record = _offscreenState(this);
+    if (!arguments.length) throw new _canvasTypeError('One argument required');
+    record.resize('height', _canvasEnforceSize(value));
+  }
+  getContext(type) {
+    const record = _offscreenState(this);
+    if (!arguments.length) throw new _canvasTypeError('One argument required');
+    return record.getContext(`${type}`, arguments[1]);
+  }
+  convertToBlob(options = {}) {
+    // Snapshot during the call while delivering errors and the result through
+    // a Promise, as a regular WebIDL operation does.
+    return new _canvasPromise((resolve, reject) => {
+      try {
+        const record = _offscreenState(this);
+        if (options !== null && typeof options !== 'object' && typeof options !== 'function') throw new _canvasTypeError('Options must be a dictionary');
+        if (options && options.type !== undefined) `${options.type}`;
+        if (options && options.quality !== undefined) +options.quality;
+        if (!record.dimension('width') || !record.dimension('height')) throw new _canvasDOMException('Canvas has no pixels', 'IndexSizeError');
+        const url = record.dataURL();
+        if (url === 'data:,') throw new _canvasDOMException('Canvas encoding failed', 'EncodingError');
+        const binary = _canvasAtob(url.slice(url.indexOf(',') + 1));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < bytes.length; i++) bytes[i] = binary.charCodeAt(i);
+        resolve(new _canvasBlob([bytes], {type: 'image/png'}));
+      } catch (error) { reject(error); }
+    });
+  }
+  transferToImageBitmap() { return {}; }
+}
+_canvasDefine(OffscreenCanvas.prototype, Symbol.toStringTag, {value: 'OffscreenCanvas', configurable: true});
+for (const name of ['width','height','getContext','convertToBlob','transferToImageBitmap']) {
+  const descriptor = _canvasDescriptor(OffscreenCanvas.prototype, name);
+  descriptor.enumerable = true;
+  if (descriptor.get) _markNativeGetter(descriptor.get, name);
+  if (descriptor.set) _markNativeSetter(descriptor.set, name);
+  if (descriptor.value) _markNative(descriptor.value);
+  _canvasRememberDescriptor(descriptor);
+  _canvasDefine(OffscreenCanvas.prototype, name, descriptor);
+}
+_canvasMarkNative(OffscreenCanvas);
+_canvasDefine(globalThis, 'OffscreenCanvas', {value: OffscreenCanvas, configurable: true, writable: true});
 
 if (typeof Path2D === 'undefined') {
   globalThis.Path2D = class Path2D { constructor(){} moveTo(){} lineTo(){} arc(){} rect(){} closePath(){} addPath(){} };
@@ -18243,8 +20230,61 @@ if (typeof Range === 'undefined') {
   };
 }
 
+// No FontFace instances exist during snapshot bootstrap. The host shares this
+// weak registry before any main/frame script runs, then consumes core handoff.
+let _fontFaceSlots = new WeakMap();
 if (typeof FontFace === 'undefined') {
-  const _fontFaceString = value => String(value ?? '');
+  const _fontFaceGet = Function.call.bind(WeakMap.prototype.get);
+  const _fontFaceSet = Function.call.bind(WeakMap.prototype.set);
+  const _fontFaceTypeError = TypeError;
+  const _fontFacePromise = Promise;
+  const _fontFaceResolve = Promise.resolve.bind(Promise);
+  const _fontFaceReject = Promise.reject.bind(Promise);
+  const _fontFaceThen = Function.call.bind(Promise.prototype.then);
+  const _fontFaceToString = String;
+  const _fontFaceString = value => {
+    if (typeof value === 'symbol') throw new _fontFaceTypeError('Cannot convert a Symbol value to a string');
+    return _fontFaceToString(value);
+  };
+  const _fontFaceState = face => {
+    const state = _fontFaceGet(_fontFaceSlots, face);
+    if (!state) throw new _fontFaceTypeError('Illegal invocation');
+    return state;
+  };
+  const _fontFaceEnsureLoaded = state => {
+    if (!state.loadedPromise) {
+      state.loadedPromise = new _fontFacePromise((resolve, reject) => {
+        state.resolveLoaded = resolve;
+        state.rejectLoaded = reject;
+      });
+    }
+    return state.loadedPromise;
+  };
+  const _fontFaceChanged = (face, state) => {
+    for (const set of state.sets) set._faceChanged(face);
+  };
+  const _fontFaceSetDescriptor = (face, key, value) => {
+    const state = _fontFaceState(face);
+    const converted = _fontFaceString(value);
+    state[key] = converted;
+    _fontFaceChanged(face, state);
+  };
+  // This preserves the existing shim loading algorithm. It is not a decoder:
+  // binary sources are still considered loaded and URL loads settle in a job.
+  const _fontFaceLoad = face => {
+    const state = _fontFaceState(face);
+    if (state.status === 'loaded' || state.status === 'loading') return state.ensureLoaded(state);
+    state.status = 'loading';
+    _fontFaceChanged(face, state);
+    const loaded = state.ensureLoaded(state);
+    _fontFaceThen(_fontFaceResolve(), () => {
+      if (state.status !== 'loading') return;
+      state.status = 'loaded';
+      state.resolveLoaded(face);
+      _fontFaceChanged(face, state);
+    });
+    return loaded;
+  };
   const _fontFaceBytesBase64 = bytes => {
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     let out = '';
@@ -18275,8 +20315,10 @@ if (typeof FontFace === 'undefined') {
       binary: true
     };
   };
-  const _fontFaceDescriptor = (descriptors, name, fallback) =>
-    descriptors && descriptors[name] !== undefined ? String(descriptors[name]) : fallback;
+  const _fontFaceDescriptor = (descriptors, name, fallback) => {
+    const value = descriptors == null ? undefined : descriptors[name];
+    return value === undefined ? fallback : _fontFaceString(value);
+  };
   const _fontFaceDeclarations = block => {
     const declarations = Object.create(null);
     let start = 0, depth = 0, quote = '', escaped = false;
@@ -18334,82 +20376,71 @@ if (typeof FontFace === 'undefined') {
     return out;
   };
 
-  globalThis.FontFace = class FontFace {
+  const _FontFace = class FontFace {
     constructor(family, source, descriptors={}) {
-      if (arguments.length < 2) throw new TypeError('FontFace requires family and source');
-      this._sets = new Set();
-      this._family = _fontFaceString(family);
-      if (!this._family.trim()) throw new DOMException('The font family is empty', 'SyntaxError');
+      if (arguments.length < 2) throw new _fontFaceTypeError('FontFace requires family and source');
+      const name = _fontFaceString(family);
+      if (!name.trim()) throw new DOMException('The font family is empty', 'SyntaxError');
       const normalizedSource = _fontFaceSource(source);
-      this._source = normalizedSource.css;
-      this._style = _fontFaceDescriptor(descriptors, 'style', 'normal');
-      this._weight = _fontFaceDescriptor(descriptors, 'weight', 'normal');
-      this._stretch = _fontFaceDescriptor(descriptors, 'stretch', 'normal');
-      this._unicodeRange = _fontFaceDescriptor(descriptors, 'unicodeRange', 'U+0-10FFFF');
-      this._variant = _fontFaceDescriptor(descriptors, 'variant', 'normal');
-      this._featureSettings = _fontFaceDescriptor(descriptors, 'featureSettings', 'normal');
-      this._variationSettings = _fontFaceDescriptor(descriptors, 'variationSettings', 'normal');
-      this._display = _fontFaceDescriptor(descriptors, 'display', 'auto');
-      this._ascentOverride = _fontFaceDescriptor(descriptors, 'ascentOverride', 'normal');
-      this._descentOverride = _fontFaceDescriptor(descriptors, 'descentOverride', 'normal');
-      this._lineGapOverride = _fontFaceDescriptor(descriptors, 'lineGapOverride', 'normal');
-      this._status = normalizedSource.binary ? 'loaded' : 'unloaded';
-      this._loadedPromise = normalizedSource.binary ? Promise.resolve(this) : null;
+      const state = { sets: new Set(), family: name, source: normalizedSource.css,
+        cssConnected: false, status: normalizedSource.binary ? 'loaded' : 'unloaded',
+        ensureLoaded: _fontFaceEnsureLoaded, loadedPromise: null };
+      state.style = _fontFaceDescriptor(descriptors, 'style', 'normal');
+      state.weight = _fontFaceDescriptor(descriptors, 'weight', 'normal');
+      state.stretch = _fontFaceDescriptor(descriptors, 'stretch', 'normal');
+      state.unicodeRange = _fontFaceDescriptor(descriptors, 'unicodeRange', 'U+0-10FFFF');
+      state.variant = _fontFaceDescriptor(descriptors, 'variant', 'normal');
+      state.featureSettings = _fontFaceDescriptor(descriptors, 'featureSettings', 'normal');
+      state.variationSettings = _fontFaceDescriptor(descriptors, 'variationSettings', 'normal');
+      state.display = _fontFaceDescriptor(descriptors, 'display', 'auto');
+      state.ascentOverride = _fontFaceDescriptor(descriptors, 'ascentOverride', 'normal');
+      state.descentOverride = _fontFaceDescriptor(descriptors, 'descentOverride', 'normal');
+      state.lineGapOverride = _fontFaceDescriptor(descriptors, 'lineGapOverride', 'normal');
+      _fontFaceSet(_fontFaceSlots, this, state);
+      if (normalizedSource.binary) state.loadedPromise = _fontFaceResolve(this);
     }
-    _changed() { for (const set of this._sets) set._faceChanged(this); }
-    _setDescriptor(slot, value) {
-      this[slot] = String(value);
-      this._changed();
-    }
-    get family() { return this._family; }
-    set family(value) { this._setDescriptor('_family', value); }
-    get style() { return this._style; }
-    set style(value) { this._setDescriptor('_style', value); }
-    get weight() { return this._weight; }
-    set weight(value) { this._setDescriptor('_weight', value); }
-    get stretch() { return this._stretch; }
-    set stretch(value) { this._setDescriptor('_stretch', value); }
-    get unicodeRange() { return this._unicodeRange; }
-    set unicodeRange(value) { this._setDescriptor('_unicodeRange', value); }
-    get variant() { return this._variant; }
-    set variant(value) { this._setDescriptor('_variant', value); }
-    get featureSettings() { return this._featureSettings; }
-    set featureSettings(value) { this._setDescriptor('_featureSettings', value); }
-    get variationSettings() { return this._variationSettings; }
-    set variationSettings(value) { this._setDescriptor('_variationSettings', value); }
-    get display() { return this._display; }
-    set display(value) { this._setDescriptor('_display', value); }
-    get ascentOverride() { return this._ascentOverride; }
-    set ascentOverride(value) { this._setDescriptor('_ascentOverride', value); }
-    get descentOverride() { return this._descentOverride; }
-    set descentOverride(value) { this._setDescriptor('_descentOverride', value); }
-    get lineGapOverride() { return this._lineGapOverride; }
-    set lineGapOverride(value) { this._setDescriptor('_lineGapOverride', value); }
-    get status() { return this._status; }
+    get family() { return _fontFaceState(this).family; }
+    set family(value) { _fontFaceSetDescriptor(this, 'family', value); }
+    get style() { return _fontFaceState(this).style; }
+    set style(value) { _fontFaceSetDescriptor(this, 'style', value); }
+    get weight() { return _fontFaceState(this).weight; }
+    set weight(value) { _fontFaceSetDescriptor(this, 'weight', value); }
+    get stretch() { return _fontFaceState(this).stretch; }
+    set stretch(value) { _fontFaceSetDescriptor(this, 'stretch', value); }
+    get unicodeRange() { return _fontFaceState(this).unicodeRange; }
+    set unicodeRange(value) { _fontFaceSetDescriptor(this, 'unicodeRange', value); }
+    get variant() { return _fontFaceState(this).variant; }
+    set variant(value) { _fontFaceSetDescriptor(this, 'variant', value); }
+    get featureSettings() { return _fontFaceState(this).featureSettings; }
+    set featureSettings(value) { _fontFaceSetDescriptor(this, 'featureSettings', value); }
+    get variationSettings() { return _fontFaceState(this).variationSettings; }
+    set variationSettings(value) { _fontFaceSetDescriptor(this, 'variationSettings', value); }
+    get display() { return _fontFaceState(this).display; }
+    set display(value) { _fontFaceSetDescriptor(this, 'display', value); }
+    get ascentOverride() { return _fontFaceState(this).ascentOverride; }
+    set ascentOverride(value) { _fontFaceSetDescriptor(this, 'ascentOverride', value); }
+    get descentOverride() { return _fontFaceState(this).descentOverride; }
+    set descentOverride(value) { _fontFaceSetDescriptor(this, 'descentOverride', value); }
+    get lineGapOverride() { return _fontFaceState(this).lineGapOverride; }
+    set lineGapOverride(value) { _fontFaceSetDescriptor(this, 'lineGapOverride', value); }
+    get status() { return _fontFaceState(this).status; }
     get loaded() {
-      if (!this._loadedPromise) {
-        this._loadedPromise = new Promise((resolve, reject) => {
-          this._resolveLoaded = resolve;
-          this._rejectLoaded = reject;
-        });
-      }
-      return this._loadedPromise;
+      const state = _fontFaceState(this);
+      return state.ensureLoaded(state);
     }
     load() {
-      if (this._status === 'loaded') return this.loaded;
-      if (this._status === 'loading') return this.loaded;
-      this._status = 'loading';
-      this._changed();
-      const loaded = this.loaded;
-      Promise.resolve().then(() => {
-        if (this._status !== 'loading') return;
-        this._status = 'loaded';
-        this._resolveLoaded?.(this);
-        this._changed();
-      });
-      return loaded;
+      // WebIDL promise operations reject conversion/receiver failures, and use
+      // the called operation's realm for the TypeError and rejection promise.
+      try { return _fontFaceLoad(this); }
+      catch (error) { return _fontFaceReject(error); }
     }
   };
+  globalThis.FontFace = _FontFace;
+  for (const key of Object.getOwnPropertyNames(_FontFace.prototype)) {
+    if (key === 'constructor') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(_FontFace.prototype, key);
+    Object.defineProperty(_FontFace.prototype, key, { ...descriptor, enumerable: true });
+  }
 
   const _fontFaceSelection = font => {
     const value = String(font);
@@ -18422,10 +20453,11 @@ if (typeof FontFace === 'undefined') {
     return { family, weight: weight === 'bold' ? 700 : weight === 'normal' ? 400 : +weight, style };
   };
   const _fontFaceMatches = (face, selection) => {
-    if (face.family.trim().replace(/^(['"])(.*)\1$/, '$2').toLowerCase() !== selection.family) return false;
-    const faceWeight = face.weight.toLowerCase() === 'bold' ? 700 :
-      face.weight.toLowerCase() === 'normal' ? 400 : +(face.weight.split(/\s+/)[0]) || 400;
-    const italic = /^(?:italic|oblique)/i.test(face.style);
+    const state = _fontFaceState(face);
+    if (state.family.trim().replace(/^(['"])(.*)\1$/, '$2').toLowerCase() !== selection.family) return false;
+    const faceWeight = state.weight.toLowerCase() === 'bold' ? 700 :
+      state.weight.toLowerCase() === 'normal' ? 400 : +(state.weight.split(/\s+/)[0]) || 400;
+    const italic = /^(?:italic|oblique)/i.test(state.style);
     return Math.abs(faceWeight - selection.weight) < 350 && italic === (selection.style !== 'normal');
   };
 
@@ -18453,16 +20485,16 @@ if (typeof FontFace === 'undefined') {
         retained.add(key);
         if (this._cssFaces.has(key)) continue;
         try {
-          const face = new FontFace(rule.family, rule.source, rule.descriptors);
-          face._cssConnected = true;
-          face._sets.add(this);
+          const face = new _FontFace(rule.family, rule.source, rule.descriptors);
+          _fontFaceState(face).cssConnected = true;
+          _fontFaceState(face).sets.add(this);
           this._cssFaces.set(key, face);
           this._faces.add(face);
         } catch (_) {}
       }
       for (const [key, face] of this._cssFaces) {
         if (retained.has(key)) continue;
-        face._sets.delete(this);
+        _fontFaceState(face).sets.delete(this);
         this._faces.delete(face);
         this._cssFaces.delete(key);
       }
@@ -18479,23 +20511,24 @@ if (typeof FontFace === 'undefined') {
     _syncNative() {
       if (!this._ownerDocument || typeof Deno.core.ops.op_set_dynamic_fonts !== 'function') return;
       const registrations = [];
-      for (const face of this._faces) registrations.push({
-        ...(face._cssConnected ? { skip: true } : {}),
-        family: face.family,
-        source: face._source,
-        style: face.style,
-        weight: face.weight,
-        unicodeRange: face.unicodeRange
-      });
-      Deno.core.ops.op_set_dynamic_fonts(JSON.stringify(registrations.filter(face => !face.skip)));
+      for (const face of this._faces) {
+        const state = _fontFaceState(face);
+        if (state.cssConnected) continue;
+        registrations.push({family: state.family, source: state.source,
+          style: state.style, weight: state.weight, unicodeRange: state.unicodeRange});
+      }
+      Deno.core.ops.op_set_dynamic_fonts(JSON.stringify(registrations));
       _scheduleResizeRenderCheckpoint();
     }
     _faceChanged(face) {
       this._syncNative();
-      if (face.status === 'loading' && this._status !== 'loading') {
+      if (_fontFaceState(face).status === 'loading' && this._status !== 'loading') {
         this._status = 'loading';
-        const pending = Array.from(this._faces).filter(candidate => candidate.status === 'loading');
-        this._readyPromise = Promise.all(pending.map(candidate => candidate.loaded)).then(() => {
+        const pending = Array.from(this._faces).filter(candidate => _fontFaceState(candidate).status === 'loading');
+        this._readyPromise = Promise.all(pending.map(candidate => {
+          const state = _fontFaceState(candidate);
+          return state.ensureLoaded(state);
+        })).then(() => {
           this._status = 'loaded';
           this._dispatch('loadingdone', Array.from(this._faces));
           return this;
@@ -18504,11 +20537,11 @@ if (typeof FontFace === 'undefined') {
       }
     }
     add(face) {
-      if (!(face instanceof FontFace)) throw new TypeError('FontFaceSet.add requires a FontFace');
+      _fontFaceState(face);
       this._discoverCssFaces();
       if (!this._faces.has(face)) {
         this._faces.add(face);
-        face._sets.add(this);
+        _fontFaceState(face).sets.add(this);
         this._syncNative();
       }
       return this;
@@ -18518,20 +20551,20 @@ if (typeof FontFace === 'undefined') {
       this._discoverCssFaces();
       const selection = _fontFaceSelection(font);
       const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection));
-      return matches.length === 0 || matches.every(face => face.status === 'loaded');
+      return matches.length === 0 || matches.every(face => _fontFaceState(face).status === 'loaded');
     }
     clear() {
       for (const face of Array.from(this._faces)) {
-        if (face._cssConnected) continue;
-        face._sets.delete(this);
+        if (_fontFaceState(face).cssConnected) continue;
+        _fontFaceState(face).sets.delete(this);
         this._faces.delete(face);
       }
       this._syncNative();
     }
     delete(face) {
       this._discoverCssFaces();
-      if (!(face instanceof FontFace) || face._cssConnected || !this._faces.delete(face)) return false;
-      face._sets.delete(this);
+      if (_fontFaceState(face).cssConnected || !this._faces.delete(face)) return false;
+      _fontFaceState(face).sets.delete(this);
       this._syncNative();
       return true;
     }
@@ -18540,14 +20573,14 @@ if (typeof FontFace === 'undefined') {
       this._discoverCssFaces();
       const selection = _fontFaceSelection(font);
       const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection));
-      return Promise.all(matches.map(face => face.load())).then(() => matches);
+      return Promise.all(matches.map(face => _fontFaceLoad(face))).then(() => matches);
     }
     forEach(callback, thisArg=undefined) {
       if (typeof callback !== 'function') throw new TypeError('FontFaceSet.forEach callback must be callable');
       this._discoverCssFaces();
       for (const face of this._faces) callback.call(thisArg, face, face, this);
     }
-    has(face) { this._discoverCssFaces(); return this._faces.has(face); }
+    has(face) { _fontFaceState(face); this._discoverCssFaces(); return this._faces.has(face); }
     entries() { this._discoverCssFaces(); return Array.from(this._faces, face => [face, face])[Symbol.iterator](); }
     keys() { this._discoverCssFaces(); return Array.from(this._faces).values(); }
     values() { this._discoverCssFaces(); return Array.from(this._faces).values(); }
@@ -18708,6 +20741,7 @@ globalThis.__obscura_init = function() {
 
   const documentNid = +_dom("document_node_id");
   globalThis.document = new HTMLDocument(documentNid);
+  _registerLiveDocumentReceiver(globalThis.document);
   // parentNode on <html> reaches the backing document node. Keep that wrapper
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
@@ -18743,13 +20777,13 @@ globalThis.__obscura_init = function() {
   var memValues = [4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  // A navigation start precedes the wall clock, so skew into the past only: an
-  // origin ahead of it makes performance.now() and the rAF timestamp negative.
-  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
-  _clockTimeOrigin = t0;
+  // Native document timing uses one monotonic clock. Snapshot construction
+  // never calls an op; initialize only after a live state exists.
+  _nativeTimingNow = Deno.core.ops.op_timing_now;
+  _nativeTimingReady = true;
+  _clockTimeOrigin = Deno.core.ops.op_timing_origin(_performanceOwner);
+  _performanceSnapshot(true);
   _clockLastReading = 0;
-  globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,
@@ -18766,6 +20800,7 @@ globalThis.__obscura_init = function() {
   // a document decides it is top-level, and one script taking that branch
   // wrongly changes everything after it.
   _installFramingRelationships();
+  _configureScreenExposure();
 
   // A parser-created <iframe src> never went through the src setter, so
   // nothing had started its load and the frame stayed empty (issue #600).
@@ -18784,6 +20819,8 @@ globalThis.__obscura_init = function() {
   // SPAs that load 1000+ globals.
   const toHide = globalThis.__obscura_hide_list || [];
   for (let i = 0; i < toHide.length; i++) {
+    // Native handoffs are consumed before init. Do not recreate deleted keys.
+    if (!Object.hasOwn(globalThis, toHide[i])) continue;
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
   delete globalThis.__obscura_init;
@@ -18799,7 +20836,9 @@ globalThis.__obscura_init = function() {
 // and leave them out of the hide list (and thus visible to the reflection-API
 // filter and to fingerprinting scripts). getOwnPropertyNames captures them.
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
-  k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
+  (k.startsWith('_') || k.includes('obscura') || k.includes('Obscura'))
+    && k !== '__obscura_checked_receivers_handoff'
+    && k !== '__obscura_bind_checked_receivers_handoff'
 );
 
 /* ===== WPT conformance shims: batch 2 ===== */
@@ -18887,24 +20926,26 @@ if (!Element.prototype.getElementsByTagNameNS) {
   _markNative(Element.prototype.getElementsByTagNameNS);
 }
 if (!Document.prototype.getElementsByTagNameNS) {
-  Document.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
-    const all = this.querySelectorAll('*');
-    const filtered = [];
-    const nsMatch = namespaceURI === '*';
-    const tagMatch = localName === '*';
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      if (!el) continue;
-      const elNs = el.namespaceURI;
-      const elTag = el.localName;
-      const nsOk = nsMatch || (elNs === (namespaceURI || null));
-      const tagOk = tagMatch || (elTag === localName);
-      if (nsOk && tagOk) filtered.push(el);
-    }
-    const result = new HTMLCollection(...filtered);
-    result.item = (i) => result[i] != null ? result[i] : null;
-    return result;
-  };
+  Document.prototype.getElementsByTagNameNS = {
+    getElementsByTagNameNS(namespaceURI, localName) {
+      const all = this.querySelectorAll('*');
+      const filtered = [];
+      const nsMatch = namespaceURI === '*';
+      const tagMatch = localName === '*';
+      for (let i = 0; i < all.length; i++) {
+        const el = all[i];
+        if (!el) continue;
+        const elNs = el.namespaceURI;
+        const elTag = el.localName;
+        const nsOk = nsMatch || (elNs === (namespaceURI || null));
+        const tagOk = tagMatch || (elTag === localName);
+        if (nsOk && tagOk) filtered.push(el);
+      }
+      const result = new HTMLCollection(...filtered);
+      result.item = (i) => result[i] != null ? result[i] : null;
+      return result;
+    },
+  }.getElementsByTagNameNS;
   _markNative(Document.prototype.getElementsByTagNameNS);
 }
 
@@ -19490,10 +21531,17 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   define(globalThis,'__obscura_native_lifecycle_handoff',{configurable:true,value(phase) {
     const doc=_wrap(_domParse('document_node_id'));
     const init={bubbles:false,cancelable:false,composed:false};
+    Deno.core.ops.op_timing_lifecycle(_performanceOwner,phase,false);
     if (phase===1 || phase===3) dispatch('readystatechange',[doc,globalThis],init,NativeEvent);
     if (phase===2) dispatch('DOMContentLoaded',[doc,globalThis],{...init,bubbles:true},NativeEvent);
-    if (phase===3) dispatch('load',[globalThis],init,NativeEvent,false,doc);
+    if (phase===3) {
+      Deno.core.ops.op_timing_lifecycle(_performanceOwner,5,false);
+      dispatch('load',[globalThis],init,NativeEvent,false,doc);
+    }
     if (phase===4) dispatch('pageshow',[globalThis],{...init,bubbles:true,cancelable:true,persisted:false},NativePageTransitionEvent,false,doc);
+    Deno.core.ops.op_timing_lifecycle(_performanceOwner,phase,true);
+    if(_performanceEntryCache.has('navigation')) _performanceSnapshot(true);
+    _notifyPerformanceObservers();
   }});
   let scrollEvents=[];
   _queueScrollEvent = (node, exact=false) => {
@@ -20100,6 +22148,20 @@ for (const [name, members] of Object.entries({
   }
 }
 
+for (const [prototype, members] of [
+  [Document.prototype, ['referrer']], [_IframeDocument.prototype, ['referrer']],
+  [HTMLIFrameElement.prototype, ['contentDocument', 'contentWindow']],
+]) {
+  for (const member of members) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, member);
+    descriptor.enumerable = true;
+    _markNativeGetter(descriptor.get, member);
+    Object.defineProperty(prototype, member, descriptor);
+  }
+}
+delete Element.prototype.contentDocument;
+delete Element.prototype.contentWindow;
+
 Object.defineProperty(HTMLScriptElement.prototype, 'fetchPriority', {
   enumerable: true, configurable: true,
   get() {
@@ -20114,8 +22176,9 @@ const _auditedEvents = {"window": ["onanimationend", "onanimationiteration", "on
 
 function _installEventAccessors(target, events) {
   if (!target) return;
-  const xhrDispatchesHandlers = target === XMLHttpRequest.prototype
-    || target === XMLHttpRequestEventTarget.prototype;
+  const dispatchesIdlHandlers = target === XMLHttpRequest.prototype
+    || target === XMLHttpRequestEventTarget.prototype
+    || target === Element.prototype || Element.prototype.isPrototypeOf(target);
   for (const prop of events) {
     if (!prop || Object.getOwnPropertyDescriptor(target, prop)) continue;
     // Preserve inherited behavior such as body's window-reflecting onload.
@@ -20131,9 +22194,9 @@ function _installEventAccessors(target, events) {
     const desc = {
       get() { return this['__' + prop] || null; },
       set(fn) {
-        // XHR dispatch already invokes the IDL property. Registering it again
-        // fires callbacks twice and can complete application counters early.
-        if (xhrDispatchesHandlers) {
+        // XHR and Element dispatch already invoke the IDL property. Registering
+        // it as a listener too invokes the same assignment twice.
+        if (dispatchesIdlHandlers) {
           this['__' + prop] = typeof fn === 'function' ? fn : null;
           return;
         }
@@ -20329,6 +22392,12 @@ globalThis.__obscura_gate_shared_array_buffer = function() {
     }
   }
 })();
+
+// Snapshot-only transfer to speech_bootstrap.js, removed before author code.
+Object.defineProperty(globalThis, '__obscura_speech_primitives', {
+  value: Object.freeze({ listeners: _eventTargetListeners, setServiceRegistry: registry => { _speechEventTargetRecords = registry; }, markTrusted: _markTrustedEvent, now: _relativeTimeNow, enqueueDelivery: callback => _browserPostedTaskEnqueue(callback, 1) }),
+  configurable: true, writable: false, enumerable: false,
+});
 
 
 })();

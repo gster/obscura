@@ -68,6 +68,8 @@ struct ConnectionIoPolicy {
     #[cfg(test)]
     admitted_request_tx: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
     #[cfg(test)]
+    input_publication_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::input_admission::Published>>,
+    #[cfg(test)]
     execution_cancellation_tx: Option<tokio::sync::mpsc::UnboundedSender<
         obscura_js::execution_cancellation::ExecutionCancellation,
     >>,
@@ -93,6 +95,8 @@ impl Default for ConnectionIoPolicy {
             terminal_reason_tx: None,
             #[cfg(test)]
             admitted_request_tx: None,
+            #[cfg(test)]
+            input_publication_tx: None,
             #[cfg(test)]
             execution_cancellation_tx: None,
             #[cfg(test)]
@@ -120,6 +124,11 @@ impl ConnectionIoPolicy {
         if let Some(sender) = &self.admitted_request_tx {
             let _ = sender.send(request_id);
         }
+    }
+
+    #[cfg(test)]
+    fn report_input_publication(&self, published: crate::input_admission::Published) {
+        if let Some(sender) = &self.input_publication_tx { let _ = sender.send(published); }
     }
 
     #[cfg(test)]
@@ -377,12 +386,13 @@ impl ServerShutdown {
     }
 }
 
-struct CdpMessage {
-    text: String,
-    reply_tx: OutboundSender,
+pub(crate) struct CdpMessage {
+    pub(crate) text: String,
+    pub(crate) reply_tx: OutboundSender,
+    pub(crate) admission: Option<crate::input_admission::Receipt>,
 }
 
-enum ServerMessage {
+pub(crate) enum ServerMessage {
     Cdp(CdpMessage),
     NewConnection {
         reply_tx: OutboundSender,
@@ -1383,6 +1393,8 @@ fn run_connection_with_io_policy(
     }
 
     let (msg_tx, msg_rx) = inbound::channel::<ServerMessage>();
+    let input_admission = crate::input_admission::Admission::default();
+    let processor_input_admission = input_admission.clone();
     let execution_cancellation = obscura_js::execution_cancellation::ExecutionCancellation::default();
     #[cfg(test)]
     io_policy.report_execution_cancellation(&execution_cancellation);
@@ -1432,6 +1444,7 @@ fn run_connection_with_io_policy(
                     default_context,
                     processor_shutdown,
                     processor_cancellation,
+                    processor_input_admission,
                 ));
                 let _ = processor_abort_tx.send(Some(processor.abort_handle()));
                 let _ = processor.await;
@@ -1518,6 +1531,7 @@ fn run_connection_with_io_policy(
                 handler_tx,
                 handler_cancellation,
                 io_policy,
+                input_admission,
             ) => {
                 if let Err(error) = result {
                     error!("WebSocket connection error: {}", error);
@@ -1915,8 +1929,11 @@ async fn cdp_processor(
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown: ServerShutdown,
     execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
+    input_admission: crate::input_admission::Admission,
 ) {
+    let _input_guard = crate::input_admission::ConnectionGuard(input_admission.clone());
     let mut ctx = CdpContext::new_with_shared_context(default_context);
+    ctx.input_admission = Some(input_admission.clone());
     ctx.execution_cancellation = Some(execution_cancellation);
     let (itx, irx) = mpsc::unbounded_channel::<crate::domains::fetch::RoutedInterceptedRequest>();
     ctx.intercept_tx = Some(itx);
@@ -1960,6 +1977,7 @@ async fn cdp_processor(
         {
             break;
         }
+        input_admission.refresh(&ctx);
         intercepted_paused.retain(|_, pause| !pause.resolver.is_closed());
         cleanup_detached_fetch_owners(&mut ctx, &mut intercepted_paused);
         crate::domains::page::service_network_idle_candidates(&mut ctx);
@@ -2103,7 +2121,9 @@ async fn cdp_processor(
                         .to_string(),
                 );
             }
-            ServerMessage::Cdp(cdp_msg) => {
+            ServerMessage::Cdp(mut cdp_msg) => {
+                let mut receipt = cdp_msg.admission.take();
+                ctx.admitted_keyboard = receipt.as_mut().and_then(|receipt| receipt.keyboard.take());
                 // Route every Page.navigate through the spawn-and-defer path,
                 // not just intercepted ones. Holding the V8 lock across a
                 // multi-second navigate inside the regular dispatch wedges the
@@ -2132,6 +2152,8 @@ async fn cdp_processor(
                         process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
                     }
                 }
+                drop(ctx.admitted_keyboard.take());
+                if let Some(receipt) = receipt { receipt.complete(&ctx); }
             }
         }
 
@@ -3577,6 +3599,7 @@ async fn handle_connection_ws(
         msg_tx,
         execution_cancellation,
         ConnectionIoPolicy::default(),
+        crate::input_admission::Admission::default(),
     )
     .await
 }
@@ -3586,10 +3609,12 @@ async fn handle_connection_ws_with_io_policy<S>(
     msg_tx: ServerMessageSender,
     execution_cancellation: obscura_js::execution_cancellation::ExecutionCancellation,
     io_policy: ConnectionIoPolicy,
+    input_admission: crate::input_admission::Admission,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let _input_guard = crate::input_admission::ConnectionGuard(input_admission.clone());
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
     // adds extra latency per frame. write_buffer_size=0 makes every WS write
@@ -3708,17 +3733,22 @@ where
                 let admitted_request_id = serde_json::from_str::<CdpRequest>(&text)
                     .ok()
                     .map(|request| request.id);
-                if let Err(error) = msg_tx.send(ServerMessage::Cdp(CdpMessage {
+                let published = match input_admission.send(&msg_tx, CdpMessage {
+                    admission: None,
                     text: text.to_string(),
                     reply_tx: reply_tx.clone(),
-                })) {
-                    warn!(
-                        "closing CDP connection after inbound admission failure: {:?}",
-                        error.reason
-                    );
-                    reply_tx.close(inbound_close_reason(error.reason));
-                    break;
-                }
+                }) {
+                    Ok(published) => published,
+                    Err(error) => {
+                        warn!("closing CDP connection after inbound admission failure: {:?}", error.reason);
+                        reply_tx.close(inbound_close_reason(error.reason));
+                        break;
+                    }
+                };
+                #[cfg(test)]
+                io_policy.report_input_publication(published);
+                #[cfg(not(test))]
+                let _ = published;
                 #[cfg(test)]
                 if let Some(request_id) = admitted_request_id {
                     io_policy.report_admitted_request(request_id);
@@ -3760,7 +3790,7 @@ pub(crate) mod tests {
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
-    use futures_util::Sink;
+    use futures_util::{Sink, SinkExt as _, StreamExt as _};
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::pin::Pin;
@@ -4366,11 +4396,21 @@ pub(crate) mod tests {
 
     struct ConnectionLifecycleProbe {
         admitted_request_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
+        input_publication_rx: tokio::sync::mpsc::UnboundedReceiver<crate::input_admission::Published>,
         execution_cancellation:
             obscura_js::execution_cancellation::ExecutionCancellation,
     }
 
     impl ConnectionLifecycleProbe {
+        async fn wait_for_input_publication(&mut self, request_id: u64) -> crate::input_admission::Published {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let published = self.input_publication_rx.recv().await.expect("input publication observer closed");
+                    if published.request_id == Some(request_id) { return published; }
+                }
+            }).await.expect("input publication was not observed")
+        }
+
         async fn wait_for_admission(&mut self, request_id: u64) {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
@@ -4465,11 +4505,13 @@ pub(crate) mod tests {
         let (reason_tx, terminal_reason_rx) = tokio::sync::mpsc::unbounded_channel();
         let (admitted_request_tx, admitted_request_rx) =
             tokio::sync::mpsc::unbounded_channel();
+        let (input_publication_tx, input_publication_rx) = tokio::sync::mpsc::unbounded_channel();
         let (execution_cancellation_tx, mut execution_cancellation_rx) =
             tokio::sync::mpsc::unbounded_channel();
         let io_policy = super::ConnectionIoPolicy {
             terminal_reason_tx: Some(reason_tx),
             admitted_request_tx: Some(admitted_request_tx),
+            input_publication_tx: Some(input_publication_tx),
             execution_cancellation_tx: Some(execution_cancellation_tx),
             ..io_policy
         };
@@ -4505,6 +4547,7 @@ pub(crate) mod tests {
             terminal_reason_rx,
             ConnectionLifecycleProbe {
                 admitted_request_rx,
+                input_publication_rx,
                 execution_cancellation,
             },
         )
@@ -5586,6 +5629,7 @@ pub(crate) mod tests {
                     default_context,
                     shutdown,
                     obscura_js::execution_cancellation::ExecutionCancellation::default(),
+                    crate::input_admission::Admission::default(),
                 ));
 
                 server_tx
@@ -5597,6 +5641,7 @@ pub(crate) mod tests {
 
                 server_tx
                     .send(super::ServerMessage::Cdp(super::CdpMessage {
+                    admission: None,
                         text: json!({"id": 1, "method": "Browser.getVersion"}).to_string(),
                         reply_tx: reply_tx.clone(),
                     }))
@@ -5612,12 +5657,14 @@ pub(crate) mod tests {
                 let (later_tx, mut later_rx, _) = crate::outbound::channel();
                 server_tx
                     .send(super::ServerMessage::Cdp(super::CdpMessage {
+                    admission: None,
                         text: json!({"id": 2, "method": "Browser.getVersion"}).to_string(),
                         reply_tx: reply_tx.clone(),
                     }))
                     .unwrap();
                 server_tx
                     .send(super::ServerMessage::Cdp(super::CdpMessage {
+                    admission: None,
                         text: json!({"id": 3, "method": "Browser.getVersion"}).to_string(),
                         reply_tx: later_tx,
                     }))
@@ -5805,6 +5852,167 @@ pub(crate) mod tests {
                     .expect("mock processor task");
             })
             .await;
+    }
+
+    // Uses the production WebSocket IO task and native keyboard dispatcher.
+    // The log is an observation that JS started, never a pending-state producer.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduling_real_socket_busy_js_and_release_before_keyboard_handler() {
+        tokio::task::LocalSet::new().run_until(async {
+            let capture = install_complete_log_capture();
+            let shutdown = super::ServerShutdown::new();
+            let (mut client, _io_abort, live, mut lifecycle) = start_direct_connection(shutdown.clone()).await;
+            let session = create_test_page(&mut client).await;
+            let setup = websocket_command(&mut client, 2, "Runtime.evaluate", json!({
+                "expression": "globalThis.inputObservations=[]; addEventListener('keydown', e => { inputObservations.push(['handler',e.key,navigator.scheduling.isInputPending()]); queueMicrotask(() => inputObservations.push(['microtask',e.key,navigator.scheduling.isInputPending()])); }); navigator.scheduling === navigator.scheduling",
+                "returnByValue": true
+            }), Some(&session)).await;
+            assert_eq!(setup["result"]["result"]["value"], true, "{setup}");
+            client.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                "id": 3, "method": "Runtime.evaluate", "sessionId": session,
+                "params": {"expression": "(() => { console.info('scheduling-native-busy-start'); const end=performance.now()+1500; let seen=false; while(performance.now()<end) { if(navigator.scheduling.isInputPending()) seen=true; } return seen; })()", "returnByValue": true}
+            }).to_string().into())).await.unwrap();
+            wait_for_log(&capture, "scheduling-native-busy-start").await;
+            for (id, key) in [(4, "a"), (5, "b")] {
+                client.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                    "id": id, "method": "Input.dispatchKeyEvent", "sessionId": session,
+                    "params": {"type":"rawKeyDown", "key":key, "code":"KeyA", "windowsVirtualKeyCode":65}
+                }).to_string().into())).await.unwrap();
+            }
+            lifecycle.wait_for_admission(5).await;
+            let mut replies = std::collections::HashMap::new();
+            tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                while replies.len() < 3 {
+                    let message = client.next().await.unwrap().unwrap();
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if let Some(id @ 3..=5) = value["id"].as_u64() { replies.insert(id, value); }
+                    }
+                }
+            }).await.expect("native pending socket responses");
+            assert_eq!(replies[&3]["result"]["result"]["value"], true, "busy JS never saw real queued keyboard input");
+            assert!(replies[&4].get("error").is_none(), "{}", replies[&4]);
+            assert!(replies[&5].get("error").is_none(), "{}", replies[&5]);
+            let observed = websocket_command(&mut client, 6, "Runtime.evaluate", json!({
+                "expression":"({events:inputObservations, pending:navigator.scheduling.isInputPending()})", "returnByValue":true
+            }), Some(&session)).await;
+            assert_eq!(observed["result"]["result"]["value"], json!({
+                "events":[["handler","a",true],["microtask","a",true],["handler","b",false],["microtask","b",false]],
+                "pending":false
+            }), "{observed}");
+            client.close(None).await.unwrap(); shutdown.cancel(); wait_for_live_connections(&live, 0).await;
+        }).await;
+    }
+
+    #[cfg(feature = "render")]
+    async fn scheduling_prefix_socket_case(ignore: bool, wrapped_barrier: bool, marker: &str) {
+        let capture = install_complete_log_capture();
+        let shutdown = super::ServerShutdown::new();
+        let (mut client, _io_abort, live, mut lifecycle) = start_direct_connection(shutdown.clone()).await;
+        let session = create_test_page(&mut client).await;
+        let initial = websocket_command(&mut client, 2, "Input.setIgnoreInputEvents", json!({"ignore":!ignore}), Some(&session)).await;
+        assert!(initial.get("error").is_none());
+        let setup = websocket_command(&mut client, 3, "Runtime.evaluate", json!({
+            "expression":"globalThis.keyCount=0;addEventListener('keydown',()=>keyCount++);true", "returnByValue":true
+        }), Some(&session)).await;
+        assert_eq!(setup["result"]["result"]["value"],true);
+        let host_started = tokio::time::Instant::now();
+        client.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+            "id":10,"method":"Runtime.evaluate","sessionId":session,"params":{
+                "expression":format!("(() => {{console.info('{marker}-gate-start');const end=performance.now()+1500;let seen=false;while(performance.now()<end){{seen ||= navigator.scheduling.isInputPending();}}console.info('{marker}-gate-end');return seen;}})()"),"returnByValue":true}
+        }).to_string().into())).await.unwrap();
+        wait_for_log(&capture,&format!("{marker}-gate-start")).await;
+        let inner = json!({"id":111,"method":"Input.setIgnoreInputEvents","sessionId":"wrong-inner-session","params":{"ignore":ignore}});
+        let mutation = if wrapped_barrier {
+            json!({"id":11,"method":"Target.sendMessageToTarget","params":{"sessionId":session,"message":inner.to_string()}})
+        } else {
+            json!({"id":11,"method":"Input.setIgnoreInputEvents","sessionId":session,"params":{"ignore":ignore}})
+        };
+        // Publish all three while the first task still owns V8. Key13 must be
+        // ProtocolQueued behind mutation11 before any completion can promote it.
+        for request in [
+            mutation,
+            json!({"id":12,"method":"Runtime.evaluate","sessionId":session,"params":{"expression":"(() => {const end=performance.now()+100;let seen=false;while(performance.now()<end){seen ||= navigator.scheduling.isInputPending();}return seen;})()","returnByValue":true}}),
+            json!({"id":13,"method":"Input.dispatchKeyEvent","sessionId":session,"params":{"type":"rawKeyDown","key":"c"}}),
+        ] { client.send(tokio_tungstenite::tungstenite::Message::Text(request.to_string().into())).await.unwrap(); }
+        let publication = lifecycle.wait_for_input_publication(13).await;
+        assert!(publication.waiting_input,"key must actually be waiting behind the unresolved prefix");
+        assert!(host_started.elapsed()<std::time::Duration::from_millis(1000),"host missed the bounded first-task setup window");
+        assert_log_absent(&capture,&format!("{marker}-gate-end"));
+        let mut replies=std::collections::HashMap::new();
+        let mut inner_reply=None;
+        tokio::time::timeout(std::time::Duration::from_secs(4),async {
+            while replies.len()<4 || (wrapped_barrier && inner_reply.is_none()) {
+                if let tokio_tungstenite::tungstenite::Message::Text(text)=client.next().await.unwrap().unwrap() {
+                    let value:serde_json::Value=serde_json::from_str(&text).unwrap();
+                    if let Some(id @ 10..=13)=value["id"].as_u64(){replies.insert(id,value);}
+                    else if value["method"]=="Target.receivedMessageFromTarget" {
+                        let inner:serde_json::Value=serde_json::from_str(value["params"]["message"].as_str().unwrap()).unwrap();
+                        if inner["id"]==111 {inner_reply=Some(inner);}
+                    }
+                }
+            }
+        }).await.unwrap();
+        for response in replies.values(){assert!(response.get("error").is_none(),"{response}");}
+        if let Some(response)=inner_reply {assert!(response.get("error").is_none(),"{response}");}
+        assert_eq!(replies[&10]["result"]["result"]["value"],false,"unresolved barrier leaked a pending input");
+        assert_eq!(replies[&12]["result"]["result"]["value"],!ignore,"promotion must occur before second busy task, only after actual state change");
+        let value=websocket_command(&mut client,14,"Runtime.evaluate",json!({"expression":"[keyCount,navigator.scheduling.isInputPending()]","returnByValue":true}),Some(&session)).await;
+        assert_eq!(value["result"]["result"]["value"],json!([if ignore {0}else{1},false]));
+        client.close(None).await.unwrap();shutdown.cancel();wait_for_live_connections(&live,0).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduling_ignore_barrier_promotes_before_intervening_busy_evaluate() {
+        tokio::task::LocalSet::new().run_until(scheduling_prefix_socket_case(false,false,"scheduling-flat-prefix")).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduling_wrapped_ignore_and_unignore_control_flat_keyboard_prefix() {
+        tokio::task::LocalSet::new().run_until(async {
+            scheduling_prefix_socket_case(true,true,"scheduling-wrapped-ignore").await;
+            scheduling_prefix_socket_case(false,true,"scheduling-wrapped-unignore").await;
+        }).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduling_wrapped_keyboard_uses_wrapper_session_and_delivers_once() {
+        tokio::task::LocalSet::new().run_until(async {
+            let capture=install_complete_log_capture();let shutdown=super::ServerShutdown::new();
+            let (mut client,_io_abort,live,mut lifecycle)=start_direct_connection(shutdown.clone()).await;
+            let session=create_test_page(&mut client).await;
+            let setup=websocket_command(&mut client,2,"Runtime.evaluate",json!({"expression":"globalThis.wrappedKeys=[];addEventListener('keydown',e=>wrappedKeys.push([e.key,navigator.scheduling.isInputPending()]));true","returnByValue":true}),Some(&session)).await;
+            assert_eq!(setup["result"]["result"]["value"],true);
+            client.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":3,"method":"Runtime.evaluate","sessionId":session,"params":{"expression":"(() => {console.info('scheduling-wrapped-key-start');const end=performance.now()+1500;let seen=false;while(performance.now()<end){seen ||= navigator.scheduling.isInputPending();}return seen;})()","returnByValue":true}}).to_string().into())).await.unwrap();
+            wait_for_log(&capture,"scheduling-wrapped-key-start").await;
+            let inner=json!({"id":40,"method":"Input.dispatchKeyEvent","sessionId":"wrong-inner-session","params":{"type":"rawKeyDown","key":"w"}});
+            client.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":4,"method":"Target.sendMessageToTarget","params":{"sessionId":session,"message":inner.to_string()}}).to_string().into())).await.unwrap();
+            let publication=lifecycle.wait_for_input_publication(4).await;assert!(!publication.waiting_input);
+            let mut busy=None;let mut outer=None;let mut inner_response=None;
+            tokio::time::timeout(std::time::Duration::from_secs(4),async {
+                while busy.is_none() || outer.is_none() || inner_response.is_none() {
+                    if let tokio_tungstenite::tungstenite::Message::Text(text)=client.next().await.unwrap().unwrap(){
+                        let value:serde_json::Value=serde_json::from_str(&text).unwrap();
+                        if value["id"]==3 {busy=Some(value);} else if value["id"]==4 {outer=Some(value);}
+                        else if value["method"]=="Target.receivedMessageFromTarget" {
+                            assert_eq!(value["params"]["sessionId"],session);
+                            let inner:serde_json::Value=serde_json::from_str(value["params"]["message"].as_str().unwrap()).unwrap();
+                            if inner["id"]==40 {inner_response=Some(inner);}
+                        }
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!(busy.unwrap()["result"]["result"]["value"],true);
+            assert!(outer.unwrap().get("error").is_none());
+            let inner=inner_response.unwrap();assert!(inner.get("error").is_none(),"{inner}");assert_eq!(inner["sessionId"],session);
+            let observed=websocket_command(&mut client,5,"Runtime.evaluate",json!({"expression":"[wrappedKeys,navigator.scheduling.isInputPending()]","returnByValue":true}),Some(&session)).await;
+            assert_eq!(observed["result"]["result"]["value"],json!([[["w",false]],false]));
+            client.close(None).await.unwrap();shutdown.cancel();wait_for_live_connections(&live,0).await;
+        }).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6283,10 +6491,12 @@ pub(crate) mod tests {
                 let server_shutdown = shutdown.clone();
                 let (admitted_request_tx, admitted_request_rx) =
                     tokio::sync::mpsc::unbounded_channel();
+                let (input_publication_tx, input_publication_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (execution_cancellation_tx, mut execution_cancellation_rx) =
                     tokio::sync::mpsc::unbounded_channel();
                 let connection_io_policy = super::ConnectionIoPolicy {
                     admitted_request_tx: Some(admitted_request_tx),
+                    input_publication_tx: Some(input_publication_tx),
                     execution_cancellation_tx: Some(execution_cancellation_tx),
                     ..Default::default()
                 };
@@ -6316,6 +6526,7 @@ pub(crate) mod tests {
                     .expect("server connection did not publish its cancellation source");
                 let mut lifecycle = ConnectionLifecycleProbe {
                     admitted_request_rx,
+                    input_publication_rx,
                     execution_cancellation,
                 };
                 let case = format!("obscura-server-shutdown-{index}");
@@ -6536,6 +6747,7 @@ pub(crate) mod tests {
                     default_context,
                     shutdown,
                     obscura_js::execution_cancellation::ExecutionCancellation::default(),
+                    crate::input_admission::Admission::default(),
                 ));
 
                 server_tx
@@ -6549,6 +6761,7 @@ pub(crate) mod tests {
                 let send = |value: serde_json::Value| {
                     server_tx
                         .send(super::ServerMessage::Cdp(super::CdpMessage {
+                    admission: None,
                             text: value.to_string(),
                             reply_tx: reply_tx.clone(),
                         }))

@@ -64,6 +64,13 @@ pub struct SendError<T> {
     pub reason: CloseReason,
 }
 
+impl<T> SendError<T> {
+    pub(crate) fn into_message(self) -> T { self._message }
+    pub(crate) fn from_message(message: T, reason: CloseReason) -> Self {
+        Self { _message: message, reason }
+    }
+}
+
 impl<T> std::fmt::Debug for SendError<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

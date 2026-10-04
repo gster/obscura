@@ -249,10 +249,12 @@ struct WorkerControl {
     #[cfg(test)]
     waiting_for_autonomous: std::sync::atomic::AtomicBool,
     isolate: std::sync::Mutex<Option<v8::IsolateHandle>>,
+    websocket_owner: std::sync::Mutex<Option<std::sync::Weak<obscura_net::websocket::session::Owner>>>,
 }
 impl WorkerControl {
     fn terminate(&self) {
         self.terminated.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(owner)=self.websocket_owner.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) { owner.retire(); }
         if let Some(handle) = self.isolate.lock().unwrap().as_ref() {
             handle.terminate_execution();
         }
@@ -397,6 +399,11 @@ impl WorkerObservations {
 }
 
 struct WorkerConfig {
+    indexed_db: std::sync::Arc<crate::indexed_db::Store>,
+    websocket_policy: Option<crate::csp::ScriptPolicy>,
+    websocket_site: Option<String>,
+    websocket_origin: Option<String>,
+    websocket_parent: Option<std::sync::Arc<obscura_net::websocket::session::Owner>>,
     persona: obscura_net::EffectivePersona,
     document_generation: u64,
     document_url: String,
@@ -454,9 +461,10 @@ pub(crate) fn extract_exception_message(
 }
 
 pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
-(function(workerId, workerUrl, ops) {
+(function(workerId, workerUrl, ops, registerNativeBindings) {
     const _origNavigator = globalThis.navigator;
     const _windowOnlyProps = [
+        "PerformanceNavigationTiming",
         "window","document","location","history","localStorage","sessionStorage",
         "navigator","constructor","self","origin","isSecureContext","crossOriginIsolated",
         "onlanguagechange","onrejectionhandled","onunhandledrejection",
@@ -493,6 +501,8 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         "XMLDocument","XMLSerializer","XPathResult","DOMParser","Range","Selection","StaticRange",
         "CSSRule","CSSRuleList","CSSStyleDeclaration","CSSStyleRule","CSSStyleSheet","StyleSheetList",
         "Animation","AnimationEvent","Attr","AudioBuffer","AudioContext","CSS",
+        "AudioParam","AudioNode","AudioDestinationNode","OscillatorNode","GainNode",
+        "DynamicsCompressorNode","BiquadFilterNode","AnalyserNode","webkitOfflineAudioContext",
         "CanvasRenderingContext2D","ClipboardEvent","CompositionEvent","ContentIndex",
         "CustomElementRegistry","DOMRectList","DOMStringMap","DOMTokenList","DataTransfer",
         "DataTransferItem","DataTransferItemList","DeviceOrientationEvent","DocumentTimeline",
@@ -653,7 +663,7 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         value: 'DedicatedWorkerGlobalScope', configurable: true,
     });
 
-    function WorkerNavigator() {}
+    function WorkerNavigator() { throw new TypeError('Illegal constructor'); }
     Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, {
         value: 'WorkerNavigator', configurable: true,
     });
@@ -661,6 +671,18 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         value: WorkerNavigator, writable: true, configurable: true,
     });
     const workerNav = Object.create(WorkerNavigator.prototype);
+    const workerNavigatorBrand = new WeakSet([workerNav]);
+    const hasWorkerNavigatorBrand = Function.call.bind(WeakSet.prototype.has);
+    const WorkerNavigatorTypeError = TypeError;
+    function defineWorkerNavigatorGetter(prop, read) {
+        const get = { getValue() {
+            if (!hasWorkerNavigatorBrand(workerNavigatorBrand, this)) throw new WorkerNavigatorTypeError('Illegal invocation');
+            return read();
+        } }.getValue;
+        Object.defineProperty(WorkerNavigator.prototype, prop, {
+            configurable: true, enumerable: true, get,
+        });
+    }
     const navProps = [
         'appCodeName', 'appName', 'appVersion', 'platform', 'product', 'userAgent',
         'language', 'languages', 'onLine', 'hardwareConcurrency', 'deviceMemory',
@@ -670,32 +692,28 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
     for (const prop of navProps) {
         if (_origNavigator && prop in _origNavigator) {
             const val = _origNavigator[prop];
-            Object.defineProperty(WorkerNavigator.prototype, prop, {
-                configurable: true, enumerable: true, get() { return val; }
-            });
+            defineWorkerNavigatorGetter(prop, () => val);
         } else if (prop === 'appCodeName') {
-            Object.defineProperty(WorkerNavigator.prototype, prop, {
-                configurable: true, enumerable: true, get() { return 'Mozilla'; }
-            });
+            defineWorkerNavigatorGetter(prop, () => 'Mozilla');
         } else if (prop === 'appName') {
-            Object.defineProperty(WorkerNavigator.prototype, prop, {
-                configurable: true, enumerable: true, get() { return 'Netscape'; }
-            });
+            defineWorkerNavigatorGetter(prop, () => 'Netscape');
         } else if (prop === 'appVersion') {
-            Object.defineProperty(WorkerNavigator.prototype, prop, {
-                configurable: true, enumerable: true, get() {
+            defineWorkerNavigatorGetter(prop, () => {
                     return _origNavigator && _origNavigator.userAgent
                         ? _origNavigator.userAgent.replace(/^Mozilla\//, '')
                         : '5.0';
-                }
             });
         } else if (prop === 'product') {
-            Object.defineProperty(WorkerNavigator.prototype, prop, {
-                configurable: true, enumerable: true, get() { return 'Gecko'; }
-            });
+            defineWorkerNavigatorGetter(prop, () => 'Gecko');
         }
     }
     globalThis.WorkerNavigator = WorkerNavigator;
+    registerNativeBindings(WorkerNavigator);
+    Object.defineProperty(PerformanceObserver,'supportedEntryTypes',{
+        get: { getValue() { return Object.freeze(['mark','measure','resource']); } }.getValue,
+        configurable:true, enumerable:true,
+    });
+    registerNativeBindings(PerformanceObserver);
 
     function WorkerLocation() {}
     Object.defineProperty(WorkerLocation.prototype, Symbol.toStringTag, {
@@ -897,9 +915,8 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
         "Subscriber", "SourceBufferList", "SourceBuffer", "SecurityPolicyViolationEvent", "ReportingObserver",
         "ReportBody", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "ReadableStreamBYOBRequest",
         "ReadableStreamBYOBReader", "ReadableByteStreamController", "RTCEncodedVideoFrame", "RTCEncodedAudioFrame",
-        "Permissions", "PermissionStatus", "PerformanceServerTiming", "PerformanceResourceTiming",
-        "PerformanceObserverEntryList", "PerformanceMeasure", "PerformanceMark", "PerformanceEntry",
-        "Performance", "OffscreenCanvasRenderingContext2D", "Observable", "NavigatorUAData",
+        "Permissions", "PermissionStatus", "PerformanceServerTiming",
+        "OffscreenCanvasRenderingContext2D", "Observable", "NavigatorUAData",
         "MediaSourceHandle", "MediaSource", "MediaCapabilities", "ImageBitmapRenderingContext",
         "IDBVersionChangeEvent", "IDBTransaction", "IDBRequest", "IDBRecord", "IDBOpenDBRequest",
         "IDBObjectStore", "IDBIndex", "IDBFactory", "IDBDatabase", "IDBCursorWithValue",
@@ -1042,8 +1059,8 @@ pub(crate) const WORKER_BOOTSTRAP_JS: &str = r#"
 })
 "#;
 
-#[op2(nofast, reentrant)]
-pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] url: &str) -> u32 {
+#[op2(reentrant)]
+pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] url: &str, #[string] response_id: Option<String>) -> u32 {
     let Some(registry) = state.try_borrow::<Rc<RefCell<WorkerRegistry>>>().cloned() else { return 0; };
     let resources = registry.borrow().resources.clone();
     let Ok(lease) = resources.worker() else { return 0; };
@@ -1073,7 +1090,9 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
         scope.rethrow();
         return 0;
     }
-    let mut parent = state.borrow::<Rc<RefCell<crate::ops::ObscuraState>>>().borrow_mut();
+    let response_policy = response_id.and_then(|id| state.borrow::<crate::ops::SharedState>().borrow_mut().websocket_responses.remove(&id));
+    let parent_owner = crate::ops::realm_state(scope, state);
+    let mut parent = parent_owner.borrow_mut();
     parent.ensure_persona_transport();
     if let Some(doc_url) = parent.dom.as_ref().and_then(obscura_dom::DomTree::document_url) {
         if let Ok(parsed) = url::Url::parse(&doc_url) {
@@ -1103,7 +1122,21 @@ pub fn op_worker_create(scope: &mut v8::HandleScope, state: &OpState, #[string] 
     let worker_stealth = parent.stealth_client.as_ref().map(|client| {
         std::sync::Arc::new(obscura_net::StealthHttpClient::detached(client))
     });
+    let websocket_origin = if url.starts_with("blob:") { parent.websocket_origin.clone() } else { response_policy.as_ref().map(|(url,_)|url.clone()) };
+    let websocket_policy = if url.starts_with("blob:") && parent.websocket_policy_known {
+        let mut policy=parent.script_policy.clone();
+        policy.append_connection_policy(&parent.websocket_dynamic_policy);
+        Some(policy)
+    }
+        else { response_policy.map(|(_,policy)|policy) };
     let config = WorkerConfig {
+        indexed_db: parent.indexed_db.clone(),
+        websocket_policy,
+        websocket_site: if url.starts_with("blob:") { parent.websocket_site.clone() }
+            else { websocket_origin.as_ref().and_then(|value|url::Url::parse(value).ok()).and_then(|url|obscura_net::cookies::schemeful_site(&url))
+                .filter(|site|parent.websocket_site.as_ref()==Some(site)) },
+        websocket_origin,
+        websocket_parent: Some(parent.websocket_owner.clone()),
         persona: parent.persona.clone(),
         document_generation: parent.network_document_generation,
         document_url: parent.network_document_url.clone(), teardown_events: parent.network_teardown_events.clone(),
@@ -1192,6 +1225,14 @@ async fn run_worker(id: u32, config: WorkerConfig,
     {
         let mut state = rt.state.borrow_mut();
         state.url = config.url.clone();
+        state.indexed_db = config.indexed_db;
+        state.websocket_policy_known = config.websocket_policy.is_some();
+        if let Some(policy) = config.websocket_policy { state.script_policy = policy; }
+        state.websocket_site = config.websocket_site;
+        state.websocket_origin = config.websocket_origin;
+        if let Some(parent) = config.websocket_parent { state.websocket_owner = obscura_net::websocket::session::Owner::child(&parent); }
+        *control.websocket_owner.lock().unwrap() = Some(std::sync::Arc::downgrade(&state.websocket_owner));
+        if control.stopped() { state.websocket_owner.retire(); }
         state.device_identity = config.identity;
         state.cookie_jar = config.cookies;
         state.network_document_generation = config.document_generation;
@@ -1309,6 +1350,7 @@ async fn run_worker(id: u32, config: WorkerConfig,
         }
         idle = false;
     }
+    rt.state.borrow().websocket_owner.retire();
     rt.shutdown_workers(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())
 }

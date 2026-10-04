@@ -115,7 +115,7 @@ enum Command {
         storage_dir: Option<std::path::PathBuf>,
 
         /// Recursively load TTF, TTC, OTF, and OTC files from this directory.
-        /// Repeat for multiple directories. Requires a render-enabled build.
+        /// Repeat for multiple directories. Shared by Canvas text and page rendering.
         #[arg(long = "font-dir", value_name = "DIR")]
         font_dirs: Vec<std::path::PathBuf>,
 
@@ -359,15 +359,10 @@ fn configure_font_directories(font_dirs: &[std::path::PathBuf]) -> anyhow::Resul
         }
     }
 
-    #[cfg(feature = "render")]
-    {
-        if !obscura_js::configure_font_directories(font_dirs.to_vec()) {
-            anyhow::bail!("Font directories must be configured before the first render");
-        }
-        Ok(())
+    if !obscura_js::configure_font_directories(font_dirs.to_vec()) {
+        anyhow::bail!("Font directories must be configured before the first text measurement or render");
     }
-    #[cfg(not(feature = "render"))]
-    anyhow::bail!("--font-dir requires a render-enabled build")
+    Ok(())
 }
 
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {

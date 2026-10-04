@@ -26,8 +26,9 @@ impl primp::dns::Resolve for Resolver {
     }
 }
 
-pub(super) struct Client {
+pub(crate) struct Client {
     client: std::sync::OnceLock<Result<primp::Client, String>>,
+    websocket_client: std::sync::OnceLock<Result<primp::Client, String>>,
     defaults: HeaderMap,
     profile: StealthProfile,
     proxy: Option<String>,
@@ -83,14 +84,14 @@ impl Client {
             headers.insert("dnt", HeaderValue::from_str(value).expect("valid persona DNT"));
         }
         Self {
-            client: std::sync::OnceLock::new(), defaults: headers, profile,
+            client: std::sync::OnceLock::new(), websocket_client: std::sync::OnceLock::new(), defaults: headers, profile,
             proxy: proxy.map(str::to_owned), allow_private, server_padding_request,
         }
     }
 
     // Worker/frame inheritance must not initialize a network pool or scan the
     // CA store unless that identity actually sends a request on this runtime.
-    fn build(&self) -> Result<primp::Client, String> {
+    fn build(&self, http1_only: bool) -> Result<primp::Client, String> {
         let (browser, os) = match self.profile {
             StealthProfile::WindowsChrome145 => (primp::Impersonate::ChromeV145, primp::ImpersonateOS::Windows),
             StealthProfile::MacChrome152 => (primp::Impersonate::ChromeV152, primp::ImpersonateOS::MacOS),
@@ -109,6 +110,7 @@ impl Client {
                     .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_owned())),
             }))
             .timeout(Duration::from_secs(30));
+        if http1_only { builder = builder.http1_only().pool_max_idle_per_host(0); }
         if let Some(proxy) = self.proxy.as_deref() {
             builder = builder.proxy(primp::Proxy::all(proxy)
                 .map_err(|error| format!("Invalid proxy {proxy}: {error}"))?);
@@ -140,6 +142,23 @@ impl Client {
         let mut client = builder.build().map_err(|error| format!("Failed to build primp client: {error}"))?;
         client.headers_mut().clear();
         Ok(client)
+    }
+
+    /// HTTP/1.1 pool with identical proxy, DNS, roots and TLS profile policy.
+    /// The ordinary H2-capable pool is untouched and both remain lazy.
+    pub(crate) async fn websocket_response(&self, url: &Url, mut headers: HeaderMap) -> Result<primp::Response, ObscuraNetError> {
+        let client = self.websocket_client.get_or_init(|| self.build(true)).as_ref()
+            .map_err(|_| ObscuraNetError::Network("WebSocket transport unavailable".into()))?;
+        for name in ["user-agent", "accept-language", "dnt"] {
+            if let Some(value) = self.defaults.get(name) { headers.insert(name, value.clone()); }
+        }
+        let mut wire_url = url.clone();
+        let _ = wire_url.set_username("");
+        let _ = wire_url.set_password(None);
+        let request = client.get(wire_url).version(http::Version::HTTP_11).headers(headers)
+            .timeout(Duration::from_secs(15)).build()
+            .map_err(|_| ObscuraNetError::Network("WebSocket request failed".into()))?;
+        client.execute(request).await.map_err(|_| ObscuraNetError::Network("WebSocket handshake failed".into()))
     }
 
     #[cfg(test)]
@@ -178,7 +197,7 @@ impl Client {
 
     fn request_inner(&self, method: http::Method, url: &Url, headers: HeaderMap, body: &[u8], body_present: Option<bool>, resource_type: Option<crate::ResourceType>, script_priority: Option<crate::ScriptPriority>, timeout: Duration) -> Result<(&primp::Client, primp::Request), ObscuraNetError> {
         let script_priority = script_priority.filter(|_| resource_type == Some(crate::ResourceType::Script));
-        let client = self.client.get_or_init(|| self.build()).as_ref()
+        let client = self.client.get_or_init(|| self.build(false)).as_ref()
             .map_err(|error| network_error(url, error))?;
         let defaults = &self.defaults;
         // primp orders H2 fields itself; construct the same order for H1.
@@ -266,6 +285,15 @@ pub(super) struct Response {
 }
 
 impl Response {
+    pub fn protocol(&self) -> Option<&'static str> {
+        match self.response.version() {
+            http::Version::HTTP_10 => Some("http/1.0"),
+            http::Version::HTTP_11 => Some("http/1.1"),
+            http::Version::HTTP_2 => Some("h2"),
+            http::Version::HTTP_3 => Some("h3"),
+            _ => None,
+        }
+    }
     pub fn status(&self) -> http::StatusCode { self.response.status() }
     pub fn headers(&self) -> &HeaderMap {
         self.response.encoded_headers().unwrap_or_else(|| self.response.headers())

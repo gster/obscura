@@ -63,8 +63,13 @@ fn startup_snapshot() -> &'static [u8] {
             skip_op_registration: true,
             ..Default::default()
         });
+        runtime.v8_isolate().set_prepare_stack_trace_callback(
+            deno_core::error::prepare_stack_trace_callback_with_v8_display,
+        );
         runtime.execute_script("<obscura:bootstrap>", include_str!("../js/bootstrap.js").to_string())
             .expect("target bootstrap snapshot creation failed");
+        runtime.execute_script("<obscura:speech-bootstrap>", include_str!("../js/speech_bootstrap.js").to_string())
+            .expect("target speech bootstrap snapshot creation failed");
         runtime.snapshot()
     }).as_ref()
 }
@@ -140,7 +145,8 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// engine-level failures (watchdog termination, the heap cap, an exhausted
 /// task budget) make the loop itself unusable. (#699)
 pub fn is_fatal_event_loop_error(error: &str) -> bool {
-    error.contains("execution terminated")
+    error.contains("SPEECH_STARTUP_FAILED")
+        || error.contains("execution terminated")
         || error.contains("heap limit exceeded")
         || error.contains("task budget")
 }
@@ -279,6 +285,14 @@ pub struct KeyboardInput {
     pub is_keypad: bool,
     pub is_system_key: bool,
     pub commands: Vec<String>,
+}
+
+impl KeyboardInput {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.commands.iter().any(|command| command != "deleteBackward") { return Err("INPUT_KEY_COMMAND_UNSUPPORTED".into()); }
+        if self.text.len() > 4096 { return Err("INPUT_VALUE_LIMIT".into()); }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "render")]
@@ -858,6 +872,27 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    unref_op_promise: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    page_initializer: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    page_initialized: bool,
+    speech_initializer: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    speech_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    speech_installed_owner: Option<crate::speech_owner::NativeSpeechOwnerCapability>,
+    // Sticky for this isolate. set_dom and termination cancellation do not
+    // authorize running a document after trusted startup failed.
+    speech_startup_failure: Option<&'static str>,
+    scheduling_installed: bool,
+    native_binding_initializer: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    image_dimension_initializer: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    plugin_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    navigator_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    screen_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    canvas_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    font_face_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    dom_receiver_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    performance_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    checked_receivers: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    response_registry: Option<deno_core::v8::Global<deno_core::v8::Value>>,
     native_mouse: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_wheel: Option<deno_core::v8::Global<deno_core::v8::Function>>,
     native_scroll: Option<deno_core::v8::Global<deno_core::v8::Function>>,
@@ -1184,6 +1219,9 @@ impl Drop for EnteredRuntime<'_> {
 
 impl Drop for ObscuraJsRuntime {
     fn drop(&mut self) {
+        self.state.borrow().scheduling_owner.retire();
+        self.state.borrow().websocket_owner.retire();
+        crate::ops::retire_canvas_document(&mut self.state.borrow_mut());
         // Background render-resource loads belong to this runtime's document;
         // a dropped JoinHandle would only detach them (the page also calls
         // `abandon_render_resources`, a directly embedded runtime may not).
@@ -1210,6 +1248,7 @@ impl Drop for ObscuraJsRuntime {
         unsafe {
             self.js_runtime.v8_isolate().enter();
         }
+        crate::speech_inventory::clear_request_op(self.js_runtime.v8_isolate());
     }
 }
 
@@ -1230,17 +1269,24 @@ impl ObscuraJsRuntime {
         }
     }
 
-    /// Freeze the document timeline for one JavaScript task. Browser timelines
-    /// update at task/rendering boundaries, not on each forced style or layout
-    /// read. Keeping one sample across the task also lets repeated CSSOM reads
-    /// share the retained layout on pages with running animations.
-    fn begin_javascript_task(&mut self) {
+    /// A trusted startup failure is fatal for all author execution in this
+    /// isolate, including timers, native event dispatch and loaded contexts.
+    /// A fresh runtime is required; set_dom/cancel_termination cannot clear it.
+    pub(crate) fn ensure_speech_startup(&self) -> Result<(), &'static str> {
+        self.speech_startup_failure.map_or(Ok(()), Err)
+    }
+
+    /// Freeze the document timeline for one permitted JavaScript task.
+    fn begin_javascript_task(&mut self) -> Result<(), &'static str> {
+        self.ensure_speech_startup()?;
         // Some internal callers intentionally ignore script errors. Recover a
         // heap-limit termination before any later task enters V8 even when the
         // caller that triggered it did not need the error value.
         self.recover_heap_limit();
+        self.state.borrow().javascript_task_clock.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "render")]
         begin_animation_task(&mut self.state.borrow_mut());
+        Ok(())
     }
     pub fn new(persona: obscura_net::EffectivePersona) -> Self {
         Self::try_new(persona).expect("runtime persona conflicts with process identity")
@@ -1298,6 +1344,7 @@ impl ObscuraJsRuntime {
         // set_v8_flags call must be refused rather than aborting the process.
         crate::v8_flags::mark_platform_started();
         let state = Rc::new(RefCell::new(ObscuraState::new(persona.clone())));
+        crate::speech_owner::issue_document_owner(&state);
         // Allocate standalone policy/cookies now; create its fixed default
         // persona pool lazily, so Page can bind its own transport first.
         {
@@ -1343,6 +1390,9 @@ impl ObscuraJsRuntime {
                 startup_snapshot: Some(startup_snapshot()),
                 ..Default::default()
             });
+            runtime.v8_isolate().set_prepare_stack_trace_callback(
+                deno_core::error::prepare_stack_trace_callback_with_v8_display,
+            );
 
             {
                 let op_state = runtime.op_state();
@@ -1351,6 +1401,14 @@ impl ObscuraJsRuntime {
                 // Empty until a frame realm exists, which is what keeps the
                 // lookup free for pages that have no frames.
                 op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+            }
+
+            // Private posted-task callbacks identify their own document by
+            // creation context, including after a child frame has retired.
+            {
+                let context = runtime.main_context();
+                let scope = &mut deno_core::v8::HandleScope::new(runtime.v8_isolate());
+                deno_core::v8::Local::new(scope, context).set_slot(state.clone());
             }
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
@@ -1385,6 +1443,25 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
+            unref_op_promise: None,
+            page_initializer: None,
+            page_initialized: false,
+            speech_initializer: None,
+            speech_registry: None,
+            speech_installed_owner: None,
+            speech_startup_failure: None,
+            scheduling_installed: false,
+            native_binding_initializer: None,
+            image_dimension_initializer: None,
+            plugin_registry: None,
+            navigator_registry: None,
+            screen_registry: None,
+            canvas_registry: None,
+            font_face_registry: None,
+            dom_receiver_registry: None,
+            performance_registry: None,
+            checked_receivers: None,
+            response_registry: None,
             native_mouse: None,
             native_wheel: None,
             native_scroll: None,
@@ -1412,16 +1489,42 @@ impl ObscuraJsRuntime {
             )),
             js_runtime: runtime,
         };
+        instance.page_initializer = Some(instance.take_native_input("__obscura_init")
+            .expect("trusted page initializer"));
+        instance.speech_initializer = Some(instance.take_native_input("__obscura_speech_handoff")
+            .expect("trusted speech bootstrap handoff"));
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
-        let ops_handoff = instance.take_ops_handoff();
+        let (ops_handoff, native_binding_initializer, screen_registry, canvas_registry, font_face_registry, dom_receiver_registry, unref_op_promise) = instance.take_ops_handoff()
+            .expect("native core handoff");
         let worker_reg = std::rc::Rc::new(std::cell::RefCell::new(crate::worker::WorkerRegistry::default()));
         instance
             .runtime()
             .op_state()
             .borrow_mut()
             .put(worker_reg);
-        instance.ops_handoff = ops_handoff;
+        instance.ops_handoff = Some(ops_handoff);
+        instance.unref_op_promise = Some(unref_op_promise);
+        instance.native_binding_initializer = Some(native_binding_initializer);
+        instance.image_dimension_initializer = Some(instance
+            .take_native_input("__obscura_image_dimensions_handoff")
+            .expect("image dimension handoff"));
+        instance.screen_registry = Some(screen_registry);
+        instance.canvas_registry = Some(canvas_registry);
+        instance.font_face_registry = Some(font_face_registry);
+        instance.dom_receiver_registry = Some(dom_receiver_registry);
+        let open_initializer = instance.take_native_input("__obscura_open_bindings_handoff");
+        let open_context = instance.runtime().main_context();
+        if !open_initializer.is_some_and(|initializer|
+            instance.install_native_html_open(&open_context, &initializer)) {
+            instance.speech_startup_failure = Some("DOM_OPEN_STARTUP_FAILED");
+        }
+        instance.plugin_registry = instance.take_plugin_registry();
+        instance.navigator_registry = instance.take_navigator_registry();
+        instance.performance_registry = instance.take_performance_registry();
+        instance.checked_receivers = Some(instance.take_checked_receivers().expect("checked receiver handoff"));
+        instance.take_native_input("__obscura_bind_checked_receivers_handoff").expect("checked receiver binder");
+        instance.response_registry = instance.take_response_registry();
         instance.native_mouse = Some(
             instance
                 .take_native_input("__obscura_native_mouse_handoff")
@@ -1492,6 +1595,7 @@ impl ObscuraJsRuntime {
     }
 
     pub(crate) fn execute_worker_script_with_name(&mut self, name: &str, source: &str) -> Result<(), String> {
+        self.ensure_speech_startup()?;
         use deno_core::v8;
         let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
         let result = (|| {
@@ -1527,8 +1631,10 @@ impl ObscuraJsRuntime {
     }
 
     pub(crate) fn initialize_worker_scope(&mut self, id: u32, url: &str) -> Result<(), String> {
+        self.ensure_speech_startup()?;
         use deno_core::v8;
         let ops = self.ops_handoff.clone().ok_or("Worker ops unavailable")?;
+        let native_bindings = self.native_binding_initializer.clone().ok_or("Worker bindings unavailable")?;
         let main = self.runtime().main_context();
         let mut runtime = self.runtime();
         let scope = &mut v8::HandleScope::with_context(runtime.v8_isolate(), main);
@@ -1538,10 +1644,11 @@ impl ObscuraJsRuntime {
         let value = script.run(scope).ok_or("Worker bootstrap failed")?;
         let function = v8::Local::<v8::Function>::try_from(value).map_err(|_| "Invalid worker bootstrap")?;
         let ops = v8::Local::new(scope, &ops);
+        let native_bindings = v8::Local::new(scope, &native_bindings);
         let id = v8::Integer::new_from_unsigned(scope, id);
         let url = v8::String::new(scope, url).ok_or("Worker URL unavailable")?;
         let receiver = v8::undefined(scope);
-        function.call(scope, receiver.into(), &[id.into(), url.into(), ops]).ok_or("Worker initialization failed")?;
+        function.call(scope, receiver.into(), &[id.into(), url.into(), ops, native_bindings.into()]).ok_or("Worker initialization failed")?;
         Ok(())
     }
 
@@ -1559,23 +1666,12 @@ impl ObscuraJsRuntime {
     pub(crate) fn create_realm_context(
         &mut self,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        self.ensure_speech_startup().ok()?;
         let context = {
             let mut entered = self.runtime();
             let isolate = entered.v8_isolate();
             let scope = &mut deno_core::v8::HandleScope::new(isolate);
-            let context = deno_core::v8::Context::from_snapshot(
-                scope,
-                1,
-                deno_core::v8::ContextOptions::default(),
-            )
-            .or_else(|| {
-                deno_core::v8::Context::from_snapshot(
-                    scope,
-                    0,
-                    deno_core::v8::ContextOptions::default(),
-                )
-            })?;
-            deno_core::v8::Global::new(scope, context)
+            crate::realm_factory::restore_snapshot(scope)?
         };
         Some(context)
     }
@@ -1589,8 +1685,7 @@ impl ObscuraJsRuntime {
     ) {
         let mut entered = self.runtime();
         let scope = &mut deno_core::v8::HandleScope::new(entered.v8_isolate());
-        let context = deno_core::v8::Local::new(scope, context);
-        context.set_slot(state);
+        crate::realm_factory::bind_document_state(scope, context, state);
     }
 
     /// Takes the ops object bootstrap handed out, and removes the handoff from
@@ -1599,7 +1694,15 @@ impl ObscuraJsRuntime {
     /// deno_core hides `globalThis.Deno` after setup and bootstrap keeps its
     /// reference in a private const, so this handoff is the only way for the
     /// host to reach the bound op functions and pass them to a child realm.
-    fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+    fn take_ops_handoff(&mut self) -> Option<(
+        deno_core::v8::Global<deno_core::v8::Value>,
+        deno_core::v8::Global<deno_core::v8::Function>,
+        deno_core::v8::Global<deno_core::v8::Value>,
+        deno_core::v8::Global<deno_core::v8::Value>,
+        deno_core::v8::Global<deno_core::v8::Value>,
+        deno_core::v8::Global<deno_core::v8::Value>,
+        deno_core::v8::Global<deno_core::v8::Function>,
+    )> {
         use deno_core::v8;
 
         let main = self.runtime().main_context();
@@ -1611,6 +1714,7 @@ impl ObscuraJsRuntime {
 
         let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
         let ops_key = v8::String::new(scope, "ops")?;
+        let bindings_key = v8::String::new(scope, "registerNativeBindings")?;
         let global = context.global(scope);
 
         let core = global.get(scope, handoff_key.into())?;
@@ -1619,9 +1723,108 @@ impl ObscuraJsRuntime {
         if !ops.is_object() {
             return None;
         }
+        crate::speech_inventory::capture_request_op(scope, v8::Local::<v8::Object>::try_from(ops).ok()?).ok()?;
         let ops = v8::Global::new(scope, ops);
+        let bindings = core.get(scope, bindings_key.into())?;
+        let bindings = v8::Local::<v8::Function>::try_from(bindings).ok()?;
+        let bindings = v8::Global::new(scope, bindings);
+        let screen_key = v8::String::new(scope, "initializeScreenRegistry")?;
+        let initialize = core.get(scope, screen_key.into())?;
+        let initialize = v8::Local::<v8::Function>::try_from(initialize).ok()?;
+        let receiver = v8::undefined(scope);
+        let screen_registry = initialize.call(scope, receiver.into(), &[])?;
+        let screen_registry = v8::Global::new(scope, screen_registry);
+        let canvas_key = v8::String::new(scope, "initializeCanvasRegistry")?;
+        let initialize = core.get(scope, canvas_key.into())?;
+        let initialize = v8::Local::<v8::Function>::try_from(initialize).ok()?;
+        let canvas_registry = initialize.call(scope, receiver.into(), &[])?;
+        let canvas_registry = v8::Global::new(scope, canvas_registry);
+        let font_face_key = v8::String::new(scope, "initializeFontFaceRegistry")?;
+        let initialize = core.get(scope, font_face_key.into())?;
+        let initialize = v8::Local::<v8::Function>::try_from(initialize).ok()?;
+        let font_face_registry = initialize.call(scope, receiver.into(), &[])?;
+        let font_face_registry = v8::Global::new(scope, font_face_registry);
+        let dom_key = v8::String::new(scope, "initializeDOMReceiverRegistry")?;
+        let initialize = core.get(scope, dom_key.into())?;
+        let initialize = v8::Local::<v8::Function>::try_from(initialize).ok()?;
+        let dom_registry = initialize.call(scope, receiver.into(), &[])?;
+        let dom_registry = v8::Global::new(scope, dom_registry);
+        let unref_key = v8::String::new(scope, "initializePromiseUnref")?;
+        let unref = core.get(scope, unref_key.into())?;
+        let unref = v8::Local::<v8::Function>::try_from(unref).ok()?;
+        let unref = unref.call(scope, receiver.into(), &[])?;
+        let unref = v8::Global::new(scope, v8::Local::<v8::Function>::try_from(unref).ok()?);
         global.delete(scope, handoff_key.into());
-        Some(ops)
+        Some((ops, bindings, screen_registry, canvas_registry, font_face_registry, dom_registry, unref))
+    }
+
+    fn take_plugin_registry(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+        let initializer = self.take_native_input("__obscura_plugin_registry_handoff")?;
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::with_context(entered.v8_isolate(), main);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, initializer);
+        let receiver = v8::undefined(scope);
+        let registry = function.call(scope, receiver.into(), &[])?;
+        Some(v8::Global::new(scope, registry))
+    }
+
+    fn take_navigator_registry(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+        let initializer = self.take_native_input("__obscura_navigator_registry_handoff")?;
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::with_context(entered.v8_isolate(), main);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, initializer);
+        let receiver = v8::undefined(scope);
+        let registry = function.call(scope, receiver.into(), &[])?;
+        Some(v8::Global::new(scope, registry))
+    }
+
+    fn take_performance_registry(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+        let initializer = self.take_native_input("__obscura_performance_registry_handoff")?;
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::with_context(entered.v8_isolate(), main);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, initializer);
+        let receiver = v8::undefined(scope);
+        let registry = function.call(scope, receiver.into(), &[])?;
+        Some(v8::Global::new(scope, registry))
+    }
+
+    fn take_response_registry(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+        let initializer = self.take_native_input("__obscura_response_registry_handoff")?;
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::with_context(entered.v8_isolate(), main);
+        let scope = &mut v8::TryCatch::new(scope);
+        let function = v8::Local::new(scope, initializer);
+        let receiver = v8::undefined(scope);
+        let registry = function.call(scope, receiver.into(), &[])?;
+        Some(v8::Global::new(scope, registry))
+    }
+
+    fn take_checked_receivers(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let global = context.global(scope);
+        let key = v8::String::new(scope, "__obscura_checked_receivers_handoff")?;
+        let registry = global.get(scope, key.into())?;
+        if !registry.is_weak_map() || !global.delete(scope, key.into()).unwrap_or(false) {
+            return None;
+        }
+        Some(v8::Global::new(scope, registry))
     }
 
     fn take_native_input(&mut self, name: &str) -> Option<deno_core::v8::Global<deno_core::v8::Function>> {
@@ -1638,16 +1841,7 @@ impl ObscuraJsRuntime {
 
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
-        let context = v8::Local::new(scope, realm);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let global = context.global(scope);
-        let key = v8::String::new(scope, name)?;
-        let value = global.get(scope, key.into())?;
-        let function = v8::Local::<v8::Function>::try_from(value).ok()?;
-        if !global.delete(scope, key.into()).unwrap_or(false) {
-            return None;
-        }
-        Some(v8::Global::new(scope, function))
+        crate::realm_factory::take_native_input(scope, realm, name)
     }
 
     /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
@@ -1674,94 +1868,71 @@ impl ObscuraJsRuntime {
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) {
-        use deno_core::{v8, CONTEXT_STATE_SLOT_INDEX, MODULE_MAP_SLOT_INDEX};
+        use deno_core::v8;
 
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
-        let main_ctx = v8::Local::new(scope, main);
-        let realm_ctx = v8::Local::new(scope, realm);
-        // SAFETY: these slots on the main context are `Rc::into_raw` pointers
-        // set by deno_core at runtime construction; they outlive every frame
-        // realm. We only copy (alias) them and never reconstruct the Rc from
-        // the frame.
-        unsafe {
-            let cs = main_ctx.get_aligned_pointer_from_embedder_data(CONTEXT_STATE_SLOT_INDEX);
-            let mm = main_ctx.get_aligned_pointer_from_embedder_data(MODULE_MAP_SLOT_INDEX);
-            realm_ctx.set_aligned_pointer_in_embedder_data(CONTEXT_STATE_SLOT_INDEX, cs);
-            realm_ctx.set_aligned_pointer_in_embedder_data(MODULE_MAP_SLOT_INDEX, mm);
-        }
+        crate::realm_factory::share_deno_context_state(scope, main, realm);
     }
 
     pub(crate) fn share_ops_with_realm(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) -> bool {
+        if self.ensure_speech_startup().is_err() { return false; }
         use deno_core::v8;
 
         let Some(ops) = self.ops_handoff.clone() else {
             return false;
         };
+        let Some(plugin_registry) = self.plugin_registry.clone() else {
+            return false;
+        };
+        let Some(plugin_initializer) = self.take_realm_native_input(realm, "__obscura_plugin_registry_handoff") else {
+            return false;
+        };
+        let Some(navigator_registry) = self.navigator_registry.clone() else {
+            return false;
+        };
+        let Some(screen_registry) = self.screen_registry.clone() else {
+            return false;
+        };
+        let Some(font_face_registry) = self.font_face_registry.clone() else { return false; };
+        let Some(dom_registry) = self.dom_receiver_registry.clone() else { return false; };
+        let Some(canvas_registry) = self.canvas_registry.clone() else {
+            return false;
+        };
+        let Some(navigator_initializer) = self.take_realm_native_input(realm, "__obscura_navigator_registry_handoff") else {
+            return false;
+        };
+        let Some(performance_registry) = self.performance_registry.clone() else { return false; };
+        let Some(checked_receivers) = self.checked_receivers.clone() else { return false; };
+        let Some(performance_initializer) = self.take_realm_native_input(realm, "__obscura_performance_registry_handoff") else { return false; };
+        let Some(unref_op_promise) = self.unref_op_promise.clone() else { return false; };
+        let Some(response_registry) = self.response_registry.clone() else { return false; };
+        let Some(response_initializer) = self.take_realm_native_input(realm, "__obscura_response_registry_handoff") else { return false; };
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
-        let context = v8::Local::new(scope, realm);
-        let scope = &mut v8::ContextScope::new(scope, context);
-
-        let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
-            return false;
-        };
-        let Some(ops_key) = v8::String::new(scope, "ops") else {
-            return false;
-        };
-        let global = context.global(scope);
-        let Some(core) = global.get(scope, handoff_key.into()) else {
-            return false;
-        };
-        let Some(core) = core.to_object(scope) else {
-            return false;
-        };
-        // `Deno.core.ops` is non-writable and non-configurable, so the table
-        // cannot be swapped wholesale: V8 reports success and changes nothing.
-        // Copy the bound op functions into the realm's existing table instead.
-        let Some(target) = core
-            .get(scope, ops_key.into())
-            .and_then(|value| value.to_object(scope))
-        else {
-            return false;
-        };
-        let source = v8::Local::new(scope, ops);
-        let Some(source) = source.to_object(scope) else {
-            return false;
-        };
-        let Some(names) = source.get_own_property_names(scope, Default::default()) else {
-            return false;
-        };
-        let mut copied = 0;
-        for index in 0..names.length() {
-            let Some(key) = names.get_index(scope, index) else {
-                continue;
-            };
-            let Some(value) = source.get(scope, key) else {
-                continue;
-            };
-            if target.set(scope, key, value).unwrap_or(false) {
-                copied += 1;
-            }
-        }
-        // Child realms cannot expose native input authority either.
-        for name in ["__obscura_native_mouse_handoff", "__obscura_native_wheel_handoff", "__obscura_native_scroll_handoff", "__obscura_native_focus_handoff", "__obscura_native_text_handoff", "__obscura_native_keyboard_handoff", "__obscura_native_submit_handoff", "__obscura_native_fragment_handoff", "__obscura_native_lifecycle_handoff"] {
-            let Some(input_key) = v8::String::new(scope, name) else {
-                return false;
-            };
-            if !global.delete(scope, input_key.into()).unwrap_or(false) {
-                return false;
-            }
-        }
-        // The child realm must not expose the handoff to frame script either.
-        global.delete(scope, handoff_key.into());
-        copied > 0
+        crate::realm_factory::install_ops(scope, realm, crate::realm_factory::RealmOps {
+            ops,
+            plugin_registry,
+            plugin_initializer,
+            navigator_registry,
+            screen_registry,
+            font_face_registry,
+            dom_registry,
+            canvas_registry,
+            navigator_initializer,
+            performance_registry,
+            checked_receivers,
+            performance_initializer,
+            response_registry,
+            response_initializer,
+            unref_op_promise,
+        })
     }
 
     /// Runs `source` inside `realm` and returns its value as a string. Errors
@@ -1771,6 +1942,7 @@ impl ObscuraJsRuntime {
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
         source: &str,
     ) -> Result<String, String> {
+        self.ensure_speech_startup()?;
         use deno_core::v8;
 
         let mut entered = self.runtime();
@@ -1802,58 +1974,15 @@ impl ObscuraJsRuntime {
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) {
+        if self.ensure_speech_startup().is_err() { return; }
         use deno_core::v8;
-
-        const IDENTITY_GLOBALS: [&str; 14] = [
-            "__obscura_ua",
-            "__obscura_ua_brands",
-            "__obscura_platform",
-            "__obscura_ua_platform",
-            "__obscura_ua_platform_version",
-            "__obscura_ua_full_version",
-            "__obscura_ua_architecture",
-            "__obscura_do_not_track",
-            "__obscura_language",
-            "__obscura_languages",
-            "__obscura_webgl_vendor",
-            "__obscura_webgl_renderer",
-            "__obscura_geo_lat",
-            "__obscura_geo_lon",
-        ];
 
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
 
-        let main_context = v8::Local::new(scope, main);
-        let mut carried = Vec::new();
-        {
-            let scope = &mut v8::ContextScope::new(scope, main_context);
-            let global = main_context.global(scope);
-            for name in IDENTITY_GLOBALS {
-                let Some(key) = v8::String::new(scope, name) else {
-                    continue;
-                };
-                match global.get(scope, key.into()) {
-                    Some(value) if !value.is_undefined() => {
-                        carried.push((name, v8::Global::new(scope, value)));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let realm_context = v8::Local::new(scope, realm);
-        let scope = &mut v8::ContextScope::new(scope, realm_context);
-        let global = realm_context.global(scope);
-        for (name, value) in carried {
-            let Some(key) = v8::String::new(scope, name) else {
-                continue;
-            };
-            let value = v8::Local::new(scope, value);
-            global.set(scope, key.into(), value);
-        }
+        crate::realm_factory::copy_identity(scope, main, realm);
     }
 
     /// Gives a frame's state the resources the page owns: cookie jar, HTTP
@@ -1862,9 +1991,12 @@ impl ObscuraJsRuntime {
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
         let mut parent = self.state.borrow_mut();
         parent.ensure_persona_transport();
+        frame.websocket_owner = std::sync::Arc::new(obscura_net::websocket::session::Owner::new(parent.websocket_owner.budget.clone()));
         frame.persona = parent.persona.clone();
         frame.cookie_jar = parent.cookie_jar.clone();
         frame.local_storage = parent.local_storage.clone();
+        frame.indexed_db = parent.indexed_db.clone();
+        frame.javascript_task_clock=parent.javascript_task_clock.clone();
         frame.session_storage = parent.session_storage.clone();
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
@@ -1914,10 +2046,7 @@ impl ObscuraJsRuntime {
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
-        let main = v8::Local::new(scope, main);
-        let realm = v8::Local::new(scope, realm);
-        let token = main.get_security_token(scope);
-        realm.set_security_token(token);
+        crate::realm_factory::share_security_token(scope, main, realm);
     }
 
     /// Publishes a frame realm's own `window` and `document` objects into the
@@ -1934,6 +2063,7 @@ impl ObscuraJsRuntime {
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
         frame_id: u32,
     ) -> bool {
+        if self.ensure_speech_startup().is_err() { return false; }
         use deno_core::v8;
 
         let main = self.runtime().main_context();
@@ -1989,6 +2119,53 @@ impl ObscuraJsRuntime {
         }
         let index = v8::Integer::new_from_unsigned(scope, frame_id);
         registry.set(scope, index.into(), entry.into()).unwrap_or(false)
+    }
+
+    /// Bind a real document to its containing iframe's private receiver slot.
+    /// Frame ids are used only at host creation; synchronous retirement follows
+    /// the captured document identity even if an exposed numeric field changes.
+    pub(crate) fn bind_realm_document_lifecycle(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+        parent_frame_id: u32,
+    ) -> bool {
+        if self.ensure_speech_startup().is_err() { return false; }
+        use deno_core::v8;
+        let Some(registry) = self.dom_receiver_registry.clone() else { return false; };
+        let main = self.runtime().main_context();
+        let owner = if parent_frame_id == 0 { main.clone() } else {
+            let Some(context) = self.realm_states().borrow().context_for_frame(parent_frame_id) else { return false; };
+            context
+        };
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let child_context = v8::Local::new(scope, realm);
+        let child_document = {
+            let scope = &mut v8::ContextScope::new(scope, child_context);
+            let Some(key) = v8::String::new(scope, "document") else { return false; };
+            let Some(document) = child_context.global(scope).get(scope, key.into()) else { return false; };
+            v8::Global::new(scope, document)
+        };
+        let owner_context = v8::Local::new(scope, owner);
+        let owner_document = {
+            let scope = &mut v8::ContextScope::new(scope, owner_context);
+            let Some(key) = v8::String::new(scope, "document") else { return false; };
+            let Some(document) = owner_context.global(scope).get(scope, key.into()) else { return false; };
+            v8::Global::new(scope, document)
+        };
+        let main_context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, main_context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let registry = v8::Local::new(scope, registry);
+        let Some(registry) = registry.to_object(scope) else { return false; };
+        let Some(key) = v8::String::new(scope, "bindFrameDocument") else { return false; };
+        let Some(bind) = registry.get(scope, key.into()).and_then(|value| v8::Local::<v8::Function>::try_from(value).ok()) else { return false; };
+        let owner_document = v8::Local::new(scope, owner_document);
+        let child_document = v8::Local::new(scope, child_document);
+        let frame_id = v8::Integer::new_from_unsigned(scope, frame_id);
+        let receiver = v8::undefined(scope);
+        bind.call(scope, receiver.into(), &[owner_document, frame_id.into(), child_document]).is_some()
     }
 
     /// The table ops consult to find the calling realm's document.
@@ -2081,6 +2258,7 @@ impl ObscuraJsRuntime {
         name: &'static str,
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        self.ensure_speech_startup()?;
         let result = self
             .runtime()
             .execute_script(name, source)
@@ -2112,6 +2290,10 @@ impl ObscuraJsRuntime {
             state.stealth_client = Some(std::sync::Arc::new(client.with_cookie_binding(jar.clone())));
         }
         state.cookie_jar = Some(jar);
+    }
+
+    pub fn set_indexed_db(&self, store: std::sync::Arc<crate::indexed_db::Store>) {
+        self.state.borrow_mut().indexed_db = store;
     }
 
     pub fn set_web_storage(&self, local: crate::ops::SharedWebStorage, session: crate::ops::SharedWebStorage) {
@@ -2222,7 +2404,7 @@ impl ObscuraJsRuntime {
         function: &deno_core::v8::Global<deno_core::v8::Function>,
         phase: u8,
     ) -> Result<(), &'static str> {
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         {
             use deno_core::v8;
             let mut entered = self.runtime();
@@ -2237,6 +2419,7 @@ impl ObscuraJsRuntime {
                 .call(scope, receiver, &[phase])
                 .ok_or("DOCUMENT_LIFECYCLE_FAILED")?;
         }
+        self.ensure_speech_startup()?;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         if self.runtime().v8_isolate().is_execution_terminating() {
             return Err("DOCUMENT_LIFECYCLE_FAILED");
@@ -2244,13 +2427,28 @@ impl ObscuraJsRuntime {
         Ok(())
     }
 
+    /// Install a committed navigation's real monotonic epoch before author code.
+    pub fn set_navigation_timing(&self, start: f64, facts: &obscura_net::timing::RequestTiming, url: &str) {
+        self.state.borrow_mut().performance_timeline.navigation(start, facts, url);
+    }
+
     pub fn set_dom(&self, dom: DomTree) {
         #[cfg(feature = "render")]
         self.abandon_render_resources();
         let mut gs = self.state.borrow_mut();
         dom.set_document_url(&gs.url);
+        crate::ops::retire_canvas_document(&mut gs);
+        crate::ops::retire_document_referrer(&mut gs);
+        gs.websocket_owner = std::sync::Arc::new(obscura_net::websocket::session::Owner::new(gs.websocket_owner.budget.clone()));
+        gs.speech_owner = Some(crate::speech_owner::NativeSpeechOwnerCapability::document(
+            &self.state, &gs.websocket_owner,
+        ));
+        gs.websocket_policy_known = false;
+        gs.websocket_dynamic_policy = crate::csp::ScriptPolicy::default(); gs.websocket_meta_nodes.clear();
+        gs.websocket_responses.clear(); gs.websocket_frame_policies.clear();
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
+        gs.performance_timeline = crate::timing::Timeline::default();
         gs.input_document_epoch
             .set(gs.input_document_epoch.get().wrapping_add(1));
         gs.activity_generation = 0;
@@ -2279,6 +2477,18 @@ impl ObscuraJsRuntime {
             gs.script_scroll_generation = 0;
             gs.resolved_scroll = None;
         }
+    }
+
+    pub fn set_script_policy(&self, policy: crate::csp::ScriptPolicy) {
+        let mut state = self.state.borrow_mut();
+        state.script_policy = policy;
+        state.websocket_policy_known = true;
+        state.websocket_origin = Some(state.url.clone());
+        state.websocket_site = url::Url::parse(&state.url).ok().and_then(|url| obscura_net::cookies::schemeful_site(&url));
+    }
+
+    pub fn script_policy(&self) -> crate::csp::ScriptPolicy {
+        self.state.borrow().script_policy.clone()
     }
 
     pub fn set_url(&self, url: &str) {
@@ -2382,6 +2592,7 @@ impl ObscuraJsRuntime {
     }
 
     pub fn resolve_blob(&mut self, url: &str) -> Option<(Vec<u8>, String)> {
+        self.ensure_speech_startup().ok()?;
         let mut entered = self.runtime();
         let scope = &mut entered.handle_scope();
         let context = scope.get_current_context();
@@ -3629,7 +3840,7 @@ impl ObscuraJsRuntime {
             return Err("INPUT_PATH_LIMIT");
         }
         let function = self.native_mouse.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -3686,7 +3897,7 @@ impl ObscuraJsRuntime {
             return Err("INPUT_PATH_LIMIT");
         }
         let function = self.native_wheel.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -3728,7 +3939,7 @@ impl ObscuraJsRuntime {
     fn native_scroll_changed(&mut self, node: NodeId) -> Result<(), &'static str> {
         use deno_core::v8;
         let function = self.native_scroll.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -3769,7 +3980,7 @@ impl ObscuraJsRuntime {
     ) -> Result<bool, &'static str> {
         use deno_core::v8;
         let function = self.native_focus.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let applied = {
             let main = self.runtime().main_context();
             let mut entered = self.runtime();
@@ -3974,6 +4185,7 @@ impl ObscuraJsRuntime {
         &mut self,
         input_document_epoch: Option<u64>,
     ) -> Result<(), &'static str> {
+        self.ensure_speech_startup()?;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         if self.runtime().v8_isolate().is_execution_terminating() {
             return Err("INPUT_DISPATCH_FAILED");
@@ -4006,6 +4218,7 @@ impl ObscuraJsRuntime {
             };
             if invalid {
                 self.native_focus_node_with_epoch(None, input_document_epoch)?;
+                self.ensure_speech_startup()?;
                 self.runtime().v8_isolate().perform_microtask_checkpoint();
                 if self.runtime().v8_isolate().is_execution_terminating() {
                     return Err("INPUT_DISPATCH_FAILED");
@@ -4470,6 +4683,7 @@ impl ObscuraJsRuntime {
                         request.referrer = source.clone();
                         request.initiator = source;
                         state.url = url.clone();
+                        state.scheduling_owner.navigation_pending(true);
                         state.pending_navigation = Some(crate::ops::PendingNavigation {
                             url, method: "GET".into(), body: String::new(), request, history: crate::ops::HistoryNavigation::Push,
                         });
@@ -4519,7 +4733,7 @@ impl ObscuraJsRuntime {
     fn navigate_native_fragment(&mut self, url: &str) -> Result<(), &'static str> {
         use deno_core::v8;
         let function = self.native_fragment.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -4560,7 +4774,7 @@ impl ObscuraJsRuntime {
     ) -> Result<(), &'static str> {
         use deno_core::v8;
         let function = self.native_submit.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -4885,12 +5099,7 @@ impl ObscuraJsRuntime {
     }
 
     pub fn dispatch_keyboard_input(&mut self, input: KeyboardInput) -> Result<(), String> {
-        if input.commands.iter().any(|command| command != "deleteBackward") {
-            return Err("INPUT_KEY_COMMAND_UNSUPPORTED".into());
-        }
-        if input.text.len() > 4096 {
-            return Err("INPUT_VALUE_LIMIT".into());
-        }
+        input.validate()?;
         #[cfg(feature = "render")]
         {
             self.dispatch_keyboard_input_render(&input).map_err(str::to_owned)
@@ -5115,7 +5324,7 @@ impl ObscuraJsRuntime {
     ) -> Result<ContenteditableEdit, &'static str> {
         use deno_core::v8;
         let function = self.native_text.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -5170,7 +5379,7 @@ impl ObscuraJsRuntime {
         use deno_core::v8;
         let Some(node) = self.keyboard_target() else { return Ok(false); };
         let function = self.native_keyboard.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -5538,7 +5747,7 @@ impl ObscuraJsRuntime {
             return Err("INPUT_PATH_LIMIT");
         }
         let function = self.native_text.clone().ok_or("INPUT_UNAVAILABLE")?;
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let scope = &mut v8::HandleScope::new(entered.v8_isolate());
@@ -5791,6 +6000,7 @@ impl ObscuraJsRuntime {
             }
             None => state.render_resources.seed_missing(url),
         }
+        crate::ops::image_dimensions_ops::publish_cached_images(&state);
     }
 
     #[cfg(feature = "render")]
@@ -5829,6 +6039,7 @@ impl ObscuraJsRuntime {
             }
             _ => state.render_resources.seed_image_missing(url, profile),
         }
+        crate::ops::image_dimensions_ops::publish_cached_images(&state);
     }
 
     #[cfg(feature = "render")]
@@ -6231,11 +6442,182 @@ impl ObscuraJsRuntime {
 
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
+    /// Install in the actual context after its document initialization, before
+    /// persona or author preload. The owner comes from host lifecycle state;
+    /// it is never recovered by a later author-visible callback.
+    pub(crate) fn install_realm_speech(
+        &mut self,
+        context: &deno_core::v8::Global<deno_core::v8::Context>,
+        initializer: &deno_core::v8::Global<deno_core::v8::Function>,
+        owner: &crate::speech_owner::NativeSpeechOwnerCapability,
+    ) -> Result<(), &'static str> {
+        self.ensure_speech_startup()?;
+        use deno_core::v8;
+        let registry = self.speech_registry.clone();
+        let outcome = {
+            let mut entered = self.runtime();
+            let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+            let context = v8::Local::new(scope, context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let result = {
+                let scope = &mut v8::TryCatch::new(scope);
+                let initializer = v8::Local::new(scope, initializer);
+                let registry = registry.as_ref().map(|value| v8::Local::new(scope, value));
+                let result = crate::speech_startup::install(scope, initializer, owner, registry)
+                    .map(|value| v8::Global::new(scope, value));
+                if scope.has_terminated() {
+                    scope.rethrow();
+                    Err("speech startup terminated")
+                } else { result }
+            };
+            if result.is_err() { crate::speech_startup::unpublish(scope); }
+            result
+        };
+        let registry = match outcome {
+            Ok(registry) => registry,
+            Err(error) => {
+                self.speech_startup_failure = Some("SPEECH_STARTUP_FAILED");
+                return Err(error);
+            }
+        };
+        if self.speech_registry.is_none() { self.speech_registry = Some(registry); }
+        Ok(())
+    }
+
+    pub fn scheduling_owner(&self) -> crate::pending_input::InputOwner {
+        self.state.borrow().scheduling_owner.clone()
+    }
+
+    fn install_main_scheduling(&mut self) -> Result<(), &'static str> {
+        if self.scheduling_installed { return Ok(()); }
+        let owner = self.scheduling_owner();
+        let main = self.runtime().main_context();
+        {
+            use deno_core::v8;
+            let mut entered = self.runtime();
+            let scope = &mut v8::HandleScope::with_context(entered.v8_isolate(), main);
+            crate::scheduling::install(scope, owner)?;
+        }
+        self.scheduling_installed = true;
+        Ok(())
+    }
+
+    fn install_main_speech(&mut self) -> Result<(), &'static str> {
+        let owner = self.state.borrow().speech_owner.clone().ok_or("speech original owner absent")?;
+        if self.speech_installed_owner.as_ref().is_some_and(|old| old.same_document(&owner)) {
+            return Ok(());
+        }
+        let initializer = self.speech_initializer.clone().ok_or("speech initializer absent")?;
+        let context = self.runtime().main_context();
+        self.install_realm_speech(&context, &initializer, &owner)?;
+        self.speech_installed_owner = Some(owner);
+        Ok(())
+    }
+
+    fn call_page_initializer<'s>(
+        scope: &mut deno_core::v8::HandleScope<'s>,
+        function: deno_core::v8::Local<'s, deno_core::v8::Function>,
+    ) -> Result<(), &'static str> {
+        use deno_core::v8;
+        let scope = &mut v8::TryCatch::new(scope);
+        let undefined = v8::undefined(scope);
+        let result = function.call(scope, undefined.into(), &[]);
+        if scope.has_terminated() {
+            scope.rethrow();
+            return Err("trusted page initialization terminated");
+        }
+        if result.is_none() { return Err("trusted page initialization failed"); }
+        Ok(())
+    }
+
+    pub(crate) fn install_native_html_open(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        initializer: &deno_core::v8::Global<deno_core::v8::Function>,
+    ) -> bool {
+        use deno_core::v8;
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let initializer = v8::Local::new(scope, initializer);
+        let installed = crate::html_open_startup::install(scope, initializer).is_ok();
+        if !installed && scope.has_caught() { scope.rethrow(); }
+        installed
+    }
+
+    pub(crate) fn install_image_document(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        initializer: &deno_core::v8::Global<deno_core::v8::Function>,
+        state: &crate::ops::SharedState,
+    ) -> bool {
+        use deno_core::v8;
+        let mut entered = self.runtime();
+        let scope = &mut v8::HandleScope::new(entered.v8_isolate());
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let initializer = v8::Local::new(scope, initializer);
+        let installed = crate::ops::image_dimensions_ops::install(scope, initializer, state).is_some();
+        if !installed && scope.has_caught() { scope.rethrow(); }
+        installed
+    }
+
+    fn initialize_page_once(&mut self) -> Result<(), &'static str> {
+        if self.page_initialized { return Ok(()); }
+        self.ensure_speech_startup()?;
+        let initializer = self.page_initializer.clone().ok_or("page initializer absent")?;
+        let main = self.runtime().main_context();
+        {
+            use deno_core::v8;
+            let mut entered = self.runtime();
+            let scope = &mut v8::HandleScope::with_context(entered.v8_isolate(), main);
+            let function = v8::Local::new(scope, initializer);
+            Self::call_page_initializer(scope, function)?;
+        }
+        self.page_initialized = true;
+        Ok(())
+    }
+
     pub fn run_page_init(&mut self) {
-        let _ = self.execute_runtime_script(
-            "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
-        );
+        if self.ensure_speech_startup().is_err() { return; }
+        let context = self.runtime().main_context();
+        let initializer = self.image_dimension_initializer.clone().expect("captured image initializer");
+        let state = self.state.clone();
+        if !self.install_image_document(&context, &initializer, &state) {
+            // The closure retains no new authority on failure. Old capabilities
+            // fail closed against the document generation/retirement lease.
+            self.speech_startup_failure = Some("SPEECH_STARTUP_FAILED");
+            tracing::error!("image document initialization failed");
+            return;
+        }
+
+        // The bootstrap's document initializer is one-shot for its realm. It
+        // deletes its global name; repeated host calls must not look up an
+        // author replacement or classify that expected absence as a failure.
+        if let Err(error) = self.initialize_page_once() {
+            self.speech_startup_failure = Some("SPEECH_STARTUP_FAILED");
+            eprintln!("Obscura document initialization failed before Speech startup: {error}");
+            return;
+        }
+        // WorkerEndpoint is installed by the trusted Rust worker launcher.
+        // Window Speech is not exposed in workers, whose owner is deliberately
+        // replaced with a child lease before this shared bootstrap runs.
+        let is_worker = self.runtime().op_state().borrow().has::<crate::worker::WorkerEndpoint>();
+        if !is_worker {
+            if let Err(error) = self.install_main_scheduling() {
+                self.speech_startup_failure = Some("SCHEDULING_STARTUP_FAILED");
+                eprintln!("Obscura Scheduling startup failed: {error}");
+                return;
+            }
+            if let Err(error) = self.install_main_speech() {
+                self.speech_startup_failure = Some("SPEECH_STARTUP_FAILED");
+                eprintln!("Obscura Speech startup failed: {error}");
+                return;
+            }
+        }
         // Initialization creates/replaces screen and window surfaces. Apply
         // the compiled persona afterwards, before any document script runs.
         let persona_script = self.state.borrow().persona.preload_script();
@@ -6262,7 +6644,7 @@ impl ObscuraJsRuntime {
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         #[cfg(feature = "render")]
         self.service_render_resources();
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let wrapped = Self::wrap_expression(expression);
         let result = self
             .execute_runtime_script("<eval>", wrapped)
@@ -6296,7 +6678,7 @@ impl ObscuraJsRuntime {
         // by-value sync case used to short-circuit through `evaluate`,
         // whose wrapper answers an exception with `null` — indistinguishable
         // from an expression that really evaluated to null (#746).
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
 
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
@@ -6488,7 +6870,7 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
 
@@ -6673,7 +7055,7 @@ impl ObscuraJsRuntime {
         .await
     }
     pub fn store_object(&mut self, js_expression: &str) -> Result<String, String> {
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let code = format!(
@@ -6693,7 +7075,7 @@ impl ObscuraJsRuntime {
         &mut self,
         js_expression: &str,
     ) -> Result<RemoteObjectInfo, String> {
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let code = format!(
@@ -6791,6 +7173,7 @@ impl ObscuraJsRuntime {
         url: &str,
         budget_ms: u64,
     ) -> Result<PreparedModule, String> {
+        self.ensure_speech_startup()?;
         let budget = tokio::time::Duration::from_millis(budget_ms);
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
@@ -6856,7 +7239,7 @@ impl ObscuraJsRuntime {
             return outcome.clone();
         }
 
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let budget = tokio::time::Duration::from_millis(budget_ms);
         // deno_core 0.350 asserts instead of treating a second evaluation as
         // the module-map no-op required by browsers. The local outcome cache
@@ -6941,6 +7324,7 @@ impl ObscuraJsRuntime {
         base_url: &str,
         budget_ms: u64,
     ) -> Result<PreparedModule, String> {
+        self.ensure_speech_startup()?;
         let budget = tokio::time::Duration::from_millis(budget_ms);
         // Inline modules use the document base URL as their module URL. This is
         // observable through import.meta.url and is also the referrer used for
@@ -6997,6 +7381,7 @@ impl ObscuraJsRuntime {
         prepared: PreparedModule,
         budget_ms: u64,
     ) -> Result<(), String> {
+        self.ensure_speech_startup()?;
         let PreparedModule {
             module_id,
             description,
@@ -7049,7 +7434,7 @@ impl ObscuraJsRuntime {
                 .unwrap_or_default().as_secs_f64() * 1_000.0,
             std::time::Instant::now(),
         ));
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let script_url = name.to_string();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
@@ -7224,12 +7609,13 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
         // pending, leaving an already-resolved Promise continuation stranded
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
+        self.ensure_speech_startup()?;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         let execution_cancellation = self.execution_cancellation.clone();
         let event_loop = entered_runtime_future(
@@ -7240,6 +7626,7 @@ impl ObscuraJsRuntime {
         let result = event_loop
             .await
             .map_err(|e| format!("Event loop error: {}", e));
+        self.ensure_speech_startup()?;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         self.finish_heap_checked(result)
     }
@@ -7440,6 +7827,7 @@ impl ObscuraJsRuntime {
     /// the watchdog terminates it. A well-behaved page returns as soon as the
     /// loop goes idle.
     pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
+        self.ensure_speech_startup()?;
         #[cfg(feature = "render")]
         self.service_render_resources();
         if budget_ms == 0 {
@@ -7478,6 +7866,7 @@ impl ObscuraJsRuntime {
                     // queued from them belongs to a subsequent cooperative
                     // turn. Yield so the wall deadline remains observable even
                     // when every turn immediately schedules another one.
+                    self.ensure_speech_startup()?;
                     self.runtime().v8_isolate().perform_microtask_checkpoint();
                     tokio::task::yield_now().await;
                 }
@@ -7514,6 +7903,7 @@ impl ObscuraJsRuntime {
     /// to the embedder between task-queue wakes. The watchdog remains solely as
     /// a backstop for one genuinely synchronous, unyielding turn.
     pub async fn run_event_loop_for_duration(&mut self, budget_ms: u64) -> Result<(), String> {
+        self.ensure_speech_startup()?;
         if budget_ms == 0 {
             return Ok(());
         }
@@ -7528,6 +7918,7 @@ impl ObscuraJsRuntime {
         budget_ms: u64,
         task_deadline: std::time::Instant,
     ) -> Result<(), String> {
+        self.ensure_speech_startup()?;
         let window = (tokio::time::Instant::now() + std::time::Duration::from_millis(budget_ms))
             .min(tokio::time::Instant::from_std(task_deadline));
         loop {
@@ -7552,7 +7943,8 @@ impl ObscuraJsRuntime {
     /// ready, it remains parked on deno_core's real I/O/timer waker, so the
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
+        self.ensure_speech_startup()?;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         let focus = self.native_focus_fixup();
         if focus != Ok(false) {
@@ -7614,12 +8006,13 @@ impl ObscuraJsRuntime {
 
         #[cfg(feature = "render")]
         self.service_render_resources();
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
             task_budget(),
         );
+        self.ensure_speech_startup()?;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         let focus = self.native_focus_fixup();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
@@ -7691,6 +8084,7 @@ impl ObscuraJsRuntime {
     /// boolean is true only when deno_core reached full idle.
     #[doc(hidden)]
     pub async fn run_load_delaying_event_loop_tick(&mut self) -> Result<bool, String> {
+        self.ensure_speech_startup()?;
         #[cfg(feature = "render")]
         self.service_render_resources();
         self.run_cooperative_event_loop_tick().await
@@ -7709,6 +8103,7 @@ impl ObscuraJsRuntime {
         budget_ms: u64,
         quiet_ms: u64,
     ) -> Result<(), String> {
+        self.ensure_speech_startup()?;
         if budget_ms == 0 {
             return Ok(());
         }
@@ -7809,6 +8204,7 @@ impl ObscuraJsRuntime {
             if tick_fired {
                 break Ok(());
             }
+            self.ensure_speech_startup()?;
             self.runtime().v8_isolate().perform_microtask_checkpoint();
             match tick {
                 Ok(Ok(true)) => break Ok(()),
@@ -7840,7 +8236,7 @@ impl ObscuraJsRuntime {
         if timeout.is_zero() {
             return self.evaluate(expression);
         }
-        self.begin_javascript_task();
+        self.begin_javascript_task()?;
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
         let result = self.runtime().execute_script("<eval>", wrapped);
@@ -7863,7 +8259,7 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn resolve_promises(&mut self) {
-        self.begin_javascript_task();
+        if self.begin_javascript_task().is_err() { return; }
         // Default settle: just pump until idle or 5s.
         let execution_cancellation = self.execution_cancellation.clone();
         let event_loop = entered_runtime_future(
@@ -7901,7 +8297,7 @@ impl ObscuraJsRuntime {
         loop {
             #[cfg(feature = "render")]
             self.service_render_resources();
-            self.begin_javascript_task();
+            if self.begin_javascript_task().is_err() { return false; }
             if done_check(self) {
                 return true;
             }
@@ -7946,6 +8342,10 @@ impl ObscuraJsRuntime {
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
         }
+        // take_dom transfers the tree to the caller; retained Canvas handles
+        // preserve their own attributes/bitmap but no longer mutate that tree.
+        crate::ops::detach_canvas_document(&mut state);
+        crate::ops::image_dimensions_ops::transfer_original_document(&mut state);
         state.dom.take()
     }
 
@@ -8188,6 +8588,7 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
+        self.ensure_speech_startup()?;
         let mut entered = self.runtime();
         let scope = &mut entered.handle_scope();
         let local = deno_core::v8::Local::new(scope, result);
@@ -10616,6 +11017,166 @@ mod tests {
     }
 
     #[test]
+    fn plugin_interfaces_serialize_without_cycles_and_keep_native_descriptors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const plugins = navigator.plugins, mimeTypes = navigator.mimeTypes;
+            const plugin = plugins[0], mime = mimeTypes[0];
+            const constructors = [PluginArray, Plugin, MimeTypeArray, MimeType];
+            const illegal = constructors.map(Ctor => {
+                try { new Ctor(); return false; } catch (error) { return error instanceof TypeError; }
+            });
+            const getter = Object.getOwnPropertyDescriptor(MimeType.prototype, 'enabledPlugin').get;
+            let branded = false;
+            try { getter.call({}); } catch (error) { branded = error instanceof TypeError; }
+            const descriptor = Object.getOwnPropertyDescriptor(plugins, '0');
+            const nonConstructible = [getter, PluginArray.prototype.item, PluginArray.prototype.namedItem,
+                PluginArray.prototype.refresh, PluginArray.prototype[Symbol.iterator]].every(fn => {
+                if (Object.hasOwn(fn, 'prototype')) return false;
+                try { Reflect.construct(function() {}, [], fn); return false; }
+                catch (error) { return error instanceof TypeError; }
+            });
+            return {
+                json: JSON.parse(JSON.stringify(plugins)), mimeJson: JSON.stringify(mime),
+                mimeKeys: Object.keys(mime), pluginKeys: Object.keys(plugin),
+                ownLength: Object.hasOwn(plugins, 'length'), ownName: Object.hasOwn(plugin, 'name'),
+                arrayPrototype: Object.getPrototypeOf(PluginArray.prototype) === Object.prototype,
+                readonlyIndex: !descriptor.writable && descriptor.enumerable && descriptor.configurable,
+                named: plugins['PDF Viewer'] === plugin && plugins.namedItem('PDF Viewer') === plugin
+                    && mimeTypes['application/pdf'] === mime && plugin.namedItem('application/pdf') === mime,
+                enabled: Array.from(plugins).every(p => Array.from(p).every(m => m.enabledPlugin === plugin)),
+                indexed: plugin.item(0) === plugin[0] && plugin[0] !== mime && plugins.item(99) === null,
+                nativeGetter: getter.toString(), illegal, branded, nonConstructible,
+            };
+        })()"#).unwrap(), serde_json::json!({
+            "json": {"0":{"0":{},"1":{}},"1":{"0":{},"1":{}},"2":{"0":{},"1":{}},
+                "3":{"0":{},"1":{}},"4":{"0":{},"1":{}}},
+            "mimeJson": "{}", "mimeKeys": [], "pluginKeys": ["0", "1"],
+            "ownLength": false, "ownName": false, "arrayPrototype": true, "readonlyIndex": true,
+            "named": true, "enabled": true, "indexed": true,
+            "nativeGetter": "function get enabledPlugin() { [native code] }",
+            "illegal": [true, true, true, true], "branded": true, "nonConstructible": true,
+        }));
+    }
+
+    #[test]
+    fn page_init_does_not_recreate_consumed_handoffs() {
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(obscura_net::StealthProfile::WindowsChrome145));
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("http://example.com/test");
+        let probe = r#"[
+            Object.hasOwn(globalThis, '__obscura_core_handoff'),
+            Object.hasOwn(globalThis, '__obscura_plugin_registry_handoff')
+        ]"#;
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([false, false]));
+        rt.evaluate(r#"
+          (function () {
+            globalThis.savedErrors = globalThis.__obscura_errors;
+            Object.defineProperty(globalThis, '__obscura_errors', { enumerable: true });
+          })()
+        "#).unwrap();
+        rt.run_page_init();
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([false, false]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const d = Object.getOwnPropertyDescriptor(globalThis, '__obscura_errors');
+            return [d.value === savedErrors, d.enumerable, d.writable, d.configurable];
+        })()"#).unwrap(), serde_json::json!([true, false, true, true]));
+    }
+
+    #[test]
+    fn plugin_interfaces_accept_branded_objects_from_another_realm() {
+        use deno_core::v8;
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let child = rt.create_realm_context().unwrap();
+        rt.share_deno_context_state_with_realm(&child);
+        assert!(rt.share_ops_with_realm(&child));
+        rt.share_security_token_with_realm(&child);
+        let main = rt.runtime().main_context();
+        {
+            let mut runtime = rt.runtime();
+            let scope = &mut v8::HandleScope::with_context(runtime.v8_isolate(), main);
+            let parent = scope.get_current_context().global(scope);
+            let child_global = v8::Local::new(scope, &child).global(scope);
+            let nav_key = v8::String::new(scope, "navigator").unwrap();
+            let main_nav = parent.get(scope, nav_key.into()).unwrap();
+            let child_nav = child_global.get(scope, nav_key.into()).unwrap();
+            let key = v8::String::new(scope, "otherNavigator").unwrap();
+            assert!(parent.set(scope, key.into(), child_nav).unwrap());
+            assert!(child_global.set(scope, key.into(), main_nav).unwrap());
+        }
+        let probe = r#"JSON.stringify([
+            navigator !== otherNavigator,
+            PluginArray.prototype.item.call(otherNavigator.plugins, 0) === otherNavigator.plugins[0],
+            Object.getOwnPropertyDescriptor(MimeType.prototype, 'type').get.call(otherNavigator.mimeTypes[0]),
+            Object.hasOwn(globalThis, '__obscura_plugin_registry_handoff'),
+            (() => { try { PluginArray.prototype.item.call({}, 0); return false; }
+                catch (error) { return error instanceof TypeError; } })()
+        ])"#;
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!("[true,true,\"application/pdf\",false,true]"));
+        assert_eq!(rt.eval_in_realm(&child, probe).unwrap(), "[true,true,\"application/pdf\",false,true]");
+    }
+
+    #[test]
+    fn canvas_text_uses_real_fonts_and_keeps_native_state_lazy() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert!(rt.state.borrow().canvas_document.is_none());
+        let value = rt.evaluate(r#"(() => {
+            const c = document.createElement('canvas'); c.width = 200; c.height = 80;
+            const ctx = c.getContext('2d');
+            ctx.font = '32px serif';
+            const narrow = ctx.measureText('iii');
+            const wide = ctx.measureText('WWW');
+            ctx.font = '32px monospace';
+            const fixed = [ctx.measureText('iii').width, ctx.measureText('WWW').width];
+            ctx.font = 'italic 32px serif'; ctx.save(); ctx.font = '12px sans-serif'; ctx.restore();
+            const restored = ctx.font;
+            ctx.font = 'not a font';
+            const invalidPreserved = ctx.font === restored;
+            ctx.fillStyle = 'rgba(240, 30, 90, 0.5)'; ctx.fillText('Ag', 8, 50);
+            const pixels = ctx.getImageData(0, 0, 200, 80).data;
+            let ink = 0, maxAlpha = 0, colors = true;
+            for (let i = 0; i < pixels.length; i += 4) if (pixels[i + 3]) {
+                ink++; maxAlpha = Math.max(maxAlpha, pixels[i + 3]);
+                colors = colors && pixels[i] === 240 && pixels[i + 1] === 30 && pixels[i + 2] === 90;
+            }
+            const baseWidth = ctx.measureText('WWW').width;
+            ctx.fillStyle = 'rgb(300, 0, 0)'; ctx.globalAlpha = NaN;
+            const paintIndependent = ctx.measureText('WWW').width === baseWidth;
+            ctx.globalAlpha = 1;
+            ctx.clearRect(0, 0, 200, 80); ctx.fillText('O', 8, 50);
+            const filled = ctx.getImageData(0, 0, 200, 80).data;
+            const colorClamped = filled.some((value, i) => i % 4 === 0 && value === 255);
+            ctx.clearRect(0, 0, 200, 80); ctx.strokeStyle = '#00ff00'; ctx.lineWidth = 1;
+            ctx.strokeText('O', 8, 50);
+            const stroked = ctx.getImageData(0, 0, 200, 80).data;
+            let strokeInk = 0, hollow = false;
+            for (let i = 3; i < stroked.length; i += 4) {
+                if (stroked[i]) strokeInk++;
+                if (filled[i] > 200 && !stroked[i]) hollow = true;
+            }
+            ctx.clearRect(0, 0, 200, 80); ctx.strokeText('WWW', 8, 50, baseWidth / 2);
+            const compressed = ctx.getImageData(0, 0, 200, 80).data;
+            let minX = 200, maxX = -1;
+            for (let i = 3; i < compressed.length; i += 4) if (compressed[i]) {
+                const x = ((i - 3) / 4) % 200; minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+            }
+            const maxWidth = maxX >= minX && maxX - minX < baseWidth * .65 && ctx.measureText('WWW').width === baseWidth;
+            const brand = Object.prototype.toString.call(narrow);
+            c.width = 200;
+            return {proportional:wide.width > narrow.width * 2, fixed:Math.abs(fixed[0] - fixed[1]) < .001,
+                invalidPreserved, ink:ink > 0, alpha:maxAlpha >= 120 && maxAlpha <= 128,
+                colors, stroke:strokeInk > 0 && hollow, maxWidth, paintIndependent, colorClamped, brand, reset:ctx.font === '10px sans-serif'};
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!({
+            "proportional":true, "fixed":true, "invalidPreserved":true, "ink":true,
+            "alpha":true, "colors":true, "stroke":true, "maxWidth":true, "paintIndependent":true, "colorClamped":true, "brand":"[object TextMetrics]", "reset":true,
+        }));
+        assert!(rt.state.borrow().canvas_document.as_ref().is_some_and(|lease| lease.has_text_engine()));
+        rt.set_dom(obscura_dom::tree::DomTree::new());
+        assert!(rt.state.borrow().canvas_document.is_none());
+    }
+
+    #[test]
     fn canvas_png_compression_preserves_rgba_pixels() {
         use base64::Engine as _;
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -10713,6 +11274,77 @@ mod tests {
     }
 
     #[test]
+    fn nested_blank_iframes_have_independent_connected_documents() {
+        let mut rt = setup_runtime("<html><body><p id='main-marker'>main</p></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const first = document.createElement('iframe');
+            document.body.appendChild(first);
+            const firstDoc = first.contentDocument;
+            const holder = firstDoc.createElement('div');
+            const detachedOwner = holder.ownerDocument === firstDoc && !holder.isConnected;
+            holder.innerHTML = '<div><iframe></iframe></div>';
+            firstDoc.body.appendChild(holder);
+            const second = holder.firstChild.firstChild;
+            const secondDoc = second.contentDocument;
+            if (!secondDoc) return {missingNestedDocument: true};
+            const third = secondDoc.createElement('iframe');
+            secondDoc.body.appendChild(third);
+            const thirdDoc = third.contentDocument;
+            if (!thirdDoc) return {missingThirdDocument: true};
+            const documents = [firstDoc, secondDoc, thirdDoc];
+            const trees = documents.every(doc => doc.nodeType === 9 && doc.ownerDocument === null &&
+                doc.documentElement.parentNode === doc && doc.body.ownerDocument === doc &&
+                doc.body.getRootNode() === doc && doc.body.isConnected && doc.documentElement.isConnected);
+            const windows = first.contentWindow.document === firstDoc &&
+                second.contentWindow.document === secondDoc && third.contentWindow.document === thirdDoc;
+            thirdDoc.body.innerHTML = '<p id="only-in-third">third</p>';
+            const isolated = document.getElementById('main-marker').textContent === 'main' &&
+                document.getElementById('only-in-third') === null &&
+                document.querySelectorAll('iframe').length === 1 && firstDoc.querySelectorAll('iframe').length === 1 &&
+                thirdDoc.getElementById('only-in-third').ownerDocument === thirdDoc;
+            const node = thirdDoc.body.firstChild;
+            node.remove();
+            const detached = !node.isConnected && node.ownerDocument === thirdDoc;
+            document.body.appendChild(node);
+            const adopted = node.ownerDocument === document && node.getRootNode() === document;
+            return {detachedOwner, trees, windows, isolated, detached, adopted};
+        })()"#).unwrap(), serde_json::json!({"detachedOwner": true, "trees": true,
+            "windows": true, "isolated": true, "detached": true, "adopted": true}));
+    }
+
+    #[test]
+    fn nested_blank_iframe_documents_survive_context_removal() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const first = document.createElement('iframe');
+            document.body.appendChild(first);
+            const firstWin = first.contentWindow, firstDoc = first.contentDocument;
+            const second = firstDoc.createElement('iframe');
+            firstDoc.body.appendChild(second);
+            const secondWin = second.contentWindow, secondDoc = second.contentDocument;
+            if (!secondDoc) return {missingNestedDocument: true};
+            first.remove();
+            const closed = firstWin.closed && secondWin.closed && first.contentWindow === null &&
+                second.contentWindow === null && second.contentDocument === null;
+            const retained = firstWin.document === firstDoc && secondWin.document === secondDoc &&
+                firstDoc.body.isConnected && secondDoc.body.isConnected && second.isConnected &&
+                second.ownerDocument === firstDoc && secondDoc.body.getRootNode() === secondDoc;
+            document.body.appendChild(first);
+            const renewed = first.contentWindow !== firstWin && first.contentDocument !== firstDoc &&
+                first.contentDocument.body.isConnected && firstDoc.body.isConnected && secondWin.closed;
+            first.contentDocument.body.appendChild(second);
+            const moved = second.contentWindow !== secondWin && second.contentDocument !== secondDoc &&
+                second.ownerDocument === first.contentDocument;
+            const replacementWin = second.contentWindow;
+            first.contentDocument.body.innerHTML = '';
+            const cleared = second.contentWindow === null && replacementWin.closed &&
+                second.ownerDocument === first.contentDocument && !second.isConnected;
+            return {closed, retained, renewed, moved, cleared};
+        })()"#).unwrap(), serde_json::json!({"closed": true, "retained": true,
+            "renewed": true, "moved": true, "cleared": true}));
+    }
+
+    #[test]
     fn iframe_context_is_discarded_on_removal_and_recreated_on_insertion() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"
@@ -10783,6 +11415,86 @@ return {before,removed,reinsert,moved,cleared};
         rt.execute_script("current-iframe-response", "requests[1].resolve({ok: true, text: async () => '<p>new</p>'})").unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(rt.take_pending_frames().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_blank_iframe_documents_do_not_load_or_accept_responses() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://example.com/page");
+        rt.execute_script("nested-iframe-loads", r#"
+            globalThis.requests = [];
+            globalThis.loads = 0;
+            globalThis.bodyReads = 0;
+            globalThis.fetch = url => new Promise((resolve, reject) => requests.push({url, resolve, reject}));
+            globalThis.outer = document.createElement('iframe');
+            document.body.appendChild(outer);
+            globalThis.oldDoc = outer.contentDocument;
+            for (let i = 0; i < 3; i++) {
+                const child = oldDoc.createElement('iframe');
+                child.onload = () => loads++;
+                child.src = '/child-' + i;
+                oldDoc.body.appendChild(child);
+            }
+            requests[0].resolve({ok: true, text: () => new Promise(resolve => globalThis.resolveBody = resolve)});
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[requests.length, typeof resolveBody]").unwrap(), serde_json::json!([3, "function"]));
+        rt.execute_script("close-parent-before-responses", r#"
+            outer.remove();
+            const queued = oldDoc.createElement('iframe');
+            queued.src = '/must-not-load';
+            oldDoc.body.appendChild(queued);
+            document.body.appendChild(document.createElement('p'));
+            resolveBody('<p>late body</p>');
+            requests[1].reject(new Error('late fetch failure'));
+            requests[2].resolve({ok: true, text: async () => { bodyReads++; return '<p>late headers</p>'; }});
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[requests.length, loads, bodyReads, oldDoc.body.isConnected]").unwrap(),
+            serde_json::json!([3, 0, 0, true]));
+        assert!(rt.take_pending_frames().is_empty(), "a closed document registered a frame");
+        assert_eq!(rt.evaluate(r#"Array.from(oldDoc.querySelectorAll('iframe'), frame =>
+            frame.isConnected && frame.contentWindow === null && frame.contentDocument === null)"#).unwrap(),
+            serde_json::json!([true, true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_iframe_scripts_do_not_execute_in_the_parent_realm() {
+        let mut rt = setup_runtime("<html><body><p id='main-marker'>main</p></body></html>");
+        rt.execute_script("blank-frame-script-isolation", r#"
+            globalThis.scriptFetches = [];
+            globalThis.fetch = url => { scriptFetches.push(url); return new Promise(() => {}); };
+            globalThis.frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            globalThis.childWin = frame.contentWindow;
+            globalThis.childDoc = frame.contentDocument;
+            function insertScripts(doc) {
+                const inline = doc.createElement('script');
+                inline.textContent = 'globalThis.childProbe = document.currentScript; document.body.setAttribute("data-child-script", "ran")';
+                doc.body.appendChild(inline);
+                const external = doc.createElement('script');
+                external.src = 'https://example.com/child.js';
+                doc.body.appendChild(external);
+            }
+            insertScripts(childDoc);
+            frame.remove();
+            insertScripts(childDoc);
+            const parentScript = document.createElement('script');
+            parentScript.textContent = 'globalThis.parentProbe = document.currentScript.ownerDocument === document';
+            document.body.appendChild(parentScript);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate(r#"({
+            parentClean: globalThis.childProbe === undefined && !document.body.hasAttribute('data-child-script') &&
+                document.getElementById('main-marker').textContent === 'main',
+            // The initial blank shim has no script realm yet. This is an
+            // explicit capability gap, not a claim that child scripts ran.
+            blankScriptsUnsupported: childWin.childProbe === undefined && !childDoc.body.hasAttribute('data-child-script'),
+            noExternalFetch: scriptFetches.length === 0,
+            parentStillExecutes: parentProbe === true,
+            currentScriptRestored: document.currentScript === null
+        })"#).unwrap(), serde_json::json!({"parentClean": true, "blankScriptsUnsupported": true,
+            "noExternalFetch": true, "parentStillExecutes": true, "currentScriptRestored": true}));
     }
 
     #[test]
@@ -11727,6 +12439,114 @@ return {before,removed,reinsert,moved,cleared};
         let expected = serde_json::json!({"relative": true, "isolated": true});
         assert_eq!(rt.evaluate("__eventPage").unwrap(), expected);
         assert_eq!(rt.evaluate("__eventWorker").unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offscreen_2d_worker_roundtrip_owns_pixels_resize_and_png() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("offscreen-2d-worker", r#"
+            async function probeOffscreen2D() {
+                const canvas = new OffscreenCanvas(2, 3);
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return {context: false};
+                ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 2, 3);
+                const before = Array.from(ctx.getImageData(0, 0, 1, 1).data);
+                const size = [ctx.canvas.width, ctx.canvas.height];
+                const owner = ctx.canvas === canvas;
+                const same = canvas.getContext('2d') === ctx;
+                const exclusive = canvas.getContext('webgl') === null;
+                const interfaceBrand = ctx instanceof OffscreenCanvasRenderingContext2D;
+                canvas.width = 4;
+                const after = Array.from(ctx.getImageData(0, 0, 1, 1).data);
+                const resized = [ctx.canvas.width, ctx.canvas.height];
+                const sameAfterResize = canvas.getContext('2d') === ctx;
+                ctx.fillStyle = '#0000ff'; ctx.fillRect(0, 0, 4, 3);
+                const blob = await canvas.convertToBlob({type: 'image/not-supported'});
+                return {context: true, owner, same, exclusive, interfaceBrand,
+                    size, before, after, resized, sameAfterResize,
+                    windowInterfacesExcluded: typeof HTMLCanvasElement === 'undefined'
+                        && typeof CanvasRenderingContext2D === 'undefined',
+                    mime: blob.type, bytes: Array.from(new Uint8Array(await blob.arrayBuffer()))};
+            }
+            globalThis.__offscreen2DWorker = null;
+            globalThis.__offscreen2DWorkerError = null;
+            const url = URL.createObjectURL(new Blob([
+                probeOffscreen2D.toString() +
+                '; probeOffscreen2D().then(result => postMessage(result), error => postMessage({error:String(error)}));'
+            ], {type: 'application/javascript'}));
+            const worker = new Worker(url);
+            worker.onerror = event => { __offscreen2DWorkerError = event.message || String(event); };
+            worker.onmessage = event => {
+                __offscreen2DWorker = event.data;
+                worker.terminate(); URL.revokeObjectURL(url);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("__offscreen2DWorkerError").unwrap(), serde_json::Value::Null);
+        let mut result = rt.evaluate("__offscreen2DWorker").unwrap();
+        let bytes: Vec<u8> = serde_json::from_value(result.as_object_mut().unwrap().remove("bytes").unwrap()).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "context": true, "owner": true, "same": true, "exclusive": true, "interfaceBrand": true,
+            "size": [2, 3], "before": [255, 0, 0, 255], "after": [0, 0, 0, 0],
+            "resized": [4, 3], "sameAfterResize": true, "windowInterfacesExcluded": true,
+            "mime": "image/png",
+        }));
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height, info.color_type), (4, 3, png::ColorType::Rgba));
+        assert_eq!(&pixels[..info.buffer_size()], &[0, 0, 255, 255].repeat(12));
+    }
+
+    #[test]
+    fn offscreen_2d_cppgc_releases_dead_surfaces_and_keeps_live_pixels() {
+        // nextest starts this test in its own process, before V8 initialization.
+        // This flag is only needed by the explicit full-GC testing API below.
+        deno_core::v8::V8::set_flags_from_string("--expose_gc");
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"(() => {
+            globalThis.__liveOffscreen = new OffscreenCanvas(2, 2);
+            globalThis.__liveOffscreenContext = __liveOffscreen.getContext('2d');
+            __liveOffscreenContext.fillStyle = '#00ff00';
+            __liveOffscreenContext.fillRect(0, 0, 2, 2);
+            globalThis.__temporaryOffscreens = Array.from({length: 8}, () => {
+                const canvas = new OffscreenCanvas(4, 4);
+                const context = canvas.getContext('2d');
+                context.fillRect(0, 0, 4, 4);
+                return {canvas, context};
+            });
+            return true;
+        })()"#).unwrap();
+        let lease = rt.state.borrow().canvas_document.as_ref().unwrap().clone();
+        assert_eq!(lease.retained_surface_stats(), (9, 8 * 4 * 4 * 4 + 2 * 2 * 4));
+        rt.evaluate("delete globalThis.__temporaryOffscreens").unwrap();
+        {
+            // Enter the owning isolate; no JS Local or RefCell borrow is held
+            // across collection. Full unified GC traces the attached cppgc heap.
+            let mut runtime = rt.runtime();
+            let isolate = runtime.v8_isolate();
+            assert!(isolate.get_cpp_heap().is_some());
+            isolate.clear_kept_objects();
+            isolate.request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+            isolate.request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+        }
+        assert_eq!(lease.retained_surface_stats(), (1, 2 * 2 * 4));
+        assert_eq!(rt.evaluate("Array.from(__liveOffscreenContext.getImageData(0,0,1,1).data)").unwrap(), serde_json::json!([0, 255, 0, 255]));
+        rt.evaluate("(() => { delete globalThis.__liveOffscreen; delete globalThis.__liveOffscreenContext; return true; })()").unwrap();
+        {
+            let mut runtime = rt.runtime();
+            let isolate = runtime.v8_isolate();
+            isolate.clear_kept_objects();
+            isolate.request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+            isolate.request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+        }
+        assert_eq!(lease.retained_surface_stats(), (0, 0));
+        // A fresh context is still usable in the same document after reclaim.
+        assert_eq!(rt.evaluate(r#"(() => {
+            const canvas = new OffscreenCanvas(1, 1), ctx = canvas.getContext('2d');
+            ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 1, 1);
+            return Array.from(ctx.getImageData(0, 0, 1, 1).data);
+        })()"#).unwrap(), serde_json::json!([255, 0, 0, 255]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12868,7 +13688,8 @@ return {before,removed,reinsert,moved,cleared};
             let workerArgumentCount;
             let workerInitKeys;
             try {
-                Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, destination) => {
+                Deno.core.ops.op_fetch_url = (url, method, headers, body, mode, credentials, _privateFetchArguments) => {
+                        const [destination, , origin] = _privateFetchArguments;
                     calls.push({url, destination: destination && destination.startsWith('{') ? (JSON.parse(destination).destination || null) : (destination || null)});
                     return JSON.stringify({status: 200, headers: {}, url, body: 'postMessage("ready");'});
                 };
@@ -12913,6 +13734,85 @@ return {before,removed,reinsert,moved,cleared};
             ],
             "overrideCalls": 5, "workerArgumentCount": 2, "workerInitKeys": [],
             "reply": "ready", "markerVisible": false,
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_fetch_mark_and_response_policy_survive_prototype_overrides() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const originalFetch = globalThis.fetch;
+            const originalFetchOp = Deno.core.ops.op_fetch_url;
+            const originalFrameOp = Deno.core.ops.op_frame_document_ready;
+            const originalAdd = WeakSet.prototype.add;
+            const originalDelete = WeakSet.prototype.delete;
+            const originalGet = WeakMap.prototype.get;
+            const originalSet = WeakMap.prototype.set;
+            const calls = [], leakedSets = [], leakedPolicies = [], framePolicies = [];
+            let argumentCount, initKeys, publicRequestId;
+            try {
+                Deno.core.ops.op_fetch_url = (url, method, headers, body, mode, credentials, metadata) => {
+                    calls.push({url, destination: JSON.parse(metadata[0]).destination || null});
+                    return JSON.stringify({status: 200, headers: {}, url,
+                        body: '<p>frame</p>', requestId: 301});
+                };
+                Deno.core.ops.op_frame_document_ready = (url, html, width, height, policy) => {
+                    framePolicies.push(policy);
+                    return null;
+                };
+                WeakSet.prototype.add = function(value) {
+                    if (value && value.mode === 'no-cors') leakedSets.push(this);
+                    return originalAdd.call(this, value);
+                };
+                WeakSet.prototype.delete = () => true;
+                WeakMap.prototype.set = function(key, value) {
+                    if (key instanceof Response) leakedPolicies.push(value);
+                    return originalSet.call(this, key, value);
+                };
+                WeakMap.prototype.get = function(key) {
+                    return key instanceof Response ? 777 : originalGet.call(this, key);
+                };
+                await originalFetch('/ordinary-init', {destination: 'iframe', mode: 'no-cors'});
+                globalThis.fetch = (...args) => {
+                    argumentCount = args.length;
+                    initKeys = Reflect.ownKeys(args[1]);
+                    const response = originalFetch(...args);
+                    return Promise.all([response, originalFetch(...args)]).then(([first]) => {
+                        // Public request metadata is not a policy receipt.
+                        Object.defineProperty(first, '__obscuraRequestId', {value: 777, configurable: true});
+                        publicRequestId = first.__obscuraRequestId;
+                        return first;
+                    });
+                };
+                const frame = document.createElement('iframe');
+                const loaded = new Promise(resolve => { frame.onload = resolve; });
+                frame.src = '/child';
+                document.body.appendChild(frame);
+                await loaded;
+                frame.remove();
+                return {calls, framePolicies, argumentCount, initKeys, publicRequestId,
+                    leakedSetCount: leakedSets.length, leakedPolicies,
+                    markerVisible: typeof _frameFetchInits !== 'undefined',
+                    policyMapVisible: typeof _responsePolicyIds !== 'undefined'};
+            } finally {
+                globalThis.fetch = originalFetch;
+                Deno.core.ops.op_fetch_url = originalFetchOp;
+                Deno.core.ops.op_frame_document_ready = originalFrameOp;
+                WeakSet.prototype.add = originalAdd;
+                WeakSet.prototype.delete = originalDelete;
+                WeakMap.prototype.get = originalGet;
+                WeakMap.prototype.set = originalSet;
+            }
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "calls": [
+                {"url": "http://example.com/ordinary-init", "destination": null},
+                {"url": "http://example.com/child", "destination": "iframe"},
+                {"url": "http://example.com/child", "destination": null},
+            ],
+            "framePolicies": [301], "argumentCount": 2, "initKeys": ["mode"], "publicRequestId": 777,
+            "leakedSetCount": 0, "leakedPolicies": [],
+            "markerVisible": false, "policyMapVisible": false,
         }));
     }
 
@@ -14856,6 +15756,90 @@ return {before,removed,reinsert,moved,cleared};
             result,
             serde_json::json!([true, false, true, true, false, true, true, false, true, false])
         );
+    }
+
+    #[test]
+    fn match_media_reports_color_display_and_default_preferences() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const queries = [
+                '(color)', '(min-color: 8)', '(max-color: 7)',
+                '(monochrome)', '(monochrome: 0)', '(max-monochrome: 0)',
+                '(max-monochrome: 1000)', '(min-monochrome: 1)',
+                '(color-index: 0)', '(grid: 0)', '(min-grid: 0)',
+                '(prefers-contrast: no-preference)', '(prefers-contrast: more)',
+                '(forced-colors: none)', '(forced-colors: active)',
+                '(prefers-reduced-transparency: no-preference)',
+                '(color-gamut: srgb)', '(color-gamut: p3)',
+                '(dynamic-range: standard)', '(dynamic-range: high)',
+                '(forced-colors: none) and (max-monochrome: 0)',
+                '(prefers-contrast: no-preference) and (color-gamut: srgb)'
+            ];
+            return queries.map(query => matchMedia(query).matches);
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true, true, false, false, true, true, true, false, true, true, false,
+            true, false, true, false, true, true, false, true, false, true, true
+        ]));
+    }
+
+    fn assert_media_resolution_units_and_ranges(profile: obscura_net::StealthProfile) {
+        let mut rt = ObscuraJsRuntime::new(obscura_net::EffectivePersona::builtin(profile));
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+        let result = rt.evaluate(r#"(() => {
+            const dpr = devicePixelRatio;
+            const queries = [
+                '(resolution)', '(resolution: ' + dpr + 'dppx)',
+                '(resolution: ' + dpr * 96 + 'dpi)',
+                '(resolution: ' + dpr + 'x)',
+                '(resolution: ' + (dpr * 96 + 1) + 'dpi)',
+                '(min-resolution: ' + (dpr - .5) + 'dppx)',
+                '(max-resolution: ' + (dpr - .5) + 'dppx)',
+                '(min-resolution: ' + dpr * 30 + 'dpcm)',
+                '(max-resolution: ' + dpr * 40 + 'dpcm)',
+                '(0dppx < resolution <= ' + dpr + 'dppx)',
+                '(' + dpr * 2 + 'dppx >= resolution > 0dppx)',
+                '(resolution > -1dpi)', '(resolution <= -1dpi)',
+                '(min-resolution: infinite)', '(max-resolution: infinite)',
+                '(resolution: 0)', '(resolution: 0dppx)',
+                '(resolution: 2px)', '(0dpi < resolution > 0dpi)',
+                '(resolution: nonsense)', '(min-resolution)',
+                '(resolution: ' + dpr + 'dppx) and (color-gamut: srgb)'
+            ];
+            return queries.map(query => matchMedia(query).matches);
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true, true, true, true, false, true, false, true, true, true, true,
+            true, false, false, true, false, false, false, false, false, false, true
+        ]));
+    }
+
+    #[test]
+    fn match_media_resolution_uses_macos_persona_pixel_density() {
+        assert_media_resolution_units_and_ranges(obscura_net::StealthProfile::MacChrome153);
+    }
+
+    #[test]
+    fn match_media_resolution_uses_windows_persona_pixel_density() {
+        assert_media_resolution_units_and_ranges(obscura_net::StealthProfile::WindowsChrome145);
+    }
+
+    #[test]
+    fn match_media_device_dimensions_track_screen_instead_of_viewport() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_viewport(640.0, 480.0);
+        let probe = r#"(() => [
+            matchMedia('(device-width: ' + screen.width + 'px)').matches,
+            matchMedia('(device-height: ' + screen.height + 'px)').matches,
+            matchMedia('(max-device-width: ' + screen.width + 'px)').matches,
+            matchMedia('(min-device-height: ' + screen.height + 'px)').matches,
+            matchMedia('(device-width: 640px)').matches,
+            matchMedia('(width: 640px)').matches
+        ])()"#;
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([true, true, true, true, false, true]));
+        rt.set_viewport(800.0, 600.0);
+        assert_eq!(rt.evaluate(probe).unwrap(), serde_json::json!([true, true, true, true, false, false]));
     }
 
     #[test]
@@ -20173,15 +21157,20 @@ return {before,removed,reinsert,moved,cleared};
             r#"
                 globalThis.__resizeBulkCalls = 0;
                 globalThis.__resizeBulkSizes = [];
+                globalThis.__resizeBulkReceiversMatch = true;
                 globalThis.__resizeLegacyGeometryCalls = 0;
                 globalThis.__resizeComputedStyleCalls = 0;
                 const nativeBulk = Deno.core.ops.op_resize_observer_measurements;
                 const nativeGeometry = Deno.core.ops.op_layout_geometry;
                 const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_resize_observer_measurements = input => {
+                Deno.core.ops.op_resize_observer_measurements = (...args) => {
                     __resizeBulkCalls++;
-                    __resizeBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    const [receivers, input] = args;
+                    const nids = JSON.parse(input);
+                    __resizeBulkSizes.push(nids.length);
+                    __resizeBulkReceiversMatch &&= receivers.length === nids.length &&
+                        receivers.every((receiver, index) => receiver instanceof Element && receiver._nid === nids[index]);
+                    return nativeBulk(...args);
                 };
                 Deno.core.ops.op_layout_geometry = (...args) => {
                     __resizeLegacyGeometryCalls++;
@@ -20226,6 +21215,7 @@ return {before,removed,reinsert,moved,cleared};
                 r#"[
                     __resizeBulkCalls,
                     __resizeBulkSizes,
+                    __resizeBulkReceiversMatch,
                     __resizeLegacyGeometryCalls,
                     __resizeComputedStyleCalls,
                     __duplicateResizeRecords,
@@ -20236,6 +21226,7 @@ return {before,removed,reinsert,moved,cleared};
             serde_json::json!([
                 1,
                 [7],
+                true,
                 0,
                 0,
                 1,
@@ -20540,15 +21531,20 @@ return {before,removed,reinsert,moved,cleared};
             r#"
                 globalThis.__intersectionBulkCalls = 0;
                 globalThis.__intersectionBulkSizes = [];
+                globalThis.__intersectionBulkReceiversMatch = true;
                 globalThis.__intersectionLegacyGeometryCalls = 0;
                 globalThis.__intersectionComputedStyleCalls = 0;
                 const nativeBulk = Deno.core.ops.op_intersection_observer_measurements;
                 const nativeGeometry = Deno.core.ops.op_layout_geometry;
                 const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_intersection_observer_measurements = input => {
+                Deno.core.ops.op_intersection_observer_measurements = (...args) => {
                     __intersectionBulkCalls++;
-                    __intersectionBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    const [receivers, input] = args;
+                    const nids = JSON.parse(input);
+                    __intersectionBulkSizes.push(nids.length);
+                    __intersectionBulkReceiversMatch &&= receivers.length === nids.length &&
+                        receivers.every((receiver, index) => receiver instanceof Element && receiver._nid === nids[index]);
+                    return nativeBulk(...args);
                 };
                 Deno.core.ops.op_layout_geometry = (...args) => {
                     __intersectionLegacyGeometryCalls++;
@@ -20595,6 +21591,7 @@ return {before,removed,reinsert,moved,cleared};
                 r#"[
                     __intersectionBulkCalls,
                     __intersectionBulkSizes,
+                    __intersectionBulkReceiversMatch,
                     __intersectionLegacyGeometryCalls,
                     __intersectionComputedStyleCalls,
                     __intersectionBatchRecords,
@@ -20604,6 +21601,7 @@ return {before,removed,reinsert,moved,cleared};
             serde_json::json!([
                 1,
                 [6],
+                true,
                 0,
                 0,
                 [
@@ -25505,7 +26503,8 @@ return {before,removed,reinsert,moved,cleared};
                     const calls = [];
                     try {
                         Deno.core.ops.op_fetch_url =
-                            (url, method, headers, body, origin, mode, credentials) => {
+                            (url, method, headers, body, mode, credentials, _privateFetchArguments) => {
+                        const origin = _privateFetchArguments[2];
                                 calls.push({ url, credentials });
                                 return JSON.stringify({
                                     status: 200,
@@ -25750,7 +26749,8 @@ return {before,removed,reinsert,moved,cleared};
             const original = Deno.core.ops.op_fetch_url;
             const calls = [];
             try {
-                Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, options) => {
+                Deno.core.ops.op_fetch_url = (url, method, headers, body, mode, credentials, _privateFetchArguments) => {
+                        const [options, , origin] = _privateFetchArguments;
                     calls.push(JSON.parse(options));
                     return JSON.stringify({status:200,headers:{},body:'',url});
                 };
@@ -25798,7 +26798,8 @@ return {before,removed,reinsert,moved,cleared};
                 const originalFetchOp = Deno.core.ops.op_fetch_url;
                 const calls = [];
                 try {
-                    Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, options) => {
+                    Deno.core.ops.op_fetch_url = (url, method, headers, body, mode, credentials, _privateFetchArguments) => {
+                        const [options, , origin] = _privateFetchArguments;
                         const fields = JSON.parse(headers);
                         const mime = Object.entries(fields).find(([name]) => name.toLowerCase() === 'content-type');
                         calls.push({present: JSON.parse(options).bodyPresent, bytes: Array.from(body), mime: mime ? mime[1] : null});
@@ -25851,7 +26852,8 @@ return {before,removed,reinsert,moved,cleared};
                 const originalFetchOp = Deno.core.ops.op_fetch_url;
                 const calls = [], errors = [];
                 try {
-                    Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode, credentials, options) => {
+                    Deno.core.ops.op_fetch_url = (url, method, headers, body, mode, credentials, _privateFetchArguments) => {
+                        const [options, , origin] = _privateFetchArguments;
                         calls.push({method,present:JSON.parse(options).bodyPresent,size:body.byteLength});
                         return JSON.stringify({status:200,headers:{},body:'ok',url});
                     };
@@ -25934,7 +26936,8 @@ return {before,removed,reinsert,moved,cleared};
                 const calls = [];
                 try {
                     Deno.core.ops.op_fetch_url =
-                        (url, method, headers, body, origin, mode, credentials, options) => {
+                        (url, method, headers, body, mode, credentials, _privateFetchArguments) => {
+                        const [options, , origin] = _privateFetchArguments;
                             calls.push({
                                 path: new URL(url).pathname,
                                 bodyPresent: JSON.parse(options).bodyPresent,
@@ -27114,7 +28117,7 @@ return {before,removed,reinsert,moved,cleared};
                 r#"async () => {
                 const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
                 const result = await WebAssembly.instantiateStreaming(
-                    Promise.resolve(new Response(bytes)),
+                    Promise.resolve(new Response(bytes, {headers:{"Content-Type":"application/wasm"}})),
                     {},
                 );
                 return result.instance instanceof WebAssembly.Instance;
@@ -28844,6 +29847,95 @@ return {before,removed,reinsert,moved,cleared};
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_capabilities_report_unsupported_real_codecs() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"
+          (function () {
+            globalThis.mediaCapabilityResults = null;
+            (async () => {
+                const video = {
+                    contentType: 'video/mp4; codecs="avc1.42E01E"',
+                    width: 640, height: 360, bitrate: 1000000, framerate: 30
+                };
+                const audio = { contentType: 'audio/mp4; codecs="mp4a.40.2"' };
+                const configuration = { type: 'file', video };
+                const pending = navigator.mediaCapabilities.decodingInfo(configuration);
+                video.width = 1920;
+                const results = await Promise.all([
+                    pending,
+                    navigator.mediaCapabilities.decodingInfo({ type: 'media-source', audio }),
+                    navigator.mediaCapabilities.decodingInfo({
+                        type: 'webrtc', video: { ...video, contentType: 'video/VP8' }
+                    }),
+                    navigator.mediaCapabilities.encodingInfo({ type: 'record', video }),
+                    navigator.mediaCapabilities.encodingInfo({ type: 'webrtc', audio }),
+                    navigator.mediaCapabilities.decodingInfo({
+                        type: 'file', audio: { contentType: 'audio/x-unknown' }
+                    })
+                ]);
+                globalThis.mediaCapabilityResults = {
+                    capabilities: results.map(r => [r.supported, r.smooth, r.powerEfficient]),
+                    keySystemAccess: results[0].keySystemAccess,
+                    copiedConfiguration: results[0].configuration !== configuration &&
+                        results[0].configuration.video !== video &&
+                        results[0].configuration.video.width === 640,
+                    canPlayType: document.createElement('video').canPlayType(video.contentType)
+                };
+            })();
+          })()
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("mediaCapabilityResults").unwrap(), serde_json::json!({
+            "capabilities": [[false, false, false], [false, false, false],
+                [false, false, false], [false, false, false],
+                [false, false, false], [false, false, false]],
+            "keySystemAccess": null,
+            "copiedConfiguration": true,
+            "canPlayType": ""
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn media_capabilities_reject_invalid_configuration() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"
+          (function () {
+            globalThis.invalidMediaCapabilityResults = null;
+            const video = {
+                contentType: 'video/webm; codecs="vp9"',
+                width: 640, height: 360, bitrate: 1000000, framerate: 30
+            };
+            const cases = [
+                ['decodingInfo', undefined],
+                ['decodingInfo', null],
+                ['decodingInfo', {}],
+                ['decodingInfo', { type: 'file' }],
+                ['decodingInfo', { type: 'record', video }],
+                ['encodingInfo', { type: 'file', video }],
+                ['decodingInfo', { type: 'file', audio: {} }],
+                ['decodingInfo', { type: 'file', audio: null }],
+                ['decodingInfo', { type: 'file', audio: { contentType: 'text/plain' } }],
+                ['decodingInfo', { type: 'file', video: { ...video, contentType: 'video/mp4' } }],
+                ['decodingInfo', { type: 'file', video: { ...video, contentType: 'not a mime type' } }],
+                ['decodingInfo', { type: 'file', video: { ...video, framerate: 0 } }],
+                ['decodingInfo', { type: 'file', video: { ...video, framerate: Infinity } }],
+                ['encodingInfo', { type: 'record', video: { contentType: video.contentType } }],
+                ['decodingInfo', { type: 'file', video, keySystemConfiguration: {} }]
+            ];
+            Promise.all(cases.map(([method, config]) => {
+                try {
+                    const pending = navigator.mediaCapabilities[method](config);
+                    return pending.then(() => 'resolved', e => e.name);
+                } catch (e) { return 'synchronous:' + e.name; }
+            })).then(results => { globalThis.invalidMediaCapabilityResults = results; });
+          })()
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("invalidMediaCapabilityResults").unwrap(),
+            serde_json::json!(vec!["TypeError"; 15]));
+    }
+
     #[test]
     fn unsupported_media_capabilities_and_readiness_are_honest() {
         let mut rt = setup_runtime(
@@ -29338,6 +30430,7 @@ return {before,removed,reinsert,moved,cleared};
         // locale here cannot race another test's V8 init.
         std::env::set_var("LC_ALL", "de-DE");
         std::env::set_var("LANG", "de-DE");
+        deno_core::v8::icu::set_default_locale("de-DE");
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
@@ -29963,4 +31056,737 @@ return {before,removed,reinsert,moved,cleared};
         // No pending navigation queued for the main page
         assert!(rt.take_pending_navigation().is_none());
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_real_proxy_protocol_tao_cors_observer_and_bounds() {
+        let (proxy, server)=standalone_proxy(vec![
+            (String::new(),b"hello".to_vec()),
+            ("Access-Control-Allow-Origin: *\r\n".into(),b"masked".to_vec()),
+            ("Access-Control-Allow-Origin: *\r\nTiming-Allow-Origin: https://wrong.test\r\nTiming-Allow-Origin: http://standalone.test\r\n".into(),b"allowed".to_vec()),
+            ("Timing-Allow-Origin: *\r\n".into(),b"opaque".to_vec()),
+            (String::new(),b"denied".to_vec()),
+        ]);
+        let mut rt=standalone_proxy_runtime(&proxy);
+        let result=rt.call_function_on_for_cdp(r#"async()=>{
+            const seen=[]; const observer=new PerformanceObserver(list=>seen.push(...list.getEntries()));
+            observer.observe({type:'resource'});
+            const before=performance.now();
+            await fetch('/same'); await fetch('http://cross.test/masked');
+            await fetch('http://cross.test/allowed'); await fetch('http://cross.test/opaque',{mode:'no-cors'});
+            let denied=false; try {await fetch('http://cross.test/denied');}catch(e){denied=e.name==='TypeError';}
+            const entries=performance.getEntriesByType('resource');
+            await new Promise(resolve=>setTimeout(resolve,0));
+            const after=performance.now();observer.disconnect();
+            const result={denied,count:entries.length,seen:seen.length,
+              protocol:entries.map(e=>e.nextHopProtocol),bytes:entries.map(e=>e.decodedBodySize),
+              range:entries.every(e=>e.startTime>=before&&e.responseEnd<=after&&e.duration>=0),
+              unknown:entries.every(e=>e.responseStart===undefined&&e.connectStart===undefined),
+              branded:entries.every(e=>e instanceof PerformanceResourceTiming&&e instanceof PerformanceEntry)};
+            performance.clearResourceTimings(); result.cleared=performance.getEntriesByType('resource').length===0;
+            performance.setResourceTimingBufferSize(0); return result;
+        }"#,None,&[],true,true).await.unwrap().value.unwrap();
+        assert_eq!(result,serde_json::json!({"denied":true,"count":4,"seen":4,
+            "protocol":["http/1.1","","http/1.1","http/1.1"],"bytes":[5,0,7,6],
+            "range":true,"unknown":true,"branded":true,"cleared":true}));
+        assert_eq!(server.join().unwrap().len(),5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_transport_failure_and_preaborted_request() {
+        use std::io::{Read as _,Write as _};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy=format!("http://{}",listener.local_addr().unwrap());
+        let server=std::thread::spawn(move||{
+            let (mut stream,_)=listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes=[0u8;8192];let n=stream.read(&mut bytes).unwrap();assert!(n>0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\nshort").unwrap();
+        });
+        let mut rt=standalone_proxy_runtime(&proxy);
+        let result=rt.call_function_on_for_cdp(r#"async()=>{
+            const ac=new AbortController();ac.abort();
+            try{await fetch('/preaborted',{signal:ac.signal});}catch(e){}
+            const pre=performance.getEntries().length;
+            let failed=false;try{await fetch('/truncated');}catch(e){failed=true;}
+            const entries=performance.getEntriesByType('resource');const e=entries[0];
+            return {pre,failed,count:entries.length,opaque:e&&e.nextHopProtocol===''&&e.decodedBodySize===0,
+              times:e&&e.duration>=0&&e.responseEnd>=e.startTime&&e.fetchStart===e.startTime};
+        }"#,None,&[],true,true).await.unwrap().value.unwrap();
+        assert_eq!(result,serde_json::json!({"pre":0,"failed":true,"count":1,"opaque":true,"times":true}));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn navigation_timing_actual_events_epoch_and_interface_brands() {
+        let mut rt=setup_runtime("<html></html>");
+        let start=obscura_net::timing::now();
+        let facts=obscura_net::timing::RequestTiming {start,fetch_start:start,end:Some(start),
+            protocol:Some("http/1.1"),decoded_body_size:Some(0),
+            hops:vec![("http://example.com/test".into(),None)],complete:true,transport_attempted:true,overflow:false};
+        rt.set_navigation_timing(start,&facts,"http://example.com/test");
+        rt.evaluate(r#"(()=>{
+            globalThis.seen=[];
+            document.addEventListener('readystatechange',()=>{
+                if(document.readyState==='complete')seen.push(['complete',performance.now(),performance.getEntriesByType('navigation')[0].loadEventStart]);
+            });
+            addEventListener('load',()=>seen.push(['load',performance.now(),performance.getEntriesByType('navigation')[0].loadEventStart]));
+        })()"#).unwrap();
+        rt.document_lifecycle(1).unwrap();rt.document_lifecycle(2).unwrap();rt.document_lifecycle(3).unwrap();
+        let value=rt.evaluate(r#"(()=>{
+            const n=performance.getEntriesByType('navigation')[0];const getter=Object.getOwnPropertyDescriptor(PerformanceResourceTiming.prototype,'fetchStart').get;
+            let forged=false,constructible=false;
+            try{getter.call(Object.create(PerformanceResourceTiming.prototype));}catch(e){forged=e instanceof TypeError;}
+            try{Reflect.construct(getter,[]);constructible=true;}catch(e){}
+            return {forged,constructible,nav:n instanceof PerformanceNavigationTiming,
+              events:seen.length===2&&seen[0][2]===0&&seen[1][2]>=seen[0][1]&&seen[1][1]>=seen[1][2],
+              ordered:n.loadEventEnd>=n.loadEventStart&&n.duration===n.loadEventEnd,
+              handoff:Object.hasOwn(globalThis,'__obscura_performance_registry_handoff')};
+        })()"#).unwrap();
+        assert_eq!(value,serde_json::json!({"forged":true,"constructible":false,"nav":true,"events":true,"ordered":true,"handoff":false}));
+        rt.set_dom(parse_html("<html><body>next</body></html>"));
+        assert_eq!(rt.evaluate("performance.getEntries().length").unwrap().as_f64(),Some(0.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_redirect_uses_final_fetch_start() {
+        use std::io::{Read as _,Write as _};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy=format!("http://{}",listener.local_addr().unwrap());
+        let server=std::thread::spawn(move||{
+            for response in [
+                b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".as_slice(),
+            ] {
+                let (mut stream,_)=listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut header=Vec::new();
+                while !header.windows(4).any(|w|w==b"\r\n\r\n") {
+                    let mut bytes=[0u8;4096];let n=stream.read(&mut bytes).unwrap();assert!(n>0);
+                    header.extend_from_slice(&bytes[..n]);assert!(header.len()<65536);
+                }
+                stream.write_all(response).unwrap();
+            }
+        });
+        let mut rt=standalone_proxy_runtime(&proxy);
+        let value=rt.call_function_on_for_cdp(r#"async()=>{
+            await fetch('/redirect');const entries=performance.getEntriesByType('resource');const e=entries[0];
+            return entries.length===1&&e.name.endsWith('/redirect')&&e.fetchStart>e.startTime&&e.responseEnd>=e.fetchStart&&e.nextHopProtocol==='http/1.1'&&e.decodedBodySize===2;
+        }"#,None,&[],true,true).await.unwrap().value;
+        assert_eq!(value,Some(serde_json::json!(true)));server.join().unwrap();
+    }
+
+    #[test]
+    fn resource_timing_cross_realm_brand_does_not_recreate_handoff() {
+        use deno_core::v8;
+        let mut rt=setup_runtime("<html></html>");
+        let start=obscura_net::timing::now();
+        let facts=obscura_net::timing::RequestTiming {start,fetch_start:start,end:Some(start),
+            protocol:Some("http/1.1"),decoded_body_size:Some(2),
+            hops:vec![("http://example.com/a".into(),None)],complete:true,transport_attempted:true,overflow:false};
+        rt.state.borrow_mut().performance_timeline.resource(&facts,"http://example.com/a","fetch","http://example.com",false);
+        rt.evaluate("globalThis.savedEntry=performance.getEntries()[0]").unwrap();
+        let child=rt.create_realm_context().unwrap();rt.share_deno_context_state_with_realm(&child);
+        assert!(rt.share_ops_with_realm(&child));rt.share_security_token_with_realm(&child);
+        let main=rt.runtime().main_context();
+        {
+            let mut entered=rt.runtime();let scope=&mut v8::HandleScope::with_context(entered.v8_isolate(),main);
+            let parent=scope.get_current_context().global(scope);
+            let child_global=v8::Local::new(scope,&child).global(scope);
+            let key=v8::String::new(scope,"savedEntry").unwrap();let entry=parent.get(scope,key.into()).unwrap();
+            assert!(child_global.set(scope,key.into(),entry).unwrap());
+        }
+        let probe=r#"JSON.stringify([
+          Object.getOwnPropertyDescriptor(PerformanceResourceTiming.prototype,'decodedBodySize').get.call(savedEntry)===2,
+          !Object.hasOwn(globalThis,'__obscura_performance_registry_handoff'),
+          (()=>{try{Object.getOwnPropertyDescriptor(PerformanceNavigationTiming.prototype,'loadEventEnd').get.call(savedEntry);return false;}catch(e){return e instanceof TypeError;}})()
+        ])"#;
+        assert_eq!(rt.eval_in_realm(&child,probe).unwrap(),"[true,true,true]");
+        rt.run_page_init();assert_eq!(rt.evaluate("Object.hasOwn(globalThis,'__obscura_performance_registry_handoff')").unwrap(),serde_json::json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_retired_document_discards_late_transport() {
+        use std::io::{Read as _,Write as _};
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy=format!("http://{}",listener.local_addr().unwrap());
+        let started=std::sync::Arc::new(AtomicBool::new(false));let server_started=started.clone();
+        let (release_tx,release_rx)=std::sync::mpsc::channel();
+        let server=std::thread::spawn(move||{
+            let (mut stream,_)=listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut buffer=[0u8;8192];assert!(stream.read(&mut buffer).unwrap()>0);
+            server_started.store(true,Ordering::Release);
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let _=stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        let mut rt=standalone_proxy_runtime(&proxy);
+        rt.evaluate("(()=>{globalThis.pendingTimingRequest=fetch('/delayed').catch(()=>null);void 0})()").unwrap();
+        for _ in 0..20 {
+            rt.run_event_loop_bounded(100).await.unwrap();
+            if started.load(Ordering::Acquire) {break;}
+        }
+        assert!(started.load(Ordering::Acquire));
+        rt.set_dom(parse_html("<html><body>replacement</body></html>"));
+        release_tx.send(()).unwrap();rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("performance.getEntries().length").unwrap().as_f64(),Some(0.0));
+        assert!(rt.state.borrow().fetch_cancellations.is_empty());server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_worker_owns_entries_and_excludes_navigation() {
+        let (proxy,server)=standalone_proxy(vec![(String::new(),b"ok".to_vec())]);
+        let mut rt=standalone_proxy_runtime(&proxy);rt.state.borrow_mut().ensure_persona_transport();
+        rt.execute_script("worker-timing",r#"
+            globalThis.workerTiming=null;
+            const code=`fetch('http://standalone.test/a').then(()=>{
+                const e=performance.getEntriesByType('resource')[0];
+                postMessage([e.nextHopProtocol,e.decodedBodySize,typeof PerformanceNavigationTiming,
+                  e instanceof PerformanceResourceTiming,PerformanceObserver.supportedEntryTypes.join(',')]);
+            }).catch(e=>postMessage({error:e.name}));`;
+            const worker=new Worker(URL.createObjectURL(new Blob([code])));
+            worker.onmessage=e=>{workerTiming=e.data;worker.terminate();};
+        "#).unwrap();
+        rt.run_event_loop_bounded(3000).await.unwrap();
+        assert_eq!(rt.evaluate("workerTiming").unwrap(),serde_json::json!(["http/1.1",2,"undefined",true,"mark,measure,resource"]));
+        assert_eq!(rt.evaluate("performance.getEntries().length").unwrap().as_f64(),Some(0.0));
+        assert_eq!(server.join().unwrap().len(),1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_observers_survive_clear_zero_full_and_take_records() {
+        let (proxy, server) = standalone_proxy((0..8).map(|_| (String::new(), b"ok".to_vec())).collect());
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let value = rt.call_function_on_for_cdp(r#"async()=>{
+            const seen=[]; const observer=new PerformanceObserver(list=>seen.push(...list.getEntries()));
+            observer.observe({type:'resource'});
+            await fetch('/clear'); const before=seen.length; performance.clearResourceTimings();
+            await new Promise(resolve=>setTimeout(resolve,0));
+            const clear=before===0&&seen.length===1&&performance.getEntries().length===0;
+            performance.setResourceTimingBufferSize(0); await fetch('/zero');
+            await new Promise(resolve=>setTimeout(resolve,0));
+            const zero=seen.length===2&&performance.getEntries().length===0;
+            performance.setResourceTimingBufferSize(1);
+            await fetch('/one');await fetch('/two');await fetch('/three');
+            await new Promise(resolve=>setTimeout(resolve,0));
+            const full=seen.length===5&&performance.getEntries().length===1;
+            let late=0;const buffered=new PerformanceObserver(list=>late+=list.getEntries().length);
+            buffered.observe({type:'resource',buffered:true});await new Promise(resolve=>setTimeout(resolve,0));buffered.disconnect();
+            await fetch('/take');const taken=observer.takeRecords();const prior=seen.length;
+            await new Promise(resolve=>setTimeout(resolve,0));const take=taken.length===1&&seen.length===prior;
+            await fetch('/disconnect');observer.disconnect();const stopped=seen.length;
+            await new Promise(resolve=>setTimeout(resolve,0));
+            await fetch('/unobserved');await new Promise(resolve=>setTimeout(resolve,0));
+            return [clear,zero,full,late===1,take,seen.length===stopped];
+        }"#,None,&[],true,true).await.unwrap().value;
+        assert_eq!(value,Some(serde_json::json!([true,true,true,true,true,true])));
+        assert_eq!(server.join().unwrap().len(),8);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_observer_reobserve_never_extends_current_delivery_task() {
+        let (proxy, server) = standalone_proxy(vec![(String::new(), b"ok".to_vec())]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let value = rt.call_function_on_for_cdp(r#"async()=>{
+            await fetch('/seed'); let calls=0;let afterFirstTask=0;
+            const observer=new PerformanceObserver(()=>{
+              calls++;observer.disconnect();
+              if(calls===1){
+                setTimeout(()=>{afterFirstTask=calls;},0);
+                observer.observe({type:'resource',buffered:true});
+              }
+            });observer.observe({type:'resource',buffered:true});
+            await new Promise(resolve=>setTimeout(resolve,20));
+            return [calls,afterFirstTask];
+        }"#,None,&[],true,true).await.unwrap().value;
+        assert_eq!(value,Some(serde_json::json!([2,1])));
+        assert_eq!(server.join().unwrap().len(),1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_retained_frame_owner_cannot_alias_reused_frame_id() {
+        use crate::frame::FrameRealm;
+        let (proxy, server) = standalone_proxy(vec![(String::new(),b"first".to_vec()),(String::new(),b"second".to_vec())]);
+        let mut rt = standalone_proxy_runtime(&proxy);
+        let old = FrameRealm::new(&mut rt, 1, 0, "http://standalone.test/old", "<html></html>").unwrap();
+        rt.execute_script("save-timing-owner", r#"
+          globalThis.oldPerformance=__obscura_frameObjects[1].window.performance;
+          globalThis.oldFetch=__obscura_frameObjects[1].window.fetch;
+          delete __obscura_frameObjects[1];
+        "#).unwrap();
+        drop(old);
+        let replacement = FrameRealm::new(&mut rt, 1, 0, "http://standalone.test/new", "<html></html>").unwrap();
+        let value = rt.call_function_on_for_cdp(r#"async()=>{
+            const child=__obscura_frameObjects[1].window;await child.fetch('/fresh-first');
+            const oldEntries=oldPerformance.getEntries().length;
+            oldPerformance.clearResourceTimings();oldPerformance.setResourceTimingBufferSize(0);
+            let rejected=false;try{await oldFetch('/retired');}catch(e){rejected=true;}
+            await child.fetch('/fresh-second');
+            const entries=child.performance.getEntriesByType('resource');
+            return [oldEntries,rejected,oldPerformance.getEntries().length,entries.length,
+              entries.map(e=>e.decodedBodySize),performance.getEntries().length];
+        }"#,None,&[],true,true).await.unwrap().value;
+        assert_eq!(value,Some(serde_json::json!([0,true,0,2,[5,6],0])));
+        assert_eq!(replacement.evaluate(&mut rt,"performance.getEntries().length").unwrap(),serde_json::json!(2));
+        assert!(rt.state.borrow().fetch_cancellations.is_empty());
+        assert_eq!(server.join().unwrap().len(),2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_child_inflight_replacement_discards_old_completion() {
+        use crate::frame::FrameRealm;
+        use std::io::{Read as _,Write as _};
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy=format!("http://{}",listener.local_addr().unwrap());
+        let started=std::sync::Arc::new(AtomicBool::new(false));let server_started=started.clone();
+        let (release_tx,release_rx)=std::sync::mpsc::channel();
+        let server=std::thread::spawn(move||{
+            let (mut stream,_)=listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut buffer=[0u8;8192];assert!(stream.read(&mut buffer).unwrap()>0);
+            server_started.store(true,Ordering::Release);
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let _=stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        let mut rt=standalone_proxy_runtime(&proxy);
+        let old=FrameRealm::new(&mut rt,1,0,"http://standalone.test/old","<html></html>").unwrap();
+        rt.evaluate("(()=>{globalThis.oldTiming=__obscura_frameObjects[1].window.performance;globalThis.pendingChild=__obscura_frameObjects[1].window.fetch('/delayed').catch(()=>null);void 0})()").unwrap();
+        for _ in 0..20 { rt.run_event_loop_bounded(100).await.unwrap();if started.load(Ordering::Acquire){break;} }
+        assert!(started.load(Ordering::Acquire));
+        rt.evaluate("delete __obscura_frameObjects[1]").unwrap();drop(old);
+        let fresh=FrameRealm::new(&mut rt,1,0,"http://standalone.test/new","<html></html>").unwrap();
+        release_tx.send(()).unwrap();rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("[oldTiming.getEntries().length,performance.getEntries().length]").unwrap(),serde_json::json!([0,0]));
+        assert_eq!(fresh.evaluate(&mut rt,"performance.getEntries().length").unwrap().as_f64(),Some(0.0));
+        assert!(rt.state.borrow().fetch_cancellations.is_empty());server.join().unwrap();
+    }
+
+    #[test]
+    fn resource_timing_observer_records_and_subscription_reset_with_document_epoch() {
+        let mut rt=setup_runtime("<html></html>");
+        rt.evaluate("(()=>{globalThis.retainedObserver=new PerformanceObserver(()=>{});retainedObserver.observe({type:'resource'});void 0})()").unwrap();
+        let seed=|rt:&ObscuraJsRuntime| {
+            let start=obscura_net::timing::now();
+            let facts=obscura_net::timing::RequestTiming { start,fetch_start:start,end:Some(start),
+                protocol:Some("http/1.1"),decoded_body_size:Some(2),hops:vec![("http://example.com/a".into(),None)],
+                complete:true,transport_attempted:true,overflow:false };
+            rt.state.borrow_mut().performance_timeline.resource(&facts,"http://example.com/a","fetch","http://example.com",false);
+        };
+        seed(&rt);
+        // Clear drains produced records into the observer, independently of retention.
+        rt.evaluate("performance.clearResourceTimings()").unwrap();
+        rt.set_dom(parse_html("<html>replacement</html>"));rt.run_page_init();
+        assert_eq!(rt.evaluate("retainedObserver.takeRecords().length").unwrap().as_f64(),Some(0.0));
+        rt.evaluate("(()=>{globalThis.freshObserver=new PerformanceObserver(()=>{});freshObserver.observe({type:'resource'});void 0})()").unwrap();
+        seed(&rt);
+        assert_eq!(rt.evaluate("[retainedObserver.takeRecords().length,freshObserver.takeRecords().length]").unwrap(),serde_json::json!([0,1]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_timing_queued_old_observer_stays_silent_and_successor_delivers() {
+        use crate::frame::FrameRealm;
+        use deno_core::v8;
+        let mut rt=setup_runtime("<html></html>");
+        // Seed the actual frame-owned native Timeline without pumping the event
+        // loop: the test must retire a genuinely queued, not-yet-delivered task.
+        let seed=|rt:&mut ObscuraJsRuntime, window_name:&str| {
+            let owner={
+                let context=rt.runtime().main_context();
+                let mut entered=rt.runtime();
+                let scope=&mut v8::HandleScope::with_context(entered.v8_isolate(),context);
+                let global=scope.get_current_context().global(scope);
+                let key=v8::String::new(scope,window_name).unwrap();
+                let value=global.get(scope,key.into()).unwrap();
+                let window=v8::Local::<v8::Object>::try_from(value).unwrap();
+                let context=window.get_creation_context(scope).unwrap();
+                context.get_slot::<std::cell::RefCell<crate::ops::ObscuraState>>()
+                    .expect("a real frame context owns Rc<RefCell<ObscuraState>>")
+            };
+            let start=obscura_net::timing::now();
+            let facts=obscura_net::timing::RequestTiming { start,fetch_start:start,end:Some(start),
+                protocol:Some("http/1.1"),decoded_body_size:Some(2),hops:vec![("http://example.com/observer".into(),None)],
+                complete:true,transport_attempted:true,overflow:false };
+            owner.borrow_mut().performance_timeline.resource(&facts,"http://example.com/observer","fetch","http://example.com",false);
+        };
+        let old=FrameRealm::new(&mut rt,71,0,"http://example.com/old-observer","<html></html>").unwrap();
+        old.execute_script(&mut rt,r#"
+            globalThis.observerCalls=[];
+            globalThis.observer=new PerformanceObserver(list=>observerCalls.push(list.getEntries().length));
+            observer.observe({type:'resource'});
+        "#).unwrap();
+        rt.evaluate("(()=>{globalThis.oldTimingWindow=__obscura_frameObjects[71].window;void 0})()").unwrap();
+        seed(&mut rt,"oldTimingWindow");
+        old.execute_script(&mut rt,"performance.clearResourceTimings();").unwrap();
+        assert_eq!(rt.evaluate("oldTimingWindow.observerCalls").unwrap(),serde_json::json!([]));
+        rt.evaluate("delete __obscura_frameObjects[71]").unwrap();drop(old);
+
+        let fresh=FrameRealm::new(&mut rt,71,0,"http://example.com/new-observer","<html></html>").unwrap();
+        fresh.execute_script(&mut rt,r#"
+            globalThis.observerCalls=[];
+            globalThis.observer=new PerformanceObserver(list=>observerCalls.push(list.getEntries().length));
+            observer.observe({type:'resource'});
+        "#).unwrap();
+        rt.evaluate("(()=>{globalThis.freshTimingWindow=__obscura_frameObjects[71].window;void 0})()").unwrap();
+        seed(&mut rt,"freshTimingWindow");
+        fresh.execute_script(&mut rt,"performance.clearResourceTimings();").unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(rt.evaluate("oldTimingWindow.observerCalls.length").unwrap().as_f64(),Some(0.0),
+            "the old already-queued observer callback must not execute after retirement");
+        assert_eq!(fresh.evaluate(&mut rt,"observerCalls").unwrap(),serde_json::json!([1]),
+            "the live successor callback must execute once with its own produced entry");
+        // Retained old observer code cannot borrow the reused frame's liveness.
+        rt.evaluate("(()=>{oldTimingWindow.observer.observe({type:'resource',buffered:true});void 0})()").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[oldTimingWindow.observerCalls.length,freshTimingWindow.observerCalls.length]").unwrap(),serde_json::json!([0,1]));
+    }
+
+    #[test]
+    fn dom_accessors_reject_incompatible_receivers_and_keep_interface_descriptors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe=document.createElement('iframe'), div=document.createElement('div');
+            return [[Document,'referrer',document],[HTMLIFrameElement,'contentDocument',iframe],
+                [HTMLIFrameElement,'contentWindow',iframe]].map(([ctor,key,real]) => {
+                const p=ctor.prototype,d=Object.getOwnPropertyDescriptor(p,key),g=d.get;
+                const rejects=value=>{try{g.call(value);return false;}catch(e){return e instanceof TypeError;}};
+                const bad=[p,{},Object.create(p),new Proxy(real,{}),null,undefined,div,
+                    {localName:'iframe',nodeType:9,_nid:real._nid,isConnected:false}];
+                const prototypeThrows=(()=>{try{p[key];return false;}catch(e){return e instanceof TypeError;}})();
+                let touches=0; const trap={get localName(){touches++;return 'iframe';}};
+                const rejectsBeforeRead=rejects(trap)&&touches===0;
+                return [bad.every(rejects),prototypeThrows,rejectsBeforeRead,
+                    d.enumerable,d.configurable,d.set===undefined,g.length===0,
+                    g.name==='get '+key,Reflect.ownKeys(g).sort().join(',')==='length,name',
+                    key==='referrer'||(!Object.hasOwn(Element.prototype,key)&&!(key in div))];
+            });
+        })()"#).unwrap(), serde_json::json!([[true,true,true,true,true,true,true,true,true,true],[true,true,true,true,true,true,true,true,true,true],[true,true,true,true,true,true,true,true,true,true]]));
+    }
+
+    #[test]
+    fn document_referrer_borrowing_uses_genuine_document_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_referrer("https://source.example/main");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const get=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;
+            const docs=[new Document(),new DOMParser().parseFromString('<p>parsed</p>','text/html'),
+                new DOMParser().parseFromString('<root/>','application/xml'),
+                document.implementation.createHTMLDocument('detached'),
+                document.implementation.createDocument(null,'root')];
+            const frame=document.createElement('iframe');document.body.appendChild(frame);
+            const child=frame.contentDocument;
+            const childGet=Object.getOwnPropertyDescriptor(frame.contentWindow.Document.prototype,'referrer').get;
+            return [get.call(document)==='https://source.example/main',
+                docs.every(d=>d.referrer===''&&get.call(d)===''),
+                child.referrer==='http://example.com/test',get.call(child)===child.referrer,
+                childGet.call(document)==='https://source.example/main'];
+        })()"#).unwrap(), serde_json::json!([true,true,true,true,true]));
+    }
+
+    #[test]
+    fn iframe_accessor_brands_cover_native_wrapper_paths_and_teardown() {
+        let mut rt = setup_runtime("<html><body><iframe id='parsed'></iframe><div id='ordinary'></div></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const getDoc=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,'contentDocument').get;
+            const getWin=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,'contentWindow').get;
+            const parsed=document.getElementById('parsed');
+            const frames=[parsed,document.createElement('iframe'),
+                document.createElementNS('http://www.w3.org/1999/xhtml','iframe'),parsed.cloneNode(false),
+                document.importNode(parsed,false)];
+            const created=frames.every(f=>{document.body.appendChild(f);return getDoc.call(f)===f.contentDocument&&
+                getWin.call(f)===f.contentWindow&&f.contentWindow.document===f.contentDocument;});
+            const outer=frames[1],doc=outer.contentDocument,win=outer.contentWindow;
+            const nested=doc.createElement('iframe');doc.body.appendChild(nested);
+            nested.contentDocument.body.innerHTML='<p id="child">retained</p>';
+            const readContents=getDoc.call(nested).getElementById('child').textContent==='retained';
+            Object.defineProperty(outer,'localName',{value:'div',configurable:true});
+            const immutableBrand=getDoc.call(outer)===doc;
+            delete outer.localName;
+            outer.remove();
+            const detached=getDoc.call(outer)===null&&getWin.call(outer)===null&&doc.isConnected&&
+                nested.contentDocument===null&&nested.contentWindow===null;
+            document.body.appendChild(outer);
+            const replaced=getDoc.call(outer)!==doc&&getWin.call(outer)!==win;
+            let forged=false;try{getDoc.call(new HTMLIFrameElement(outer._nid));}catch(e){forged=e instanceof TypeError;}
+            return [created,readContents,immutableBrand,detached,replaced,forged,
+                !('contentDocument' in document.getElementById('ordinary'))];
+        })()"#).unwrap(), serde_json::json!([true,true,true,true,true,true,true]));
+    }
+
+    #[test]
+    fn document_referrer_retained_document_does_not_alias_next_navigation() {
+        let mut rt = setup_runtime("<html><body>old</body></html>");
+        rt.set_referrer("https://source.example/old");
+        rt.evaluate("(()=>{globalThis.oldDocument=document; globalThis.oldReferrerGetter=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;return true;})()").unwrap();
+        assert_eq!(rt.evaluate("[oldDocument.referrer,oldReferrerGetter.call(oldDocument)]").unwrap(),
+            serde_json::json!(["https://source.example/old","https://source.example/old"]));
+        rt.set_dom(parse_html("<html><body>new</body></html>"));
+        rt.set_referrer("https://source.example/new");
+        // Init is once per runtime. set_dom retires the exposed Document but
+        // does not replace the global wrapper; Page navigation uses a new runtime.
+        assert_eq!(rt.state.borrow().referrer,"https://source.example/new");
+        assert_eq!(rt.evaluate("[document===oldDocument,oldDocument.referrer,oldReferrerGetter.call(oldDocument)]").unwrap(),
+            serde_json::json!([true,"",""]));
+    }
+
+    #[test]
+    fn document_and_iframe_accessors_borrow_across_real_frame_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_referrer("https://source.example/parent");
+        let child=crate::frame::FrameRealm::new(&mut rt,87,0,"http://example.com/child",
+            "<html><body><iframe id='nested'></iframe></body></html>").unwrap();
+        child.execute_script(&mut rt,r#"globalThis.childReferrerGetter=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;"#).unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const w=__obscura_frameObjects[87].window,d=w.document;
+            const parentGet=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;
+            globalThis.retainedFrameDocument=d;globalThis.retainedFrameGetter=w.childReferrerGetter;
+            const iframe=d.getElementById('nested');
+            const getDoc=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,'contentDocument').get;
+            const getWin=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,'contentWindow').get;
+            return [parentGet.call(d)==='',w.childReferrerGetter.call(document)==='https://source.example/parent',
+                getDoc.call(iframe)===iframe.contentDocument,getWin.call(iframe)===iframe.contentWindow,
+                !Object.hasOwn(w,'__obscura_core_handoff')];
+        })()"#).unwrap(),serde_json::json!([true,true,true,true,true]));
+        drop(child);
+        rt.evaluate("delete __obscura_frameObjects[87]").unwrap();
+        let fresh=crate::frame::FrameRealm::new(&mut rt,87,0,"http://example.com/replacement","<html><body>new</body></html>").unwrap();
+        assert_eq!(rt.evaluate("[retainedFrameGetter.call(document),retainedFrameGetter.call(retainedFrameDocument),retainedFrameDocument.referrer]").unwrap(),
+            serde_json::json!(["https://source.example/parent","",""]));
+        drop(fresh);
+    }
+
+    #[test]
+    fn iframe_accessors_use_registered_native_identity_despite_public_field_shadows() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const a=document.createElement('iframe'),b=document.createElement('iframe');
+            document.body.append(a,b);
+            const ad=a.contentDocument,bd=b.contentDocument,aw=a.contentWindow;
+            ad.body.innerHTML='<p id="a">first frame</p>';bd.body.innerHTML='<p id="b">second frame</p>';
+            const getDoc=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,'contentDocument').get;
+            const getWin=Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype,'contentWindow').get;
+            const id=a._nid;
+            a._nid=b._nid;
+            Object.defineProperty(a,'isConnected',{value:false,configurable:true});
+            Object.defineProperty(a,'localName',{value:'div',configurable:true});
+            const same=getDoc.call(a)===ad&&getWin.call(a)===aw&&getDoc.call(a).getElementById('a').textContent==='first frame';
+            a._nid=id;delete a.isConnected;delete a.localName;a.remove();
+            Object.defineProperty(a,'isConnected',{value:true,configurable:true});
+            a._nid=b._nid;
+            return [same,getDoc.call(a)===null,getWin.call(a)===null,b.contentDocument===bd];
+        })()"#).unwrap(),serde_json::json!([true,true,true,true]));
+    }
+
+    #[test]
+    fn document_referrer_native_cloned_root_is_detached_metadata() {
+        let mut rt = setup_runtime("<html><body><p>clone contents</p><iframe id='cloned-frame'></iframe></body></html>");
+        rt.set_referrer("https://source.example/active");
+        let child = {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            let clone = dom.clone_node(dom.document(), true).unwrap();
+            dom.children(clone).last().copied().unwrap().raw()
+        };
+        // Reach the uncached native Document through the real wrapper path.
+        // Public document.cloneNode currently uses a different incomplete path.
+        assert_eq!(rt.evaluate(&format!(r#"(() => {{
+            globalThis.clonedRoot=new HTMLElement({child});
+            globalThis.clonedDocument=clonedRoot.parentNode;
+            const clonedFrame=clonedRoot.querySelector('iframe');
+            const get=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;
+            return [clonedDocument.nodeType===9,clonedDocument!==document,
+                clonedDocument.referrer,get.call(clonedDocument),document.referrer,
+                clonedFrame!==document.getElementById('cloned-frame'),!clonedFrame.isConnected,
+                clonedFrame.contentDocument===null,clonedFrame.contentWindow===null];
+        }})()"#)).unwrap(),serde_json::json!([true,true,"","","https://source.example/active",true,true,true,true]));
+        rt.set_dom(parse_html("<html><body>new document</body></html>"));
+        rt.set_referrer("https://source.example/replacement");
+        // The detached clone remains empty, and the old exposed main Document
+        // is retired even though native host metadata now describes a new DOM.
+        assert_eq!(rt.state.borrow().referrer,"https://source.example/replacement");
+        assert_eq!(rt.evaluate("[clonedDocument.referrer,document.referrer]").unwrap(),
+            serde_json::json!(["",""]));
+    }
+
+    #[test]
+    fn document_referrer_initial_blank_retirement_and_reinsert_are_receiver_owned() {
+        let mut rt=setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const frame=document.createElement('iframe');document.body.appendChild(frame);
+            const old=frame.contentDocument,win=frame.contentWindow;
+            const get=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;
+            const childGet=Object.getOwnPropertyDescriptor(win.Document.prototype,'referrer').get;
+            const nested=old.createElement('iframe');old.body.appendChild(nested);
+            const nestedDoc=nested.contentDocument;
+            const initial=get.call(old)==='http://example.com/test'&&get.call(nestedDoc)==='about:blank';
+            frame.remove();
+            const retired=old.referrer===''&&get.call(old)===''&&childGet.call(old)===''&&get.call(nestedDoc)==='';
+            const contentsRetained=old.isConnected&&nestedDoc.isConnected&&nested.contentDocument===null;
+            document.body.appendChild(frame);
+            const current=frame.contentDocument;
+            return [initial,retired,contentsRetained,current!==old,
+                get.call(current)==='http://example.com/test',get.call(old)==='',get.call(nestedDoc)===''];
+        })()"#).unwrap(),serde_json::json!([true,true,true,true,true,true,true]));
+    }
+
+    #[test]
+    fn document_referrer_real_frame_nonempty_metadata_retires_before_id_reuse() {
+        use deno_core::v8;
+        let mut rt=setup_runtime("<html><body></body></html>");rt.set_referrer("https://source.example/parent");
+        // Seed the same native document-owned navigation metadata used by the
+        // host, independently of JavaScript slots and without network traffic.
+        let seed=|rt:&mut ObscuraJsRuntime,name:&str,referrer:&str| {
+            let owner={
+                let context=rt.runtime().main_context();let mut entered=rt.runtime();
+                let scope=&mut v8::HandleScope::with_context(entered.v8_isolate(),context);
+                let global=scope.get_current_context().global(scope);
+                let key=v8::String::new(scope,name).unwrap();let value=global.get(scope,key.into()).unwrap();
+                let window=v8::Local::<v8::Object>::try_from(value).unwrap();
+                window.get_creation_context(scope).unwrap()
+                    .get_slot::<std::cell::RefCell<crate::ops::ObscuraState>>().unwrap()
+            };
+            owner.borrow_mut().referrer=referrer.to_owned();
+        };
+        let old=crate::frame::FrameRealm::new(&mut rt,93,0,"http://example.com/old","<html><body>old</body></html>").unwrap();
+        rt.evaluate("(()=>{globalThis.oldWindow=__obscura_frameObjects[93].window;globalThis.oldFrameDoc=oldWindow.document;globalThis.borrowedFrameReferrer=Object.getOwnPropertyDescriptor(oldWindow.Document.prototype,'referrer').get;return true;})()").unwrap();
+        seed(&mut rt,"oldWindow","https://source.example/old-child");
+        assert_eq!(rt.evaluate("[oldFrameDoc.referrer,Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get.call(oldFrameDoc),borrowedFrameReferrer.call(document)]").unwrap(),
+            serde_json::json!(["https://source.example/old-child","https://source.example/old-child","https://source.example/parent"]));
+        drop(old);rt.evaluate("delete __obscura_frameObjects[93]").unwrap();
+        assert_eq!(rt.evaluate("[oldFrameDoc.referrer,borrowedFrameReferrer.call(oldFrameDoc)]").unwrap(),serde_json::json!(["",""]));
+        let fresh=crate::frame::FrameRealm::new(&mut rt,93,0,"http://example.com/fresh","<html><body>fresh</body></html>").unwrap();
+        rt.evaluate("(()=>{globalThis.freshWindow=__obscura_frameObjects[93].window;return true;})()").unwrap();
+        seed(&mut rt,"freshWindow","https://source.example/fresh-child");
+        assert_eq!(rt.evaluate("[oldFrameDoc.referrer,freshWindow.document.referrer,borrowedFrameReferrer.call(freshWindow.document),borrowedFrameReferrer.call(document)]").unwrap(),
+            serde_json::json!(["","https://source.example/fresh-child","https://source.example/fresh-child","https://source.example/parent"]));
+        drop(fresh);
+    }
+
+    #[test]
+    fn document_referrer_loaded_remove_retires_synchronously_while_realms_alive() {
+        use deno_core::v8;
+        let mut rt=setup_runtime("<html><body><iframe id='loaded'></iframe></body></html>");
+        rt.set_referrer("https://source.example/parent");
+        let seed=|rt:&mut ObscuraJsRuntime,name:&str,referrer:&str| {
+            let owner={
+                let context=rt.runtime().main_context();let mut entered=rt.runtime();
+                let scope=&mut v8::HandleScope::with_context(entered.v8_isolate(),context);
+                let global=scope.get_current_context().global(scope);
+                let key=v8::String::new(scope,name).unwrap();let value=global.get(scope,key.into()).unwrap();
+                let window=v8::Local::<v8::Object>::try_from(value).unwrap();
+                window.get_creation_context(scope).unwrap()
+                    .get_slot::<std::cell::RefCell<crate::ops::ObscuraState>>().unwrap()
+            };
+            owner.borrow_mut().referrer=referrer.to_owned();
+        };
+        // Bind the real host-created realm to an actual connected iframe using
+        // the same element registry populated by the frame-ready path.
+        rt.evaluate("(()=>{globalThis.loadedFrame=document.getElementById('loaded');void loadedFrame.contentDocument;loadedFrame._frameId=95;__obscura_frameElements[95]=loadedFrame;return true;})()").unwrap();
+        let child=crate::frame::FrameRealm::new(&mut rt,95,0,"http://example.com/loaded",
+            "<html><body><p id='marker'>loaded contents</p><iframe id='nested'></iframe></body></html>").unwrap();
+        child.execute_script(&mut rt,"globalThis.nestedFrame=document.getElementById('nested');void nestedFrame.contentDocument;nestedFrame._frameId=96;__obscura_frameElements[96]=nestedFrame;").unwrap();
+        let nested=crate::frame::FrameRealm::new(&mut rt,96,95,"http://example.com/nested","<html><body>nested contents</body></html>").unwrap();
+        rt.evaluate("(()=>{globalThis.loadedWindow=__obscura_frameObjects[95].window;globalThis.nestedWindow=__obscura_frameObjects[96].window;globalThis.loadedDoc=loadedWindow.document;globalThis.nestedDoc=nestedWindow.document;globalThis.loadedGet=Object.getOwnPropertyDescriptor(loadedWindow.Document.prototype,'referrer').get;return true;})()").unwrap();
+        seed(&mut rt,"loadedWindow","https://source.example/child");
+        seed(&mut rt,"nestedWindow","https://source.example/nested");
+        assert_eq!(rt.evaluate("[loadedFrame.contentDocument===loadedDoc,loadedDoc.referrer,nestedDoc.referrer]").unwrap(),
+            serde_json::json!([true,"https://source.example/child","https://source.example/nested"]));
+        let unrelated=crate::frame::FrameRealm::new(&mut rt,98,0,"http://example.com/unrelated","<html><body>unrelated</body></html>").unwrap();
+        rt.evaluate("(()=>{globalThis.unrelatedWindow=__obscura_frameObjects[98].window;globalThis.unrelatedDoc=unrelatedWindow.document;return true;})()").unwrap();
+        seed(&mut rt,"unrelatedWindow","https://source.example/unrelated");
+        // Both Rust FrameRealms remain alive through this same JS call. Waiting
+        // for host sweep/drop cannot satisfy synchronous browser semantics.
+        // A public field changed after trusted binding cannot retarget native
+        // document retirement to a different live realm.
+        assert_eq!(rt.evaluate(r#"(()=>{
+            const get=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;
+            loadedFrame._frameId=98;loadedFrame.remove();
+            return [loadedDoc.referrer,get.call(loadedDoc),loadedGet.call(loadedDoc),
+                nestedDoc.referrer,get.call(nestedDoc),loadedGet.call(document),
+                loadedDoc.getElementById('marker').textContent,loadedDoc.isConnected,
+                loadedFrame.contentDocument===null,loadedWindow.nestedFrame.contentDocument===null];
+        })()"#).unwrap(),serde_json::json!(["","","","","","https://source.example/parent","loaded contents",true,true,true]));
+        assert_eq!(child.evaluate(&mut rt,"document.referrer").unwrap(),serde_json::json!(""));
+        assert_eq!(nested.evaluate(&mut rt,"document.referrer").unwrap(),serde_json::json!(""));
+        assert_eq!(unrelated.evaluate(&mut rt,"document.referrer").unwrap(),serde_json::json!("https://source.example/unrelated"));
+        assert_eq!(rt.evaluate("unrelatedDoc.referrer").unwrap(),serde_json::json!("https://source.example/unrelated"));
+        drop(unrelated);drop(nested);drop(child);
+        rt.evaluate("(()=>{document.body.appendChild(loadedFrame);void loadedFrame.contentDocument;loadedFrame._frameId=95;__obscura_frameElements[95]=loadedFrame;return true;})()").unwrap();
+        let fresh=crate::frame::FrameRealm::new(&mut rt,95,0,"http://example.com/fresh","<html><body>fresh</body></html>").unwrap();
+        rt.evaluate("(()=>{globalThis.freshLoadedWindow=__obscura_frameObjects[95].window;return true;})()").unwrap();
+        seed(&mut rt,"freshLoadedWindow","https://source.example/fresh");
+        assert_eq!(rt.evaluate("[loadedDoc.referrer,nestedDoc.referrer,loadedFrame.contentDocument===freshLoadedWindow.document,loadedGet.call(freshLoadedWindow.document),document.referrer]").unwrap(),
+            serde_json::json!(["","",true,"https://source.example/fresh","https://source.example/parent"]));
+        drop(fresh);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_referrer_provisional_iframe_retires_on_each_response_path() {
+        use deno_core::v8;
+        let mut rt=setup_runtime("<html><body></body></html>");
+        rt.set_url("http://example.com/parent");
+        rt.execute_script("pending-frame-responses",r#"
+            globalThis.requests=[];
+            globalThis.fetch=url=>new Promise((resolve,reject)=>requests.push({url,resolve,reject}));
+            globalThis.cases=[];
+            for(let i=0;i<3;i++){
+                const frame=document.createElement('iframe');document.body.appendChild(frame);
+                frame.src='/response-'+i;
+                const old=frame.contentDocument;
+                const nested=old.createElement('iframe');old.body.appendChild(nested);
+                const nestedDoc=nested.contentDocument;
+                old.body.appendChild(old.createElement('p')).textContent='retained '+i;
+                cases.push({frame,old,nested,nestedDoc,generation:frame._iframeGeneration,
+                    get:Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get});
+            }
+            cases[0].nested._frameId=97;__obscura_frameElements[97]=cases[0].nested;
+        "#).unwrap();
+        let descendant=crate::frame::FrameRealm::new(&mut rt,97,0,"http://example.com/descendant","<html><body>real descendant</body></html>").unwrap();
+        rt.evaluate("(()=>{globalThis.descendantWindow=__obscura_frameObjects[97].window;globalThis.descendantDoc=descendantWindow.document;return true;})()").unwrap();
+        let owner={
+            let context=rt.runtime().main_context();let mut entered=rt.runtime();
+            let scope=&mut v8::HandleScope::with_context(entered.v8_isolate(),context);
+            let global=scope.get_current_context().global(scope);
+            let key=v8::String::new(scope,"descendantWindow").unwrap();
+            let value=global.get(scope,key.into()).unwrap();
+            let window=v8::Local::<v8::Object>::try_from(value).unwrap();
+            window.get_creation_context(scope).unwrap()
+                .get_slot::<std::cell::RefCell<crate::ops::ObscuraState>>().unwrap()
+        };
+        owner.borrow_mut().referrer="https://source.example/real-descendant".into();
+        assert_eq!(rt.evaluate("[requests.length,descendantDoc.referrer]").unwrap(),
+            serde_json::json!([3,"https://source.example/real-descendant"]));
+        rt.execute_script("finish-frame-responses",r#"
+            requests[0].resolve({ok:true,text:async()=>'<p id="loaded">loaded</p>'});
+            requests[1].resolve({ok:false,type:'basic'});
+            requests[2].reject(new Error('controlled fixture rejection'));
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_frames().len(),1,"only the successful current response queues a real realm");
+        assert_eq!(rt.evaluate(r#"cases.map(({frame,old,nested,nestedDoc,get,generation})=>[
+            old.referrer,get.call(old),nestedDoc.referrer,get.call(nestedDoc),
+            frame.contentDocument!==old,frame.contentDocument.referrer,
+            old.body.textContent.includes('retained'),old.isConnected,
+            nested.contentDocument===null,frame._iframeGeneration===generation])"#).unwrap(),
+            serde_json::json!([["","","","",true,"http://example.com/parent",true,true,true,true],
+                ["","","","",true,"http://example.com/parent",true,true,true,true],
+                ["","","","",true,"http://example.com/parent",true,true,true,true]]));
+        assert_eq!(descendant.evaluate(&mut rt,"document.referrer").unwrap(),serde_json::json!(""),
+            "replacing a provisional shim must synchronously retire its real descendant while host realm survives");
+        assert_eq!(rt.evaluate(r#"cases.map(({frame,old,get})=>{
+            const current=frame.contentDocument;frame.remove();frame.removeAttribute('src');
+            document.body.appendChild(frame);
+            return [get.call(old),get.call(current),frame.contentDocument.referrer,frame.contentDocument!==current];
+        })"#).unwrap(),serde_json::json!([["","","http://example.com/parent",true],
+            ["","","http://example.com/parent",true],["","","http://example.com/parent",true]]));
+        drop(descendant);
+    }
+
 }
+
+#[cfg(test)]
+#[path = "speech_startup_tests.rs"]
+mod speech_startup_tests;
+
+#[cfg(test)]
+#[path="image_dimension_tests.rs"]
+mod image_dimension_tests;

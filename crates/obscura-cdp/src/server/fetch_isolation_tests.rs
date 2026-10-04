@@ -21,6 +21,7 @@ impl Client {
     async fn command(&mut self, session: Option<&str>, method: &str, params: Value) -> Value {
         self.id += 1;
         self.tx.send(ServerMessage::Cdp(CdpMessage {
+            admission: None,
             text: json!({"id":self.id,"sessionId":session,"method":method,"params":params}).to_string(),
             reply_tx: self.reply_tx.clone(),
         })).unwrap();
@@ -118,6 +119,7 @@ async fn client() -> (Client, tokio::task::JoinHandle<()>) {
         context,
         ServerShutdown::new(),
         obscura_js::execution_cancellation::ExecutionCancellation::default(),
+        crate::input_admission::Admission::default(),
     ));
     tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
     let mut client = Client { tx, replies, reply_tx, events: Vec::new(), id: 0 };
@@ -658,6 +660,7 @@ async fn single_page_sessionless_pause_resolution_and_navigation_disconnect() {
         let html = format!("<script>globalThis.result=fetch('{base}/during-nav').then(r=>r.text())</script>");
         client.id += 1;
         client.tx.send(ServerMessage::Cdp(CdpMessage {
+            admission: None,
             text:json!({"id":client.id,"method":"Page.navigate","sessionId":session,"params":{"url":format!("data:text/html,{html}")}}).to_string(),
             reply_tx:client.reply_tx.clone(),
         })).unwrap();
@@ -690,6 +693,7 @@ async fn target_lifecycle_commands_release_navigation_fetch_pauses_before_defer(
         let html = format!("<script>globalThis.result=fetch('{base}/detach-during-nav').then(r=>r.text()).catch(()=> 'failed')</script>");
         client.id += 1;
         client.tx.send(ServerMessage::Cdp(CdpMessage {
+            admission: None,
             text:json!({"id":client.id,"method":"Page.navigate","sessionId":detached_session,
                 "params":{"url":format!("data:text/html,{html}")}}).to_string(),
             reply_tx:client.reply_tx.clone(),
@@ -713,6 +717,7 @@ async fn target_lifecycle_commands_release_navigation_fetch_pauses_before_defer(
         let html = format!("<script>globalThis.result=fetch('{base}/close-during-nav').then(r=>r.text()).catch(()=> 'failed')</script>");
         client.id += 1;
         client.tx.send(ServerMessage::Cdp(CdpMessage {
+            admission: None,
             text:json!({"id":client.id,"method":"Page.navigate","sessionId":close_session,
                 "params":{"url":format!("data:text/html,{html}")}}).to_string(),
             reply_tx:client.reply_tx.clone(),
@@ -744,6 +749,7 @@ async fn navigation_keeps_page_count_and_sessionless_owner_stable() {
         client.id += 1;
         let html = format!("<script>globalThis.result=fetch('{base}/left-nav').then(r=>r.text())</script>");
         client.tx.send(ServerMessage::Cdp(CdpMessage {
+            admission: None,
             text:json!({"id":client.id,"method":"Page.navigate","sessionId":left,"params":{"url":format!("data:text/html,{html}")}}).to_string(),
             reply_tx:client.reply_tx.clone(),
         })).unwrap();
@@ -771,6 +777,7 @@ async fn queued_fetches_abort_before_disconnect_without_transport() {
         let (_, session) = page(&mut client, &base).await;
         client.id += 1;
         client.tx.send(ServerMessage::Cdp(CdpMessage {
+            admission: None,
             text:json!({"id":client.id,"method":"Runtime.evaluate","sessionId":session,
                 "params":{"expression":format!("fetch('{base}/queued-a').catch(()=>{{}});fetch('{base}/queued-b').catch(()=>{{}}); 'queued'"),"returnByValue":true}}).to_string(),
             reply_tx:client.reply_tx.clone(),
@@ -998,6 +1005,7 @@ async fn failure_observation_navigation_pause_uses_pending_document_loader() {
         client.id+=1;
         let command_id=client.id;
         client.tx.send(ServerMessage::Cdp(CdpMessage {
+            admission: None,
             text:json!({"id":command_id,"method":"Page.navigate","sessionId":session,"params":{"url":url}}).to_string(),reply_tx:client.reply_tx.clone(),
         })).unwrap();
         let pause=client.pause(&session).await;

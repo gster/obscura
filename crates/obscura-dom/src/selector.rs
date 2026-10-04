@@ -104,6 +104,7 @@ pub enum PseudoClass {
     Focus,
     FocusVisible,
     FocusWithin,
+    PopoverOpen,
     Target,
     Enabled,
     Disabled,
@@ -154,6 +155,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Focus => dest.write_str(":focus"),
             PseudoClass::FocusVisible => dest.write_str(":focus-visible"),
             PseudoClass::FocusWithin => dest.write_str(":focus-within"),
+            PseudoClass::PopoverOpen => dest.write_str(":popover-open"),
             PseudoClass::Target => dest.write_str(":target"),
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
@@ -235,6 +237,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "focus" => Ok(PseudoClass::Focus),
             "focus-visible" => Ok(PseudoClass::FocusVisible),
             "focus-within" => Ok(PseudoClass::FocusWithin),
+            "popover-open" => Ok(PseudoClass::PopoverOpen),
             "target" => Ok(PseudoClass::Target),
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
@@ -523,6 +526,7 @@ impl<'a> Element for DomElement<'a> {
                     id == self.node_id || self.tree.ancestors(id).contains(&self.node_id)
                 })
             }
+            PseudoClass::PopoverOpen => self.tree.popover_open(self.node_id),
             PseudoClass::Target => self.tree.target_element() == Some(self.node_id),
             PseudoClass::Focus => self.tree.input_state().focused == Some(self.node_id),
             PseudoClass::FocusVisible => {
@@ -1279,6 +1283,27 @@ mod tests {
     use crate::tree_sink::parse_html;
 
     use super::{DomElement, SelectorKey};
+
+    #[test]
+    fn popover_selectors_share_native_state_and_disconnect_closes_subtrees() {
+        let tree = parse_html("<div id=parent><div id=p popover=manual></div></div>");
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let popover = tree.get_element_by_id("p").unwrap();
+        assert!(tree.query_selector_all(":popover-open").unwrap().is_empty());
+        assert!(tree.set_popover_open(popover, true));
+        assert!(!tree.set_popover_open(popover, true));
+        assert_eq!(tree.query_selector_all(":is(:popover-open,#missing)").unwrap(), vec![popover]);
+        assert!(tree.matches_selector(popover, "[popover]:popover-open").unwrap());
+        assert!(!tree.matches_selector(popover, "[popover]:not(:popover-open)").unwrap());
+        tree.detach(parent);
+        assert!(!tree.popover_open(popover));
+        assert!(!tree.set_popover_open(popover, true));
+        tree.append_child(tree.document(), parent);
+        assert!(tree.query_selector_all(":popover-open").unwrap().is_empty());
+        assert!(tree.set_popover_open(popover, true));
+        tree.remove(parent);
+        assert!(!tree.popover_open(popover));
+    }
 
     fn shadow_element(
         tree: &crate::tree::DomTree,

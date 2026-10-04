@@ -559,6 +559,7 @@ pub struct Page {
     /// while a navigation requested by page script uses the previous document.
     pub referrer: String,
     referrer_policy: ReferrerPolicy,
+    script_policy: obscura_js::csp::ScriptPolicy,
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
@@ -1452,6 +1453,7 @@ impl Page {
             title: String::new(),
             referrer: String::new(),
             referrer_policy: ReferrerPolicy::default(),
+            script_policy: obscura_js::csp::ScriptPolicy::default(),
             viewport: persona_viewport,
             device_metrics_baseline: None,
             device_scale_factor: persona_device_scale_factor,
@@ -2202,9 +2204,11 @@ impl Page {
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
         rt.set_referrer_policy(self.referrer_policy);
+        rt.set_script_policy(self.script_policy.clone());
         rt.set_viewport(self.viewport.0 as f64, self.viewport.1 as f64);
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_web_storage(self.context.local_storage.clone(), self.session_storage.clone());
+        rt.set_indexed_db(self.context.indexed_db.clone());
         rt.bind_page_transport(self.stealth_client.clone(), self.callbacks.clone())
             .expect("page transport must match its frozen context persona");
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -2594,14 +2598,20 @@ impl Page {
             nid: u32,
             /// Document base URL at this element's parser encounter point.
             base_url: String,
+            policy: obscura_js::csp::ScriptPolicy,
+            nonce: String,
+            allowed: bool,
         }
 
+        let mut final_script_policy = self.script_policy.clone();
         let all_scripts = match &self.js {
             Some(js) => {
                 let document_url = self.url_string();
                 js.with_dom(|dom| {
                     let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut bases_at_script = std::collections::HashMap::new();
+                    let mut policies_at_script = std::collections::HashMap::new();
+                    let mut active_policy = self.script_policy.clone();
                     let mut active_base = url::Url::parse(&document_url).ok();
                     let mut found_base = false;
                     for nid in dom.descendants(dom.document()) {
@@ -2611,6 +2621,16 @@ impl Page {
                         let Some(name) = node.as_element() else {
                             continue;
                         };
+                        if name.local.as_ref() == "meta"
+                            && node.get_attribute("http-equiv").is_some_and(|value|
+                                value.eq_ignore_ascii_case("content-security-policy"))
+                            && dom.ancestors(nid).iter().any(|ancestor| dom.get_node(*ancestor)
+                                .is_some_and(|node| node.as_element()
+                                    .is_some_and(|name| name.local.as_ref() == "head"))) {
+                            if let Some(content) = node.get_attribute("content") {
+                                active_policy.append(content);
+                            }
+                        }
                         if name.local.as_ref() == "base" && !found_base {
                             if let Some(href) = node.get_attribute("href") {
                                 found_base = true;
@@ -2621,6 +2641,7 @@ impl Page {
                                 }
                             }
                         } else if name.local.as_ref() == "script" {
+                            policies_at_script.insert(nid.raw(), active_policy.clone());
                             bases_at_script.insert(
                                 nid.raw(),
                                 active_base
@@ -2630,6 +2651,7 @@ impl Page {
                             );
                         }
                     }
+                    final_script_policy = active_policy;
                     let mut scripts = Vec::new();
 
                     for sid in script_ids {
@@ -2661,7 +2683,18 @@ impl Page {
                                 || src.is_some()
                                 || !inline_code.trim().is_empty()
                             {
+                                let policy = policies_at_script.remove(&sid.raw()).unwrap_or_default();
+                                let base = bases_at_script.get(&sid.raw()).unwrap_or(&document_url);
+                                let resolved = src.as_ref().map(|source| url::Url::parse(base).ok()
+                                    .and_then(|base| base.join(source).ok())
+                                    .map(|url| url.to_string()).unwrap_or_else(|| source.clone()));
+                                let nonce = node.get_attribute("nonce").unwrap_or("").to_string();
+                                let allowed = policy.allows(&document_url, resolved.as_deref(),
+                                    &nonce, &inline_code, true, false);
                                 scripts.push(ScriptInfo {
+                                    policy,
+                                    nonce,
+                                    allowed,
                                     src,
                                     inline: inline_code,
                                     is_defer,
@@ -2709,7 +2742,7 @@ impl Page {
         let mut fetch_tasks: Vec<(usize, String, obscura_net::observation::RequestTrace, obscura_net::ScriptPriority)> = Vec::new();
 
         for (i, script) in all_scripts.iter().enumerate() {
-            if !matches!(script.kind, ScriptKind::Classic) {
+            if !script.allowed || !matches!(script.kind, ScriptKind::Classic) {
                 continue;
             }
             if let Some(src_url) = &script.src {
@@ -3026,6 +3059,11 @@ impl Page {
                 if script.src.is_some() {
                     if let Some((url, resp)) = fetched_script {
                         let execution_url = resp.url.to_string();
+                        if !script.policy.allows(&page.url_string(), Some(&execution_url),
+                            &script.nonce, "", true, !resp.redirected_from.is_empty()) {
+                            tracing::warn!("Content Security Policy blocked script {}", execution_url);
+                            return;
+                        }
                         if !script_response_is_executable(resp.status) {
                             tracing::warn!("Refusing to execute script {} after HTTP {}", url, resp.status);
                             return;
@@ -3072,6 +3110,14 @@ impl Page {
         // register at their exact position; module graphs start there too, but
         // evaluation of non-async modules remains post-parse.
         for (index, script) in all_scripts.iter().enumerate() {
+            if let Some(js) = &self.js { js.set_script_policy(script.policy.clone()); }
+            if !script.allowed {
+                if let Some(js) = &mut self.js {
+                    let _ = js.execute_script("<csp-script-error>", &format!(
+                        "queueMicrotask(()=>{{const s=document.querySelectorAll('script');for(const e of s)if(e._nid==={})e.dispatchEvent(new Event('error'));}})", script.nid));
+                }
+                continue;
+            }
             fetched.poll_ready(self, &mut execute_ready);
             if fetched.error.is_some() { break; }
             if tokio::time::Instant::now() >= script_deadline {
@@ -3259,6 +3305,8 @@ impl Page {
                 }
             }
         }
+
+        if let Some(js) = &self.js { js.set_script_policy(final_script_policy); }
 
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
@@ -4024,6 +4072,7 @@ impl Page {
         history_kind: obscura_js::ops::HistoryNavigation,
         deadline: Option<std::time::Instant>,
     ) -> Result<(), PageError> {
+        let navigation_started = obscura_net::timing::now();
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
         // Revisit the original entry with its request policy. Never turn a
@@ -4058,6 +4107,7 @@ impl Page {
             self.url = Some(url.clone());
             self.referrer.clear();
             self.referrer_policy = ReferrerPolicy::default();
+            self.script_policy = obscura_js::csp::ScriptPolicy::default();
             self.navigate_blank();
             self.stealth_client.begin_network_document();
             self.init_js();
@@ -4177,6 +4227,7 @@ impl Page {
         })?;
 
         if local_navigation {
+            navigation_trace.timing_body_completed(response.body.len());
             navigation_trace.response(&response, true);
         }
 
@@ -4201,6 +4252,17 @@ impl Page {
         ).map_err(|e| PageError::NetworkError(e.into()))?;
         self.referrer = response.request_referrer.as_ref().map(Url::to_string).unwrap_or_default();
         self.referrer_policy = response.header("referrer-policy").and_then(ReferrerPolicy::from_header).unwrap_or_default();
+        self.script_policy = obscura_js::csp::ScriptPolicy::default();
+        // Raw captures preserve repeated CSP headers; each policy must hold.
+        if let Some(raw) = &response.raw_headers {
+            for field in &raw.fields {
+                if field.name.eq_ignore_ascii_case(b"content-security-policy") {
+                    self.script_policy.append(&String::from_utf8_lossy(&field.value));
+                }
+            }
+        } else if let Some(policy) = response.header("content-security-policy") {
+            self.script_policy.append(policy);
+        }
 
         // Honor the response charset: HTTP Content-Type → <meta charset> sniff
         // in the first 1KB → UTF-8 fallback. Without this, every non-UTF-8
@@ -4220,6 +4282,9 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        if let Some(js) = &self.js {
+            js.set_navigation_timing(navigation_started, &navigation_trace.timing(), &self.url_string());
+        }
         let _watchdog = deadline.and_then(|end| self.js.as_ref().map(|js| js.execution_deadline(end)));
         let author_stylesheets = self.fetch_stylesheets().await;
 
@@ -5214,6 +5279,14 @@ impl Page {
     }
 
     /// Dispatch one keyboard protocol phase through the shared native path.
+    pub fn scheduling_navigation_pending(&self) -> bool {
+        self.js.as_ref().is_none_or(|runtime| runtime.has_pending_navigation())
+    }
+
+    pub fn scheduling_owner(&self) -> Option<obscura_js::pending_input::InputOwner> {
+        self.js.as_ref().map(|runtime| runtime.scheduling_owner())
+    }
+
     pub fn dispatch_keyboard_input(
         &mut self,
         input: obscura_js::runtime::KeyboardInput,
@@ -5674,6 +5747,7 @@ impl Page {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        self.script_policy = js.script_policy();
         self.suspended_cdp_object_state = js.take_cdp_object_state();
         let dom = js.take_dom();
         if let Some(dom) = dom {
@@ -6558,7 +6632,7 @@ mod tests {
             error,
             super::PageError::NavigationAborted { ref error_text }
                 if error_text == "net::ERR_ABORTED"
-        ));
+        ), "unexpected no-content navigation result: {error:?}");
         assert_eq!(page.document_identity(), old_document);
         assert_eq!(page.url_string(), old_url);
         assert_eq!(page.lifecycle, old_lifecycle);
@@ -8451,6 +8525,105 @@ mod tests {
             .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
             .unwrap();
         assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn csp_meta_blocks_scripts_and_preserves_parser_timing() {
+        let mut page = frame_page("csp-meta");
+        page.url = Some(url::Url::parse("https://fixture.test/page").unwrap());
+        page.dom = Some(obscura_dom::parse_html(r#"<!doctype html><html><head>
+            <script>globalThis.cspResults = ['before'];
+              const early = document.createElement('script');
+              early.textContent = "cspResults.push('early-dynamic')";
+              document.head.appendChild(early);
+            </script>
+            <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'nonce-good' 'unsafe-eval'">
+            <script>cspResults.push('blocked-inline')</script>
+            <script nonce="good">cspResults.push('nonce');
+              if (document.currentScript.nonce === 'good') cspResults.push('nonce-property');
+              const permitted = document.createElement('script');
+              permitted.nonce = 'good';
+              permitted.textContent = "cspResults.push('dynamic-nonce')";
+              document.head.appendChild(permitted);
+              const wrongNonce = document.createElement('script');
+              wrongNonce.nonce = 'bad';
+              wrongNonce.textContent = "cspResults.push('blocked-wrong-nonce')";
+              document.head.appendChild(wrongNonce);
+              const denied = document.createElement('script');
+              denied.src = 'data:text/javascript,cspResults.push("blocked-external")';
+              denied.onload = () => cspResults.push('wrong-load');
+              denied.onerror = () => cspResults.push('blocked-error');
+              document.head.appendChild(denied);
+              document.querySelector('meta').remove();
+              const inline = document.createElement('script');
+              inline.textContent = "cspResults.push('blocked-after-meta-removal')";
+              document.head.appendChild(inline);
+              cspResults.push(eval("'eval-allowed'"));
+            </script></head><body></body></html>"#));
+        page.init_js();
+        page.execute_scripts().await.unwrap();
+        page.settle(50).await;
+        let result = page.js.as_mut().unwrap().evaluate("cspResults").unwrap();
+        let values = result.as_array().unwrap();
+        for value in ["before", "early-dynamic", "nonce", "nonce-property", "dynamic-nonce", "blocked-error", "eval-allowed"] {
+            assert!(values.contains(&serde_json::json!(value)), "missing {value}: {result}");
+        }
+        assert_eq!(values.len(), 7, "a blocked script executed or an error fired twice: {result}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn csp_error_idl_handler_replacement_preserves_independent_listeners() {
+        let mut page = frame_page("csp-error-handler");
+        page.dom = Some(obscura_dom::parse_html("<!doctype html><body></body>"));
+        page.init_js();
+        let result = page.js.as_mut().unwrap().evaluate(r#"(() => {
+            const script = document.createElement('script');
+            const seen = [];
+            const first = () => seen.push('first');
+            const second = () => seen.push('second');
+            const listener = () => seen.push('listener');
+            script.addEventListener('error', listener);
+            script.onerror = first;
+            const assigned = script.onerror === first;
+            script.dispatchEvent(new Event('error'));
+            script.onerror = second;
+            script.dispatchEvent(new Event('error'));
+            script.onerror = null;
+            script.dispatchEvent(new Event('error'));
+            script.removeEventListener('error', listener);
+            script.dispatchEvent(new Event('error'));
+            return {seen, assigned, cleared: script.onerror === null};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({"seen": ["first", "listener", "second", "listener", "listener"], "assigned": true, "cleared": true}));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn csp_response_headers_intersect_and_report_only_does_not_enforce() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break; };
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    let count = socket.read(&mut request).await.unwrap();
+                    let report = String::from_utf8_lossy(&request[..count]).contains("/report");
+                    let headers = if report { "Content-Security-Policy-Report-Only: script-src 'none'\r\n" }
+                        else { "Content-Security-Policy: script-src 'unsafe-inline'\r\nContent-Security-Policy: script-src 'none'\r\n" };
+                    let body = "<!doctype html><script>globalThis.cspExecuted=true</script>";
+                    let reply = format!("HTTP/1.1 200 OK\r\n{headers}Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let mut page = frame_page("csp-header");
+        page.navigate(&format!("http://{addr}/enforce")).await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("typeof cspExecuted").unwrap(), serde_json::json!("undefined"));
+        page.navigate(&format!("http://{addr}/report")).await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("cspExecuted").unwrap(), serde_json::json!(true));
+        server.abort();
     }
 
     /// The sweep still does its job: an iframe removed from the document has

@@ -12,7 +12,7 @@ stealth = []
 # Builds the obscura-render layout layer and exposes real box geometry to JS
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.
-render = ["dep:obscura-render", "obscura-render/paint"]
+render = ["obscura-render/paint"]
 
 [build-dependencies]
 deno_core = "0.350"
@@ -51,4 +51,11 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
-obscura-render = { workspace = true, optional = true }
+obscura-render = { workspace = true, default-features = false, features = ["text"] }
+
+[dev-dependencies]
+# Same pinned local TLS fixture stack already used by obscura-net tests.
+# Client-side WSS remains the production primp transport.
+rcgen = "0.13"
+tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
